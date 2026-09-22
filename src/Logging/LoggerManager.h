@@ -1,0 +1,47 @@
+// Copyright (c) 2011-2017 The Cryptonote developers
+// Copyright (c) 2017-2018 The Circle Foundation & Conceal Devs
+// Copyright (c) 2018-2026 Conceal Network & Conceal Devs
+//
+// Distributed under the MIT/X11 software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#pragma once
+
+#include <list>
+#include <memory>
+#include <mutex>
+
+#include "LoggerGroup.h"
+
+#include "Common/Json.h"
+
+namespace Logging {
+
+class LoggerManager : public LoggerGroup {
+public:
+  LoggerManager();
+  void configure(const Common::Json& val);
+  virtual void operator()(const std::string& category, Level level, boost::posix_time::ptime time, const std::string& body) override;
+
+  Level getLevel() const override
+  {
+    // Return the maximum level from all loggers, or a default
+    Level maxLevel = ERROR;
+    for (const auto &logger : loggers)
+    {
+      if (logger && logger->getLevel() > maxLevel)
+      {
+        maxLevel = logger->getLevel();
+      }
+    }
+    return maxLevel;
+  }
+
+  void flush();
+
+private:
+  std::vector<std::unique_ptr<CommonLogger>> loggers;
+  std::mutex reconfigureLock;
+};
+
+}
