@@ -1,3 +1,21 @@
+## Build
+
+```bash
+git clone https://github.com/nullcryptodev/Clarity
+cd Clarity
+
+# remove and readd bugged external
+rm -rf external/json
+git clone --branch v3.11.3 --depth 1 https://github.com/nlohmann/json.git external/json
+
+mkdir build
+
+cmake ..
+make
+```
+
+To build tests, refer to [TESTING.md](https://github.com/nullcryptodev/Clarity/blob/main/TESTING.md)
+
 ## What it is
 
 Clarity is a **single-chain, Byzantine-fault-tolerant proof-of-stake network** with a native currency (CLRTY), a general-purpose token system, an automated market maker, a limit-order book, validator rewards with a pot mechanism, and a growing feature set around staking, validator rotation, and on-chain governance of validator sets.
