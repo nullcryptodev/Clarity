@@ -15,6 +15,7 @@ namespace P2P
     Connecting,
     Handshaking,
     VerackPending,
+    AuthPending,
     Established,
     Disconnecting,
     Closed,

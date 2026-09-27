@@ -7,6 +7,8 @@
 
 #include "Crypto/Blake2b.h"
 
+#include "State/StateDB.h"
+
 #include <cstring>
 
 namespace Core
@@ -61,18 +63,17 @@ namespace Core
   std::optional<Block> ChainDB::getBlock(const Crypto::Hash &hash) const
   {
     std::vector<uint8_t> bytes;
-    if (!db_.rawGet(TBL_BLOCKS_BY_HASH,
-                    hash.data.data(), hash.data.size(),
-                    bytes))
-    {
+    bool got = db_.rawGet(TBL_BLOCKS_BY_HASH,
+                          hash.data.data(), hash.data.size(),
+                          bytes);
+    if (!got)
       return std::nullopt;
-    }
 
     Block block;
-    if (!Block::deserialize(bytes.data(), bytes.size(), block))
-    {
+    bool ok = Block::deserialize(bytes.data(), bytes.size(), block);
+
+    if (!ok)
       return std::nullopt;
-    }
 
     return block;
   }
@@ -81,7 +82,9 @@ namespace Core
   {
     auto hash_opt = getHashByHeight(height);
     if (!hash_opt.has_value())
+    {
       return std::nullopt;
+    }
     return getBlock(*hash_opt);
   }
 
@@ -334,7 +337,6 @@ namespace Core
   }
 
   //  Txn-aware block storage
-
   void ChainDB::storeBlockTxn(State::StateDB::Txn &txn,
                               const Block &block,
                               const Crypto::Hash &hash)
@@ -353,6 +355,31 @@ namespace Core
     txn.put(TBL_BLOCKS_BY_HEIGHT,
             height_key, sizeof(height_key),
             hash.data.data(), hash.data.size());
+
+    // ---- Transaction index ----
+    //
+    // One entry per tx, keyed by txid, so getTxLocation can answer
+    // "which block contains this tx, and at what index?" without
+    // scanning blocks. Written in the same MDBX txn as the block
+    // itself, so the index can never reference a block that isn't
+    // committed.
+    //
+    // Duplicate txids (impossible in practice — nonces are
+    // per-sender and monotonic) would overwrite, which is fine: the
+    // block is the source of truth, the index is a convenience.
+
+    for (uint32_t i = 0; i < block.transactions.size(); ++i)
+    {
+      Crypto::Hash txid = block.transactions[i].txid();
+      TxLocation loc;
+      loc.block_hash = hash;
+      loc.block_height = height;
+      loc.tx_index = i;
+      auto loc_bytes = encodeTxLocation(loc);
+      txn.put(12,//TBL_TX_INDEX
+              txid.data.data(), txid.data.size(),
+              loc_bytes.data(), loc_bytes.size());
+    }
   }
 
   void ChainDB::setHeadTxn(State::StateDB::Txn &txn, const ChainHead &head)
@@ -368,4 +395,52 @@ namespace Core
             bytes.data(), bytes.size());
   }
 
+  //  Tx index encoding
+  //
+  //  Layout: [32] block_hash, [8] block_height LE, [4] tx_index LE.
+  //  Fixed 44 bytes.
+
+  std::vector<uint8_t> ChainDB::encodeTxLocation(const TxLocation &loc)
+  {
+    std::vector<uint8_t> out;
+    out.reserve(44);
+    out.insert(out.end(), loc.block_hash.data.begin(), loc.block_hash.data.end());
+    for (int i = 0; i < 8; ++i)
+      out.push_back(uint8_t(loc.block_height >> (i * 8)));
+    for (int i = 0; i < 4; ++i)
+      out.push_back(uint8_t(loc.tx_index >> (i * 8)));
+    return out;
+  }
+
+  bool ChainDB::decodeTxLocation(const uint8_t *data, size_t len, TxLocation &out)
+  {
+    if (len != 44)
+      return false;
+    std::memcpy(out.block_hash.data.data(), data, 32);
+    out.block_height = 0;
+    for (int i = 0; i < 8; ++i)
+      out.block_height |= uint64_t(data[32 + i]) << (i * 8);
+    out.tx_index = 0;
+    for (int i = 0; i < 4; ++i)
+      out.tx_index |= uint32_t(data[40 + i]) << (i * 8);
+    return true;
+  }
+
+  std::optional<ChainDB::TxLocation>
+  ChainDB::getTxLocation(const Crypto::Hash &txid) const
+  {
+    std::vector<uint8_t> bytes;
+    if (!db_.rawGet(State::StateDB::TBL_TX_INDEX,
+                    txid.data.data(), txid.data.size(),
+                    bytes))
+    {
+      return std::nullopt;
+    }
+
+    TxLocation loc;
+    if (!decodeTxLocation(bytes.data(), bytes.size(), loc))
+      return std::nullopt;
+
+    return loc;
+  }
 } // namespace Core

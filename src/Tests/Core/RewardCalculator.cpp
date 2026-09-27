@@ -13,30 +13,28 @@
 using namespace Core;
 using namespace Tests;
 
-// ============================================================================
-//  applyBps — arithmetic helper
-// ============================================================================
+// arithmetic helper
 
-TEST(ApplyBps, Zero)
+TEST(Core_ApplyBps, Zero)
 {
   EXPECT_EQ(applyBps(1000, 0), 0u);
   EXPECT_EQ(applyBps(0, 5000), 0u);
 }
 
-TEST(ApplyBps, Full)
+TEST(Core_ApplyBps, Full)
 {
   // 10000 bps = 100%
   EXPECT_EQ(applyBps(1000, 10'000), 1000u);
   EXPECT_EQ(applyBps(0xDEADBEEF, 10'000), 0xDEADBEEFu);
 }
 
-TEST(ApplyBps, Half)
+TEST(Core_ApplyBps, Half)
 {
   EXPECT_EQ(applyBps(1000, 5000), 500u);
   EXPECT_EQ(applyBps(1, 5000), 0u); // rounds down
 }
 
-TEST(ApplyBps, NoOverflowAtMax)
+TEST(Core_ApplyBps, NoOverflowAtMax)
 {
   // UINT64_MAX * 10000 would overflow uint64 but fits in uint128.
   const uint64_t v = std::numeric_limits<uint64_t>::max();
@@ -44,7 +42,7 @@ TEST(ApplyBps, NoOverflowAtMax)
   EXPECT_EQ(applyBps(v, 0), 0u);
 }
 
-TEST(ApplyBpsRound, RoundsToNearest)
+TEST(Core_ApplyBpsRound, RoundsToNearest)
 {
   // 1000 * 250 / 10000 = 25.0 exactly.
   EXPECT_EQ(applyBpsRound(1000, 250), 25u);
@@ -75,11 +73,7 @@ TEST(ApplyBpsRound, RoundsToNearest)
   EXPECT_EQ(applyBpsRound(2020, 250), 51u);
 }
 
-// ============================================================================
-//  computeBlockReward
-// ============================================================================
-
-TEST(ComputeBlockReward, EmptyActiveSetReturnsZero)
+TEST(Core_ComputeBlockReward, EmptyActiveSetReturnsZero)
 {
   RewardContext ctx = makeContext();
   ValidatorRegistry registry; // no validators
@@ -90,7 +84,7 @@ TEST(ComputeBlockReward, EmptyActiveSetReturnsZero)
   EXPECT_TRUE(result.validator_rewards.empty());
 }
 
-TEST(ComputeBlockReward, ValidatorPoolShare)
+TEST(Core_ComputeBlockReward, ValidatorPoolShare)
 {
   RewardContext ctx = makeContext();
   ctx.block_reward_atomic = 1000;
@@ -102,7 +96,7 @@ TEST(ComputeBlockReward, ValidatorPoolShare)
   EXPECT_EQ(result.total_issued, 600u);
 }
 
-TEST(ComputeBlockReward, ProducerBonusShare)
+TEST(Core_ComputeBlockReward, ProducerBonusShare)
 {
   RewardContext ctx = makeContext();
   ctx.block_reward_atomic = 10'000;
@@ -118,7 +112,7 @@ TEST(ComputeBlockReward, ProducerBonusShare)
   EXPECT_EQ(result.set_amount, 4800u);
 }
 
-TEST(ComputeBlockReward, SetDistributionSingleValidator)
+TEST(Core_ComputeBlockReward, SetDistributionSingleValidator)
 {
   RewardContext ctx = makeContext();
   ctx.block_reward_atomic = 10'000;
@@ -131,7 +125,7 @@ TEST(ComputeBlockReward, SetDistributionSingleValidator)
   EXPECT_EQ(result.validator_rewards[0].amount, 4800u);
 }
 
-TEST(ComputeBlockReward, SetDistributionMultipleValidators)
+TEST(Core_ComputeBlockReward, SetDistributionMultipleValidators)
 {
   RewardContext ctx = makeContext();
   ctx.block_reward_atomic = 10'000;
@@ -151,7 +145,7 @@ TEST(ComputeBlockReward, SetDistributionMultipleValidators)
   EXPECT_EQ(total, 4800u);
 }
 
-TEST(ComputeBlockReward, RemainderDistributedDeterministically)
+TEST(Core_ComputeBlockReward, RemainderDistributedDeterministically)
 {
   RewardContext ctx = makeContext();
   ctx.block_reward_atomic = 10'000;
@@ -180,7 +174,7 @@ TEST(ComputeBlockReward, RemainderDistributedDeterministically)
   EXPECT_EQ(total, 4800u);
 }
 
-TEST(ComputeBlockReward, TotalDistributionEqualsPool)
+TEST(Core_ComputeBlockReward, TotalDistributionEqualsPool)
 {
   RewardContext ctx = makeContext();
   ctx.block_reward_atomic = 10'000;
@@ -197,7 +191,7 @@ TEST(ComputeBlockReward, TotalDistributionEqualsPool)
   }
 }
 
-TEST(ComputeBlockReward, ActiveSetIdsMatchOrder)
+TEST(Core_ComputeBlockReward, ActiveSetIdsMatchOrder)
 {
   RewardContext ctx = makeContext();
   ctx.block_reward_atomic = 10'000;
@@ -212,11 +206,7 @@ TEST(ComputeBlockReward, ActiveSetIdsMatchOrder)
   }
 }
 
-// ============================================================================
-//  computeEffectiveApy
-// ============================================================================
-
-TEST(ComputeEffectiveApy, BaseOnly)
+TEST(Core_ComputeEffectiveApy, BaseOnly)
 {
   RewardContext ctx = makeContext();
   ctx.apy_base_bps = 500;
@@ -226,7 +216,7 @@ TEST(ComputeEffectiveApy, BaseOnly)
   EXPECT_EQ(computeEffectiveApy(ctx, 60), 500u);
 }
 
-TEST(ComputeEffectiveApy, ActivityAdded)
+TEST(Core_ComputeEffectiveApy, ActivityAdded)
 {
   RewardContext ctx = makeContext();
   ctx.apy_base_bps = 500;
@@ -235,7 +225,7 @@ TEST(ComputeEffectiveApy, ActivityAdded)
   EXPECT_EQ(computeEffectiveApy(ctx, 60), 800u);
 }
 
-TEST(ComputeEffectiveApy, ActivityCapped)
+TEST(Core_ComputeEffectiveApy, ActivityCapped)
 {
   RewardContext ctx = makeContext();
   ctx.apy_base_bps = 500;
@@ -245,7 +235,7 @@ TEST(ComputeEffectiveApy, ActivityCapped)
   EXPECT_EQ(computeEffectiveApy(ctx, 60), 1000u);
 }
 
-TEST(ComputeEffectiveApy, PotBonusAdded)
+TEST(Core_ComputeEffectiveApy, PotBonusAdded)
 {
   RewardContext ctx = makeContext();
   ctx.apy_base_bps = 500;
@@ -254,7 +244,7 @@ TEST(ComputeEffectiveApy, PotBonusAdded)
   EXPECT_EQ(computeEffectiveApy(ctx, 60), 700u);
 }
 
-TEST(ComputeEffectiveApy, PotBonusCapped)
+TEST(Core_ComputeEffectiveApy, PotBonusCapped)
 {
   RewardContext ctx = makeContext();
   ctx.apy_base_bps = 500;
@@ -264,7 +254,7 @@ TEST(ComputeEffectiveApy, PotBonusCapped)
   EXPECT_EQ(computeEffectiveApy(ctx, 60), 800u);
 }
 
-TEST(ComputeEffectiveApy, AllComponentsMax)
+TEST(Core_ComputeEffectiveApy, AllComponentsMax)
 {
   RewardContext ctx = makeContext();
   ctx.apy_base_bps = 500;
@@ -275,7 +265,7 @@ TEST(ComputeEffectiveApy, AllComponentsMax)
   EXPECT_EQ(computeEffectiveApy(ctx, 60), 1300u);
 }
 
-TEST(ComputeEffectiveApy, Uint16Cap)
+TEST(Core_ComputeEffectiveApy, Uint16Cap)
 {
   RewardContext ctx = makeContext();
   ctx.apy_base_bps = 60'000;
@@ -287,11 +277,7 @@ TEST(ComputeEffectiveApy, Uint16Cap)
   EXPECT_EQ(computeEffectiveApy(ctx, 60), 60'800u);
 }
 
-// ============================================================================
-//  computeTargetStakerPayout
-// ============================================================================
-
-TEST(ComputeTargetStakerPayout, ZeroStake)
+TEST(Core_ComputeTargetStakerPayout, ZeroStake)
 {
   RewardContext ctx = makeContext();
   ctx.total_staked = 0;
@@ -299,7 +285,7 @@ TEST(ComputeTargetStakerPayout, ZeroStake)
   EXPECT_EQ(computeTargetStakerPayout(ctx, 500, 60), 0u);
 }
 
-TEST(ComputeTargetStakerPayout, ZeroApy)
+TEST(Core_ComputeTargetStakerPayout, ZeroApy)
 {
   RewardContext ctx = makeContext();
   ctx.total_staked = 1'000'000;
@@ -307,7 +293,7 @@ TEST(ComputeTargetStakerPayout, ZeroApy)
   EXPECT_EQ(computeTargetStakerPayout(ctx, 0, 60), 0u);
 }
 
-TEST(ComputeTargetStakerPayout, BasicCase)
+TEST(Core_ComputeTargetStakerPayout, BasicCase)
 {
   RewardContext ctx = makeContext();
   ctx.total_staked = 1'000'000'000ULL; // 1B atomic units
@@ -322,7 +308,7 @@ TEST(ComputeTargetStakerPayout, BasicCase)
   EXPECT_EQ(payout, 95u);
 }
 
-TEST(ComputeTargetStakerPayout, ScalesWithStake)
+TEST(Core_ComputeTargetStakerPayout, ScalesWithStake)
 {
   RewardContext ctx = makeContext();
 
@@ -337,7 +323,7 @@ TEST(ComputeTargetStakerPayout, ScalesWithStake)
   EXPECT_LE(p2, p1 * 2 + 1);
 }
 
-TEST(ComputeTargetStakerPayout, ScalesWithTime)
+TEST(Core_ComputeTargetStakerPayout, ScalesWithTime)
 {
   RewardContext ctx = makeContext();
   ctx.total_staked = 1'000'000'000ULL;
@@ -350,7 +336,7 @@ TEST(ComputeTargetStakerPayout, ScalesWithTime)
   EXPECT_LE(p2, p1 * 2 + 1);
 }
 
-TEST(ComputeTargetStakerPayout, ScalesWithApy)
+TEST(Core_ComputeTargetStakerPayout, ScalesWithApy)
 {
   RewardContext ctx = makeContext();
   ctx.total_staked = 100'000'000'000ULL; // 100B
@@ -363,7 +349,7 @@ TEST(ComputeTargetStakerPayout, ScalesWithApy)
   EXPECT_LE(p2, p1 * 2 + 1);
 }
 
-TEST(ComputeTargetStakerPayout, NoOverflowAtMax)
+TEST(Core_ComputeTargetStakerPayout, NoOverflowAtMax)
 {
   RewardContext ctx = makeContext();
   ctx.total_staked = std::numeric_limits<uint64_t>::max();
@@ -378,11 +364,7 @@ TEST(ComputeTargetStakerPayout, NoOverflowAtMax)
   EXPECT_GE(payout, ctx.total_staked / 2);
 }
 
-// ============================================================================
-//  applyPotMechanics
-// ============================================================================
-
-TEST(ApplyPotMechanics, PoolCoversTarget)
+TEST(Core_ApplyPotMechanics, PoolCoversTarget)
 {
   // Pool = 1000, target = 600, pot = 0, baseline = 100.
   // Result: distribute 600, add 400 to pot, no drain, no burn.
@@ -398,7 +380,7 @@ TEST(ApplyPotMechanics, PoolCoversTarget)
   EXPECT_EQ(adj.burned, 0u);
 }
 
-TEST(ApplyPotMechanics, PoolEqualsTarget)
+TEST(Core_ApplyPotMechanics, PoolEqualsTarget)
 {
   // Pool == target, pot unchanged.
   auto adj = applyPotMechanics(1000, 1000, 0, 100);
@@ -409,7 +391,7 @@ TEST(ApplyPotMechanics, PoolEqualsTarget)
   EXPECT_EQ(adj.burned, 0u);
 }
 
-TEST(ApplyPotMechanics, PoolShortPotCovers)
+TEST(Core_ApplyPotMechanics, PoolShortPotCovers)
 {
   // Pool = 500, target = 1000, pot = 700.
   // Result: distribute 1000, drain 500 from pot, no add.
@@ -421,7 +403,7 @@ TEST(ApplyPotMechanics, PoolShortPotCovers)
   EXPECT_EQ(adj.burned, 0u);
 }
 
-TEST(ApplyPotMechanics, PoolShortPotInsufficient)
+TEST(Core_ApplyPotMechanics, PoolShortPotInsufficient)
 {
   // Pool = 500, target = 1000, pot = 300.
   // Result: distribute 800 (all available), drain 300, no add.
@@ -433,7 +415,7 @@ TEST(ApplyPotMechanics, PoolShortPotInsufficient)
   EXPECT_EQ(adj.burned, 0u);
 }
 
-TEST(ApplyPotMechanics, PotBurnedAtMax)
+TEST(Core_ApplyPotMechanics, PotBurnedAtMax)
 {
   // pot_max = baseline * POT_MAX_EPOCHS. Compute it rather than
   // hardcoding so this test stays correct if the constant changes.
@@ -462,7 +444,7 @@ TEST(ApplyPotMechanics, PotBurnedAtMax)
   }
 }
 
-TEST(ApplyPotMechanics, PoolZeroTargetZero)
+TEST(Core_ApplyPotMechanics, PoolZeroTargetZero)
 {
   auto adj = applyPotMechanics(0, 0, 0, 100);
 
@@ -472,7 +454,7 @@ TEST(ApplyPotMechanics, PoolZeroTargetZero)
   EXPECT_EQ(adj.burned, 0u);
 }
 
-TEST(ApplyPotMechanics, ZeroBaselineUsesPool)
+TEST(Core_ApplyPotMechanics, ZeroBaselineUsesPool)
 {
   // If baseline is 0, use staker_pool.
   // Shouldn't crash, should still compute reasonably.
@@ -481,16 +463,12 @@ TEST(ApplyPotMechanics, ZeroBaselineUsesPool)
   EXPECT_EQ(adj.added_to_pot, 500u);
 }
 
-// ============================================================================
-//  apyToPerSecondScaled
-// ============================================================================
-
-TEST(ApyToPerSecondScaled, Zero)
+TEST(Core_ApyToPerSecondScaled, Zero)
 {
   EXPECT_EQ(apyToPerSecondScaled(0), 0u);
 }
 
-TEST(ApyToPerSecondScaled, NonZero)
+TEST(Core_ApyToPerSecondScaled, NonZero)
 {
   // 500 * 10^12 / 31,556,952 = 15,844,369 (integer division).
   // Pinning the exact value makes this test fail loudly if SCALE or
@@ -498,7 +476,7 @@ TEST(ApyToPerSecondScaled, NonZero)
   EXPECT_EQ(apyToPerSecondScaled(500), 15'844'369u);
 }
 
-TEST(ApyToPerSecondScaled, ScalesLinearly)
+TEST(Core_ApyToPerSecondScaled, ScalesLinearly)
 {
   uint64_t r1 = apyToPerSecondScaled(500);
   uint64_t r2 = apyToPerSecondScaled(1000);
@@ -508,11 +486,9 @@ TEST(ApyToPerSecondScaled, ScalesLinearly)
   EXPECT_LE(r2, r1 * 2 + 1);
 }
 
-// ============================================================================
-//  Integration scenarios
-// ============================================================================
+// Integration scenarios
 
-TEST(RewardIntegration, TypicalBlock)
+TEST(Core_RewardIntegration, TypicalBlock)
 {
   // 21 active validators, standard block reward.
   RewardContext ctx = makeContext();
@@ -541,7 +517,7 @@ TEST(RewardIntegration, TypicalBlock)
   EXPECT_EQ(result.validator_rewards.size(), 21u);
 }
 
-TEST(RewardIntegration, TypicalEpoch)
+TEST(Core_RewardIntegration, TypicalEpoch)
 {
   RewardContext ctx = makeContext();
   ctx.total_staked = 50'000'000 * 100'000ULL; // 50M CLRTY staked
@@ -566,24 +542,20 @@ TEST(RewardIntegration, TypicalEpoch)
   EXPECT_NEAR(target, 760'000u, 10'000u);
 }
 
-// ============================================================================
-//  computeActivityBps
-//
-//  Returns 0 at zero activity, APY_ACTIVITY_MAX_BPS at TRAFFIC_SATURATION_TX,
-//  linearly interpolated between. Clamps above saturation.
-// ============================================================================
+// Returns 0 at zero activity, APY_ACTIVITY_MAX_BPS at TRAFFIC_SATURATION_TX,
+// linearly interpolated between. Clamps above saturation.
 
-TEST(ComputeActivityBps, ZeroTxReturnsZero)
+TEST(Core_ComputeActivityBps, ZeroTxReturnsZero)
 {
   EXPECT_EQ(computeActivityBps(0), 0u);
 }
 
-TEST(ComputeActivityBps, AtSaturationReturnsMax)
+TEST(Core_ComputeActivityBps, AtSaturationReturnsMax)
 {
   EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX), APY_ACTIVITY_MAX_BPS);
 }
 
-TEST(ComputeActivityBps, AboveSaturationClampsToMax)
+TEST(Core_ComputeActivityBps, AboveSaturationClampsToMax)
 {
   EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX + 1), APY_ACTIVITY_MAX_BPS);
   EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX * 100), APY_ACTIVITY_MAX_BPS);
@@ -591,7 +563,7 @@ TEST(ComputeActivityBps, AboveSaturationClampsToMax)
             APY_ACTIVITY_MAX_BPS);
 }
 
-TEST(ComputeActivityBps, LinearInterpolation)
+TEST(Core_ComputeActivityBps, LinearInterpolation)
 {
   // TRAFFIC_SATURATION_TX = 1000, APY_ACTIVITY_MAX_BPS = 500.
   // Halfway: 500 tx → 250 bps.
@@ -604,7 +576,7 @@ TEST(ComputeActivityBps, LinearInterpolation)
   EXPECT_EQ(computeActivityBps(100), 50u);
 }
 
-TEST(ComputeActivityBps, SmallValuesRoundDown)
+TEST(Core_ComputeActivityBps, SmallValuesRoundDown)
 {
   // 1 tx out of 1000 → 500 * 1 / 1000 = 0 (integer division).
   EXPECT_EQ(computeActivityBps(1), 0u);
@@ -619,7 +591,7 @@ TEST(ComputeActivityBps, SmallValuesRoundDown)
   EXPECT_EQ(computeActivityBps(4), 2u);
 }
 
-TEST(ComputeActivityBps, NeverExceedsMax)
+TEST(Core_ComputeActivityBps, NeverExceedsMax)
 {
   // Sweep a range and confirm the cap holds.
   for (uint64_t tx = 0; tx <= TRAFFIC_SATURATION_TX * 2; tx += 50)
@@ -629,21 +601,17 @@ TEST(ComputeActivityBps, NeverExceedsMax)
   }
 }
 
-// ============================================================================
-//  computePotBonusBps
-//
-//  Returns 0 below POT_HIGH, ramps linearly from 0 to APY_POT_BONUS_MAX_BPS
-//  between POT_HIGH and POT_MAX, clamps at the max above POT_MAX. Returns
-//  0 when baseline is 0.
-// ============================================================================
+// Returns 0 below POT_HIGH, ramps linearly from 0 to APY_POT_BONUS_MAX_BPS
+// between POT_HIGH and POT_MAX, clamps at the max above POT_MAX. Returns
+// 0 when baseline is 0.
 
-TEST(ComputePotBonusBps, ZeroBaselineReturnsZero)
+TEST(Core_ComputePotBonusBps, ZeroBaselineReturnsZero)
 {
   EXPECT_EQ(computePotBonusBps(0, 0), 0u);
   EXPECT_EQ(computePotBonusBps(1'000'000'000ULL, 0), 0u);
 }
 
-TEST(ComputePotBonusBps, BelowPotHighReturnsZero)
+TEST(Core_ComputePotBonusBps, BelowPotHighReturnsZero)
 {
   const uint64_t baseline = 100;
   const uint64_t pot_high = baseline * POT_HIGH_EPOCHS;
@@ -653,7 +621,7 @@ TEST(ComputePotBonusBps, BelowPotHighReturnsZero)
   EXPECT_EQ(computePotBonusBps(pot_high - 1, baseline), 0u);
 }
 
-TEST(ComputePotBonusBps, AtPotHighReturnsZero)
+TEST(Core_ComputePotBonusBps, AtPotHighReturnsZero)
 {
   const uint64_t baseline = 100;
   const uint64_t pot_high = baseline * POT_HIGH_EPOCHS;
@@ -664,7 +632,7 @@ TEST(ComputePotBonusBps, AtPotHighReturnsZero)
   EXPECT_EQ(computePotBonusBps(pot_high, baseline), 0u);
 }
 
-TEST(ComputePotBonusBps, MidpointInterpolates)
+TEST(Core_ComputePotBonusBps, MidpointInterpolates)
 {
   const uint64_t baseline = 100;
   const uint64_t pot_high = baseline * POT_HIGH_EPOCHS;
@@ -680,7 +648,7 @@ TEST(ComputePotBonusBps, MidpointInterpolates)
   EXPECT_LE(actual, expected + 1);
 }
 
-TEST(ComputePotBonusBps, AtPotMaxReturnsMax)
+TEST(Core_ComputePotBonusBps, AtPotMaxReturnsMax)
 {
   const uint64_t baseline = 100;
   const uint64_t pot_max = baseline * POT_MAX_EPOCHS;
@@ -688,7 +656,7 @@ TEST(ComputePotBonusBps, AtPotMaxReturnsMax)
   EXPECT_EQ(computePotBonusBps(pot_max, baseline), APY_POT_BONUS_MAX_BPS);
 }
 
-TEST(ComputePotBonusBps, AbovePotMaxClampsToMax)
+TEST(Core_ComputePotBonusBps, AbovePotMaxClampsToMax)
 {
   const uint64_t baseline = 100;
   const uint64_t pot_max = baseline * POT_MAX_EPOCHS;
@@ -699,7 +667,7 @@ TEST(ComputePotBonusBps, AbovePotMaxClampsToMax)
             APY_POT_BONUS_MAX_BPS);
 }
 
-TEST(ComputePotBonusBps, MonotonicallyNonDecreasing)
+TEST(Core_ComputePotBonusBps, MonotonicallyNonDecreasing)
 {
   const uint64_t baseline = 100;
   const uint64_t pot_high = baseline * POT_HIGH_EPOCHS;
@@ -721,7 +689,7 @@ TEST(ComputePotBonusBps, MonotonicallyNonDecreasing)
   EXPECT_EQ(computePotBonusBps(pot_max, baseline), APY_POT_BONUS_MAX_BPS);
 }
 
-TEST(ComputePotBonusBps, NeverExceedsMax)
+TEST(Core_ComputePotBonusBps, NeverExceedsMax)
 {
   const uint64_t baseline = 100;
 

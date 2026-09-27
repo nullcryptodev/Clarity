@@ -157,6 +157,10 @@ namespace Consensus
     void resetForNewHeight(Height height);
     void resetForNewRound(Round round);
 
+    // Deliver any stashed proposal for the current round. Called from
+    // resetForNewRound after the round counter is updated.
+    void drainFutureProposal();
+
     Dependencies deps_;
     Callbacks callbacks_;
     Config config_;
@@ -195,6 +199,22 @@ namespace Consensus
     std::unordered_map<Index, Vote> precommits_;
 
     std::unique_ptr<Common::RoundTimer> round_timer_;
+
+    // Proposals received for a round we haven't reached yet. Keyed by
+    // round number. When resetForNewRound advances us to round N, any
+    // stashed proposal for N is processed before we enter the propose
+    // step.
+    //
+    // Why this matters: a proposer in round N+1 can send its proposal
+    // while a slow validator is still finishing round N. Without the
+    // queue, the slow validator's `p.round != round_` check drops the
+    // proposal on the floor and the round stalls until the proposer
+    // times out and tries again — which in the 2-validator case means
+    // the chain never advances.
+    //
+    // Cleared in resetForNewHeight. Retained across rounds within a
+    // height.
+    std::unordered_map<Round, Proposal> future_proposals_;
   };
 
 } // namespace Consensus

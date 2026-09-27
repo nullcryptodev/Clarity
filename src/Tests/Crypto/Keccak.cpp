@@ -14,7 +14,7 @@
 using namespace Crypto;
 using namespace Tests;
 
-TEST(Keccak, Empty)
+TEST(Crypto_Keccak, Empty)
 {
   uint8_t out[32];
   keccak256(reinterpret_cast<const uint8_t *>(""), 0, out);
@@ -24,7 +24,7 @@ TEST(Keccak, Empty)
             "e500b653ca82273b7bfad8045d85a470");
 }
 
-TEST(Keccak, Abc)
+TEST(Crypto_Keccak, Abc)
 {
   uint8_t out[32];
   keccak256(reinterpret_cast<const uint8_t *>("abc"), 3, out);
@@ -35,7 +35,7 @@ TEST(Keccak, Abc)
             "c0d1e6e33a64a036ec44f58fa12d6c45");
 }
 
-TEST(Sha3, Empty)
+TEST(Crypto_Sha3, Empty)
 {
   uint8_t out[32];
   sha3_256(reinterpret_cast<const uint8_t *>(""), 0, out);
@@ -45,7 +45,7 @@ TEST(Sha3, Empty)
             "f580ff4de43b49fa82d80a4b80f8434a");
 }
 
-TEST(Sha3, Abc)
+TEST(Crypto_Sha3, Abc)
 {
   uint8_t out[32];
   sha3_256(reinterpret_cast<const uint8_t *>("abc"), 3, out);

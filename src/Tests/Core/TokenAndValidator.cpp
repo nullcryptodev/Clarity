@@ -14,61 +14,61 @@
 using namespace Core;
 using namespace Tests;
 
-TEST(TokenInfo, DefaultIsNativePlaceholder)
+TEST(Core_TokenInfo, DefaultIsNativePlaceholder)
 {
   TokenInfo t;
   EXPECT_TRUE(t.isNative());
   EXPECT_FALSE(t.isBridged());
 }
 
-TEST(TokenInfo, ValidToken)
+TEST(Core_TokenInfo, ValidToken)
 {
   EXPECT_TRUE(makeToken().isValid());
 }
 
-TEST(TokenInfo, RejectsShortSymbol)
+TEST(Core_TokenInfo, RejectsShortSymbol)
 {
   TokenInfo t = makeToken();
   t.symbol = "AB";
   EXPECT_FALSE(t.isValid());
 }
 
-TEST(TokenInfo, RejectsLongSymbol)
+TEST(Core_TokenInfo, RejectsLongSymbol)
 {
   TokenInfo t = makeToken();
   t.symbol = "ABCDEFGHI";
   EXPECT_FALSE(t.isValid());
 }
 
-TEST(TokenInfo, RejectsEmptyName)
+TEST(Core_TokenInfo, RejectsEmptyName)
 {
   TokenInfo t = makeToken();
   t.name = "";
   EXPECT_FALSE(t.isValid());
 }
 
-TEST(TokenInfo, RejectsOverlongName)
+TEST(Core_TokenInfo, RejectsOverlongName)
 {
   TokenInfo t = makeToken();
   t.name.assign(TOKEN_NAME_MAX + 1, 'x');
   EXPECT_FALSE(t.isValid());
 }
 
-TEST(TokenInfo, RejectsTooManyDecimals)
+TEST(Core_TokenInfo, RejectsTooManyDecimals)
 {
   TokenInfo t = makeToken();
   t.decimals = 19;
   EXPECT_FALSE(t.isValid());
 }
 
-TEST(TokenInfo, RejectsExcessiveRoyalty)
+TEST(Core_TokenInfo, RejectsExcessiveRoyalty)
 {
   TokenInfo t = makeToken();
   t.royaltyBps = 10'001;
   EXPECT_FALSE(t.isValid());
 }
 
-TEST(TokenInfo, StateRoundTrip)
+TEST(Core_TokenInfo, StateRoundTrip)
 {
   TokenInfo original = makeToken();
 
@@ -87,7 +87,7 @@ TEST(TokenInfo, StateRoundTrip)
   EXPECT_FALSE(restored.fingerprint.has_value());
 }
 
-TEST(TokenInfo, StateRoundTripWithFingerprint)
+TEST(Core_TokenInfo, StateRoundTripWithFingerprint)
 {
   TokenInfo original = makeToken();
   Crypto::Hash fp;
@@ -104,13 +104,13 @@ TEST(TokenInfo, StateRoundTripWithFingerprint)
   EXPECT_TRUE(restored.isBridged());
 }
 
-TEST(TokenInfo, StateDeterministic)
+TEST(Core_TokenInfo, StateDeterministic)
 {
   TokenInfo t = makeToken();
   EXPECT_EQ(t.serializeState(), t.serializeState());
 }
 
-TEST(TokenInfo, DeserializeRejectsTruncated)
+TEST(Core_TokenInfo, DeserializeRejectsTruncated)
 {
   TokenInfo t = makeToken();
   auto bytes = t.serializeState();
@@ -119,45 +119,7 @@ TEST(TokenInfo, DeserializeRejectsTruncated)
   EXPECT_FALSE(TokenInfo::deserializeState(bytes.data(), bytes.size() / 2, restored));
 }
 
-// ============================================================================
-//  ValidatorInfo
-// ============================================================================
-
-namespace
-{
-  ValidatorInfo makeValidator()
-  {
-    ValidatorInfo v;
-    v.id = 7;
-    v.reward_address = Crypto::Address{};
-    for (int i = 0; i < 32; ++i)
-      v.reward_address.data[i] = static_cast<uint8_t>(i);
-    v.node_key = Crypto::PublicKey{};
-    for (int i = 0; i < 32; ++i)
-      v.node_key.data[i] = static_cast<uint8_t>(0x80 + i);
-    v.owner = v.reward_address;
-    v.registered_at_height = 100;
-    v.stake = VALIDATOR_MIN_STAKE;
-    v.uptime_score = 9'800;
-    v.last_ping_height = 150;
-    v.pings_responded_this_epoch = 55;
-    v.pings_sent_this_epoch = 60;
-    v.last_seen_height = 200;
-    v.reward_multiplier = REWARD_MULTIPLIER_START;
-    v.infraction_count = 0;
-    v.last_infraction_height = 0;
-    v.total_blocks_produced = 42;
-    v.total_rewards_earned = 5000;
-    v.epochs_active = 7;
-    v.is_seed = false;
-    v.is_active = true;
-    v.became_active_at = 100;
-    v.last_active_at = 200;
-    return v;
-  }
-}
-
-TEST(ValidatorInfo, DefaultIsInvalid)
+TEST(Core_ValidatorInfo, DefaultIsInvalid)
 {
   ValidatorInfo v;
   EXPECT_EQ(v.id, INVALID_ID);
@@ -165,7 +127,7 @@ TEST(ValidatorInfo, DefaultIsInvalid)
   EXPECT_EQ(v.infraction_count, 0);
 }
 
-TEST(ValidatorInfo, MeetsStakeRequirement)
+TEST(Core_ValidatorInfo, MeetsStakeRequirement)
 {
   ValidatorInfo v = makeValidator();
   EXPECT_TRUE(v.meetsStakeRequirement());
@@ -174,7 +136,7 @@ TEST(ValidatorInfo, MeetsStakeRequirement)
   EXPECT_FALSE(v.meetsStakeRequirement());
 }
 
-TEST(ValidatorInfo, IsHealthy)
+TEST(Core_ValidatorInfo, IsHealthy)
 {
   ValidatorInfo v = makeValidator();
   v.uptime_score = UPTIME_REMOVAL_THRESHOLD_BPS;
@@ -184,7 +146,7 @@ TEST(ValidatorInfo, IsHealthy)
   EXPECT_FALSE(v.isHealthy());
 }
 
-TEST(ValidatorInfo, CanBeActive)
+TEST(Core_ValidatorInfo, CanBeActive)
 {
   ValidatorInfo v = makeValidator();
   v.uptime_score = UPTIME_ACTIVE_MIN_BPS;
@@ -194,21 +156,21 @@ TEST(ValidatorInfo, CanBeActive)
   EXPECT_FALSE(v.canBeActive());
 }
 
-TEST(ValidatorInfo, IsOfflineUnderThreshold)
+TEST(Core_ValidatorInfo, IsOfflineUnderThreshold)
 {
   ValidatorInfo v = makeValidator();
   v.last_seen_height = 1000;
   EXPECT_FALSE(v.isOffline(1000 + OFFLINE_KICK_BLOCKS - 1));
 }
 
-TEST(ValidatorInfo, IsOfflineAtThreshold)
+TEST(Core_ValidatorInfo, IsOfflineAtThreshold)
 {
   ValidatorInfo v = makeValidator();
   v.last_seen_height = 1000;
   EXPECT_TRUE(v.isOffline(1000 + OFFLINE_KICK_BLOCKS));
 }
 
-TEST(ValidatorInfo, IsOfflineRejectsFuture)
+TEST(Core_ValidatorInfo, IsOfflineRejectsFuture)
 {
   ValidatorInfo v = makeValidator();
   v.last_seen_height = 2000;
@@ -216,7 +178,7 @@ TEST(ValidatorInfo, IsOfflineRejectsFuture)
   EXPECT_FALSE(v.isOffline(1500));
 }
 
-TEST(ValidatorInfo, StateRoundTrip)
+TEST(Core_ValidatorInfo, StateRoundTrip)
 {
   ValidatorInfo original = makeValidator();
 
@@ -249,7 +211,7 @@ TEST(ValidatorInfo, StateRoundTrip)
   EXPECT_EQ(restored.last_active_at, original.last_active_at);
 }
 
-TEST(ValidatorInfo, StateRoundTripPreservesFlags)
+TEST(Core_ValidatorInfo, StateRoundTripPreservesFlags)
 {
   ValidatorInfo original = makeValidator();
   original.is_seed = true;
@@ -263,13 +225,13 @@ TEST(ValidatorInfo, StateRoundTripPreservesFlags)
   EXPECT_FALSE(restored.is_active);
 }
 
-TEST(ValidatorInfo, StateDeterministic)
+TEST(Core_ValidatorInfo, StateDeterministic)
 {
   ValidatorInfo v = makeValidator();
   EXPECT_EQ(v.serializeState(), v.serializeState());
 }
 
-TEST(ValidatorInfo, DeserializeRejectsShortBuffer)
+TEST(Core_ValidatorInfo, DeserializeRejectsShortBuffer)
 {
   ValidatorInfo v = makeValidator();
   auto bytes = v.serializeState();

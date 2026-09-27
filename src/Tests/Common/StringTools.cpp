@@ -11,12 +11,12 @@
 
 using namespace Common;
 
-TEST(Hex, ToHexEmpty)
+TEST(Common_Hex, ToHexEmpty)
 {
   EXPECT_EQ(toHex(nullptr, 0), "");
 }
 
-TEST(Hex, ToHexSingleByte)
+TEST(Common_Hex, ToHexSingleByte)
 {
   uint8_t data[] = {0x00};
   EXPECT_EQ(toHex(data, 1), "00");
@@ -28,13 +28,13 @@ TEST(Hex, ToHexSingleByte)
   EXPECT_EQ(toHex(data3, 1), "ab");
 }
 
-TEST(Hex, ToHexMultiByte)
+TEST(Common_Hex, ToHexMultiByte)
 {
   uint8_t data[] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF};
   EXPECT_EQ(toHex(data, 8), "0123456789abcdef");
 }
 
-TEST(Hex, RoundTrip)
+TEST(Common_Hex, RoundTrip)
 {
   uint8_t original[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33};
   std::string hex = toHex(original, 8);
@@ -46,7 +46,7 @@ TEST(Hex, RoundTrip)
   EXPECT_EQ(std::memcmp(decoded.data(), original, 8), 0);
 }
 
-TEST(Hex, FromHexUppercase)
+TEST(Common_Hex, FromHexUppercase)
 {
   std::vector<uint8_t> data;
   ASSERT_TRUE(fromHex("DEADBEEF", data));
@@ -58,19 +58,19 @@ TEST(Hex, FromHexUppercase)
   EXPECT_EQ(data[3], 0xEF);
 }
 
-TEST(Hex, FromHexInvalidOddLength)
+TEST(Common_Hex, FromHexInvalidOddLength)
 {
   std::vector<uint8_t> data;
   EXPECT_FALSE(fromHex("abc", data));
 }
 
-TEST(Hex, FromHexInvalidCharacter)
+TEST(Common_Hex, FromHexInvalidCharacter)
 {
   std::vector<uint8_t> data;
   EXPECT_FALSE(fromHex("zz", data));
 }
 
-TEST(PodToHex, RoundTrip)
+TEST(Common_PodToHex, RoundTrip)
 {
   uint32_t original = 0xDEADBEEF;
   std::string hex = podToHex(original);
@@ -84,7 +84,7 @@ TEST(PodToHex, RoundTrip)
   EXPECT_EQ(decoded, original);
 }
 
-TEST(Strings, Extract)
+TEST(Common_Strings, Extract)
 {
   std::string text = "a,b,c";
   EXPECT_EQ(extract(text, ','), "a");
@@ -93,14 +93,14 @@ TEST(Strings, Extract)
   EXPECT_EQ(text, "");
 }
 
-TEST(Strings, ExtractNoDelimiter)
+TEST(Common_Strings, ExtractNoDelimiter)
 {
   std::string text = "abc";
   EXPECT_EQ(extract(text, ','), "abc");
   EXPECT_EQ(text, "");
 }
 
-TEST(Strings, ExtractWithOffset)
+TEST(Common_Strings, ExtractWithOffset)
 {
   std::string text = "a,b,c";
   size_t offset = 0;
@@ -113,7 +113,7 @@ TEST(Strings, ExtractWithOffset)
   EXPECT_EQ(offset, 5);
 }
 
-TEST(IP, AddressToString)
+TEST(Common_IP, AddressToString)
 {
   // 192.168.1.1 = 0xC0A80101 in big-endian integer form
   // ipAddressToString expects ip in network byte order when stored as uint32.
@@ -123,7 +123,7 @@ TEST(IP, AddressToString)
   EXPECT_EQ(ipAddressToString(ip), "192.168.1.1");
 }
 
-TEST(IP, ParseAndFormatRoundTrip)
+TEST(Common_IP, ParseAndFormatRoundTrip)
 {
   uint32_t ip = 0;
   uint32_t port = 0;
@@ -132,7 +132,7 @@ TEST(IP, ParseAndFormatRoundTrip)
   EXPECT_EQ(ipAddressToString(ip), "10.0.0.5");
 }
 
-TEST(Time, FormatInterval)
+TEST(Common_Time, FormatInterval)
 {
   EXPECT_EQ(timeIntervalToString(0), "0s");
   EXPECT_EQ(timeIntervalToString(1), "1s");

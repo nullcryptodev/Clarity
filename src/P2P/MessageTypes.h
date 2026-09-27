@@ -31,6 +31,7 @@ namespace P2P
     Pong = 0x0004,
     GetPeers = 0x0005,
     Peers = 0x0006,
+    Auth = 0x0007,
 
     // Chain sync
     GetHeaders = 0x0010,
@@ -54,6 +55,12 @@ namespace P2P
   };
 
   std::string_view messageTypeName(MessageType t) noexcept;
+
+  // Per-message cost for the peer's rate-limit bucket. Reflects the
+  // asymmetry of work: cheap-to-send, expensive-to-serve messages cost
+  // more. A peer's bucket is drained by the sum of costs, not by the
+  // message count.
+  uint32_t messageCost(MessageType t) noexcept;
 
   // Helper to get the correct magic for a network.
   inline uint32_t magicForNetwork(int network)

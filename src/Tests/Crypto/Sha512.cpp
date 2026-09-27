@@ -14,7 +14,7 @@
 using namespace Crypto;
 using namespace Tests;
 
-TEST(Sha512, Empty)
+TEST(Crypto_Sha512, Empty)
 {
   uint8_t out[64];
   sha512(reinterpret_cast<const uint8_t *>(""), 0, out);
@@ -26,7 +26,7 @@ TEST(Sha512, Empty)
             "63b931bd47417a81a538327af927da3e");
 }
 
-TEST(Sha512, Abc)
+TEST(Crypto_Sha512, Abc)
 {
   uint8_t out[64];
   sha512(reinterpret_cast<const uint8_t *>("abc"), 3, out);
@@ -38,7 +38,7 @@ TEST(Sha512, Abc)
             "454d4423643ce80e2a9ac94fa54ca49f");
 }
 
-TEST(Sha512, LongerMessage)
+TEST(Crypto_Sha512, LongerMessage)
 {
   const char *msg =
       "The quick brown fox jumps over the lazy dog";

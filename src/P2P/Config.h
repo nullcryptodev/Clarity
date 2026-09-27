@@ -49,6 +49,25 @@ namespace P2P
     uint32_t banThreshold = 100;
     uint32_t banDurationSec = 24 * 60 * 60;
 
+    // ---- Rate limiting ----
+    //
+    // Per-peer token buckets. Both zero in a pair = that bucket is
+    // disabled. Mirrors the RPC config convention; the validator in
+    // P2PConfig (if/when one is added) should enforce
+    // burst >= refillPerSecond when either is non-zero.
+    //
+    // msgBucket_       — all inbound messages, consumed in
+    //                    Peer::handleReadHeader before the body read.
+    // consensusBucket_ — Proposal/Prevote/Precommit only, consumed
+    //                    after the body read. Stricter than msgBucket_
+    //                    because a non-validator flooding consensus
+    //                    traffic is almost always malicious.
+    uint32_t rateLimitBurst = 200;
+    uint32_t rateLimitPerSecond = 50;
+
+    uint32_t consensusRateLimitBurst = 50;
+    uint32_t consensusRateLimitPerSecond = 10;
+
     // ---- Worker pool ----
     size_t workerThreads = 1; // 0 = hardware_concurrency - 1 (aka max threads)
 

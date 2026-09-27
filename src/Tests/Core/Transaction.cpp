@@ -17,54 +17,54 @@ using namespace Tests;
 
 // Well-formedness
 
-TEST(Transaction, WellFormedBaseline)
+TEST(Core_Transaction, WellFormedBaseline)
 {
   EXPECT_TRUE(makeTx().isWellFormed());
 }
 
-TEST(Transaction, RejectsWrongVersion)
+TEST(Core_Transaction, RejectsWrongVersion)
 {
   Transaction tx = makeTx();
   tx.version = 999;
   EXPECT_FALSE(tx.isWellFormed());
 }
 
-TEST(Transaction, RejectsZeroChainId)
+TEST(Core_Transaction, RejectsZeroChainId)
 {
   Transaction tx = makeTx();
   tx.chain_id = 0;
   EXPECT_FALSE(tx.isWellFormed());
 }
 
-TEST(Transaction, RejectsInvalidTxType)
+TEST(Core_Transaction, RejectsInvalidTxType)
 {
   Transaction tx = makeTx();
   tx.tx_type = TxType::Invalid;
   EXPECT_FALSE(tx.isWellFormed());
 }
 
-TEST(Transaction, RejectsNullSender)
+TEST(Core_Transaction, RejectsNullSender)
 {
   Transaction tx = makeTx();
   tx.from = Crypto::Address{};
   EXPECT_FALSE(tx.isWellFormed());
 }
 
-TEST(Transaction, RejectsOversizePayload)
+TEST(Core_Transaction, RejectsOversizePayload)
 {
   Transaction tx = makeTx();
   tx.payload.assign(TX_MAX_PAYLOAD_SIZE + 1, 0xAA);
   EXPECT_FALSE(tx.isWellFormed());
 }
 
-TEST(Transaction, AcceptsMaxSizePayload)
+TEST(Core_Transaction, AcceptsMaxSizePayload)
 {
   Transaction tx = makeTx();
   tx.payload.assign(TX_MAX_PAYLOAD_SIZE, 0xAA);
   EXPECT_TRUE(tx.isWellFormed());
 }
 
-TEST(Transaction, RejectsCompletelyEmpty)
+TEST(Core_Transaction, RejectsCompletelyEmpty)
 {
   Transaction tx = makeTx();
   tx.amount = 0;
@@ -73,7 +73,7 @@ TEST(Transaction, RejectsCompletelyEmpty)
   EXPECT_FALSE(tx.isWellFormed());
 }
 
-TEST(Transaction, AcceptsZeroAmountWithFee)
+TEST(Core_Transaction, AcceptsZeroAmountWithFee)
 {
   Transaction tx = makeTx();
   tx.amount = 0;
@@ -83,7 +83,7 @@ TEST(Transaction, AcceptsZeroAmountWithFee)
 
 // Serialization round-trip
 
-TEST(Transaction, SerializeRoundTrip)
+TEST(Core_Transaction, SerializeRoundTrip)
 {
   Transaction original = makeTx();
   original.payload = {0x01, 0x02, 0x03, 0x04, 0x05};
@@ -114,7 +114,7 @@ TEST(Transaction, SerializeRoundTrip)
   EXPECT_EQ(restored.signature.toString(), original.signature.toString());
 }
 
-TEST(Transaction, SerializeEmptyPayloadRoundTrip)
+TEST(Core_Transaction, SerializeEmptyPayloadRoundTrip)
 {
   Transaction original = makeTx();
   original.payload.clear();
@@ -132,7 +132,7 @@ TEST(Transaction, SerializeEmptyPayloadRoundTrip)
   EXPECT_EQ(restored.signature.toString(), original.signature.toString());
 }
 
-TEST(Transaction, SerializeDeterministic)
+TEST(Core_Transaction, SerializeDeterministic)
 {
   Transaction tx = makeTx();
   tx.payload = {0xAA, 0xBB, 0xCC};
@@ -142,7 +142,7 @@ TEST(Transaction, SerializeDeterministic)
   EXPECT_EQ(a, b);
 }
 
-TEST(Transaction, DeserializeRejectsTruncated)
+TEST(Core_Transaction, DeserializeRejectsTruncated)
 {
   Transaction tx = makeTx();
   auto bytes = tx.serialize();
@@ -156,7 +156,7 @@ TEST(Transaction, DeserializeRejectsTruncated)
   }
 }
 
-TEST(Transaction, SerializedSizeMatchesActual)
+TEST(Core_Transaction, SerializedSizeMatchesActual)
 {
   Transaction tx = makeTx();
   tx.payload = {1, 2, 3, 4, 5};
@@ -166,7 +166,7 @@ TEST(Transaction, SerializedSizeMatchesActual)
 
 // Hash / signing
 
-TEST(Transaction, SigningHashExcludesSignature)
+TEST(Core_Transaction, SigningHashExcludesSignature)
 {
   Transaction tx1 = makeTx();
   Transaction tx2 = makeTx();
@@ -179,7 +179,7 @@ TEST(Transaction, SigningHashExcludesSignature)
   EXPECT_EQ(tx1.signingHash().toString(), tx2.signingHash().toString());
 }
 
-TEST(Transaction, SigningHashCoversAllFields)
+TEST(Core_Transaction, SigningHashCoversAllFields)
 {
   Transaction tx1 = makeTx();
   Crypto::Hash h1 = tx1.signingHash();
@@ -191,19 +191,19 @@ TEST(Transaction, SigningHashCoversAllFields)
   EXPECT_NE(h1.toString(), tx2.signingHash().toString());
 }
 
-TEST(Transaction, SigningHashDeterministic)
+TEST(Core_Transaction, SigningHashDeterministic)
 {
   Transaction tx = makeTx();
   EXPECT_EQ(tx.signingHash().toString(), tx.signingHash().toString());
 }
 
-TEST(Transaction, TxidEqualsSigningHash)
+TEST(Core_Transaction, TxidEqualsSigningHash)
 {
   Transaction tx = makeTx();
   EXPECT_EQ(tx.txid().toString(), tx.signingHash().toString());
 }
 
-TEST(Transaction, RealSignatureValidates)
+TEST(Core_Transaction, RealSignatureValidates)
 {
   // Generate a keypair, use it as sender.
   Crypto::KeyPair kp = Crypto::generateKeyPair();
@@ -219,7 +219,7 @@ TEST(Transaction, RealSignatureValidates)
   EXPECT_TRUE(Crypto::verify(sighash, kp.publicKey, tx.signature));
 }
 
-TEST(Transaction, RealSignatureRejectsTamperedTx)
+TEST(Core_Transaction, RealSignatureRejectsTamperedTx)
 {
   Crypto::KeyPair kp = Crypto::generateKeyPair();
 
@@ -238,7 +238,7 @@ TEST(Transaction, RealSignatureRejectsTamperedTx)
 
 // TxTypes helpers
 
-TEST(TxTypes, UserSubmittedClassification)
+TEST(Core_TxTypes, UserSubmittedClassification)
 {
   EXPECT_TRUE(isUserSubmitted(TxType::Transfer));
   EXPECT_TRUE(isUserSubmitted(TxType::CreateToken));
@@ -249,7 +249,7 @@ TEST(TxTypes, UserSubmittedClassification)
   EXPECT_FALSE(isUserSubmitted(TxType::Invalid));
 }
 
-TEST(TxTypes, SystemTxClassification)
+TEST(Core_TxTypes, SystemTxClassification)
 {
   EXPECT_TRUE(isSystemTx(TxType::BlockReward));
   EXPECT_TRUE(isSystemTx(TxType::OrderExpired));
@@ -258,7 +258,7 @@ TEST(TxTypes, SystemTxClassification)
   EXPECT_FALSE(isSystemTx(TxType::Invalid));
 }
 
-TEST(TxTypes, NameLookup)
+TEST(Core_TxTypes, NameLookup)
 {
   EXPECT_EQ(txTypeName(TxType::Transfer), "transfer");
   EXPECT_EQ(txTypeName(TxType::Swap), "swap");
@@ -268,7 +268,7 @@ TEST(TxTypes, NameLookup)
 
 // Copy semantics
 
-TEST(Transaction, CopyIsIndependent)
+TEST(Core_Transaction, CopyIsIndependent)
 {
   Transaction original = makeTx();
   original.payload = {1, 2, 3};

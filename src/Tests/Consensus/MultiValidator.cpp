@@ -3,20 +3,17 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <set>
 #include <gtest/gtest.h>
 
-#include <set>
-
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 
 using namespace Consensus;
 using namespace Tests;
 
-// ============================================================================
-//  A. Basic multi-validator rounds
-// ============================================================================
+// Basic multi-validator rounds
 
-TEST_F(ConsensusNetworkFixture, FourValidatorsReachCommit)
+TEST_F(Consensus_NetworkFixture, FourValidatorsReachCommit)
 {
   makeNetwork(4);
   net().startAll(0);
@@ -30,7 +27,7 @@ TEST_F(ConsensusNetworkFixture, FourValidatorsReachCommit)
   }
 }
 
-TEST_F(ConsensusNetworkFixture, AllValidatorsAgreeOnCommittedBlock)
+TEST_F(Consensus_NetworkFixture, AllValidatorsAgreeOnCommittedBlock)
 {
   makeNetwork(4);
   net().startAll(0);
@@ -45,7 +42,7 @@ TEST_F(ConsensusNetworkFixture, AllValidatorsAgreeOnCommittedBlock)
   }
 }
 
-TEST_F(ConsensusNetworkFixture, ThreeOfFourIsQuorum)
+TEST_F(Consensus_NetworkFixture, ThreeOfFourIsQuorum)
 {
   // Quorum for 4 validators is bftQuorum(4) = 3.
   // Take one offline: the other three still reach quorum and commit.
@@ -64,7 +61,7 @@ TEST_F(ConsensusNetworkFixture, ThreeOfFourIsQuorum)
       << "offline validator should not have committed";
 }
 
-TEST_F(ConsensusNetworkFixture, TwoOfFourIsNotQuorum)
+TEST_F(Consensus_NetworkFixture, TwoOfFourIsNotQuorum)
 {
   // Two offline, two online: quorum not reached. Rounds advance via
   // the timer, but no commit happens.
@@ -85,11 +82,9 @@ TEST_F(ConsensusNetworkFixture, TwoOfFourIsNotQuorum)
   }
 }
 
-// ============================================================================
-//  B. Fault tolerance
-// ============================================================================
+// Fault tolerance
 
-TEST_F(ConsensusNetworkFixture, OneEquivocatingValidator)
+TEST_F(Consensus_NetworkFixture, OneEquivocatingValidator)
 {
   // Three honest validators prevote for the canonical block. The
   // fourth tries to prevote for a different block hash to a subset of
@@ -122,7 +117,7 @@ TEST_F(ConsensusNetworkFixture, OneEquivocatingValidator)
   EXPECT_EQ(net().committed(2)[0].hash(), canonical);
 }
 
-TEST_F(ConsensusNetworkFixture, ValidatorRejoinsAfterRoundAdvance)
+TEST_F(Consensus_NetworkFixture, ValidatorRejoinsAfterRoundAdvance)
 {
   // Start with 3 of 4 online. Quorum is reached (3 of 4) and the
   // round commits. This exercises the round-advance-on-timeout path
@@ -142,18 +137,16 @@ TEST_F(ConsensusNetworkFixture, ValidatorRejoinsAfterRoundAdvance)
   ASSERT_TRUE(net().committed(3).empty());
 }
 
-TEST_F(ConsensusNetworkFixture, TwoRoundsTwoBlocks)
+TEST_F(Consensus_NetworkFixture, TwoRoundsTwoBlocks)
 {
-  // Drive the network through two full rounds at heights 0 and 1.
-  // Every validator should commit both blocks in order.
   makeNetwork(4);
-
   net().startAll(0);
-  net().advanceAllTimers();
 
-  // After the first round the instances have advanced to height 1.
-  // Advance again to commit height 1.
-  net().advanceAllTimers();
+  // Advance until every validator has committed 2 blocks.
+  // advanceAllTimers() drives the network forward one round-trip
+  // at a time, so we call it twice.
+  net().advanceAllTimers(); // commits height 0
+  net().advanceAllTimers(); // commits height 1
 
   for (size_t i = 0; i < 4; ++i)
   {
@@ -162,7 +155,6 @@ TEST_F(ConsensusNetworkFixture, TwoRoundsTwoBlocks)
     EXPECT_EQ(net().committed(i)[1].header.height, 1u) << "validator " << i;
   }
 
-  // All validators agree on both blocks.
   for (size_t i = 1; i < 4; ++i)
   {
     EXPECT_EQ(net().committed(i)[0].hash(),
@@ -172,23 +164,12 @@ TEST_F(ConsensusNetworkFixture, TwoRoundsTwoBlocks)
   }
 }
 
-// ============================================================================
-//  C. Broadcast routing and message flow
-// ============================================================================
+// Broadcast routing and message flow
 
-TEST_F(ConsensusNetworkFixture, ProposalReachesEveryValidator)
+TEST_F(Consensus_NetworkFixture, ProposalReachesEveryValidator)
 {
-  // The proposer for (0, 0) is index 0 (formula (height + round) mod n).
-  // All three other validators should accept the proposal.
   makeNetwork(4);
   net().startAll(0);
-
-  // After startAll, every non-proposer should be in Prevote with one
-  // prevote recorded (their own). If the proposal had been rejected,
-  // they'd have prevoted nil, which is still 1 prevote — so we can't
-  // distinguish by count alone. Instead, drive to Precommit and verify
-  // they all agree on a non-nil precommit.
-
   net().advanceAllTimers();
 
   // If everyone accepted the proposal, everyone committed. That's the
@@ -197,7 +178,7 @@ TEST_F(ConsensusNetworkFixture, ProposalReachesEveryValidator)
     EXPECT_EQ(net().committed(i).size(), 1u) << "validator " << i;
 }
 
-TEST_F(ConsensusNetworkFixture, AllInstancesAdvancePastPropose)
+TEST_F(Consensus_NetworkFixture, AllInstancesAdvancePastPropose)
 {
   makeNetwork(4);
   net().startAll(0);
@@ -212,11 +193,9 @@ TEST_F(ConsensusNetworkFixture, AllInstancesAdvancePastPropose)
   }
 }
 
-// ============================================================================
-//  D. Determinism
-// ============================================================================
+// Determinism
 
-TEST_F(ConsensusNetworkFixture, SameRunProducesSameCommit)
+TEST_F(Consensus_NetworkFixture, SameRunProducesSameCommit)
 {
   // Run the network twice from the same starting conditions and verify
   // the committed block hashes match. This pins the property that
@@ -244,7 +223,7 @@ TEST_F(ConsensusNetworkFixture, SameRunProducesSameCommit)
   }
 }
 
-TEST_F(ConsensusNetworkFixture, AllValidatorsCommitSameHash)
+TEST_F(Consensus_NetworkFixture, AllValidatorsCommitSameHash)
 {
   // Repeat the safety check with a longer drain to be sure no
   // late-arriving message changes anyone's view.

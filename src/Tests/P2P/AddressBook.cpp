@@ -12,14 +12,14 @@
 using namespace P2P;
 using namespace Tests;
 
-TEST(AddressBook, InitiallyEmpty)
+TEST(P2P_AddressBook, InitiallyEmpty)
 {
   TempFile f;
   AddressBook ab(f.path());
   EXPECT_EQ(ab.size(), 0u);
 }
 
-TEST(AddressBook, AddAndSize)
+TEST(P2P_AddressBook, AddAndSize)
 {
   TempFile f;
   AddressBook ab(f.path());
@@ -29,7 +29,7 @@ TEST(AddressBook, AddAndSize)
   EXPECT_EQ(ab.size(), 2u);
 }
 
-TEST(AddressBook, AddIsIdempotent)
+TEST(P2P_AddressBook, AddIsIdempotent)
 {
   TempFile f;
   AddressBook ab(f.path());
@@ -39,7 +39,7 @@ TEST(AddressBook, AddIsIdempotent)
   EXPECT_EQ(ab.size(), 1u);
 }
 
-TEST(AddressBook, SameIpDifferentPortIsDistinct)
+TEST(P2P_AddressBook, SameIpDifferentPortIsDistinct)
 {
   TempFile f;
   AddressBook ab(f.path());
@@ -49,7 +49,7 @@ TEST(AddressBook, SameIpDifferentPortIsDistinct)
   EXPECT_EQ(ab.size(), 2u);
 }
 
-TEST(AddressBook, PickRandomAll)
+TEST(P2P_AddressBook, PickRandomAll)
 {
   TempFile f;
   AddressBook ab(f.path());
@@ -62,7 +62,7 @@ TEST(AddressBook, PickRandomAll)
   EXPECT_EQ(picked.size(), 3u);
 }
 
-TEST(AddressBook, PickRandomEmpty)
+TEST(P2P_AddressBook, PickRandomEmpty)
 {
   TempFile f;
   AddressBook ab(f.path());
@@ -71,7 +71,7 @@ TEST(AddressBook, PickRandomEmpty)
   EXPECT_TRUE(picked.empty());
 }
 
-TEST(AddressBook, PickRandomExcludes)
+TEST(P2P_AddressBook, PickRandomExcludes)
 {
   TempFile f;
   AddressBook ab(f.path());
@@ -85,7 +85,7 @@ TEST(AddressBook, PickRandomExcludes)
   EXPECT_EQ(picked[0].ip, "10.0.0.2");
 }
 
-TEST(AddressBook, MarkConnectedResetsAttempts)
+TEST(P2P_AddressBook, MarkConnectedResetsAttempts)
 {
   TempFile f;
   AddressBook ab(f.path());
@@ -106,7 +106,7 @@ TEST(AddressBook, MarkConnectedResetsAttempts)
   EXPECT_EQ(after[0].attempts, 0u);
 }
 
-TEST(AddressBook, PersistAndReload)
+TEST(P2P_AddressBook, PersistAndReload)
 {
   TempFile f;
   {
@@ -129,7 +129,7 @@ TEST(AddressBook, PersistAndReload)
   EXPECT_TRUE(has_seed);
 }
 
-TEST(AddressBook, PurgeStaleRemovesOldFailed)
+TEST(P2P_AddressBook, PurgeStaleRemovesOldFailed)
 {
   TempFile f;
   AddressBook ab(f.path());
@@ -150,7 +150,7 @@ TEST(AddressBook, PurgeStaleRemovesOldFailed)
   EXPECT_EQ(ab.size(), 1u);
 }
 
-TEST(AddressBook, PurgeStaleKeepsSeeds)
+TEST(P2P_AddressBook, PurgeStaleKeepsSeeds)
 {
   TempFile f;
   AddressBook ab(f.path());

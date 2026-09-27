@@ -20,6 +20,9 @@
 #include "Message.h"
 #include "PeerState.h"
 #include "PeerStats.h"
+#include "AuthMessage.h"
+
+#include "Common/RateLimiter.h"
 
 #include "Logging/LoggerRef.h"
 
@@ -71,6 +74,12 @@ namespace P2P
     bool isOperational() const noexcept { return state_ == PeerState::Established; }
     bool isClosed() const noexcept { return state_ == PeerState::Closed; }
 
+    uint64_t validatorId() const noexcept { return peerValidatorId_; }
+    const Crypto::PublicKey &pubkey() const noexcept { return peerPubkey_; }
+
+    uint64_t localNonce() const noexcept { return localNonce_; }
+    uint64_t peerNonce() const noexcept { return peerNonce_; }
+
     // ---- Lifecycle ----
 
     void startConnect(const tcp::endpoint &endpoint);
@@ -93,6 +102,25 @@ namespace P2P
     // to send one. The manager knows our best height, nonce, agent, etc.
     std::function<VersionMessage()> buildVersionMessage;
 
+    // Fills in our Auth message. Set by P2PManager, which holds the
+    // node's signing key and both nonces.
+    std::function<AuthMessage()> buildAuthMessage;
+
+    // Verifies the peer's Auth message. Returns true if the signature
+    // is valid AND the pubkey is acceptable (validator or not, per
+    // policy). On success, outValidatorId is set to the validator ID
+    // bound to this pubkey, or 0 if the peer is authenticated but not
+    // a validator. Set by P2PManager; carries the Node lookup.
+    std::function<bool(const AuthMessage &, uint64_t &outValidatorId)>
+        verifyAuth;
+
+    // Fired exactly once, after the peer transitions to Established.
+    // That is: after both sides have exchanged and verified Auth.
+    // Used by P2PManager to notify the node that a peer is now
+    // ready to exchange application messages (sync, block gossip,
+    // transaction relay).
+    std::function<void(Peer &)> onEstablished;
+
   private:
     // ---- Asio callbacks ----
     void handleConnect(const boost::system::error_code &ec);
@@ -110,6 +138,8 @@ namespace P2P
     void handleGetPeers();
     void handlePeers(Message &msg);
     void handleDisconnect();
+    void handleAuth(Message &msg);
+    void sendAuth();
 
     // ---- Timers ----
     void armHandshakeTimer();
@@ -144,6 +174,10 @@ namespace P2P
     uint32_t protocolVersion_ = 0;
     uint64_t peerNonce_ = 0;
     uint16_t peerListenPort_ = 0;
+    // The networkNonce we sent in our Version message. Used to build
+    // the auth challenge. Captured from the VersionMessage returned by
+    // buildVersionMessage() in beginHandshake().
+    uint64_t localNonce_ = 0;
 
     // Buffers
     std::array<uint8_t, MESSAGE_HEADER_SIZE> headerBuffer_{};
@@ -163,6 +197,17 @@ namespace P2P
     // Stats
     PeerStats stats_;
     int64_t connectStartedAt_ = 0;
+
+    // Rate limiters. One bucket for all inbound messages, one
+    // stricter bucket for consensus messages only. Both are disabled
+    // when their config pair is zero.
+    Common::RateLimiter msgBucket_;
+    Common::RateLimiter consensusBucket_;
+
+    // Authentication. Populated from the peer's Auth message.
+    // peerValidatorId_ is 0 for an authenticated non-validator.
+    Crypto::PublicKey peerPubkey_;
+    uint64_t peerValidatorId_ = 0;
 
     // Shutdown
     std::string closeReason_;

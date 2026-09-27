@@ -50,6 +50,25 @@ namespace Node
     uint64_t validator_id{0};
     Crypto::SecretKey validator_secret_key{};
 
+    // ---- Node identity (P2P auth) ----
+    //
+    // Every node that speaks P2P needs a stable identity key to sign
+    // the Auth exchange. This is NOT the validator key: a non-validator
+    // node has no validator key, but it still authenticates to peers
+    // so the ban list and per-peer reputation have something to bind
+    // to.
+    //
+    // If this is null (the default), Node::initP2P() loads it from
+    // <data_dir>/node_key, generating and persisting a fresh key on
+    // first run. Set it explicitly only for tests that need a fixed
+    // identity.
+    //
+    // On a validator, this may be the same key as validator_secret_key
+    // or different — either works. The auth protocol doesn't require
+    // the node key to match the validator key; the validator binding
+    // is a separate lookup by reward address in verifyPeerAuth().
+    Crypto::SecretKey node_secret_key{};
+
     // ---- Consensus ----
     uint64_t max_block_bytes{256 * 1024};
     uint64_t max_block_txs{5'000};

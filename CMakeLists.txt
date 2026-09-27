@@ -18,9 +18,11 @@ set(CMAKE_CONFIGURATION_TYPES Debug RelWithDebInfo Release CACHE STRING INTERNAL
 set(CMAKE_SKIP_PACKAGE_ALL_DEPENDENCY ON)
 set(CMAKE_SUPPRESS_REGENERATION ON)
 
-project(concealX)
+project(Clarity C CXX)
 
 include_directories(src apps include external)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
 
 if(APPLE OR FREEBSD)
   include_directories(SYSTEM /usr/include/malloc)

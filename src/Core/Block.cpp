@@ -51,11 +51,22 @@ namespace Core
       return false;
     if (chain_id == 0)
       return false;
-    if (proposer.isNull())
+
+    // Genesis has no proposer; that's expected and valid.
+    if (height > 0 && proposer.isNull())
       return false;
-    if (tx_count > 100'000)
-      return false;
+
     if (active_validator_count == 0)
+      return false;
+    if (tx_count > 5'000)
+      return false; // max_block_txs
+
+    // For non-genesis blocks, the parent must be set.
+    if (height > 0 && parent_hash.isNull())
+      return false;
+
+    // Non-genesis blocks must have a non-null state root.
+    if (height > 0 && state_root.isNull())
       return false;
 
     return true;
@@ -127,24 +138,36 @@ namespace Core
     out.version = r.readU16();
     out.chain_id = r.readU64();
     out.height = r.readU64();
+
     r.readBytes(out.parent_hash.data.data(), out.parent_hash.data.size());
+
     out.timestamp_ms = r.readU64();
+
     r.readBytes(out.proposer.data.data(), out.proposer.data.size());
+
     out.epoch = r.readU64();
     out.rotation_index = r.readU64();
     out.commit_round = r.readU64();
+
     r.readBytes(out.state_root.data.data(), out.state_root.data.size());
     r.readBytes(out.tx_root.data.data(), out.tx_root.data.size());
     r.readBytes(out.receipts_root.data.data(), out.receipts_root.data.size());
     r.readBytes(out.validator_set_root.data.data(), out.validator_set_root.data.size());
+
     out.total_fees = r.readU64();
     out.tx_count = r.readU32();
     out.active_validator_count = r.readU32();
 
     if (!r.ok())
+    {
       return false;
+    }
 
-    return out.isWellFormed();
+    // NOTE: We deliberately do NOT call isWellFormed() here. That's a
+    // consensus-layer check; the storage layer's job is to round-trip
+    // bytes faithfully. Callers that need validation (block processor,
+    // mempool) call isWellFormed() explicitly after deserializing.
+    return true;
   }
 
   void BlockHeader::serialize(Serialization::ISerializer &s)
@@ -174,9 +197,14 @@ namespace Core
         return false;
     }
 
-    if (quorum_signatures.size() < bftQuorum(header.active_validator_count))
+    // Genesis has no quorum signatures — it's the chain's first block
+    // and wasn't produced by consensus.
+    if (header.height > 0)
     {
-      return false;
+      if (quorum_signatures.size() < bftQuorum(header.active_validator_count))
+      {
+        return false;
+      }
     }
 
     return true;
@@ -227,6 +255,7 @@ namespace Core
     r.readBytes(hdr.data(), hdr_size);
     if (!r.ok())
       return false;
+
     if (!BlockHeader::deserialize(hdr.data(), hdr.size(), out.header))
     {
       return false;

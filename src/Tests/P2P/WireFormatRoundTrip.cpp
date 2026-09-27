@@ -26,7 +26,7 @@ using namespace Tests;
 // consensus encode -> P2P framing -> P2P decode -> consensus decode
 // Every field must survive.
 
-TEST(WireFormatRoundTrip, ProposalSurvivesEndToEnd)
+TEST(P2P_WireFormatRoundTrip, ProposalSurvivesEndToEnd)
 {
   // Build a proposal.
   Proposal original;
@@ -70,7 +70,7 @@ TEST(WireFormatRoundTrip, ProposalSurvivesEndToEnd)
 
 //  Vote round trip: same structure.
 
-TEST(WireFormatRoundTrip, VoteSurvivesEndToEnd)
+TEST(P2P_WireFormatRoundTrip, VoteSurvivesEndToEnd)
 {
   Vote original;
   original.height = 42;
@@ -108,7 +108,7 @@ TEST(WireFormatRoundTrip, VoteSurvivesEndToEnd)
 // Nil vote: the is_nil flag must survive (it changes the consensus
 // engine's interpretation entirely).
 
-TEST(WireFormatRoundTrip, NilVotePreservesFlag)
+TEST(P2P_WireFormatRoundTrip, NilVotePreservesFlag)
 {
   Vote original;
   original.height = 1;
@@ -131,7 +131,7 @@ TEST(WireFormatRoundTrip, NilVotePreservesFlag)
 
 // Framing layer: message type must survive, and the magic must match.
 
-TEST(WireFormatRoundTrip, MessageTypeSurvivesFraming)
+TEST(P2P_WireFormatRoundTrip, MessageTypeSurvivesFraming)
 {
   for (auto type : {MessageType::Proposal,
                     MessageType::Prevote,
@@ -146,7 +146,7 @@ TEST(WireFormatRoundTrip, MessageTypeSurvivesFraming)
 
 //  Framing layer: bad magic is rejected.
 
-TEST(WireFormatRoundTrip, WrongMagicIsRejected)
+TEST(P2P_WireFormatRoundTrip, WrongMagicIsRejected)
 {
   Message msg(MessageType::Proposal, {0x01, 0x02, 0x03});
 

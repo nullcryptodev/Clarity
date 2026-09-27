@@ -14,6 +14,7 @@ std::string_view peerStateName(PeerState s) noexcept
     case PeerState::Connecting:    return "connecting";
     case PeerState::Handshaking:   return "handshaking";
     case PeerState::VerackPending: return "verack-pending";
+    case PeerState::AuthPending:   return "AuthPending";
     case PeerState::Established:   return "established";
     case PeerState::Disconnecting: return "disconnecting";
     case PeerState::Closed:        return "closed";

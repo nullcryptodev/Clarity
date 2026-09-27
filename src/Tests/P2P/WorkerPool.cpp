@@ -15,19 +15,19 @@
 using namespace P2P;
 using namespace std::chrono_literals;
 
-TEST(WorkerPool, ThreadCountNonZero)
+TEST(P2P_WorkerPool, ThreadCountNonZero)
 {
   WorkerPool pool(1);
   EXPECT_EQ(pool.threadCount(), 1u);
 }
 
-TEST(WorkerPool, AutoThreadCount)
+TEST(P2P_WorkerPool, AutoThreadCount)
 {
   WorkerPool pool(0);
   EXPECT_GE(pool.threadCount(), 1u);
 }
 
-TEST(WorkerPool, RunsJob)
+TEST(P2P_WorkerPool, RunsJob)
 {
   WorkerPool pool(1);
 
@@ -43,7 +43,7 @@ TEST(WorkerPool, RunsJob)
   EXPECT_TRUE(ran.load());
 }
 
-TEST(WorkerPool, RunsMultipleJobs)
+TEST(P2P_WorkerPool, RunsMultipleJobs)
 {
   WorkerPool pool(2);
 
@@ -59,7 +59,7 @@ TEST(WorkerPool, RunsMultipleJobs)
   EXPECT_EQ(count.load(), 10);
 }
 
-TEST(WorkerPool, ExceptionInJobDoesNotKillWorker)
+TEST(P2P_WorkerPool, ExceptionInJobDoesNotKillWorker)
 {
   WorkerPool pool(1);
 
@@ -77,7 +77,7 @@ TEST(WorkerPool, ExceptionInJobDoesNotKillWorker)
   EXPECT_EQ(ran.load(), 1);
 }
 
-TEST(WorkerPool, PendingJobsCount)
+TEST(P2P_WorkerPool, PendingJobsCount)
 {
   WorkerPool pool(1);
   // No jobs yet.

@@ -3,30 +3,32 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
+
+#include "Crypto/Blake2b.h"
 
 using namespace State;
 using namespace Tests;
 
-TEST_F(SmtTestFixture, EmptyTreeRootIsDefaultHash)
+TEST_F(State_SmtFixture, EmptyTreeRootIsDefaultHash)
 {
   EXPECT_EQ(tree_->root(), SparseMerkleTree::defaultHash(SparseMerkleTree::DEPTH));
 }
 
-TEST_F(SmtTestFixture, EmptyTreeGetReturnsNullopt)
+TEST_F(State_SmtFixture, EmptyTreeGetReturnsNullopt)
 {
   EXPECT_FALSE(get(0).has_value());
   EXPECT_FALSE(get(1).has_value());
   EXPECT_FALSE(get(0xFFFFFFFFFFFFFFFFULL).has_value());
 }
 
-TEST_F(SmtTestFixture, EmptyTreeRootIsDeterministic)
+TEST_F(State_SmtFixture, EmptyTreeRootIsDeterministic)
 {
   SparseMerkleTree other(db_.db());
   EXPECT_EQ(tree_->root(), other.root());
 }
 
-TEST_F(SmtTestFixture, DefaultHashesAreConsistent)
+TEST_F(State_SmtFixture, DefaultHashesAreConsistent)
 {
   for (size_t d = 1; d <= SparseMerkleTree::DEPTH; ++d)
   {
@@ -42,7 +44,7 @@ TEST_F(SmtTestFixture, DefaultHashesAreConsistent)
   }
 }
 
-TEST_F(SmtTestFixture, DefaultHashAboveDepthClamps)
+TEST_F(State_SmtFixture, DefaultHashAboveDepthClamps)
 {
   EXPECT_EQ(SparseMerkleTree::defaultHash(257),
             SparseMerkleTree::defaultHash(256));
@@ -50,14 +52,14 @@ TEST_F(SmtTestFixture, DefaultHashAboveDepthClamps)
             SparseMerkleTree::defaultHash(256));
 }
 
-TEST_F(SmtTestFixture, InsertSingleLeafChangesRoot)
+TEST_F(State_SmtFixture, InsertSingleLeafChangesRoot)
 {
   auto before = tree_->root();
   auto after = update(1, 100);
   EXPECT_NE(before, after);
 }
 
-TEST_F(SmtTestFixture, InsertSingleLeafIsRetrievable)
+TEST_F(State_SmtFixture, InsertSingleLeafIsRetrievable)
 {
   update(1, 100);
   auto v = get(1);
@@ -65,7 +67,7 @@ TEST_F(SmtTestFixture, InsertSingleLeafIsRetrievable)
   EXPECT_EQ(*v, makeValue(100));
 }
 
-TEST_F(SmtTestFixture, InsertSingleLeafOthersStillEmpty)
+TEST_F(State_SmtFixture, InsertSingleLeafOthersStillEmpty)
 {
   update(1, 100);
   EXPECT_FALSE(get(2).has_value());
@@ -73,14 +75,14 @@ TEST_F(SmtTestFixture, InsertSingleLeafOthersStillEmpty)
   EXPECT_FALSE(get(1000).has_value());
 }
 
-TEST_F(SmtTestFixture, InsertSameValueTwiceIsIdempotent)
+TEST_F(State_SmtFixture, InsertSameValueTwiceIsIdempotent)
 {
   auto r1 = update(1, 100);
   auto r2 = update(1, 100);
   EXPECT_EQ(r1, r2);
 }
 
-TEST_F(SmtTestFixture, UpdateExistingKeyChangesValueAndRoot)
+TEST_F(State_SmtFixture, UpdateExistingKeyChangesValueAndRoot)
 {
   auto r1 = update(1, 100);
   auto r2 = update(1, 200);
@@ -91,21 +93,21 @@ TEST_F(SmtTestFixture, UpdateExistingKeyChangesValueAndRoot)
   EXPECT_EQ(*v, makeValue(200));
 }
 
-TEST_F(SmtTestFixture, UpdateDifferentKeysGiveDifferentRoots)
+TEST_F(State_SmtFixture, UpdateDifferentKeysGiveDifferentRoots)
 {
   auto r1 = update(1, 100);
   auto r2 = update(2, 100);
   EXPECT_NE(r1, r2);
 }
 
-TEST_F(SmtTestFixture, SameValueDifferentKeysHaveDifferentLeaves)
+TEST_F(State_SmtFixture, SameValueDifferentKeysHaveDifferentLeaves)
 {
   auto r_a = update(1, 42);
   auto r_b = update(2, 42);
   EXPECT_NE(r_a, r_b);
 }
 
-TEST_F(SmtTestFixture, RemoveReturnsToPriorRoot)
+TEST_F(State_SmtFixture, RemoveReturnsToPriorRoot)
 {
   auto empty_root = tree_->root();
   update(1, 100);
@@ -116,7 +118,7 @@ TEST_F(SmtTestFixture, RemoveReturnsToPriorRoot)
   EXPECT_EQ(tree_->root(), empty_root);
 }
 
-TEST_F(SmtTestFixture, RemoveRetrievableKeyReturnsToPriorRoot)
+TEST_F(State_SmtFixture, RemoveRetrievableKeyReturnsToPriorRoot)
 {
   auto prior = tree_->root();
   update(1, 100);
@@ -132,7 +134,7 @@ TEST_F(SmtTestFixture, RemoveRetrievableKeyReturnsToPriorRoot)
   EXPECT_EQ(tree_->root(), prior);
 }
 
-TEST_F(SmtTestFixture, RemoveNonexistentKeyIsNoOp)
+TEST_F(State_SmtFixture, RemoveNonexistentKeyIsNoOp)
 {
   update(1, 100);
   auto before = tree_->root();
@@ -140,7 +142,7 @@ TEST_F(SmtTestFixture, RemoveNonexistentKeyIsNoOp)
   EXPECT_EQ(tree_->root(), before);
 }
 
-TEST_F(SmtTestFixture, GetAfterRemoveReturnsNullopt)
+TEST_F(State_SmtFixture, GetAfterRemoveReturnsNullopt)
 {
   update(1, 100);
   ASSERT_TRUE(get(1).has_value());
@@ -148,7 +150,7 @@ TEST_F(SmtTestFixture, GetAfterRemoveReturnsNullopt)
   EXPECT_FALSE(get(1).has_value());
 }
 
-TEST_F(SmtTestFixture, ReinsertAfterRemove)
+TEST_F(State_SmtFixture, ReinsertAfterRemove)
 {
   update(1, 100);
   auto r1 = tree_->root();
@@ -157,7 +159,7 @@ TEST_F(SmtTestFixture, ReinsertAfterRemove)
   EXPECT_EQ(tree_->root(), r1);
 }
 
-TEST_F(SmtTestFixture, InsertionOrderDoesNotAffectRoot)
+TEST_F(State_SmtFixture, InsertionOrderDoesNotAffectRoot)
 {
   update(1, 100);
   update(2, 200);
@@ -172,7 +174,7 @@ TEST_F(SmtTestFixture, InsertionOrderDoesNotAffectRoot)
   EXPECT_EQ(root_ab, root_ba);
 }
 
-TEST_F(SmtTestFixture, ManyInsertsAreOrderIndependent)
+TEST_F(State_SmtFixture, ManyInsertsAreOrderIndependent)
 {
   std::vector<uint64_t> keys = {10, 20, 30, 40, 50, 60, 70, 80};
 
@@ -189,7 +191,7 @@ TEST_F(SmtTestFixture, ManyInsertsAreOrderIndependent)
   EXPECT_EQ(root_fwd, root_rev);
 }
 
-TEST_F(SmtPersistenceTestFixture, RootSurvivesSaveAndLoad)
+TEST_F(State_SmtPersistenceFixture, RootSurvivesSaveAndLoad)
 {
   Crypto::Hash root_before;
 
@@ -219,7 +221,7 @@ TEST_F(SmtPersistenceTestFixture, RootSurvivesSaveAndLoad)
   }
 }
 
-TEST_F(SmtPersistenceTestFixture, DataSurvivesSaveAndLoad)
+TEST_F(State_SmtPersistenceFixture, DataSurvivesSaveAndLoad)
 {
   // ---- Write phase ----
   {
@@ -251,7 +253,7 @@ TEST_F(SmtPersistenceTestFixture, DataSurvivesSaveAndLoad)
   }
 }
 
-TEST_F(SmtTestFixture, VersionedRootIsRetrievable)
+TEST_F(State_SmtFixture, VersionedRootIsRetrievable)
 {
   update(1, 100);
   tree_->save(/*version=*/5);
@@ -264,7 +266,7 @@ TEST_F(SmtTestFixture, VersionedRootIsRetrievable)
   EXPECT_FALSE(root_at_6.has_value());
 }
 
-TEST_F(SmtTestFixture, MultipleVersionsArePersisted)
+TEST_F(State_SmtFixture, MultipleVersionsArePersisted)
 {
   update(1, 100);
   tree_->save(1);
@@ -279,7 +281,7 @@ TEST_F(SmtTestFixture, MultipleVersionsArePersisted)
   EXPECT_NE(root_v1, root_v2);
 }
 
-TEST_F(SmtTestFixture, HundredLeaves)
+TEST_F(State_SmtFixture, HundredLeaves)
 {
   for (uint64_t i = 1; i <= 100; ++i)
     update(i, i);
@@ -295,7 +297,7 @@ TEST_F(SmtTestFixture, HundredLeaves)
   EXPECT_FALSE(get(101).has_value());
 }
 
-TEST_F(SmtTestFixture, ThousandLeaves)
+TEST_F(State_SmtFixture, ThousandLeaves)
 {
   constexpr uint64_t N = 1000;
   for (uint64_t i = 1; i <= N; ++i)
@@ -309,7 +311,7 @@ TEST_F(SmtTestFixture, ThousandLeaves)
   }
 }
 
-TEST_F(SmtTestFixture, HundredLeavesRemoveHalf)
+TEST_F(State_SmtFixture, HundredLeavesRemoveHalf)
 {
   for (uint64_t i = 1; i <= 100; ++i)
     update(i, i);
@@ -330,7 +332,7 @@ TEST_F(SmtTestFixture, HundredLeavesRemoveHalf)
   EXPECT_NE(tree_->root(), full_root);
 }
 
-TEST_F(SmtTestFixture, SimilarKeysAreDistinguished)
+TEST_F(State_SmtFixture, SimilarKeysAreDistinguished)
 {
   Crypto::Hash k1;
   Crypto::Hash k2;
@@ -352,7 +354,7 @@ TEST_F(SmtTestFixture, SimilarKeysAreDistinguished)
   EXPECT_EQ(*v2, makeValue(2));
 }
 
-TEST_F(SmtTestFixture, SimilarKeysRootReflectsBothLeaves)
+TEST_F(State_SmtFixture, SimilarKeysRootReflectsBothLeaves)
 {
   Crypto::Hash k1;
   Crypto::Hash k2;
@@ -372,7 +374,7 @@ TEST_F(SmtTestFixture, SimilarKeysRootReflectsBothLeaves)
   EXPECT_NE(root_one, root_two);
 }
 
-TEST_F(SmtTestFixture, EmptyValueIsStored)
+TEST_F(State_SmtFixture, EmptyValueIsStored)
 {
   Crypto::Hash k = makeKey(1);
   std::vector<uint8_t> empty_val;
@@ -384,7 +386,7 @@ TEST_F(SmtTestFixture, EmptyValueIsStored)
   EXPECT_TRUE(v->empty());
 }
 
-TEST_F(SmtTestFixture, EmptyValueHasDifferentRootThanEmptyTree)
+TEST_F(State_SmtFixture, EmptyValueHasDifferentRootThanEmptyTree)
 {
   auto empty_root = tree_->root();
 
@@ -394,7 +396,7 @@ TEST_F(SmtTestFixture, EmptyValueHasDifferentRootThanEmptyTree)
   EXPECT_NE(tree_->root(), empty_root);
 }
 
-TEST_F(SmtTestFixture, RemoveEmptyValueLeafRestoresRoot)
+TEST_F(State_SmtFixture, RemoveEmptyValueLeafRestoresRoot)
 {
   auto empty_root = tree_->root();
 
@@ -405,7 +407,7 @@ TEST_F(SmtTestFixture, RemoveEmptyValueLeafRestoresRoot)
   EXPECT_EQ(tree_->root(), empty_root);
 }
 
-TEST_F(SmtTestFixture, ApplyBatchMatchesSequential)
+TEST_F(State_SmtFixture, ApplyBatchMatchesSequential)
 {
   std::vector<SparseMerkleTree::Update> updates;
   for (uint64_t i = 1; i <= 20; ++i)
@@ -429,7 +431,7 @@ TEST_F(SmtTestFixture, ApplyBatchMatchesSequential)
   EXPECT_EQ(batch_root, tree2.root());
 }
 
-TEST_F(SmtTestFixture, ApplyBatchWithDeletes)
+TEST_F(State_SmtFixture, ApplyBatchWithDeletes)
 {
   for (uint64_t i = 1; i <= 10; ++i)
     update(i, i);
@@ -465,13 +467,13 @@ TEST_F(SmtTestFixture, ApplyBatchWithDeletes)
   }
 }
 
-TEST_F(SmtTestFixture, ReadChildrenOnEmptyRootFails)
+TEST_F(State_SmtFixture, ReadChildrenOnEmptyRootFails)
 {
   Crypto::Hash left, right;
   EXPECT_FALSE(tree_->readChildren(tree_->root(), left, right));
 }
 
-TEST_F(SmtTestFixture, ReadChildrenAfterInsertSucceeds)
+TEST_F(State_SmtFixture, ReadChildrenAfterInsertSucceeds)
 {
   update(1, 100);
 
@@ -483,7 +485,7 @@ TEST_F(SmtTestFixture, ReadChildrenAfterInsertSucceeds)
   EXPECT_TRUE(non_default);
 }
 
-TEST_F(SmtTestFixture, ReadChildrenOnUnknownHashFails)
+TEST_F(State_SmtFixture, ReadChildrenOnUnknownHashFails)
 {
   Crypto::Hash left, right;
   Crypto::Hash unknown;

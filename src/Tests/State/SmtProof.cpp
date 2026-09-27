@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <cstring>
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 
 #include "State/SmtProof.h"
 #include "State/StateAccess.h"
@@ -16,7 +16,7 @@ using namespace Tests;
 
 // Inclusion proofs
 
-TEST_F(SmtTestFixture, ProveSingleLeaf)
+TEST_F(State_SmtFixture, ProveSingleLeaf)
 {
   Crypto::Hash key = makeHash(1);
   std::vector<uint8_t> val = proofValue(100);
@@ -33,7 +33,7 @@ TEST_F(SmtTestFixture, ProveSingleLeaf)
   EXPECT_TRUE(State::verifyProof(tree_->root(), *proof));
 }
 
-TEST_F(SmtTestFixture, ProveKeyInTenLeafTree)
+TEST_F(State_SmtFixture, ProveKeyInTenLeafTree)
 {
   for (uint64_t i = 1; i <= 10; ++i)
     tree_->update(makeHash(i), proofValue(i * 100), 0);
@@ -44,7 +44,7 @@ TEST_F(SmtTestFixture, ProveKeyInTenLeafTree)
   EXPECT_TRUE(State::verifyProof(tree_->root(), *proof));
 }
 
-TEST_F(SmtTestFixture, ProveKeyInHundredLeafTree)
+TEST_F(State_SmtFixture, ProveKeyInHundredLeafTree)
 {
   for (uint64_t i = 1; i <= 100; ++i)
     tree_->update(makeHash(i), proofValue(i), 0);
@@ -55,7 +55,7 @@ TEST_F(SmtTestFixture, ProveKeyInHundredLeafTree)
   EXPECT_TRUE(State::verifyProof(tree_->root(), *proof));
 }
 
-TEST_F(SmtTestFixture, ProveKeyWithDeepSharedPrefix)
+TEST_F(State_SmtFixture, ProveKeyWithDeepSharedPrefix)
 {
   // Two keys that share 255 bits of prefix — differ only in the last bit.
   Crypto::Hash k1, k2;
@@ -79,7 +79,7 @@ TEST_F(SmtTestFixture, ProveKeyWithDeepSharedPrefix)
   EXPECT_TRUE(State::verifyProof(tree_->root(), *proof2));
 }
 
-TEST_F(SmtTestFixture, ProofAgainstStaleRootFails)
+TEST_F(State_SmtFixture, ProofAgainstStaleRootFails)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof = State::prove(*tree_, makeHash(1));
@@ -98,7 +98,7 @@ TEST_F(SmtTestFixture, ProofAgainstStaleRootFails)
 
 // Non-inclusion proofs
 
-TEST_F(SmtTestFixture, ProveAbsenceInEmptyTree)
+TEST_F(State_SmtFixture, ProveAbsenceInEmptyTree)
 {
   auto proof = State::prove(*tree_, makeHash(999));
   ASSERT_TRUE(proof.has_value());
@@ -108,7 +108,7 @@ TEST_F(SmtTestFixture, ProveAbsenceInEmptyTree)
   EXPECT_TRUE(State::verifyProof(tree_->root(), *proof));
 }
 
-TEST_F(SmtTestFixture, ProveAbsenceInPopulatedTree)
+TEST_F(State_SmtFixture, ProveAbsenceInPopulatedTree)
 {
   for (uint64_t i = 1; i <= 20; ++i)
     tree_->update(makeHash(i), proofValue(i), 0);
@@ -119,7 +119,7 @@ TEST_F(SmtTestFixture, ProveAbsenceInPopulatedTree)
   EXPECT_TRUE(State::verifyProof(tree_->root(), *proof));
 }
 
-TEST_F(SmtTestFixture, ProveAbsenceOfAdjacentKey)
+TEST_F(State_SmtFixture, ProveAbsenceOfAdjacentKey)
 {
   // Insert a key. Prove absence of a key whose path shares all but
   // the last bit.
@@ -139,7 +139,7 @@ TEST_F(SmtTestFixture, ProveAbsenceOfAdjacentKey)
   EXPECT_TRUE(State::verifyProof(tree_->root(), *proof));
 }
 
-TEST_F(SmtTestFixture, AbsenceProofAgainstWrongRootFails)
+TEST_F(State_SmtFixture, AbsenceProofAgainstWrongRootFails)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof = State::prove(*tree_, makeHash(999));
@@ -151,7 +151,7 @@ TEST_F(SmtTestFixture, AbsenceProofAgainstWrongRootFails)
 
 // Tamper detection
 
-TEST_F(SmtTestFixture, TamperedSiblingFails)
+TEST_F(State_SmtFixture, TamperedSiblingFails)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof = State::prove(*tree_, makeHash(1));
@@ -162,7 +162,7 @@ TEST_F(SmtTestFixture, TamperedSiblingFails)
   EXPECT_FALSE(State::verifyProof(tree_->root(), *proof));
 }
 
-TEST_F(SmtTestFixture, TamperedValueFails)
+TEST_F(State_SmtFixture, TamperedValueFails)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof = State::prove(*tree_, makeHash(1));
@@ -174,7 +174,7 @@ TEST_F(SmtTestFixture, TamperedValueFails)
   EXPECT_FALSE(State::verifyProof(tree_->root(), *proof));
 }
 
-TEST_F(SmtTestFixture, TamperedKeyFails)
+TEST_F(State_SmtFixture, TamperedKeyFails)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof = State::prove(*tree_, makeHash(1));
@@ -185,7 +185,7 @@ TEST_F(SmtTestFixture, TamperedKeyFails)
   EXPECT_FALSE(State::verifyProof(tree_->root(), *proof));
 }
 
-TEST_F(SmtTestFixture, FlippedInclusionFlagFails)
+TEST_F(State_SmtFixture, FlippedInclusionFlagFails)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof = State::prove(*tree_, makeHash(1));
@@ -198,7 +198,7 @@ TEST_F(SmtTestFixture, FlippedInclusionFlagFails)
   EXPECT_FALSE(State::verifyProof(tree_->root(), *proof));
 }
 
-TEST_F(SmtTestFixture, TruncatedSiblingsFail)
+TEST_F(State_SmtFixture, TruncatedSiblingsFail)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof = State::prove(*tree_, makeHash(1));
@@ -211,7 +211,7 @@ TEST_F(SmtTestFixture, TruncatedSiblingsFail)
 
 // Serialization
 
-TEST_F(SmtTestFixture, SerializationRoundTrip)
+TEST_F(State_SmtFixture, SerializationRoundTrip)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof = State::prove(*tree_, makeHash(1));
@@ -232,7 +232,7 @@ TEST_F(SmtTestFixture, SerializationRoundTrip)
   EXPECT_TRUE(State::verifyProof(tree_->root(), decoded));
 }
 
-TEST_F(SmtTestFixture, SerializationRoundTripNonInclusion)
+TEST_F(State_SmtFixture, SerializationRoundTripNonInclusion)
 {
   auto proof = State::prove(*tree_, makeHash(999));
   ASSERT_TRUE(proof.has_value());
@@ -245,7 +245,7 @@ TEST_F(SmtTestFixture, SerializationRoundTripNonInclusion)
   EXPECT_TRUE(State::verifyProof(tree_->root(), decoded));
 }
 
-TEST_F(SmtTestFixture, SerializedSizeMatches)
+TEST_F(State_SmtFixture, SerializedSizeMatches)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof = State::prove(*tree_, makeHash(1));
@@ -254,7 +254,7 @@ TEST_F(SmtTestFixture, SerializedSizeMatches)
   EXPECT_EQ(proof->serialize().size(), proof->serializedSize());
 }
 
-TEST_F(SmtTestFixture, DeserializeRejectsTruncated)
+TEST_F(State_SmtFixture, DeserializeRejectsTruncated)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof = State::prove(*tree_, makeHash(1));
@@ -268,7 +268,7 @@ TEST_F(SmtTestFixture, DeserializeRejectsTruncated)
   EXPECT_FALSE(SmtProof::deserialize(bytes.data(), bytes.size(), decoded));
 }
 
-TEST_F(SmtTestFixture, DeserializeRejectsOversizedValueSize)
+TEST_F(State_SmtFixture, DeserializeRejectsOversizedValueSize)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof = State::prove(*tree_, makeHash(1));
@@ -288,7 +288,7 @@ TEST_F(SmtTestFixture, DeserializeRejectsOversizedValueSize)
 
 // Scale, many proofs from one tree
 
-TEST_F(SmtTestFixture, ManyProofsFromOneTree)
+TEST_F(State_SmtFixture, ManyProofsFromOneTree)
 {
   constexpr uint64_t N = 50;
   for (uint64_t i = 1; i <= N; ++i)
@@ -304,7 +304,7 @@ TEST_F(SmtTestFixture, ManyProofsFromOneTree)
   }
 }
 
-TEST_F(SmtTestFixture, ProofsAfterUpdate)
+TEST_F(State_SmtFixture, ProofsAfterUpdate)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   auto proof_v1 = State::prove(*tree_, makeHash(1));
@@ -325,7 +325,7 @@ TEST_F(SmtTestFixture, ProofsAfterUpdate)
   EXPECT_FALSE(State::verifyProof(root_v1, *proof_v2));
 }
 
-TEST_F(SmtTestFixture, ProofAfterRemove)
+TEST_F(State_SmtFixture, ProofAfterRemove)
 {
   tree_->update(makeHash(1), proofValue(100), 0);
   Crypto::Hash root_with = tree_->root();
@@ -343,7 +343,7 @@ TEST_F(SmtTestFixture, ProofAfterRemove)
 
 // Cross-check with StateAccess
 
-TEST_F(SmtPersistenceTestFixture, ProveAccountViaStateAccess)
+TEST_F(State_SmtPersistenceFixture, ProveAccountViaStateAccess)
 {
   auto db = openDB();
 
@@ -391,7 +391,7 @@ TEST_F(SmtPersistenceTestFixture, ProveAccountViaStateAccess)
   db->close();
 }
 
-TEST_F(SmtPersistenceTestFixture, ProveGlobalViaStateAccess)
+TEST_F(State_SmtPersistenceFixture, ProveGlobalViaStateAccess)
 {
   auto db = openDB();
 
@@ -426,7 +426,7 @@ TEST_F(SmtPersistenceTestFixture, ProveGlobalViaStateAccess)
 
 // Key helpers
 
-TEST_F(SmtTestFixture, ProofKeysMatchKeys)
+TEST_F(State_SmtFixture, ProofKeysMatchKeys)
 {
   Crypto::Address addr;
   addr.data[0] = 0xAB;
@@ -437,7 +437,7 @@ TEST_F(SmtTestFixture, ProofKeysMatchKeys)
   EXPECT_EQ(ProofKeys::forGlobal("x"), Keys::global("x"));
 }
 
-TEST_F(SmtTestFixture, ProofKeysForTokenBalanceAreDistinct)
+TEST_F(State_SmtFixture, ProofKeysForTokenBalanceAreDistinct)
 {
   Crypto::Address addr;
   addr.data[0] = 0xAB;

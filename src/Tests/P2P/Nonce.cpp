@@ -10,7 +10,7 @@
 
 using namespace P2P;
 
-TEST(Nonce, GeneratesNonZero)
+TEST(P2P_Nonce, GeneratesNonZero)
 {
   // It's astronomically unlikely that 100 random 64-bit values all
   // come back zero, but if the RNG is broken we'd see it immediately.
@@ -23,7 +23,7 @@ TEST(Nonce, GeneratesNonZero)
   EXPECT_EQ(zeros, 0);
 }
 
-TEST(Nonce, GeneratesDistinct)
+TEST(P2P_Nonce, GeneratesDistinct)
 {
   std::set<uint64_t> seen;
   for (int i = 0; i < 100; ++i)

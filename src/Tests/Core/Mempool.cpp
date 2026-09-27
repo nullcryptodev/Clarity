@@ -9,22 +9,20 @@
 #include "Core/TransactionTypes.h"
 #include "Crypto/Ed25519.h"
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 
 using namespace Core;
 using namespace Tests;
 
-// ============================================================================
-//  Basic acceptance
-// ============================================================================
+// Basic acceptance
 
-TEST_F(MempoolTestFixture, AcceptsWellFormedTransfer)
+TEST_F(Core_MempoolFixture, AcceptsWellFormedTransfer)
 {
   EXPECT_EQ(addTransfer(0, 500), MempoolAddResult::Accepted);
   EXPECT_EQ(pool_.size(), 1u);
 }
 
-TEST_F(MempoolTestFixture, IdempotentAdd)
+TEST_F(Core_MempoolFixture, IdempotentAdd)
 {
   Transaction tx = builder_.buildTransfer(0, 1000, 500);
 
@@ -34,7 +32,7 @@ TEST_F(MempoolTestFixture, IdempotentAdd)
   EXPECT_EQ(pool_.size(), 1u);
 }
 
-TEST_F(MempoolTestFixture, SameTxRebroadcastAccepted)
+TEST_F(Core_MempoolFixture, SameTxRebroadcastAccepted)
 {
   // Explicit test: rebroadcasting the exact same tx is idempotent.
   Transaction tx = builder_.buildTransfer(0, 1000, 500);
@@ -46,18 +44,16 @@ TEST_F(MempoolTestFixture, SameTxRebroadcastAccepted)
   EXPECT_EQ(pool_.size(), 1u);
 }
 
-// ============================================================================
-//  Rejection cases
-// ============================================================================
+// Rejection cases
 
-TEST_F(MempoolTestFixture, RejectsMalformedTransaction)
+TEST_F(Core_MempoolFixture, RejectsMalformedTransaction)
 {
   Transaction tx;
   EXPECT_EQ(pool_.add(tx, state_, FeeTier::Standard),
             MempoolAddResult::Rejected_Malformed);
 }
 
-TEST_F(MempoolTestFixture, RejectsWrongChainId)
+TEST_F(Core_MempoolFixture, RejectsWrongChainId)
 {
   Transaction tx = builder_.buildTransfer(0, 1000, 500);
   tx.chain_id = 0xDEADBEEF;
@@ -69,7 +65,7 @@ TEST_F(MempoolTestFixture, RejectsWrongChainId)
             MempoolAddResult::Rejected_WrongChain);
 }
 
-TEST_F(MempoolTestFixture, RejectsBadSignature)
+TEST_F(Core_MempoolFixture, RejectsBadSignature)
 {
   Transaction tx = builder_.buildTransfer(0, 1000, 500);
   tx.signature.data[0] ^= 0xFF;
@@ -78,18 +74,18 @@ TEST_F(MempoolTestFixture, RejectsBadSignature)
             MempoolAddResult::Rejected_BadSignature);
 }
 
-TEST_F(MempoolTestFixture, RejectsLowFee)
+TEST_F(Core_MempoolFixture, RejectsLowFee)
 {
   EXPECT_EQ(addTransfer(0, /*fee=*/0), MempoolAddResult::Rejected_LowFee);
 }
 
-TEST_F(MempoolTestFixture, RejectsHighFee)
+TEST_F(Core_MempoolFixture, RejectsHighFee)
 {
   EXPECT_EQ(addTransfer(0, /*fee=*/10'000'000ULL),
             MempoolAddResult::Rejected_HighFee);
 }
 
-TEST_F(MempoolTestFixture, RejectsNonceTooLow)
+TEST_F(Core_MempoolFixture, RejectsNonceTooLow)
 {
   state_.setNonce(builder_.senderAddress(), 5);
 
@@ -98,7 +94,7 @@ TEST_F(MempoolTestFixture, RejectsNonceTooLow)
             MempoolAddResult::Rejected_NonceTooLow);
 }
 
-TEST_F(MempoolTestFixture, RejectsInsufficientBalance)
+TEST_F(Core_MempoolFixture, RejectsInsufficientBalance)
 {
   state_.setBalance(builder_.senderAddress(), 100);
 
@@ -107,7 +103,7 @@ TEST_F(MempoolTestFixture, RejectsInsufficientBalance)
             MempoolAddResult::Rejected_InsufficientFunds);
 }
 
-TEST_F(MempoolTestFixture, RejectsExpiredTx)
+TEST_F(Core_MempoolFixture, RejectsExpiredTx)
 {
   state_.setHeight(200);
 
@@ -121,11 +117,9 @@ TEST_F(MempoolTestFixture, RejectsExpiredTx)
             MempoolAddResult::Rejected_Expired);
 }
 
-// ============================================================================
-//  Nonce conflict handling
-// ============================================================================
+// Nonce conflict handling
 
-TEST_F(MempoolTestFixture, NonceConflictRejected)
+TEST_F(Core_MempoolFixture, NonceConflictRejected)
 {
   // Add nonce 0.
   EXPECT_EQ(addTransfer(0, 500), MempoolAddResult::Accepted);
@@ -140,7 +134,7 @@ TEST_F(MempoolTestFixture, NonceConflictRejected)
   EXPECT_EQ(pool_.size(), 1u);
 }
 
-TEST_F(MempoolTestFixture, HigherFeeReplacesLowFeeNonce)
+TEST_F(Core_MempoolFixture, HigherFeeReplacesLowFeeNonce)
 {
   EXPECT_EQ(addTransfer(0, /*fee=*/500), MempoolAddResult::Accepted);
 
@@ -151,7 +145,7 @@ TEST_F(MempoolTestFixture, HigherFeeReplacesLowFeeNonce)
   EXPECT_EQ(pool_.size(), 1u);
 }
 
-TEST_F(MempoolTestFixture, PriorityReplacesStandardNonce)
+TEST_F(Core_MempoolFixture, PriorityReplacesStandardNonce)
 {
   EXPECT_EQ(addTransfer(0, /*fee=*/5000, FeeTier::Standard),
             MempoolAddResult::Accepted);
@@ -164,7 +158,7 @@ TEST_F(MempoolTestFixture, PriorityReplacesStandardNonce)
   EXPECT_EQ(pool_.priorityCount(), 1u);
 }
 
-TEST_F(MempoolTestFixture, NonPriorityCannotReplacePriority)
+TEST_F(Core_MempoolFixture, NonPriorityCannotReplacePriority)
 {
   EXPECT_EQ(addTransfer(0, /*fee=*/500, FeeTier::Priority),
             MempoolAddResult::Accepted);
@@ -177,11 +171,9 @@ TEST_F(MempoolTestFixture, NonPriorityCannotReplacePriority)
   EXPECT_EQ(pool_.priorityCount(), 1u);
 }
 
-// ============================================================================
-//  Stats
-// ============================================================================
+// Stats
 
-TEST_F(MempoolTestFixture, StatsReflectPool)
+TEST_F(Core_MempoolFixture, StatsReflectPool)
 {
   addTransfer(0, 500);
   addTransfer(1, 1000);
@@ -194,11 +186,9 @@ TEST_F(MempoolTestFixture, StatsReflectPool)
   EXPECT_GT(s.total_bytes, 0u);
 }
 
-// ============================================================================
-//  Block selection
-// ============================================================================
+// Block selection
 
-TEST_F(MempoolTestFixture, SelectionPicksAllWhenSmall)
+TEST_F(Core_MempoolFixture, SelectionPicksAllWhenSmall)
 {
   addTransfer(0, 500);
   addTransfer(1, 500);
@@ -210,7 +200,7 @@ TEST_F(MempoolTestFixture, SelectionPicksAllWhenSmall)
   EXPECT_EQ(selected.size(), 3u);
 }
 
-TEST_F(MempoolTestFixture, SelectionRespectsByteLimit)
+TEST_F(Core_MempoolFixture, SelectionRespectsByteLimit)
 {
   for (uint64_t i = 0; i < 10; ++i)
   {
@@ -224,7 +214,7 @@ TEST_F(MempoolTestFixture, SelectionRespectsByteLimit)
   EXPECT_GT(selected.size(), 0u);
 }
 
-TEST_F(MempoolTestFixture, SelectionRespectsCountLimit)
+TEST_F(Core_MempoolFixture, SelectionRespectsCountLimit)
 {
   for (uint64_t i = 0; i < 10; ++i)
   {
@@ -237,7 +227,7 @@ TEST_F(MempoolTestFixture, SelectionRespectsCountLimit)
   EXPECT_EQ(selected.size(), 3u);
 }
 
-TEST_F(MempoolTestFixture, SelectionRespectsNonceOrder)
+TEST_F(Core_MempoolFixture, SelectionRespectsNonceOrder)
 {
   // Add nonces 2, 0, 1 (out of order).
   addTransfer(2, 500);
@@ -253,7 +243,7 @@ TEST_F(MempoolTestFixture, SelectionRespectsNonceOrder)
   EXPECT_EQ(selected[2].nonce, 2u);
 }
 
-TEST_F(MempoolTestFixture, SelectionSkipsNonceGap)
+TEST_F(Core_MempoolFixture, SelectionSkipsNonceGap)
 {
   // Add nonces 0 and 2, but not 1.
   addTransfer(0, 500);
@@ -266,7 +256,7 @@ TEST_F(MempoolTestFixture, SelectionSkipsNonceGap)
   EXPECT_EQ(selected[0].nonce, 0u);
 }
 
-TEST_F(MempoolTestFixture, SelectionPrioritizesPriorityTier)
+TEST_F(Core_MempoolFixture, SelectionPrioritizesPriorityTier)
 {
   for (uint64_t i = 0; i < 5; ++i)
   {
@@ -294,11 +284,9 @@ TEST_F(MempoolTestFixture, SelectionPrioritizesPriorityTier)
   EXPECT_TRUE(found_priority);
 }
 
-// ============================================================================
-//  Removal
-// ============================================================================
+// Removal
 
-TEST_F(MempoolTestFixture, RemoveByTxid)
+TEST_F(Core_MempoolFixture, RemoveByTxid)
 {
   Transaction tx = builder_.buildTransfer(0, 1000, 500);
   pool_.add(tx, state_, FeeTier::Standard);
@@ -310,7 +298,7 @@ TEST_F(MempoolTestFixture, RemoveByTxid)
   EXPECT_EQ(pool_.size(), 0u);
 }
 
-TEST_F(MempoolTestFixture, RemoveUnknownTxid)
+TEST_F(Core_MempoolFixture, RemoveUnknownTxid)
 {
   Crypto::Hash bogus;
   for (size_t i = 0; i < 32; ++i)
@@ -319,7 +307,7 @@ TEST_F(MempoolTestFixture, RemoveUnknownTxid)
   EXPECT_FALSE(pool_.remove(bogus));
 }
 
-TEST_F(MempoolTestFixture, RemoveIncluded)
+TEST_F(Core_MempoolFixture, RemoveIncluded)
 {
   Transaction tx1 = builder_.buildTransfer(0, 1000, 500);
   Transaction tx2 = builder_.buildTransfer(1, 1000, 500);
@@ -336,7 +324,7 @@ TEST_F(MempoolTestFixture, RemoveIncluded)
   EXPECT_FALSE(pool_.contains(tx1.txid()));
 }
 
-TEST_F(MempoolTestFixture, RemoveIncludedIgnoresUnknown)
+TEST_F(Core_MempoolFixture, RemoveIncludedIgnoresUnknown)
 {
   Transaction tx = builder_.buildTransfer(0, 1000, 500);
   pool_.add(tx, state_, FeeTier::Standard);
@@ -349,7 +337,7 @@ TEST_F(MempoolTestFixture, RemoveIncludedIgnoresUnknown)
   EXPECT_EQ(pool_.size(), 1u);
 }
 
-TEST_F(MempoolTestFixture, Clear)
+TEST_F(Core_MempoolFixture, Clear)
 {
   for (uint64_t i = 0; i < 5; ++i)
   {
@@ -362,11 +350,9 @@ TEST_F(MempoolTestFixture, Clear)
   EXPECT_EQ(pool_.bytes(), 0u);
 }
 
-// ============================================================================
-//  Expiry
-// ============================================================================
+// Expiry
 
-TEST_F(MempoolTestFixture, PurgeExpired)
+TEST_F(Core_MempoolFixture, PurgeExpired)
 {
   addTransfer(0, 500);
 
@@ -383,7 +369,7 @@ TEST_F(MempoolTestFixture, PurgeExpired)
   EXPECT_EQ(pool_.size(), 1u);
 }
 
-TEST_F(MempoolTestFixture, PurgeExpiredKeepsUnexpired)
+TEST_F(Core_MempoolFixture, PurgeExpiredKeepsUnexpired)
 {
   addTransfer(0, 500);
 
@@ -391,11 +377,9 @@ TEST_F(MempoolTestFixture, PurgeExpiredKeepsUnexpired)
   EXPECT_EQ(pool_.size(), 1u);
 }
 
-// ============================================================================
-//  Query
-// ============================================================================
+// Query
 
-TEST_F(MempoolTestFixture, Contains)
+TEST_F(Core_MempoolFixture, Contains)
 {
   Transaction tx = builder_.buildTransfer(0, 1000, 500);
   pool_.add(tx, state_, FeeTier::Standard);
@@ -408,7 +392,7 @@ TEST_F(MempoolTestFixture, Contains)
   EXPECT_FALSE(pool_.contains(bogus));
 }
 
-TEST_F(MempoolTestFixture, Get)
+TEST_F(Core_MempoolFixture, Get)
 {
   Transaction tx = builder_.buildTransfer(0, 1000, 500);
   pool_.add(tx, state_, FeeTier::Standard);
@@ -420,7 +404,7 @@ TEST_F(MempoolTestFixture, Get)
   EXPECT_EQ(got->fee, tx.fee);
 }
 
-TEST_F(MempoolTestFixture, GetMissing)
+TEST_F(Core_MempoolFixture, GetMissing)
 {
   Crypto::Hash bogus;
   for (size_t i = 0; i < 32; ++i)
@@ -428,11 +412,9 @@ TEST_F(MempoolTestFixture, GetMissing)
   EXPECT_FALSE(pool_.get(bogus).has_value());
 }
 
-// ============================================================================
-//  Priority count
-// ============================================================================
+// Priority count
 
-TEST_F(MempoolTestFixture, PriorityCount)
+TEST_F(Core_MempoolFixture, PriorityCount)
 {
   EXPECT_EQ(pool_.priorityCount(), 0u);
 
@@ -446,11 +428,9 @@ TEST_F(MempoolTestFixture, PriorityCount)
   EXPECT_EQ(pool_.priorityCount(), 2u);
 }
 
-// ============================================================================
-//  Byte accounting
-// ============================================================================
+// Byte accounting
 
-TEST_F(MempoolTestFixture, BytesAccountedCorrectly)
+TEST_F(Core_MempoolFixture, BytesAccountedCorrectly)
 {
   Transaction tx = builder_.buildTransfer(0, 1000, 500);
   size_t tx_size = tx.serializedSize();
@@ -462,11 +442,9 @@ TEST_F(MempoolTestFixture, BytesAccountedCorrectly)
   EXPECT_EQ(pool_.bytes(), 0u);
 }
 
-// ============================================================================
-//  Fee rate ordering
-// ============================================================================
+// Fee rate ordering
 
-TEST_F(MempoolTestFixture, HigherFeeRateSelectedFirst)
+TEST_F(Core_MempoolFixture, HigherFeeRateSelectedFirst)
 {
   TransactionBuilder low_fee_builder;
   TransactionBuilder high_fee_builder;
@@ -491,7 +469,7 @@ TEST_F(MempoolTestFixture, HigherFeeRateSelectedFirst)
 //  Multiple senders
 // ============================================================================
 
-TEST_F(MempoolTestFixture, MultipleSendersIndependentNonces)
+TEST_F(Core_MempoolFixture, MultipleSendersIndependentNonces)
 {
   TransactionBuilder other;
   state_.setBalance(other.senderAddress(), 10'000'000'000ULL);

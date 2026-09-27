@@ -9,26 +9,22 @@
 #include "Core/ChainDB.h"
 #include "Core/Block.h"
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 
 using namespace Core;
 using namespace Tests;
 
-// ============================================================================
-//  Initial state
-// ============================================================================
+// Initial state
 
-TEST_F(ChainTestFixture, HeightIsZeroInitially)
+TEST_F(Core_ChainFixture, HeightIsZeroInitially)
 {
   EXPECT_EQ(chain_->height(), 0u);
   EXPECT_TRUE(chain_->headHash().isNull());
 }
 
-// ============================================================================
-//  Appending genesis (height 0)
-// ============================================================================
+// Appending genesis (height 0)
 
-TEST_F(ChainTestFixture, AppendGenesis)
+TEST_F(Core_ChainFixture, AppendGenesis)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
 
@@ -39,7 +35,7 @@ TEST_F(ChainTestFixture, AppendGenesis)
   EXPECT_EQ(chain_->headHash().toString(), genesis.hash().toString());
 }
 
-TEST_F(ChainTestFixture, AppendGenesisIsIdempotent)
+TEST_F(Core_ChainFixture, AppendGenesisIsIdempotent)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
 
@@ -47,11 +43,9 @@ TEST_F(ChainTestFixture, AppendGenesisIsIdempotent)
   EXPECT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::AlreadyHave);
 }
 
-// ============================================================================
-//  Appending blocks that extend the head
-// ============================================================================
+// Appending blocks that extend the head
 
-TEST_F(ChainTestFixture, AppendSequenceOfBlocks)
+TEST_F(Core_ChainFixture, AppendSequenceOfBlocks)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
@@ -70,7 +64,7 @@ TEST_F(ChainTestFixture, AppendSequenceOfBlocks)
   EXPECT_EQ(chain_->height(), 5u);
 }
 
-TEST_F(ChainTestFixture, AppendHeightMustBeParentPlusOne)
+TEST_F(Core_ChainFixture, AppendHeightMustBeParentPlusOne)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
@@ -82,16 +76,13 @@ TEST_F(ChainTestFixture, AppendHeightMustBeParentPlusOne)
   EXPECT_EQ(chain_->height(), 0u);
 }
 
-// ============================================================================
 //  Unknown parent handling
-//
 //  A parent we've never seen is indistinguishable from a valid block
 //  whose parent hasn't arrived yet. We report NotConnected and wait.
 //  (The "parent exists but isn't head" case is a fork, covered by
 //  RejectsForkFromKnownParent below.)
-// ============================================================================
 
-TEST_F(ChainTestFixture, AppendRejectsUnknownParentHash)
+TEST_F(Core_ChainFixture, AppendRejectsUnknownParentHash)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
@@ -107,7 +98,7 @@ TEST_F(ChainTestFixture, AppendRejectsUnknownParentHash)
   EXPECT_EQ(chain_->height(), 0u);
 }
 
-TEST_F(ChainTestFixture, AppendAlreadyHaveBlock)
+TEST_F(Core_ChainFixture, AppendAlreadyHaveBlock)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
@@ -119,11 +110,9 @@ TEST_F(ChainTestFixture, AppendAlreadyHaveBlock)
   EXPECT_EQ(chain_->height(), 1u);
 }
 
-// ============================================================================
-//  BFT-specific: no forks allowed
-// ============================================================================
+// BFT-specific: no forks allowed
 
-TEST_F(ChainTestFixture, RejectsForkFromKnownParent)
+TEST_F(Core_ChainFixture, RejectsForkFromKnownParent)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
@@ -141,11 +130,9 @@ TEST_F(ChainTestFixture, RejectsForkFromKnownParent)
   EXPECT_EQ(chain_->height(), 1u);
 }
 
-// ============================================================================
-//  Chain head persistence
-// ============================================================================
+// Chain head persistence
 
-TEST_F(ChainTestFixture, HeadPersistsAcrossReopen)
+TEST_F(Core_ChainFixture, HeadPersistsAcrossReopen)
 {
   const auto &path = tmp_path();
 
@@ -173,11 +160,9 @@ TEST_F(ChainTestFixture, HeadPersistsAcrossReopen)
   EXPECT_EQ(chain_->headHash().toString(), expected_head.toString());
 }
 
-// ============================================================================
-//  Sync state
-// ============================================================================
+// Sync state
 
-TEST_F(ChainTestFixture, IsSyncingWhenFarBehind)
+TEST_F(Core_ChainFixture, IsSyncingWhenFarBehind)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
@@ -186,7 +171,7 @@ TEST_F(ChainTestFixture, IsSyncingWhenFarBehind)
   EXPECT_TRUE(chain_->isSyncing());
 }
 
-TEST_F(ChainTestFixture, NotSyncingWhenCaughtUp)
+TEST_F(Core_ChainFixture, NotSyncingWhenCaughtUp)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
@@ -195,7 +180,7 @@ TEST_F(ChainTestFixture, NotSyncingWhenCaughtUp)
   EXPECT_FALSE(chain_->isSyncing());
 }
 
-TEST_F(ChainTestFixture, NotSyncingWhenPeerBehind)
+TEST_F(Core_ChainFixture, NotSyncingWhenPeerBehind)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
@@ -204,11 +189,9 @@ TEST_F(ChainTestFixture, NotSyncingWhenPeerBehind)
   EXPECT_FALSE(chain_->isSyncing());
 }
 
-// ============================================================================
-//  Integration with ChainDB
-// ============================================================================
+// Integration with ChainDB
 
-TEST_F(ChainTestFixture, AppendedBlockIsRetrievable)
+TEST_F(Core_ChainFixture, AppendedBlockIsRetrievable)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
@@ -227,11 +210,9 @@ TEST_F(ChainTestFixture, AppendedBlockIsRetrievable)
   EXPECT_EQ(raw->header.height, 1u);
 }
 
-// ============================================================================
-//  Long chain integrity
-// ============================================================================
+// Long chain integrity
 
-TEST_F(ChainTestFixture, LongChainIntegrity)
+TEST_F(Core_ChainFixture, LongChainIntegrity)
 {
   Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);

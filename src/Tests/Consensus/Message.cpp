@@ -5,40 +5,19 @@
 
 #include <gtest/gtest.h>
 
+#include "Fixtures.h"
 #include "Tests/Utils.h"
 
 using namespace Consensus;
 using namespace Tests;
 
-// ============================================================================
-//  Proposal encode/decode
-// ============================================================================
+// Proposal encode/decode
 
-TEST(ConsensusMessage, ProposalRoundTrip)
+TEST(Consensus_Message, ProposalRoundTrip)
 {
-  Core::Block block;
-  block.header.version = GlobalConfig::CURRENT_BLOCK_VERSION;
-  block.header.chain_id = 0x434C5247;
-  block.header.height = 42;
-  block.header.parent_hash = Crypto::Hash{};
-  block.header.timestamp_ms = 1'700'000'000'000ULL;
-  block.header.proposer = Crypto::Address{};
-  for (size_t i = 0; i < 32; ++i)
-    block.header.proposer.data[i] = 0x80;
-  block.header.tx_root = Core::computeTxRoot({});
-  block.header.state_root = Crypto::Hash{};
-  block.header.receipts_root = Crypto::Hash{};
-  block.header.validator_set_root = Crypto::Hash{};
-  block.header.active_validator_count = 4;
-  block.header.tx_count = 0;
-
-  // Fill quorum signatures so Block::isWellFormed() passes after
-  // deserialize. bftQuorum(4) == 3.
-  block.quorum_signatures.resize(Core::bftQuorum(4));
-  for (size_t i = 0; i < block.quorum_signatures.size(); ++i)
-  {
-    block.quorum_signatures[i].signer_index = static_cast<uint16_t>(i);
-  }
+  Core::BlockHeader blockHeader = makeTestHeader(42, Crypto::Hash{}, 0x434C5247);
+  blockHeader.active_validator_count = 21;
+  Core::Block block = makeTestBlock(blockHeader);
 
   Proposal p;
   p.height = 42;
@@ -61,7 +40,7 @@ TEST(ConsensusMessage, ProposalRoundTrip)
   EXPECT_EQ(decoded.block_hash, p.block_hash);
 }
 
-TEST(ConsensusMessage, DecodeProposalRejectsTruncated)
+TEST(Consensus_Message, DecodeProposalRejectsTruncated)
 {
   Proposal p;
   p.height = 1;
@@ -83,7 +62,7 @@ TEST(ConsensusMessage, DecodeProposalRejectsTruncated)
   EXPECT_FALSE(decodeProposal(tiny.data(), tiny.size(), decoded));
 }
 
-TEST(ConsensusMessage, DecodeProposalRejectsOversizedBlockSize)
+TEST(Consensus_Message, DecodeProposalRejectsOversizedBlockSize)
 {
   // Craft a header that claims a block_bytes size larger than the
   // payload actually contains.
@@ -117,11 +96,9 @@ TEST(ConsensusMessage, DecodeProposalRejectsOversizedBlockSize)
   EXPECT_FALSE(decodeProposal(bytes.data(), bytes.size(), decoded));
 }
 
-// ============================================================================
-//  Vote encode/decode
-// ============================================================================
+// Vote encode/decode
 
-TEST(ConsensusMessage, VoteRoundTripInclusion)
+TEST(Consensus_Message, VoteRoundTripInclusion)
 {
   Vote v;
   v.height = 100;
@@ -145,7 +122,7 @@ TEST(ConsensusMessage, VoteRoundTripInclusion)
   EXPECT_EQ(decoded.signature.data, v.signature.data);
 }
 
-TEST(ConsensusMessage, VoteRoundTripNil)
+TEST(Consensus_Message, VoteRoundTripNil)
 {
   Vote v;
   v.height = 200;
@@ -166,7 +143,7 @@ TEST(ConsensusMessage, VoteRoundTripNil)
   EXPECT_EQ(decoded.signer_index, v.signer_index);
 }
 
-TEST(ConsensusMessage, DecodeVoteRejectsTruncated)
+TEST(Consensus_Message, DecodeVoteRejectsTruncated)
 {
   Vote v;
   v.height = 1;
@@ -186,11 +163,9 @@ TEST(ConsensusMessage, DecodeVoteRejectsTruncated)
   EXPECT_FALSE(decodeVote(tiny.data(), tiny.size(), decoded));
 }
 
-// ============================================================================
-//  Signing hashes
-// ============================================================================
+// Signing hashes
 
-TEST(ConsensusMessage, ProposalSigningHashIsDeterministic)
+TEST(Consensus_Message, ProposalSigningHashIsDeterministic)
 {
   Crypto::Hash block_hash;
   block_hash.data[0] = 0xAA;
@@ -200,7 +175,7 @@ TEST(ConsensusMessage, ProposalSigningHashIsDeterministic)
   EXPECT_EQ(h1, h2);
 }
 
-TEST(ConsensusMessage, ProposalSigningHashCoversAllFields)
+TEST(Consensus_Message, ProposalSigningHashCoversAllFields)
 {
   Crypto::Hash block_hash;
   block_hash.data[0] = 0xAA;
@@ -215,7 +190,7 @@ TEST(ConsensusMessage, ProposalSigningHashCoversAllFields)
   EXPECT_NE(base, proposalSigningHash(1, 2, other_hash)); // block_hash
 }
 
-TEST(ConsensusMessage, VoteSigningHashIsDeterministic)
+TEST(Consensus_Message, VoteSigningHashIsDeterministic)
 {
   Crypto::Hash block_hash;
   block_hash.data[0] = 0xBB;
@@ -225,7 +200,7 @@ TEST(ConsensusMessage, VoteSigningHashIsDeterministic)
   EXPECT_EQ(h1, h2);
 }
 
-TEST(ConsensusMessage, VoteSigningHashCoversAllFields)
+TEST(Consensus_Message, VoteSigningHashCoversAllFields)
 {
   Crypto::Hash block_hash;
   block_hash.data[0] = 0xBB;
@@ -241,7 +216,7 @@ TEST(ConsensusMessage, VoteSigningHashCoversAllFields)
   EXPECT_NE(base, voteSigningHash(5, 3, false, other_hash)); // block_hash
 }
 
-TEST(ConsensusMessage, ProposalAndVoteDomainsDiffer)
+TEST(Consensus_Message, ProposalAndVoteDomainsDiffer)
 {
   // Same height/round/block_hash: proposal and vote signing hashes
   // must differ (different domain strings).

@@ -8,16 +8,14 @@
 #include "Core/ChainDB.h"
 #include "Core/Block.h"
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 
 using namespace Core;
 using namespace Tests;
 
-// ============================================================================
-//  Block storage and retrieval
-// ============================================================================
+// Block storage and retrieval
 
-TEST_F(ChainTestFixture, StoreAndRetrieveByHash)
+TEST_F(Core_ChainFixture, StoreAndRetrieveByHash)
 {
   Block b = makeTestBlock(makeTestHeader(/*height=*/1));
 
@@ -33,7 +31,7 @@ TEST_F(ChainTestFixture, StoreAndRetrieveByHash)
   EXPECT_EQ(retrieved->header.chain_id, b.header.chain_id);
 }
 
-TEST_F(ChainTestFixture, StoreAndRetrieveByHeight)
+TEST_F(Core_ChainFixture, StoreAndRetrieveByHeight)
 {
   Block b = makeTestBlock(makeTestHeader(/*height=*/5));
 
@@ -44,7 +42,7 @@ TEST_F(ChainTestFixture, StoreAndRetrieveByHeight)
   EXPECT_EQ(retrieved->header.height, 5u);
 }
 
-TEST_F(ChainTestFixture, GetBlockReturnsNullForMissing)
+TEST_F(Core_ChainFixture, GetBlockReturnsNullForMissing)
 {
   Crypto::Hash missing;
   for (size_t i = 0; i < 32; ++i)
@@ -54,7 +52,7 @@ TEST_F(ChainTestFixture, GetBlockReturnsNullForMissing)
   EXPECT_FALSE(chain_db_->getBlockByHeight(9999).has_value());
 }
 
-TEST_F(ChainTestFixture, GetHeaderByHash)
+TEST_F(Core_ChainFixture, GetHeaderByHash)
 {
   Block b = makeTestBlock(makeTestHeader(/*height=*/10));
   chain_db_->storeBlock(b);
@@ -64,7 +62,7 @@ TEST_F(ChainTestFixture, GetHeaderByHash)
   EXPECT_EQ(header->height, 10u);
 }
 
-TEST_F(ChainTestFixture, GetHeaderByHeight)
+TEST_F(Core_ChainFixture, GetHeaderByHeight)
 {
   Block b = makeTestBlock(makeTestHeader(/*height=*/15));
   chain_db_->storeBlock(b);
@@ -74,7 +72,7 @@ TEST_F(ChainTestFixture, GetHeaderByHeight)
   EXPECT_EQ(header->height, 15u);
 }
 
-TEST_F(ChainTestFixture, GetHashByHeight)
+TEST_F(Core_ChainFixture, GetHashByHeight)
 {
   Block b = makeTestBlock(makeTestHeader(/*height=*/20));
   Crypto::Hash expected = b.hash();
@@ -85,16 +83,14 @@ TEST_F(ChainTestFixture, GetHashByHeight)
   EXPECT_EQ(got->toString(), expected.toString());
 }
 
-TEST_F(ChainTestFixture, GetHashByHeightReturnsNullForMissing)
+TEST_F(Core_ChainFixture, GetHashByHeightReturnsNullForMissing)
 {
   EXPECT_FALSE(chain_db_->getHashByHeight(1).has_value());
 }
 
-// ============================================================================
-//  Store is idempotent
-// ============================================================================
+// Store is idempotent
 
-TEST_F(ChainTestFixture, StoreIsIdempotent)
+TEST_F(Core_ChainFixture, StoreIsIdempotent)
 {
   Block b = makeTestBlock(makeTestHeader(/*height=*/1));
 
@@ -106,18 +102,16 @@ TEST_F(ChainTestFixture, StoreIsIdempotent)
   EXPECT_EQ(chain_db_->blockCount(), 1u);
 }
 
-// ============================================================================
-//  Chain head
-// ============================================================================
+// Chain head
 
-TEST_F(ChainTestFixture, HeadIsEmptyInitially)
+TEST_F(Core_ChainFixture, HeadIsEmptyInitially)
 {
   auto head = chain_db_->getHead();
   EXPECT_TRUE(head.hash.isNull());
   EXPECT_EQ(head.height, 0u);
 }
 
-TEST_F(ChainTestFixture, SetAndGetHead)
+TEST_F(Core_ChainFixture, SetAndGetHead)
 {
   Crypto::Hash h;
   for (size_t i = 0; i < 32; ++i)
@@ -133,27 +127,25 @@ TEST_F(ChainTestFixture, SetAndGetHead)
   EXPECT_EQ(retrieved.height, 42u);
 }
 
-// ============================================================================
-//  Chain metadata
-// ============================================================================
+// Chain metadata
 
-TEST_F(ChainTestFixture, ChainIdDefaultZero)
+TEST_F(Core_ChainFixture, ChainIdDefaultZero)
 {
   EXPECT_EQ(chain_db_->getChainId(), 0u);
 }
 
-TEST_F(ChainTestFixture, SetAndGetChainId)
+TEST_F(Core_ChainFixture, SetAndGetChainId)
 {
   chain_db_->setChainId(0x434C5247);
   EXPECT_EQ(chain_db_->getChainId(), 0x434C5247u);
 }
 
-TEST_F(ChainTestFixture, GenesisHashDefaultEmpty)
+TEST_F(Core_ChainFixture, GenesisHashDefaultEmpty)
 {
   EXPECT_TRUE(chain_db_->getGenesisHash().isNull());
 }
 
-TEST_F(ChainTestFixture, SetAndGetGenesisHash)
+TEST_F(Core_ChainFixture, SetAndGetGenesisHash)
 {
   Crypto::Hash h;
   for (size_t i = 0; i < 32; ++i)
@@ -163,26 +155,22 @@ TEST_F(ChainTestFixture, SetAndGetGenesisHash)
   EXPECT_EQ(chain_db_->getGenesisHash().toString(), h.toString());
 }
 
-// ============================================================================
-//  Best peer height
-// ============================================================================
+// Best peer height
 
-TEST_F(ChainTestFixture, BestPeerHeightDefaultZero)
+TEST_F(Core_ChainFixture, BestPeerHeightDefaultZero)
 {
   EXPECT_EQ(chain_db_->getBestPeerHeight(), 0u);
 }
 
-TEST_F(ChainTestFixture, SetAndGetBestPeerHeight)
+TEST_F(Core_ChainFixture, SetAndGetBestPeerHeight)
 {
   chain_db_->setBestPeerHeight(12345);
   EXPECT_EQ(chain_db_->getBestPeerHeight(), 12345u);
 }
 
-// ============================================================================
-//  Receipts
-// ============================================================================
+// Receipts
 
-TEST_F(ChainTestFixture, StoreAndRetrieveReceipt)
+TEST_F(Core_ChainFixture, StoreAndRetrieveReceipt)
 {
   Crypto::Hash tx_hash;
   for (size_t i = 0; i < 32; ++i)
@@ -198,7 +186,7 @@ TEST_F(ChainTestFixture, StoreAndRetrieveReceipt)
   EXPECT_EQ(retrieved, receipt_data);
 }
 
-TEST_F(ChainTestFixture, GetReceiptReturnsNullForMissing)
+TEST_F(Core_ChainFixture, GetReceiptReturnsNullForMissing)
 {
   Crypto::Hash missing;
   for (size_t i = 0; i < 32; ++i)
@@ -208,16 +196,14 @@ TEST_F(ChainTestFixture, GetReceiptReturnsNullForMissing)
   EXPECT_FALSE(chain_db_->getReceipt(missing, retrieved));
 }
 
-// ============================================================================
-//  Block count
-// ============================================================================
+// Block count
 
-TEST_F(ChainTestFixture, BlockCountStartsAtZero)
+TEST_F(Core_ChainFixture, BlockCountStartsAtZero)
 {
   EXPECT_EQ(chain_db_->blockCount(), 0u);
 }
 
-TEST_F(ChainTestFixture, BlockCountGrowsWithStores)
+TEST_F(Core_ChainFixture, BlockCountGrowsWithStores)
 {
   for (uint64_t h = 1; h <= 10; ++h)
   {
@@ -227,11 +213,9 @@ TEST_F(ChainTestFixture, BlockCountGrowsWithStores)
   EXPECT_EQ(chain_db_->blockCount(), 10u);
 }
 
-// ============================================================================
-//  Persistence across "restart"
-// ============================================================================
+// Persistence across "restart"
 
-TEST_F(ChainTestFixture, DataSurvivesReopen)
+TEST_F(Core_ChainFixture, DataSurvivesReopen)
 {
   const auto &path = tmp_path();
 

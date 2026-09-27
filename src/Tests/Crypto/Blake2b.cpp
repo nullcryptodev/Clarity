@@ -14,7 +14,7 @@
 using namespace Crypto;
 using namespace Tests;
 
-TEST(Blake2b, EmptyInput)
+TEST(Crypto_Blake2b, EmptyInput)
 {
   uint8_t out[32];
   blake2b(reinterpret_cast<const uint8_t *>(""), 0, out, 32);
@@ -23,7 +23,7 @@ TEST(Blake2b, EmptyInput)
             "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8");
 }
 
-TEST(Blake2b, Abc)
+TEST(Crypto_Blake2b, Abc)
 {
   uint8_t out[32];
   blake2b(reinterpret_cast<const uint8_t *>("abc"), 3, out, 32);
@@ -32,7 +32,7 @@ TEST(Blake2b, Abc)
             "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319");
 }
 
-TEST(Blake2b, LongerMessage)
+TEST(Crypto_Blake2b, LongerMessage)
 {
   const char *msg =
       "The quick brown fox jumps over the lazy dog";

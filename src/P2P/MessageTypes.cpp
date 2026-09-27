@@ -7,30 +7,106 @@
 
 namespace P2P
 {
-
-std::string_view messageTypeName(MessageType t) noexcept
-{
-  switch (t) {
-    case MessageType::Version:    return "version";
-    case MessageType::Verack:     return "verack";
-    case MessageType::Ping:       return "ping";
-    case MessageType::Pong:       return "pong";
-    case MessageType::GetPeers:   return "getpeers";
-    case MessageType::Peers:      return "peers";
-    case MessageType::GetHeaders: return "getheaders";
-    case MessageType::Headers:    return "headers";
-    case MessageType::GetBlocks:  return "getblocks";
-    case MessageType::Blocks:     return "blocks";
-    case MessageType::Inv:        return "inv";
-    case MessageType::GetData:    return "getdata";
-    case MessageType::Tx:         return "tx";
-    case MessageType::Block:      return "block";
-    case MessageType::Proposal:   return "proposal";
-    case MessageType::Prevote:    return "prevote";
-    case MessageType::Precommit:  return "precommit";
-    case MessageType::Disconnect: return "disconnect";
+  std::string_view messageTypeName(MessageType t) noexcept
+  {
+    switch (t)
+    {
+    case MessageType::Version:
+      return "version";
+    case MessageType::Verack:
+      return "verack";
+    case MessageType::Ping:
+      return "ping";
+    case MessageType::Pong:
+      return "pong";
+    case MessageType::GetPeers:
+      return "getpeers";
+    case MessageType::Peers:
+      return "peers";
+    case MessageType::Auth:
+      return "Auth";
+    case MessageType::GetHeaders:
+      return "getheaders";
+    case MessageType::Headers:
+      return "headers";
+    case MessageType::GetBlocks:
+      return "getblocks";
+    case MessageType::Blocks:
+      return "blocks";
+    case MessageType::Inv:
+      return "inv";
+    case MessageType::GetData:
+      return "getdata";
+    case MessageType::Tx:
+      return "tx";
+    case MessageType::Block:
+      return "block";
+    case MessageType::Proposal:
+      return "proposal";
+    case MessageType::Prevote:
+      return "prevote";
+    case MessageType::Precommit:
+      return "precommit";
+    case MessageType::Disconnect:
+      return "disconnect";
+    }
+    return "unknown";
   }
-  return "unknown";
-}
 
+  uint32_t messageCost(MessageType t) noexcept
+  {
+    // Costs reflect the work the *receiver* does per message, relative
+    // to a cheap control message. Cheap-to-send, expensive-to-serve
+    // types are charged more. Consensus types are not listed — they're
+    // charged only to the consensus bucket, which is checked separately
+    // (see Peer::handleReadHeader and the body-read lambda in
+    // Peer::startRead's continuation).
+    switch (t)
+    {
+    case MessageType::GetHeaders:
+      return 20; // server loops up to MAX_HEADERS_PER_REQUEST (2000) getHashByHeight calls
+
+    case MessageType::GetBlocks:
+      return 20; // server loops up to MAX_BLOCKS_PER_REQUEST (128) getBlock calls, each deserializing
+
+    case MessageType::Blocks:
+      return 10; // we deserialize up to 128 blocks
+
+    case MessageType::Block:
+      return 10; // we deserialize + apply one block, then re-broadcast
+
+    case MessageType::Tx:
+      return 5; // mempool add does signature verify + state view; re-broadcast to N peers
+
+    case MessageType::Headers:
+      return 1; // small, parsed cheaply
+
+    case MessageType::Proposal:
+    case MessageType::Prevote:
+    case MessageType::Precommit:
+      // Consensus types are not charged to this bucket; the consensus
+      // bucket handles them. Return 1 as a defensive default so that
+      // if messageCost() is ever called on them, the value is
+      // meaningful (1 is the cheapest possible cost).
+      return 1;
+
+    case MessageType::Version:
+    case MessageType::Verack:
+    case MessageType::Ping:
+    case MessageType::Pong:
+    case MessageType::GetPeers:
+    case MessageType::Peers:
+    case MessageType::Auth:
+    case MessageType::Inv:
+    case MessageType::GetData:
+    case MessageType::Disconnect:
+      return 1;
+
+    default:
+      // Unknown / future message types get a nominal cost. This is the
+      // safe default: a new type that's cheap to send and expensive to
+      // serve doesn't silently bypass the limiter.
+      return 1;
+    }
+  }
 } // namespace P2P

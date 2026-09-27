@@ -16,7 +16,7 @@ using namespace Common;
 //  Round-trip
 // ============================================================================
 
-TEST(Varint, RoundTripU8)
+TEST(Common_Varint, RoundTripU8)
 {
   for (uint8_t v : {0, 1, 42, 127, 128, 200, 255})
   {
@@ -29,7 +29,7 @@ TEST(Varint, RoundTripU8)
   }
 }
 
-TEST(Varint, RoundTripU16)
+TEST(Common_Varint, RoundTripU16)
 {
   for (uint16_t v : {uint16_t(0), uint16_t(127), uint16_t(128),
                      uint16_t(16383), uint16_t(16384),
@@ -43,7 +43,7 @@ TEST(Varint, RoundTripU16)
   }
 }
 
-TEST(Varint, RoundTripU32)
+TEST(Common_Varint, RoundTripU32)
 {
   for (uint32_t v : {uint32_t(0), uint32_t(127), uint32_t(128),
                      uint32_t(16383), uint32_t(16384),
@@ -58,7 +58,7 @@ TEST(Varint, RoundTripU32)
   }
 }
 
-TEST(Varint, RoundTripU64)
+TEST(Common_Varint, RoundTripU64)
 {
   for (uint64_t v : {uint64_t(0), uint64_t(127), uint64_t(128),
                      uint64_t(16383), uint64_t(16384),
@@ -77,31 +77,31 @@ TEST(Varint, RoundTripU64)
 //  Encoding sizes
 // ============================================================================
 
-TEST(Varint, SizeOneByte)
+TEST(Common_Varint, SizeOneByte)
 {
   EXPECT_EQ(to_varint(uint64_t(0)).size(), 1);
   EXPECT_EQ(to_varint(uint64_t(1)).size(), 1);
   EXPECT_EQ(to_varint(uint64_t(127)).size(), 1);
 }
 
-TEST(Varint, SizeTwoBytes)
+TEST(Common_Varint, SizeTwoBytes)
 {
   EXPECT_EQ(to_varint(uint64_t(128)).size(), 2);
   EXPECT_EQ(to_varint(uint64_t(16383)).size(), 2);
 }
 
-TEST(Varint, SizeThreeBytes)
+TEST(Common_Varint, SizeThreeBytes)
 {
   EXPECT_EQ(to_varint(uint64_t(16384)).size(), 3);
 }
 
-TEST(Varint, SizeMax)
+TEST(Common_Varint, SizeMax)
 {
   // 64-bit max needs 10 bytes.
   EXPECT_EQ(to_varint(uint64_t(0xFFFFFFFFFFFFFFFFULL)).size(), 10);
 }
 
-TEST(Varint, SizeHelper)
+TEST(Common_Varint, SizeHelper)
 {
   EXPECT_EQ(varint_size(uint64_t(0)), 1);
   EXPECT_EQ(varint_size(uint64_t(127)), 1);
@@ -113,14 +113,14 @@ TEST(Varint, SizeHelper)
 //  Error handling
 // ============================================================================
 
-TEST(Varint, EmptyInput)
+TEST(Common_Varint, EmptyInput)
 {
   auto result = read_varint_from_string<uint32_t>("");
   EXPECT_FALSE(result.success());
   EXPECT_EQ(result.error, VarintError::InsufficientData);
 }
 
-TEST(Varint, IncompleteVarint)
+TEST(Common_Varint, IncompleteVarint)
 {
   // 0x80 signals "more bytes follow" — but there's nothing after it.
   std::string bad;
@@ -131,7 +131,7 @@ TEST(Varint, IncompleteVarint)
   EXPECT_EQ(result.error, VarintError::InsufficientData);
 }
 
-TEST(Varint, OverflowForU8)
+TEST(Common_Varint, OverflowForU8)
 {
   // Encode a value that's too big for uint8_t.
   auto encoded = to_varint(uint64_t(300));
@@ -144,7 +144,7 @@ TEST(Varint, OverflowForU8)
 //  Buffer-based read/write
 // ============================================================================
 
-TEST(Varint, WriteToBuffer)
+TEST(Common_Varint, WriteToBuffer)
 {
   uint8_t buffer[16];
   size_t n = write_varint_to_buffer(uint64_t(300), buffer);
@@ -155,7 +155,7 @@ TEST(Varint, WriteToBuffer)
   EXPECT_EQ(result.value, 300);
 }
 
-TEST(Varint, WriteToVector)
+TEST(Common_Varint, WriteToVector)
 {
   std::vector<uint8_t> out;
   write_varint_to_vector(uint64_t(16384), out);

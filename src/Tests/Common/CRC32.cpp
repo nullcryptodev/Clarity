@@ -13,13 +13,13 @@ using namespace Common;
 
 // Standard CRC32 test vectors (IEEE 802.3, the same polynomial as zlib).
 
-TEST(CRC32, EmptyString)
+TEST(Common_CRC32, EmptyString)
 {
   // CRC32 of empty string is 0.
   EXPECT_EQ(crc32(""), 0);
 }
 
-TEST(CRC32, KnownVectors)
+TEST(Common_CRC32, KnownVectors)
 {
   // Well-known CRC32 test vectors (IEEE polynomial).
   EXPECT_EQ(crc32("The quick brown fox jumps over the lazy dog"),
@@ -29,13 +29,13 @@ TEST(CRC32, KnownVectors)
   EXPECT_EQ(crc32("123456789"), uint64_t(0xCBF43926));
 }
 
-TEST(CRC32, DeterministicForSameInput)
+TEST(Common_CRC32, DeterministicForSameInput)
 {
   std::string s = "hello world";
   EXPECT_EQ(crc32(s), crc32(s));
 }
 
-TEST(CRC32, DifferentInputsDifferentCRC)
+TEST(Common_CRC32, DifferentInputsDifferentCRC)
 {
   EXPECT_NE(crc32("hello"), crc32("world"));
 }

@@ -4,7 +4,7 @@
 #include <sstream>
 #include <cstring>
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 #include "Tests/Types.h"
 
 #include "Serialization/JsonSerializer.h"
@@ -15,7 +15,7 @@ using namespace Tests;
 
 // Primitive Type Tests
 
-TEST_F(JsonSerializerTestFixture, UInt8)
+TEST_F(Serialization_JsonSerializerFixture, UInt8)
 {
   uint8_t original = 0xFF;
   uint8_t result = 0;
@@ -24,7 +24,7 @@ TEST_F(JsonSerializerTestFixture, UInt8)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(JsonSerializerTestFixture, UInt64)
+TEST_F(Serialization_JsonSerializerFixture, UInt64)
 {
   uint64_t original = 0xFFFFFFFFFFFFFFFFULL;
   uint64_t result = 0;
@@ -33,7 +33,7 @@ TEST_F(JsonSerializerTestFixture, UInt64)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(JsonSerializerTestFixture, Int64)
+TEST_F(Serialization_JsonSerializerFixture, Int64)
 {
   int64_t original = -123456789012345LL;
   int64_t result = 0;
@@ -42,7 +42,7 @@ TEST_F(JsonSerializerTestFixture, Int64)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(JsonSerializerTestFixture, Bool)
+TEST_F(Serialization_JsonSerializerFixture, Bool)
 {
   bool original = true;
   bool result = false;
@@ -51,7 +51,7 @@ TEST_F(JsonSerializerTestFixture, Bool)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(JsonSerializerTestFixture, String)
+TEST_F(Serialization_JsonSerializerFixture, String)
 {
   std::string original = "Hello, World!";
   std::string result;
@@ -60,7 +60,7 @@ TEST_F(JsonSerializerTestFixture, String)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(JsonSerializerTestFixture, StringWithSpecialChars)
+TEST_F(Serialization_JsonSerializerFixture, StringWithSpecialChars)
 {
   std::string original = "Hello\nWorld\tTest\"Quote\"";
   std::string result;
@@ -71,7 +71,7 @@ TEST_F(JsonSerializerTestFixture, StringWithSpecialChars)
 
 // SimpleType Tests
 
-TEST_F(JsonSerializerTestFixture, SimpleType)
+TEST_F(Serialization_JsonSerializerFixture, SimpleType)
 {
   SimpleType original;
   original.u8 = 0x12;
@@ -93,7 +93,7 @@ TEST_F(JsonSerializerTestFixture, SimpleType)
 
 // Pretty Print Tests
 
-TEST_F(JsonSerializerTestFixture, PrettyPrint)
+TEST_F(Serialization_JsonSerializerFixture, PrettyPrint)
 {
   SimpleType original;
   original.u8 = 0x12;
@@ -106,7 +106,7 @@ TEST_F(JsonSerializerTestFixture, PrettyPrint)
 
 // Error Handling Tests
 
-TEST_F(JsonSerializerTestFixture, InvalidJson)
+TEST_F(Serialization_JsonSerializerFixture, InvalidJson)
 {
   SimpleType result;
   EXPECT_FALSE(fromJson(result, "{invalid json}"));

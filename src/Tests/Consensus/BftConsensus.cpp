@@ -3,16 +3,14 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 
 using namespace Consensus;
 using namespace Tests;
 
-// ============================================================================
-//  A. Single validator, full lifecycle
-// ============================================================================
+// Single validator, full lifecycle
 
-TEST_F(ConsensusTestFixture, StartEntersPropose)
+TEST_F(Consensus_BftFixture, StartEntersPropose)
 {
   makeValidators(1);
   makeConsensus(0);
@@ -27,7 +25,7 @@ TEST_F(ConsensusTestFixture, StartEntersPropose)
   EXPECT_EQ(s.step, Step::Propose);
 }
 
-TEST_F(ConsensusTestFixture, SingleValidatorProposes)
+TEST_F(Consensus_BftFixture, SingleValidatorProposes)
 {
   makeValidators(1);
   makeConsensus(0);
@@ -38,7 +36,7 @@ TEST_F(ConsensusTestFixture, SingleValidatorProposes)
   EXPECT_EQ(broadcast_proposals[0].round, 0u);
 }
 
-TEST_F(ConsensusTestFixture, NonValidatorDoesNotPropose)
+TEST_F(Consensus_BftFixture, NonValidatorDoesNotPropose)
 {
   makeValidators(4);
   makeConsensus(SIZE_MAX);
@@ -52,7 +50,7 @@ TEST_F(ConsensusTestFixture, NonValidatorDoesNotPropose)
   EXPECT_EQ(s.step, Step::Propose);
 }
 
-TEST_F(ConsensusTestFixture, ProposeTimeoutEntersPrevote)
+TEST_F(Consensus_BftFixture, ProposeTimeoutEntersPrevote)
 {
   makeValidators(4);
   makeConsensus(SIZE_MAX);
@@ -68,7 +66,7 @@ TEST_F(ConsensusTestFixture, ProposeTimeoutEntersPrevote)
   EXPECT_EQ(after.step, Step::Prevote);
 }
 
-TEST_F(ConsensusTestFixture, PrevoteTimeoutEntersPrecommit)
+TEST_F(Consensus_BftFixture, PrevoteTimeoutEntersPrecommit)
 {
   makeValidators(4);
   makeConsensus(SIZE_MAX);
@@ -84,7 +82,7 @@ TEST_F(ConsensusTestFixture, PrevoteTimeoutEntersPrecommit)
   EXPECT_EQ(consensus_->state().step, Step::Precommit);
 }
 
-TEST_F(ConsensusTestFixture, SingleValidatorCommitsEmptyBlock)
+TEST_F(Consensus_BftFixture, SingleValidatorCommitsEmptyBlock)
 {
   makeValidators(1);
   makeConsensus(0);
@@ -97,7 +95,7 @@ TEST_F(ConsensusTestFixture, SingleValidatorCommitsEmptyBlock)
   EXPECT_EQ(committed_blocks[0].header.height, 0u);
 }
 
-TEST_F(ConsensusTestFixture, CommitAdvancesHeight)
+TEST_F(Consensus_BftFixture, CommitAdvancesHeight)
 {
   makeValidators(1);
   makeConsensus(0);
@@ -114,7 +112,7 @@ TEST_F(ConsensusTestFixture, CommitAdvancesHeight)
   EXPECT_EQ(s.round, 0u);
 }
 
-TEST_F(ConsensusTestFixture, StopHaltsConsensus)
+TEST_F(Consensus_BftFixture, StopHaltsConsensus)
 {
   makeValidators(1);
   makeConsensus(0);
@@ -131,11 +129,9 @@ TEST_F(ConsensusTestFixture, StopHaltsConsensus)
   EXPECT_EQ(before.step, after.step);
 }
 
-// ============================================================================
-//  B. Proposal handling
-// ============================================================================
+// Proposal handling
 
-TEST_F(ConsensusTestFixture, AcceptsValidProposal)
+TEST_F(Consensus_BftFixture, AcceptsValidProposal)
 {
   makeValidators(4);
   makeConsensus(2);
@@ -154,7 +150,7 @@ TEST_F(ConsensusTestFixture, AcceptsValidProposal)
   EXPECT_EQ(s.prevote_count, 1u);
 }
 
-TEST_F(ConsensusTestFixture, RejectsProposalFromWrongHeight)
+TEST_F(Consensus_BftFixture, RejectsProposalFromWrongHeight)
 {
   makeValidators(4);
   makeConsensus(2);
@@ -171,7 +167,7 @@ TEST_F(ConsensusTestFixture, RejectsProposalFromWrongHeight)
   EXPECT_EQ(s.step, Step::Prevote);
 }
 
-TEST_F(ConsensusTestFixture, RejectsProposalFromWrongRound)
+TEST_F(Consensus_BftFixture, RejectsProposalFromWrongRound)
 {
   makeValidators(4);
   makeConsensus(2);
@@ -188,7 +184,7 @@ TEST_F(ConsensusTestFixture, RejectsProposalFromWrongRound)
   EXPECT_EQ(s.step, Step::Prevote);
 }
 
-TEST_F(ConsensusTestFixture, RejectsProposalFromWrongSigner)
+TEST_F(Consensus_BftFixture, RejectsProposalFromWrongSigner)
 {
   makeValidators(4);
   makeConsensus(2);
@@ -204,7 +200,7 @@ TEST_F(ConsensusTestFixture, RejectsProposalFromWrongSigner)
   EXPECT_EQ(consensus_->state().step, Step::Prevote);
 }
 
-TEST_F(ConsensusTestFixture, RejectsProposalWithBadSignature)
+TEST_F(Consensus_BftFixture, RejectsProposalWithBadSignature)
 {
   makeValidators(4);
   makeConsensus(2);
@@ -222,11 +218,9 @@ TEST_F(ConsensusTestFixture, RejectsProposalWithBadSignature)
   EXPECT_EQ(consensus_->state().step, Step::Prevote);
 }
 
-// ============================================================================
-//  C. Vote handling
-// ============================================================================
+// Vote handling
 
-TEST_F(ConsensusTestFixture, RecordsValidPrevote)
+TEST_F(Consensus_BftFixture, RecordsValidPrevote)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -243,7 +237,7 @@ TEST_F(ConsensusTestFixture, RecordsValidPrevote)
   EXPECT_EQ(consensus_->state().prevote_count, 2u);
 }
 
-TEST_F(ConsensusTestFixture, IgnoresDuplicatePrevote)
+TEST_F(Consensus_BftFixture, IgnoresDuplicatePrevote)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -262,7 +256,7 @@ TEST_F(ConsensusTestFixture, IgnoresDuplicatePrevote)
   EXPECT_EQ(consensus_->state().prevote_count, 2u);
 }
 
-TEST_F(ConsensusTestFixture, IgnoresVoteWithWrongHeight)
+TEST_F(Consensus_BftFixture, IgnoresVoteWithWrongHeight)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -276,7 +270,7 @@ TEST_F(ConsensusTestFixture, IgnoresVoteWithWrongHeight)
   EXPECT_EQ(consensus_->state().prevote_count, 1u);
 }
 
-TEST_F(ConsensusTestFixture, IgnoresVoteWithWrongRound)
+TEST_F(Consensus_BftFixture, IgnoresVoteWithWrongRound)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -290,7 +284,7 @@ TEST_F(ConsensusTestFixture, IgnoresVoteWithWrongRound)
   EXPECT_EQ(consensus_->state().prevote_count, 1u);
 }
 
-TEST_F(ConsensusTestFixture, IgnoresVoteWithBadSignature)
+TEST_F(Consensus_BftFixture, IgnoresVoteWithBadSignature)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -306,11 +300,9 @@ TEST_F(ConsensusTestFixture, IgnoresVoteWithBadSignature)
   EXPECT_EQ(consensus_->state().prevote_count, 1u);
 }
 
-// ============================================================================
-//  D. Quorum
-// ============================================================================
+// Quorum
 
-TEST_F(ConsensusTestFixture, QuorumThresholdIsBftQuorum)
+TEST_F(Consensus_BftFixture, QuorumThresholdIsBftQuorum)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -328,7 +320,7 @@ TEST_F(ConsensusTestFixture, QuorumThresholdIsBftQuorum)
   EXPECT_EQ(consensus_->state().prevote_count, 2u);
 }
 
-TEST_F(ConsensusTestFixture, ReachesQuorumWithThresholdPrevotes)
+TEST_F(Consensus_BftFixture, ReachesQuorumWithThresholdPrevotes)
 {
   makeValidators(4);
   makeConsensus(1);
@@ -351,7 +343,7 @@ TEST_F(ConsensusTestFixture, ReachesQuorumWithThresholdPrevotes)
   EXPECT_EQ(consensus_->state().step, Step::Precommit);
 }
 
-TEST_F(ConsensusTestFixture, PrecommitQuorumEntersCommit)
+TEST_F(Consensus_BftFixture, PrecommitQuorumEntersCommit)
 {
   makeValidators(4);
   makeConsensus(1);
@@ -378,7 +370,7 @@ TEST_F(ConsensusTestFixture, PrecommitQuorumEntersCommit)
   EXPECT_EQ(committed_blocks.size(), 1u);
 }
 
-TEST_F(ConsensusTestFixture, CommitAppliesQuorumBlockNotLatestProposal)
+TEST_F(Consensus_BftFixture, CommitAppliesQuorumBlockNotLatestProposal)
 {
   // Reproduce the round-crossing scenario: proposer at round 0 proposes
   // block X, validators reach precommit on X, but the precommit quorum
@@ -440,11 +432,9 @@ TEST_F(ConsensusTestFixture, CommitAppliesQuorumBlockNotLatestProposal)
   EXPECT_NE(committed_blocks[0].hash(), y_hash);
 }
 
-// ============================================================================
-//  E. Locking
-// ============================================================================
+// Locking
 
-TEST_F(ConsensusTestFixture, LocksOnFirstPrevote)
+TEST_F(Consensus_BftFixture, LocksOnFirstPrevote)
 {
   makeValidators(4);
   makeConsensus(1);
@@ -463,7 +453,7 @@ TEST_F(ConsensusTestFixture, LocksOnFirstPrevote)
   EXPECT_EQ(consensus_->state().locked_hash, block.hash());
 }
 
-TEST_F(ConsensusTestFixture, LockReleasedOnNewHeight)
+TEST_F(Consensus_BftFixture, LockReleasedOnNewHeight)
 {
   makeValidators(1);
   makeConsensus(0);
@@ -477,7 +467,7 @@ TEST_F(ConsensusTestFixture, LockReleasedOnNewHeight)
   EXPECT_FALSE(s.locked);
 }
 
-TEST_F(ConsensusTestFixture, WrongSignerIndexOutOfRangeIsIgnored)
+TEST_F(Consensus_BftFixture, WrongSignerIndexOutOfRangeIsIgnored)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -493,15 +483,12 @@ TEST_F(ConsensusTestFixture, WrongSignerIndexOutOfRangeIsIgnored)
   EXPECT_EQ(consensus_->state().prevote_count, 1u);
 }
 
-// ============================================================================
-//  F. Vote type routing
-//
-//  Prevotes and precommits are distinct message types on the wire. The
-//  consensus engine must be told which is which by the caller; it must
-//  not infer the type from the receiver's current step.
-// ============================================================================
+// Vote type routing
+// Prevotes and precommits are distinct message types on the wire. The
+// consensus engine must be told which is which by the caller; it must
+// not infer the type from the receiver's current step.
 
-TEST_F(ConsensusTestFixture, PrecommitRejectedDuringPrevoteStep)
+TEST_F(Consensus_BftFixture, PrecommitRejectedDuringPrevoteStep)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -525,7 +512,7 @@ TEST_F(ConsensusTestFixture, PrecommitRejectedDuringPrevoteStep)
   EXPECT_EQ(consensus_->state().step, Step::Prevote);
 }
 
-TEST_F(ConsensusTestFixture, PrevoteRejectedDuringPrecommitStep)
+TEST_F(Consensus_BftFixture, PrevoteRejectedDuringPrecommitStep)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -553,7 +540,7 @@ TEST_F(ConsensusTestFixture, PrevoteRejectedDuringPrecommitStep)
   EXPECT_EQ(consensus_->state().step, Step::Precommit);
 }
 
-TEST_F(ConsensusTestFixture, MixedVotesDoNotFormFalseQuorum)
+TEST_F(Consensus_BftFixture, MixedVotesDoNotFormFalseQuorum)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -575,7 +562,7 @@ TEST_F(ConsensusTestFixture, MixedVotesDoNotFormFalseQuorum)
   EXPECT_EQ(consensus_->state().precommit_count, 0u);
 }
 
-TEST_F(ConsensusTestFixture, CorrectlyRoutedVotesFormQuorum)
+TEST_F(Consensus_BftFixture, CorrectlyRoutedVotesFormQuorum)
 {
   makeValidators(4);
   makeConsensus(1);
@@ -596,18 +583,15 @@ TEST_F(ConsensusTestFixture, CorrectlyRoutedVotesFormQuorum)
   EXPECT_EQ(consensus_->state().step, Step::Precommit);
 }
 
-// ============================================================================
-//  G. Precommit validity
-//
-//  A precommit references a block by hash. It is only acceptable if
-//  the current round has a prevote quorum for that block, or if the
-//  receiver is already locked on it. Otherwise the precommit is a
-//  protocol violation and must be dropped — accepting it would let a
-//  minority of validators drive the receiver toward a commit on a
-//  block that was never legitimately proposed.
-// ============================================================================
+// Precommit validity
+// A precommit references a block by hash. It is only acceptable if
+// the current round has a prevote quorum for that block, or if the
+// receiver is already locked on it. Otherwise the precommit is a
+// protocol violation and must be dropped — accepting it would let a
+// minority of validators drive the receiver toward a commit on a
+// block that was never legitimately proposed.
 
-TEST_F(ConsensusTestFixture, PrecommitForUnknownBlockIsRejected)
+TEST_F(Consensus_BftFixture, PrecommitForUnknownBlockIsRejected)
 {
   // After entering Precommit with no prevote quorum (valid_set_ is
   // false) and no lock, a precommit for an arbitrary block must be
@@ -633,7 +617,7 @@ TEST_F(ConsensusTestFixture, PrecommitForUnknownBlockIsRejected)
       << "precommit for an unknown block was accepted";
 }
 
-TEST_F(ConsensusTestFixture, PrecommitForLockedBlockIsAccepted)
+TEST_F(Consensus_BftFixture, PrecommitForLockedBlockIsAccepted)
 {
   makeValidators(4);
   makeConsensus(1);
@@ -659,7 +643,7 @@ TEST_F(ConsensusTestFixture, PrecommitForLockedBlockIsAccepted)
   EXPECT_GT(consensus_->state().precommit_count, before);
 }
 
-TEST_F(ConsensusTestFixture, PrecommitForOtherBlockIsRejected)
+TEST_F(Consensus_BftFixture, PrecommitForOtherBlockIsRejected)
 {
   makeValidators(4);
   makeConsensus(1);
@@ -689,19 +673,16 @@ TEST_F(ConsensusTestFixture, PrecommitForOtherBlockIsRejected)
       << "precommit for a non-locked, non-valid block was accepted";
 }
 
-// ============================================================================
-//  H. Broadcast type routing
-//
-//  The consensus engine emits two kinds of vote through distinct
-//  callbacks. The wire format does not carry the vote type — the
-//  enclosing P2P message type does. An earlier version funnelled both
-//  through a single broadcast_vote callback and the node hardcoded
-//  the P2P message type as Prevote, so precommits went out labeled as
-//  prevotes. These tests verify that each kind of vote reaches its
-//  own callback.
-// ============================================================================
+// Broadcast type routing
+// The consensus engine emits two kinds of vote through distinct
+// callbacks. The wire format does not carry the vote type — the
+// enclosing P2P message type does. An earlier version funnelled both
+// through a single broadcast_vote callback and the node hardcoded
+// the P2P message type as Prevote, so precommits went out labeled as
+// prevotes. These tests verify that each kind of vote reaches its
+// own callback.
 
-TEST_F(ConsensusTestFixture, ProposalBroadcastsProposal)
+TEST_F(Consensus_BftFixture, ProposalBroadcastsProposal)
 {
   makeValidators(1);
   makeConsensus(0);
@@ -712,7 +693,7 @@ TEST_F(ConsensusTestFixture, ProposalBroadcastsProposal)
   EXPECT_TRUE(broadcast_precommits.empty());
 }
 
-TEST_F(ConsensusTestFixture, EnterPrevoteBroadcastsPrevote)
+TEST_F(Consensus_BftFixture, EnterPrevoteBroadcastsPrevote)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -729,7 +710,7 @@ TEST_F(ConsensusTestFixture, EnterPrevoteBroadcastsPrevote)
       << "entering prevote broadcast a precommit";
 }
 
-TEST_F(ConsensusTestFixture, EnterPrecommitBroadcastsPrecommit)
+TEST_F(Consensus_BftFixture, EnterPrecommitBroadcastsPrecommit)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -751,7 +732,7 @@ TEST_F(ConsensusTestFixture, EnterPrecommitBroadcastsPrecommit)
       << "entering precommit broadcast an extra prevote";
 }
 
-TEST_F(ConsensusTestFixture, PrecommitQuorumDoesNotBroadcastPrevote)
+TEST_F(Consensus_BftFixture, PrecommitQuorumDoesNotBroadcastPrevote)
 {
   // Once we're past the prevote step, no further prevotes should be
   // broadcast. This pins the invariant that broadcast routing follows

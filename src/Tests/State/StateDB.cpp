@@ -3,12 +3,12 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 
 using namespace State;
 using namespace Tests;
 
-TEST_F(StateDBTestFixture, RawPutGet)
+TEST_F(State_StateDBFixture, RawPutGet)
 {
   std::vector<uint8_t> out;
   EXPECT_FALSE(db_.db().rawGet(StateDB::TBL_META, "key", 3, out));
@@ -20,7 +20,7 @@ TEST_F(StateDBTestFixture, RawPutGet)
   EXPECT_EQ(out, value);
 }
 
-TEST_F(StateDBTestFixture, RawPutOverwrites)
+TEST_F(State_StateDBFixture, RawPutOverwrites)
 {
   std::vector<uint8_t> v1 = {1, 2, 3};
   std::vector<uint8_t> v2 = {4, 5, 6, 7, 8};
@@ -32,7 +32,7 @@ TEST_F(StateDBTestFixture, RawPutOverwrites)
   EXPECT_EQ(out, v2);
 }
 
-TEST_F(StateDBTestFixture, RawDel)
+TEST_F(State_StateDBFixture, RawDel)
 {
   std::vector<uint8_t> v = {1, 2, 3};
   db_.db().rawPut(StateDB::TBL_META, "k", 1, v.data(), v.size());
@@ -42,12 +42,12 @@ TEST_F(StateDBTestFixture, RawDel)
   EXPECT_FALSE(db_.db().rawHas(StateDB::TBL_META, "k", 1));
 }
 
-TEST_F(StateDBTestFixture, RawDelMissingIsNoOp)
+TEST_F(State_StateDBFixture, RawDelMissingIsNoOp)
 {
   db_.db().rawDel(StateDB::TBL_META, "nonexistent", 11);
 }
 
-TEST_F(StateDBTestFixture, RawHas)
+TEST_F(State_StateDBFixture, RawHas)
 {
   EXPECT_FALSE(db_.db().rawHas(StateDB::TBL_META, "a", 1));
   std::vector<uint8_t> v = {1};
@@ -55,7 +55,7 @@ TEST_F(StateDBTestFixture, RawHas)
   EXPECT_TRUE(db_.db().rawHas(StateDB::TBL_META, "a", 1));
 }
 
-TEST_F(StateDBTestFixture, RawEmptyValue)
+TEST_F(State_StateDBFixture, RawEmptyValue)
 {
   std::vector<uint8_t> empty;
   db_.db().rawPut(StateDB::TBL_META, "e", 1, empty.data(), 0);
@@ -65,7 +65,7 @@ TEST_F(StateDBTestFixture, RawEmptyValue)
   EXPECT_TRUE(out.empty());
 }
 
-TEST_F(StateDBTestFixture, RawLargeValue)
+TEST_F(State_StateDBFixture, RawLargeValue)
 {
   std::vector<uint8_t> big(1024 * 16);
   for (size_t i = 0; i < big.size(); ++i)
@@ -78,7 +78,7 @@ TEST_F(StateDBTestFixture, RawLargeValue)
   EXPECT_EQ(out, big);
 }
 
-TEST_F(StateDBTestFixture, MetaPutGet)
+TEST_F(State_StateDBFixture, MetaPutGet)
 {
   std::vector<uint8_t> v = {7, 8, 9};
   db_.db().putMeta("my_meta", v);
@@ -92,7 +92,7 @@ TEST_F(StateDBTestFixture, MetaPutGet)
   EXPECT_EQ(*opt, v);
 }
 
-TEST_F(StateDBTestFixture, MetaRemove)
+TEST_F(State_StateDBFixture, MetaRemove)
 {
   db_.db().putMeta("k", {1, 2});
   db_.db().removeMeta("k");
@@ -102,13 +102,13 @@ TEST_F(StateDBTestFixture, MetaRemove)
   EXPECT_FALSE(db_.db().getMeta("k").has_value());
 }
 
-TEST_F(StateDBTestFixture, MetaMissingReturnsFalse)
+TEST_F(State_StateDBFixture, MetaMissingReturnsFalse)
 {
   std::vector<uint8_t> out;
   EXPECT_FALSE(db_.db().getMeta("never_set", out));
 }
 
-TEST_F(StateDBTestFixture, TxnCommitPersists)
+TEST_F(State_StateDBFixture, TxnCommitPersists)
 {
   {
     auto txn = db_.db().beginWrite();
@@ -122,7 +122,7 @@ TEST_F(StateDBTestFixture, TxnCommitPersists)
   EXPECT_EQ(out, std::vector<uint8_t>({1, 2, 3}));
 }
 
-TEST_F(StateDBTestFixture, TxnAbortDiscards)
+TEST_F(State_StateDBFixture, TxnAbortDiscards)
 {
   {
     auto txn = db_.db().beginWrite();
@@ -135,7 +135,7 @@ TEST_F(StateDBTestFixture, TxnAbortDiscards)
   EXPECT_FALSE(db_.db().rawGet(StateDB::TBL_META, "k", 1, out));
 }
 
-TEST_F(StateDBTestFixture, TxnDestructorAborts)
+TEST_F(State_StateDBFixture, TxnDestructorAborts)
 {
   {
     auto txn = db_.db().beginWrite();
@@ -147,7 +147,7 @@ TEST_F(StateDBTestFixture, TxnDestructorAborts)
   EXPECT_FALSE(db_.db().rawGet(StateDB::TBL_META, "k", 1, out));
 }
 
-TEST_F(StateDBTestFixture, TxnSeesOwnWrites)
+TEST_F(State_StateDBFixture, TxnSeesOwnWrites)
 {
   auto txn = db_.db().beginWrite();
   std::vector<uint8_t> v = {1, 2, 3};
@@ -158,7 +158,7 @@ TEST_F(StateDBTestFixture, TxnSeesOwnWrites)
   EXPECT_EQ(out, v);
 }
 
-TEST_F(StateDBTestFixture, TxnDelWithinTxn)
+TEST_F(State_StateDBFixture, TxnDelWithinTxn)
 {
   {
     std::vector<uint8_t> v = {1, 2, 3};
@@ -175,7 +175,7 @@ TEST_F(StateDBTestFixture, TxnDelWithinTxn)
   EXPECT_FALSE(db_.db().rawGet(StateDB::TBL_META, "k", 1, out));
 }
 
-TEST_F(StateDBTestFixture, TxnHas)
+TEST_F(State_StateDBFixture, TxnHas)
 {
   auto txn = db_.db().beginWrite();
   EXPECT_FALSE(txn.has(StateDB::TBL_META, "k", 1));
@@ -185,7 +185,7 @@ TEST_F(StateDBTestFixture, TxnHas)
   txn.abort();
 }
 
-TEST_F(StateDBTestFixture, TxnIsOpen)
+TEST_F(State_StateDBFixture, TxnIsOpen)
 {
   auto txn = db_.db().beginWrite();
   EXPECT_TRUE(txn.isOpen());
@@ -193,14 +193,14 @@ TEST_F(StateDBTestFixture, TxnIsOpen)
   EXPECT_FALSE(txn.isOpen());
 }
 
-TEST_F(StateDBTestFixture, BeginWriteFailsWithActiveTxn)
+TEST_F(State_StateDBFixture, BeginWriteFailsWithActiveTxn)
 {
   auto txn1 = db_.db().beginWrite();
   EXPECT_THROW(db_.db().beginWrite(), StateDBError);
   txn1.abort();
 }
 
-TEST_F(StateDBTestFixture, BeginWriteAfterAbortSucceeds)
+TEST_F(State_StateDBFixture, BeginWriteAfterAbortSucceeds)
 {
   {
     auto txn = db_.db().beginWrite();
@@ -210,7 +210,7 @@ TEST_F(StateDBTestFixture, BeginWriteAfterAbortSucceeds)
   txn2.abort();
 }
 
-TEST_F(StateDBTestFixture, TxnPutAfterCloseThrows)
+TEST_F(State_StateDBFixture, TxnPutAfterCloseThrows)
 {
   auto txn = db_.db().beginWrite();
   txn.commit();
@@ -218,7 +218,7 @@ TEST_F(StateDBTestFixture, TxnPutAfterCloseThrows)
                StateDBError);
 }
 
-TEST_F(StateDBTestFixture, DataSurvivesCloseReopen)
+TEST_F(State_StateDBFixture, DataSurvivesCloseReopen)
 {
   {
     std::vector<uint8_t> v = {10, 20, 30};
@@ -235,7 +235,7 @@ TEST_F(StateDBTestFixture, DataSurvivesCloseReopen)
   db2.close();
 }
 
-TEST_F(StateDBTestFixture, ForEachEntryVisitsAllKeys)
+TEST_F(State_StateDBFixture, ForEachEntryVisitsAllKeys)
 {
   for (uint64_t i = 0; i < 10; ++i)
   {
@@ -262,7 +262,7 @@ TEST_F(StateDBTestFixture, ForEachEntryVisitsAllKeys)
     EXPECT_NE(std::find(visited.begin(), visited.end(), e), visited.end());
 }
 
-TEST_F(StateDBTestFixture, ForEachEntryStopsOnFalse)
+TEST_F(State_StateDBFixture, ForEachEntryStopsOnFalse)
 {
   for (uint64_t i = 0; i < 10; ++i)
   {
@@ -282,7 +282,7 @@ TEST_F(StateDBTestFixture, ForEachEntryStopsOnFalse)
   EXPECT_LE(count, 3);
 }
 
-TEST_F(StateDBTestFixture, EntryCount)
+TEST_F(State_StateDBFixture, EntryCount)
 {
   size_t before = db_.db().entryCount(StateDB::TBL_ORDERS);
   for (uint64_t i = 0; i < 5; ++i)

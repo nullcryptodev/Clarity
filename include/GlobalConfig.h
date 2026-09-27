@@ -30,6 +30,10 @@ namespace GlobalConfig
   inline constexpr Id TESTNET_CHAIN_ID = 0x434C5454; // 'CLTT'
   inline constexpr Id REGNET_CHAIN_ID  = 0x434C5247; // 'CLRG'
 
+  inline constexpr const char *MAINNET_HRP = "clrty";
+  inline constexpr const char *TESTNET_HRP = "tclrty";
+  inline constexpr const char *REGTEST_HRP = "rclrty";
+
   // Version
 
   inline constexpr Version CURRENT_BLOCK_VERSION       = 1;

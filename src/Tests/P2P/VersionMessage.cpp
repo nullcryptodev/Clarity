@@ -15,7 +15,7 @@ using namespace Tests;
 
 // Version round-trip
 
-TEST(VersionMessage, RoundTrip)
+TEST(P2P_VersionMessage, RoundTrip)
 {
   VersionMessage v;
   v.protocolVersion = GlobalConfig::CURRENT_PROTOCOL_VERSION;
@@ -39,7 +39,7 @@ TEST(VersionMessage, RoundTrip)
   EXPECT_EQ(decoded.peerNonce, v.peerNonce);
 }
 
-TEST(VersionMessage, RoundTripEmptyAgent)
+TEST(P2P_VersionMessage, RoundTripEmptyAgent)
 {
   VersionMessage v;
   v.protocolVersion = 1;
@@ -51,7 +51,7 @@ TEST(VersionMessage, RoundTripEmptyAgent)
   EXPECT_EQ(decoded.agentString, "");
 }
 
-TEST(VersionMessage, DeserializeRejectsTruncated)
+TEST(P2P_VersionMessage, DeserializeRejectsTruncated)
 {
   VersionMessage v;
   v.agentString = GlobalConfig::PROJECT_AGENT_STRING;
@@ -65,7 +65,7 @@ TEST(VersionMessage, DeserializeRejectsTruncated)
 
 // Peers round-trip
 
-TEST(VersionMessage, PeersRoundTrip)
+TEST(P2P_VersionMessage, PeersRoundTrip)
 {
   std::vector<PeerAddressEntry> peers = {
       {"10.0.0.1", 19444},
@@ -85,7 +85,7 @@ TEST(VersionMessage, PeersRoundTrip)
   }
 }
 
-TEST(VersionMessage, PeersEmptyRoundTrip)
+TEST(P2P_VersionMessage, PeersEmptyRoundTrip)
 {
   auto bytes = serializePeers({});
   std::vector<PeerAddressEntry> decoded;
@@ -95,7 +95,7 @@ TEST(VersionMessage, PeersEmptyRoundTrip)
 
 // GetHeaders round-trip
 
-TEST(VersionMessage, GetHeadersRoundTrip)
+TEST(P2P_VersionMessage, GetHeadersRoundTrip)
 {
   GetHeadersMessage m;
   m.startHeight = 42;
@@ -111,7 +111,7 @@ TEST(VersionMessage, GetHeadersRoundTrip)
 
 // Inv round-trip
 
-TEST(VersionMessage, InvRoundTrip)
+TEST(P2P_VersionMessage, InvRoundTrip)
 {
   std::vector<InvEntry> entries;
   for (uint64_t i = 0; i < 3; ++i)
@@ -134,7 +134,7 @@ TEST(VersionMessage, InvRoundTrip)
   }
 }
 
-TEST(VersionMessage, InvRejectsOversize)
+TEST(P2P_VersionMessage, InvRejectsOversize)
 {
   // Count field says 20000, but no entries follow.
   std::vector<uint8_t> bytes;
@@ -145,7 +145,7 @@ TEST(VersionMessage, InvRejectsOversize)
   EXPECT_FALSE(deserializeInv(bytes.data(), bytes.size(), decoded));
 }
 
-TEST(VersionMessage, GetDataRoundTrip)
+TEST(P2P_VersionMessage, GetDataRoundTrip)
 {
   std::vector<InvEntry> entries;
   InvEntry e;

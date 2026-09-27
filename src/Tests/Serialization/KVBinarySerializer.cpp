@@ -4,7 +4,7 @@
 #include <cstring>
 #include <gtest/gtest.h>
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 #include "Tests/Types.h"
 
 #include "Serialization/KVBinarySerializer.h"
@@ -16,7 +16,7 @@ using namespace Tests;
 
 // KV Binary Format Tests
 
-TEST_F(KVBinarySerializerTestFixture, InvalidSignature)
+TEST_F(Serialization_KVBinarySerializerFixture, InvalidSignature)
 {
   std::vector<uint8_t> buffer;
   // Write invalid signature
@@ -32,7 +32,7 @@ TEST_F(KVBinarySerializerTestFixture, InvalidSignature)
   EXPECT_THROW(createKVBinarySerializer(stream), std::runtime_error);
 }
 
-TEST_F(KVBinarySerializerTestFixture, InvalidVersion)
+TEST_F(Serialization_KVBinarySerializerFixture, InvalidVersion)
 {
   std::vector<uint8_t> buffer;
   // Write valid signature but invalid version

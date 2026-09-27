@@ -9,7 +9,7 @@
 
 using namespace P2P;
 
-TEST(MessageTypes, TypeNames)
+TEST(P2P_MessageTypes, TypeNames)
 {
   EXPECT_EQ(messageTypeName(MessageType::Version), "version");
   EXPECT_EQ(messageTypeName(MessageType::Verack), "verack");
@@ -31,13 +31,13 @@ TEST(MessageTypes, TypeNames)
   EXPECT_EQ(messageTypeName(MessageType::Disconnect), "disconnect");
 }
 
-TEST(MessageTypes, UnknownTypeName)
+TEST(P2P_MessageTypes, UnknownTypeName)
 {
   auto unknown = static_cast<MessageType>(0xFFFF);
   EXPECT_EQ(messageTypeName(unknown), "unknown");
 }
 
-TEST(MessageTypes, MagicForNetwork)
+TEST(P2P_MessageTypes, MagicForNetwork)
 {
   EXPECT_EQ(magicForNetwork(0), MAGIC_MAINNET);
   EXPECT_EQ(magicForNetwork(1), MAGIC_TESTNET);

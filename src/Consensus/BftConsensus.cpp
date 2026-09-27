@@ -108,6 +108,9 @@ namespace Consensus
 
   void BftConsensus::enterPrevote(Height height, Round round)
   {
+    if (step_ == Step::Prevote && round_ == round)
+      return; // already in prevote for this round
+
     step_ = Step::Prevote;
     prevotes_.clear();
 
@@ -140,6 +143,9 @@ namespace Consensus
 
   void BftConsensus::enterPrecommit(Height height, Round round)
   {
+    if (step_ == Step::Precommit && round_ == round)
+      return; // already in precommit for this round
+
     step_ = Step::Precommit;
     precommits_.clear();
 
@@ -290,13 +296,55 @@ namespace Consensus
   void BftConsensus::handleProposal(const Proposal &p)
   {
     if (p.height != height_)
+    {
+      log_(Logging::WARNING) << "handleProposal REJECT height: p=" << p.height << " local=" << height_;
       return;
+    }
 
-    if (p.round != round_)
+    // A proposal for a future round is not invalid — it's early. The
+    // proposer for round N+1 can legitimately send its proposal while
+    // some validators are still finishing round N. Queue it and
+    // deliver it when we reach round N+1. Dropping it (as the code
+    // did previously) stalls the round until the proposer times out
+    // and re-proposes, which for a 2-validator network is a liveness
+    // failure: the proposer cannot re-propose within the same round.
+    if (p.round > round_)
+    {
+      // Reject absurdly-far-ahead rounds. The BFT safety argument
+      // doesn't cover an unbounded queue, and a peer that sends a
+      // proposal for round 10'000 is not being helpful.
+      constexpr Round MAX_FUTURE_ROUNDS = 64;
+      if (p.round - round_ > MAX_FUTURE_ROUNDS)
+      {
+        log_(Logging::WARNING)
+            << "handleProposal REJECT round-too-far: p=" << p.round
+            << " local=" << round_;
+        return;
+      }
+
+      future_proposals_[p.round] = p;
+      log_(Logging::DEBUGGING)
+          << "handleProposal QUEUED future round: p=" << p.round
+          << " local=" << round_
+          << " hash=" << p.block_hash.toString().substr(0, 16);
       return;
+    }
+
+    if (p.round < round_)
+    {
+      log_(Logging::WARNING)
+          << "handleProposal REJECT round-stale: p=" << p.round
+          << " local=" << round_;
+      return;
+    }
+
+    // p.round == round_. Continue as before.
 
     if (proposal_.has_value())
+    {
+      log_(Logging::WARNING) << "handleProposal REJECT already-have";
       return;
+    }
 
     auto active = deps_.active_set();
     Id expected_proposer = proposerFor(height_, round_, active);
@@ -316,11 +364,34 @@ namespace Consensus
     }
 
     proposal_ = p;
+
+    log_(Logging::WARNING) << "handleProposal SET: h=" << height_
+                           << " r=" << round_
+                           << " hash=" << p.block_hash.toString().substr(0, 16);
+
     proposals_by_hash_[p.block_hash] = block;
 
     log_(Logging::DEBUGGING) << "Accepted proposal for h=" << height_
                              << " r=" << round_
                              << " hash=" << p.block_hash.toString().substr(0, 16);
+  }
+
+  void BftConsensus::drainFutureProposal()
+  {
+    auto it = future_proposals_.find(round_);
+    if (it == future_proposals_.end())
+      return;
+
+    Proposal p = std::move(it->second);
+    future_proposals_.erase(it);
+
+    log_(Logging::DEBUGGING)
+        << "Draining queued proposal for round " << round_
+        << " hash=" << p.block_hash.toString().substr(0, 16);
+
+    // Re-enter handleProposal. It will now see p.round == round_
+    // and process normally.
+    handleProposal(p);
   }
 
   void BftConsensus::handlePrevote(const Vote &v)
@@ -419,18 +490,19 @@ namespace Consensus
 
   void BftConsensus::onPrecommitTimeout()
   {
-    log_(Logging::DEBUGGING) << "Precommit timeout: h=" << height_
-                             << " r=" << round_;
-
     auto quorum_block = quorumValue(/*is_precommit=*/true);
 
-    if (quorum_block.has_value() &&
-        proposals_by_hash_.count(*quorum_block) > 0)
+    log_(Logging::WARNING) << "onPrecommitTimeout: h=" << height_
+                           << " r=" << round_
+                           << " precommits=" << precommits_.size()
+                           << " quorum=" << (quorum_block ? "yes" : "no")
+                           << " prop_known=" << (quorum_block && proposals_by_hash_.count(*quorum_block) > 0 ? "yes" : "no");
+
+    if (quorum_block.has_value() && proposals_by_hash_.count(*quorum_block) > 0)
     {
       enterCommit(height_, round_);
       return;
     }
-
     enterPropose(height_, round_ + 1);
   }
 
@@ -816,6 +888,12 @@ namespace Consensus
     proposals_by_hash_.clear();
     prevotes_.clear();
     precommits_.clear();
+
+    // Queued proposals are for rounds at the previous height. Even if
+    // the round number happens to match a new round at the new height,
+    // the proposal's height field is stale and it must not be
+    // delivered. Clear unconditionally.
+    future_proposals_.clear();
   }
 
   void BftConsensus::resetForNewRound(Round round)
@@ -836,6 +914,11 @@ namespace Consensus
     valid_set_ = false;
     valid_hash_ = Crypto::Hash{};
     valid_round_ = 0;
+
+    // Deliver any proposal we queued for this round before the round
+    // timer starts. If there is one, we now have a chance to prevote
+    // it in this round instead of timing out and advancing again.
+    drainFutureProposal();
   }
 
   //  Introspection

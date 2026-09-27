@@ -9,6 +9,8 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <boost/asio/steady_timer.hpp>
 
 #include "NodeConfig.h"
 #include "GlobalConfig.h"
@@ -21,6 +23,8 @@
 #include "Core/Mempool.h"
 #include "Core/StateViewFromAccess.h"
 #include "P2P/P2PManager.h"
+#include "P2P/AuthMessage.h"
+#include "P2P/SyncManager.h"
 #include "State/StateAccess.h"
 #include "State/StateDB.h"
 
@@ -77,7 +81,13 @@ namespace Node
 
     Status status() const;
 
-    bool submitTransaction(const Core::Transaction &tx, std::string &error);
+    // Submit a transaction to the mempool. Returns the raw result code
+    // so callers can distinguish rejection reasons. `error` is populated
+    // with a human-readable name on non-accepted results; on Accepted it
+    // is cleared.
+    Core::MempoolAddResult submitTransaction(const Core::Transaction &tx,
+                                             std::string &error);
+
     Crypto::Hash stateRoot() const;
 
     // Test-only crash injection.
@@ -89,6 +99,21 @@ namespace Node
 
     void setFailPointForTest(FailPoint fp) { fail_point_for_test_ = fp; }
 
+    const Core::Chain &chain() const { return *chain_; }
+    const Core::Mempool &mempool() const { return *mempool_; }
+    State::StateDB &stateDB() const { return *state_db_; }
+    Core::ChainDB &chainDB() const { return *chain_db_; }
+
+    // Forwarding method for RPC. Returns an empty vector if P2P is
+    // disabled or not initialized. Thread-safe: P2PManager::peerList
+    // posts to the event loop and blocks.
+    std::vector<P2P::P2PManager::PeerInfo> p2pPeerList() const;
+
+    // Given a peer's public key, return the validator ID whose reward
+    // address matches it, or 0 if no active validator claims it.
+    // Called from the P2P auth path on the event loop thread.
+    uint64_t validatorIdForAddress(const Crypto::PublicKey &pk) const;
+    
   private:
     friend class Tests::NodeTestAccess;
 
@@ -104,9 +129,24 @@ namespace Node
     void handleIncomingProposal(const P2P::Message &msg);
     void handleIncomingVote(const P2P::Message &msg, bool is_precommit);
     void handleIncomingTx(const P2P::Message &msg);
-    void handleIncomingBlock(const P2P::Message &msg);
+    void handleIncomingBlock(const P2P::Message &msg, P2P::PeerId from);
     void handleGetHeaders(const P2P::Message &msg, P2P::PeerId from);
     void handleGetBlocks(const P2P::Message &msg, P2P::PeerId from);
+
+    void onP2PPeerEstablished(const P2P::P2PManager::PeerEstablishedInfo &info);
+    void handleIncomingHeaders(const P2P::Message &msg, P2P::PeerId from);
+    void handleIncomingBlocks(const P2P::Message &msg, P2P::PeerId from);
+
+    // Broadcast a freshly committed block to every Established peer.
+    // Called from onBlockCommitted after applyCommittedBlock succeeds.
+    // No-op if P2P is disabled or there are no Established peers.
+    void broadcastBlock(const Core::Block &block);
+
+    // Broadcast a transaction to every Established peer. Called after
+    // a successful mempool add, from both submitTransaction (local
+    // submission) and handleIncomingTx (relay). Symmetric with
+    // broadcastBlock.
+    void broadcastTransaction(const Core::Transaction &tx);
 
     Consensus::Dependencies buildConsensusDeps();
     Consensus::Callbacks buildConsensusCallbacks();
@@ -124,7 +164,6 @@ namespace Node
     void onBlockCommitted(const Core::Block &block);
     void onHeightAdvanced(Height height);
 
-    void scheduleConsensusPoll();
     void onConsensusPoll();
 
     // Start consensus if we have enough peers to form a quorum.
@@ -135,12 +174,40 @@ namespace Node
 
     bool applyCommittedBlock(const Core::Block &block, std::string &error);
 
+    // Auth callbacks for P2P. Wired in initP2P().
+    P2P::AuthMessage buildAuthMessageForPeer(P2P::Peer &peer);
+    bool verifyPeerAuth(P2P::Peer &peer,
+                        const P2P::AuthMessage &msg,
+                        uint64_t &outValidatorId);
+
     std::vector<Id> loadActiveSetFromState(
         State::StateAccess &state) const;
 
     std::unique_ptr<Core::StateView> makeStateView() const;
 
     Core::GenesisConfig genesisConfig() const;
+
+    // Load <data_dir>/node_key, or generate and persist a fresh key
+    // on first run. Cached in node_key_ after the first call.
+    void loadOrCreateNodeKey();
+
+    void updateBestPeerHeight();
+
+    void onSyncTick();
+
+    // Timer-driven poll loops. Each timer's handler does one tick of
+    // work, then re-arms the timer. Cancelled in stop().
+    //
+    // These replace an earlier post-and-sleep pattern that blocked
+    // the io_context thread for the sleep duration and made shutdown
+    // wait for up to one full interval. The timer approach leaves the
+    // io_context free to service I/O between ticks, and cancel() wakes
+    // the handler immediately on shutdown.
+    void armConsensusPollTimer();
+    void onConsensusPollTimer(const boost::system::error_code &ec);
+
+    void armSyncTickTimer();
+    void onSyncTickTimer(const boost::system::error_code &ec);
 
     NodeConfig config_;
     Logging::ILogger &logger_;
@@ -163,6 +230,35 @@ namespace Node
     mutable std::mutex status_mutex_;
 
     FailPoint fail_point_for_test_{FailPoint::None};
+
+    // The key used to sign P2P Auth messages. Either config_.node_secret_key
+    // (if set) or the key loaded/created by loadOrCreateNodeKey().
+    Crypto::SecretKey node_key_{};
+    bool node_key_loaded_{false};
+
+    // One sync manager per Established peer, keyed by PeerId. Created
+    // in onP2PPeerEstablished, destroyed in onP2PPeerDisconnected.
+    // All accesses happen on the P2P io_context thread, so no lock
+    // is needed.
+    std::unordered_map<P2P::PeerId, std::unique_ptr<P2P::SyncManager>>
+        sync_managers_;
+
+    std::unordered_map<P2P::PeerId, uint64_t> peer_heights_;
+
+    // Timer-driven poll loops. Both use the P2P io_context's executor.
+    // Constructed lazily in run(), cancelled in stop(). The `armed_`
+    // flags guard against stop() racing with a handler that's mid-flight:
+    // the handler checks its flag before re-arming, so a cancel that
+    // happens between the work and the re-arm is honored.
+    std::unique_ptr<boost::asio::steady_timer> consensus_timer_;
+    std::unique_ptr<boost::asio::steady_timer> sync_timer_;
+
+    // Sync tick interval. Every tick, each peer's SyncManager::tick()
+    // is called, which drives both timeout detection and Idle refresh.
+    // 200ms is frequent enough for a 30s refresh interval and cheap
+    // when there's nothing to do (each tick is a timestamp comparison
+    // when Idle).
+    static constexpr uint32_t SYNC_TICK_INTERVAL_MS = 200;
   };
 
 } // namespace Node

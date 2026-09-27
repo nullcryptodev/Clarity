@@ -14,7 +14,7 @@ using namespace Tests;
 
 // Encode / decode round-trips
 
-TEST(P2PMessage, EncodeEmptyPayload)
+TEST(P2P_P2PMessage, EncodeEmptyPayload)
 {
   Message msg(MessageType::Ping);
   auto bytes = encodeMessage(msg, MAGIC_REGTEST);
@@ -38,7 +38,7 @@ TEST(P2PMessage, EncodeEmptyPayload)
   EXPECT_EQ(bytes[9], 0);
 }
 
-TEST(P2PMessage, EncodeWithPayload)
+TEST(P2P_P2PMessage, EncodeWithPayload)
 {
   Message msg(MessageType::Tx, {0xAA, 0xBB, 0xCC, 0xDD});
   auto bytes = encodeMessage(msg, MAGIC_TESTNET);
@@ -54,7 +54,7 @@ TEST(P2PMessage, EncodeWithPayload)
   EXPECT_EQ(bytes[7], 0);
 }
 
-TEST(P2PMessage, EncodeRejectsOversizePayload)
+TEST(P2P_P2PMessage, EncodeRejectsOversizePayload)
 {
   Message msg(MessageType::Tx, std::vector<uint8_t>(100));
   EXPECT_THROW(encodeMessage(msg, MAGIC_REGTEST, /*maxSize=*/10),
@@ -63,7 +63,7 @@ TEST(P2PMessage, EncodeRejectsOversizePayload)
 
 // Decoder, whole messages
 
-TEST(P2PMessage, DecodeWholeMessage)
+TEST(P2P_P2PMessage, DecodeWholeMessage)
 {
   MessageDecoder decoder(MAGIC_REGTEST, MAX_MESSAGE_SIZE);
 
@@ -84,7 +84,7 @@ TEST(P2PMessage, DecodeWholeMessage)
 
 // Decoder, partial / streaming
 
-TEST(P2PMessage, DecodePartialHeader)
+TEST(P2P_P2PMessage, DecodePartialHeader)
 {
   MessageDecoder decoder(MAGIC_REGTEST, MAX_MESSAGE_SIZE);
 
@@ -94,7 +94,7 @@ TEST(P2PMessage, DecodePartialHeader)
   EXPECT_EQ(decoder.next().status, DecodeStatus::NeedMoreData);
 }
 
-TEST(P2PMessage, DecodePartialBody)
+TEST(P2P_P2PMessage, DecodePartialBody)
 {
   MessageDecoder decoder(MAGIC_REGTEST, MAX_MESSAGE_SIZE);
 
@@ -112,7 +112,7 @@ TEST(P2PMessage, DecodePartialBody)
   EXPECT_EQ(result.message->payload.size(), 5u);
 }
 
-TEST(P2PMessage, DecodeByteByByte)
+TEST(P2P_P2PMessage, DecodeByteByByte)
 {
   MessageDecoder decoder(MAGIC_REGTEST, MAX_MESSAGE_SIZE);
 
@@ -133,7 +133,7 @@ TEST(P2PMessage, DecodeByteByByte)
 
 // Decoder, multiple messages in the stream
 
-TEST(P2PMessage, DecodeMultipleMessages)
+TEST(P2P_P2PMessage, DecodeMultipleMessages)
 {
   MessageDecoder decoder(MAGIC_REGTEST, MAX_MESSAGE_SIZE);
 
@@ -166,7 +166,7 @@ TEST(P2PMessage, DecodeMultipleMessages)
 
 // Decoder, corrupted input
 
-TEST(P2PMessage, DecodeRejectsBadMagic)
+TEST(P2P_P2PMessage, DecodeRejectsBadMagic)
 {
   MessageDecoder decoder(MAGIC_REGTEST, MAX_MESSAGE_SIZE);
 
@@ -179,7 +179,7 @@ TEST(P2PMessage, DecodeRejectsBadMagic)
   EXPECT_EQ(result.status, DecodeStatus::Corrupted);
 }
 
-TEST(P2PMessage, DecodeRejectsOversize)
+TEST(P2P_P2PMessage, DecodeRejectsOversize)
 {
   MessageDecoder decoder(MAGIC_REGTEST, /*maxSize=*/10);
 
@@ -195,7 +195,7 @@ TEST(P2PMessage, DecodeRejectsOversize)
 
 // Reset
 
-TEST(P2PMessage, ResetClearsBuffer)
+TEST(P2P_P2PMessage, ResetClearsBuffer)
 {
   MessageDecoder decoder(MAGIC_REGTEST, MAX_MESSAGE_SIZE);
 
@@ -210,7 +210,7 @@ TEST(P2PMessage, ResetClearsBuffer)
 
 // Factory methods
 
-TEST(P2PMessage, FactoryMethods)
+TEST(P2P_P2PMessage, FactoryMethods)
 {
   EXPECT_EQ(Message::ping().type, MessageType::Ping);
   EXPECT_EQ(Message::pong().type, MessageType::Pong);

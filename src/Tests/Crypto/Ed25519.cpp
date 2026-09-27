@@ -25,7 +25,7 @@ using namespace Tests;
 // If this test FAILS, the bug is in Monocypher (or the wrong version
 // is linked). If it PASSES, the bug is in our wrapper.
 
-TEST(Ed25519Raw, RFC8032_Test1_EmptyMessage)
+TEST(Crypto_Ed25519Raw, RFC8032_Test1_EmptyMessage)
 {
   // RFC 8032 Test 1 vectors.
   uint8_t seed[32];
@@ -65,7 +65,7 @@ TEST(Ed25519Raw, RFC8032_Test1_EmptyMessage)
 
 // RFC 8032 Test Vectors (via our wrapper)
 
-TEST(Ed25519, RFC8032_Test1_EmptyMessage)
+TEST(Crypto_Ed25519, RFC8032_Test1_EmptyMessage)
 {
   SecretKey sk;
   PublicKey pk_expected;
@@ -93,7 +93,7 @@ TEST(Ed25519, RFC8032_Test1_EmptyMessage)
   EXPECT_TRUE(verify(empty, 0, pk, sig));
 }
 
-TEST(Ed25519, RFC8032_Test2_OneByteMessage)
+TEST(Crypto_Ed25519, RFC8032_Test2_OneByteMessage)
 {
   SecretKey sk;
   PublicKey pk_expected;
@@ -121,7 +121,7 @@ TEST(Ed25519, RFC8032_Test2_OneByteMessage)
   EXPECT_TRUE(verify(msg, 1, pk, sig));
 }
 
-TEST(Ed25519, RFC8032_Test3_TwoByteMessage)
+TEST(Crypto_Ed25519, RFC8032_Test3_TwoByteMessage)
 {
   SecretKey sk;
   PublicKey pk_expected;
@@ -151,7 +151,7 @@ TEST(Ed25519, RFC8032_Test3_TwoByteMessage)
 
 // Round-trip
 
-TEST(Ed25519, GenerateKeyPairIsValid)
+TEST(Crypto_Ed25519, GenerateKeyPairIsValid)
 {
   KeyPair kp = generateKeyPair();
   EXPECT_FALSE(kp.publicKey.isNull());
@@ -161,7 +161,7 @@ TEST(Ed25519, GenerateKeyPairIsValid)
   EXPECT_EQ(derived.toString(), kp.publicKey.toString());
 }
 
-TEST(Ed25519, DeterministicFromSeed)
+TEST(Crypto_Ed25519, DeterministicFromSeed)
 {
   SecretKey seed;
   for (size_t i = 0; i < 32; ++i)
@@ -174,7 +174,7 @@ TEST(Ed25519, DeterministicFromSeed)
   EXPECT_EQ(kp1.secretKey.toString(), kp2.secretKey.toString());
 }
 
-TEST(Ed25519, SignVerifyRoundTrip)
+TEST(Crypto_Ed25519, SignVerifyRoundTrip)
 {
   KeyPair kp = generateKeyPair();
 
@@ -186,7 +186,7 @@ TEST(Ed25519, SignVerifyRoundTrip)
                      std::strlen(msg), kp.publicKey, sig));
 }
 
-TEST(Ed25519, VerifyRejectsTamperedSignature)
+TEST(Crypto_Ed25519, VerifyRejectsTamperedSignature)
 {
   KeyPair kp = generateKeyPair();
 
@@ -200,7 +200,7 @@ TEST(Ed25519, VerifyRejectsTamperedSignature)
                       std::strlen(msg), kp.publicKey, sig));
 }
 
-TEST(Ed25519, VerifyRejectsWrongMessage)
+TEST(Crypto_Ed25519, VerifyRejectsWrongMessage)
 {
   KeyPair kp = generateKeyPair();
 
@@ -214,7 +214,7 @@ TEST(Ed25519, VerifyRejectsWrongMessage)
                       std::strlen(msg2), kp.publicKey, sig));
 }
 
-TEST(Ed25519, VerifyRejectsWrongKey)
+TEST(Crypto_Ed25519, VerifyRejectsWrongKey)
 {
   KeyPair kp1 = generateKeyPair();
   KeyPair kp2 = generateKeyPair();
@@ -225,4 +225,62 @@ TEST(Ed25519, VerifyRejectsWrongKey)
 
   EXPECT_FALSE(verify(reinterpret_cast<const uint8_t *>(msg),
                       std::strlen(msg), kp2.publicKey, sig));
+}
+
+TEST(Crypto_Ed25519Verify, RejectsNullPubkey)
+{
+    Crypto::SecretKey sk;
+    for (auto &b : sk.data)
+        b = 0x42;
+    auto kp = Crypto::generateKeyPairFromSeed(sk);
+
+    Crypto::Hash msg;
+    for (auto &b : msg.data)
+        b = 0x77;
+    auto sig = Crypto::sign(msg, kp.secretKey);
+
+    Crypto::PublicKey null_pk{};
+    EXPECT_FALSE(Crypto::verify(msg, null_pk, sig));
+}
+
+TEST(Crypto_Ed25519Verify, RejectsNullSignature)
+{
+    Crypto::SecretKey sk;
+    for (auto &b : sk.data)
+        b = 0x42;
+    auto kp = Crypto::generateKeyPairFromSeed(sk);
+
+    Crypto::Hash msg;
+    for (auto &b : msg.data)
+        b = 0x77;
+
+    Crypto::Signature null_sig{};
+    EXPECT_FALSE(Crypto::verify(msg, kp.publicKey, null_sig));
+}
+
+TEST(Crypto_Ed25519Verify, RejectsBothNull)
+{
+    Crypto::Hash msg;
+    for (auto &b : msg.data)
+        b = 0x77;
+
+    Crypto::PublicKey null_pk{};
+    Crypto::Signature null_sig{};
+    EXPECT_FALSE(Crypto::verify(msg, null_pk, null_sig));
+}
+
+TEST(Crypto_Ed25519Verify, StillAcceptsValidSignature)
+{
+    // Regression: the null checks must not break the valid path.
+    Crypto::SecretKey sk;
+    for (auto &b : sk.data)
+        b = 0x42;
+    auto kp = Crypto::generateKeyPairFromSeed(sk);
+
+    Crypto::Hash msg;
+    for (auto &b : msg.data)
+        b = 0x77;
+    auto sig = Crypto::sign(msg, kp.secretKey);
+
+    EXPECT_TRUE(Crypto::verify(msg, kp.publicKey, sig));
 }

@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 #include "Tests/Utils.h"
 
 #include "Node/Node.h"
@@ -14,7 +14,7 @@ using namespace Tests;
 
 // Start / stop lifecycle
 
-TEST_F(NodeTestFixture, StartAppliesGenesisOnEmptyDB)
+TEST_F(Node_Fixture, StartAppliesGenesisOnEmptyDB)
 {
   Node::NodeConfig cfg = makeValidConfig();
   Node::Node node(cfg, logger_);
@@ -30,7 +30,7 @@ TEST_F(NodeTestFixture, StartAppliesGenesisOnEmptyDB)
   node.stop();
 }
 
-TEST_F(NodeTestFixture, StartIdempotent)
+TEST_F(Node_Fixture, StartIdempotent)
 {
   Node::NodeConfig cfg = makeValidConfig();
   Node::Node node(cfg, logger_);
@@ -41,7 +41,7 @@ TEST_F(NodeTestFixture, StartIdempotent)
   node.stop();
 }
 
-TEST_F(NodeTestFixture, StopIsIdempotentAfterStart)
+TEST_F(Node_Fixture, StopIsIdempotentAfterStart)
 {
   Node::NodeConfig cfg = makeValidConfig();
   Node::Node node(cfg, logger_);
@@ -54,7 +54,7 @@ TEST_F(NodeTestFixture, StopIsIdempotentAfterStart)
   EXPECT_FALSE(s.running);
 }
 
-TEST_F(NodeTestFixture, RestartRecoversGenesisState)
+TEST_F(Node_Fixture, RestartRecoversGenesisState)
 {
   Node::NodeConfig cfg = makeValidConfig();
   Crypto::Hash first_root;
@@ -75,7 +75,7 @@ TEST_F(NodeTestFixture, RestartRecoversGenesisState)
   }
 }
 
-TEST_F(NodeTestFixture, RestartDoesNotReapplyGenesis)
+TEST_F(Node_Fixture, RestartDoesNotReapplyGenesis)
 {
   Node::NodeConfig cfg = makeValidConfig();
 
@@ -97,7 +97,7 @@ TEST_F(NodeTestFixture, RestartDoesNotReapplyGenesis)
 
 // Status
 
-TEST_F(NodeTestFixture, StatusReflectsRunningState)
+TEST_F(Node_Fixture, StatusReflectsRunningState)
 {
   Node::NodeConfig cfg = makeValidConfig();
   Node::Node node(cfg, logger_);
@@ -109,7 +109,7 @@ TEST_F(NodeTestFixture, StatusReflectsRunningState)
   EXPECT_FALSE(node.status().running);
 }
 
-TEST_F(NodeTestFixture, StatusReflectsNetwork)
+TEST_F(Node_Fixture, StatusReflectsNetwork)
 {
   Node::NodeConfig cfg = makeValidConfig();
   Node::Node node(cfg, logger_);
@@ -124,7 +124,7 @@ TEST_F(NodeTestFixture, StatusReflectsNetwork)
 
 // State root persistence
 
-TEST_F(NodeTestFixture, StateRootMatchesGenesisRoot)
+TEST_F(Node_Fixture, StateRootMatchesGenesisRoot)
 {
   Node::NodeConfig cfg = makeValidConfig();
   Node::Node node(cfg, logger_);
@@ -141,7 +141,7 @@ TEST_F(NodeTestFixture, StateRootMatchesGenesisRoot)
 
 // Consensus (validator node, headless)
 
-TEST_F(NodeTestFixture, ValidatorNodeStartsWithConsensus)
+TEST_F(Node_Fixture, ValidatorNodeStartsWithConsensus)
 {
   // Validator 1 is a regtest seed validator.
   Node::NodeConfig cfg = makeValidatorConfig(1);
@@ -159,7 +159,7 @@ TEST_F(NodeTestFixture, ValidatorNodeStartsWithConsensus)
   node.stop();
 }
 
-TEST_F(NodeTestFixture, NonValidatorNodeHasNoConsensus)
+TEST_F(Node_Fixture, NonValidatorNodeHasNoConsensus)
 {
   Node::NodeConfig cfg = makeValidConfig(); // validator_id = 0
   Node::Node node(cfg, logger_);
@@ -172,14 +172,16 @@ TEST_F(NodeTestFixture, NonValidatorNodeHasNoConsensus)
 
 // Mempool interaction
 
-TEST_F(NodeTestFixture, SubmitTransactionAfterStart)
+TEST_F(Node_Fixture, SubmitTransactionAfterStart)
 {
   Node::NodeConfig cfg = makeValidConfig();
   Node::Node node(cfg, logger_);
   node.start();
 
-  // Submit a well-formed but unfunded transaction. It should be
-  // rejected at the mempool level (no funds), not at the API level.
+  // Submit a syntactically well-formed tx from an unfunded account.
+  // The node should hand it off to the mempool, which returns a
+  // rejection result with an explanatory message — not throw, not
+  // crash, not silently accept.
   Core::Transaction tx;
   tx.version = GlobalConfig::CURRENT_TRANSACTION_VERSION;
   tx.chain_id = cfg.chain_id;
@@ -197,11 +199,13 @@ TEST_F(NodeTestFixture, SubmitTransactionAfterStart)
   tx.fee = 1;
 
   std::string error;
-  bool ok = node.submitTransaction(tx, error);
-  // Either rejected due to signature or insufficient funds — we don't
-  // care which, just that the call doesn't crash and reports an error.
-  EXPECT_FALSE(ok);
-  EXPECT_FALSE(error.empty());
+  Core::MempoolAddResult result = node.submitTransaction(tx, error);
+
+  // Whatever rejection the mempool chose, it must be a clean
+  // rejection with a message — never Accepted (no funds), never a
+  // thrown exception (that would be an API-layer bug).
+  EXPECT_NE(result, Core::MempoolAddResult::Accepted);
+  EXPECT_FALSE(error.empty()) << "rejection must carry an error message";
 
   node.stop();
 }

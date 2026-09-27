@@ -4,8 +4,12 @@
 #include "Utils.h"
 
 #include "Crypto/Ed25519.h"
+#include "Crypto/Hmac.h"
+#include "Crypto/Pbkdf2.h"
 
 #include "Common/Put.h"
+
+#include "RPC/Methods/Methods.h"
 
 namespace Tests
 {
@@ -38,11 +42,59 @@ namespace Tests
     return s;
   }
 
+  Core::AmmPool makePool()
+  {
+    Core::AmmPool p;
+    p.id = 1;
+    p.creator = Crypto::addrFromHex(
+        "2222222222222222222222222222222222222222222222222222222222222222");
+    p.token_a = 0;
+    p.token_b = 42;
+    p.reserve_a = 1'000'000;
+    p.reserve_b = 2'000'000;
+    p.total_liquidity = 1'000;
+    p.fee_bps = 30;
+    p.created_at_height = 10;
+    p.active = true;
+    return p;
+  }
+
   std::vector<uint8_t> proofValue(uint64_t n, size_t len)
   {
     std::vector<uint8_t> v(len);
     for (size_t i = 0; i < len; ++i)
       v[i] = uint8_t((n >> ((i % 8) * 8)) ^ (i * 7));
+    return v;
+  }
+
+  Core::ValidatorInfo makeValidator()
+  {
+    Core::ValidatorInfo v;
+    v.id = 7;
+    v.reward_address = Crypto::Address{};
+    for (int i = 0; i < 32; ++i)
+      v.reward_address.data[i] = static_cast<uint8_t>(i);
+    v.node_key = Crypto::PublicKey{};
+    for (int i = 0; i < 32; ++i)
+      v.node_key.data[i] = static_cast<uint8_t>(0x80 + i);
+    v.owner = v.reward_address;
+    v.registered_at_height = 100;
+    v.stake = Core::VALIDATOR_MIN_STAKE;
+    v.uptime_score = 9'800;
+    v.last_ping_height = 150;
+    v.pings_responded_this_epoch = 55;
+    v.pings_sent_this_epoch = 60;
+    v.last_seen_height = 200;
+    v.reward_multiplier = Core::REWARD_MULTIPLIER_START;
+    v.infraction_count = 0;
+    v.last_infraction_height = 0;
+    v.total_blocks_produced = 42;
+    v.total_rewards_earned = 5000;
+    v.epochs_active = 7;
+    v.is_seed = false;
+    v.is_active = true;
+    v.became_active_at = 100;
+    v.last_active_at = 200;
     return v;
   }
 
@@ -466,15 +518,28 @@ namespace Tests
     h.chain_id = chain_id;
     h.height = height;
     h.parent_hash = parent;
+
+    // For non-genesis headers, isWellFormed requires a non-null parent.
+    // If the caller didn't provide one, use a deterministic non-null
+    // placeholder so the header round-trips through serialize/deserialize.
+    if (height > 0 && h.parent_hash.isNull())
+    {
+      h.parent_hash.data[0] = 0x01;
+    }
+
     h.timestamp_ms = 1'700'000'000'000ULL + height * 1000;
     h.proposer = Crypto::Address{};
     for (size_t i = 0; i < 32; ++i)
-    {
       h.proposer.data[i] = static_cast<uint8_t>(0x80 + i);
-    }
     h.epoch = 0;
     h.rotation_index = 0;
-    h.state_root = Crypto::Hash{};
+
+    // For non-genesis headers, isWellFormed requires a non-null state root.
+    if (height > 0)
+    {
+      h.state_root.data[0] = 0x02;
+    }
+
     h.tx_root = Crypto::Hash{};
     h.receipts_root = Crypto::Hash{};
     h.validator_set_root = Crypto::Hash{};
@@ -600,19 +665,32 @@ namespace Tests
     h.version = GlobalConfig::CURRENT_BLOCK_VERSION;
     h.chain_id = 0x434C5247;
     h.height = 100;
+
+    // Non-null parent (already set).
     h.parent_hash = Crypto::Hash{};
     for (size_t i = 0; i < 32; ++i)
       h.parent_hash.data[i] = static_cast<uint8_t>(i);
+
     h.timestamp_ms = 1700000000000ULL;
     h.proposer = Crypto::Address{};
     for (size_t i = 0; i < 32; ++i)
       h.proposer.data[i] = static_cast<uint8_t>(0x80 + i);
+
     h.epoch = 1;
     h.rotation_index = 1;
+
+    // isWellFormed requires non-null state_root for height > 0.
+    // Use a deterministic value so tests are reproducible.
     h.state_root = Crypto::Hash{};
+    h.state_root.data[0] = 0x11;
+
     h.tx_root = Crypto::Hash{};
+    h.tx_root.data[0] = 0x22;
     h.receipts_root = Crypto::Hash{};
+    h.receipts_root.data[0] = 0x33;
     h.validator_set_root = Crypto::Hash{};
+    h.validator_set_root.data[0] = 0x44;
+
     h.total_fees = 1500;
     h.tx_count = 0;
     h.active_validator_count = 21;
@@ -635,5 +713,152 @@ namespace Tests
     tx.amount = 100000 + nonce;
     tx.fee = 500;
     return tx;
+  }
+
+  // Standard test input from RFC 9106 §5.3, minus the secret and AD
+  // which our API doesn't support.
+  //
+  // Password: 32 bytes of 0x01
+  // Salt:     16 bytes of 0x02
+  //
+  // These are the "canonical" Argon2 test inputs; using them means
+  // we can compare against any reference implementation that also
+  // omits secret/AD.
+  std::vector<uint8_t> testPassword()
+  {
+    return std::vector<uint8_t>(32, 0x01);
+  }
+  std::vector<uint8_t> testSalt()
+  {
+    return std::vector<uint8_t>(16, 0x02);
+  }
+
+  // Compute argon2id with the given params, return hex.
+  std::string argon2idHex(const std::vector<uint8_t> &password,
+                          const std::vector<uint8_t> &salt,
+                          const Crypto::Argon2Params &params,
+                          size_t out_len)
+  {
+    std::vector<uint8_t> out(out_len);
+    const bool ok = argon2id(
+        password.data(), password.size(),
+        salt.data(), salt.size(),
+        params,
+        out.data(), out.size());
+    EXPECT_TRUE(ok);
+    return toHex(out.data(), out.size());
+  }
+
+  // Encode a fixed test payload for round-trip testing.
+  std::vector<uint8_t> testPayload()
+  {
+    // 33 bytes: witness version 0 + 32-byte pubkey, matching the
+    // shape Wallet::AddressCodec uses.
+    std::vector<uint8_t> payload(33);
+    payload[0] = 0x00;
+    for (size_t i = 1; i < 33; ++i)
+      payload[i] = uint8_t(i * 7 + 3);
+    return payload;
+  }
+
+  // Helper to run one-shot HMAC-SHA512 and return the hex digest.
+  std::string hmacHex(const std::vector<uint8_t> &key,
+                      const std::vector<uint8_t> &msg)
+  {
+    uint8_t out[Crypto::HMAC_SHA512_OUTPUT_SIZE];
+    Crypto::hmacSha512(key.data(), key.size(), msg.data(), msg.size(), out);
+    return toHex(out, Crypto::HMAC_SHA512_OUTPUT_SIZE);
+  }
+
+  // Build a byte vector from a repeating pattern, per RFC 4231.
+  // Cases 2, 4, 6, 7 use 0xaa, 0xaa... etc.
+  std::vector<uint8_t> repeat(uint8_t byte, size_t n)
+  {
+    return std::vector<uint8_t>(n, byte);
+  }
+
+  std::vector<uint8_t> bytes(std::string_view s)
+  {
+    return std::vector<uint8_t>(s.begin(), s.end());
+  }
+
+  std::string pbkdf2Hex(std::string_view password,
+                        std::string_view salt,
+                        uint32_t iterations,
+                        size_t out_len)
+  {
+    std::vector<uint8_t> out(out_len);
+    Crypto::pbkdf2HmacSha512(
+        reinterpret_cast<const uint8_t *>(password.data()), password.size(),
+        reinterpret_cast<const uint8_t *>(salt.data()), salt.size(),
+        iterations,
+        out.data(), out.size());
+    return toHex(out.data(), out.size());
+  }
+
+  std::string pbkdf2Hex(const std::vector<uint8_t> &password,
+                        const std::vector<uint8_t> &salt,
+                        uint32_t iterations,
+                        size_t out_len)
+  {
+    std::vector<uint8_t> out(out_len);
+    Crypto::pbkdf2HmacSha512(
+        password.data(), password.size(),
+        salt.data(), salt.size(),
+        iterations,
+        out.data(), out.size());
+    return toHex(out.data(), out.size());
+  }
+
+  Node::NodeConfig makeTestNodeConfig(const std::string &data_dir)
+  {
+    Node::NodeConfig cfg;
+    cfg.network = Node::Network::Regtest;
+    cfg.chain_id = 0x434C5247;
+    cfg.data_dir = data_dir;
+    cfg.state_map_size = 64ULL * 1024 * 1024;
+    cfg.chain_map_size = 64ULL * 1024 * 1024;
+    cfg.p2p_port = 0;
+    cfg.enable_p2p = false;
+    cfg.validator_id = 0;
+    cfg.apply_genesis_on_start = true;
+    return cfg;
+  }
+
+  Rpc::RpcConfig makeTestRpcConfig()
+  {
+    Rpc::RpcConfig cfg;
+    cfg.enabled = true;
+    cfg.bind_address = "127.0.0.1";
+    cfg.port = 0; // no listener needed for tests
+    cfg.worker_threads = 1;
+    cfg.max_queued_connections = 64;
+    cfg.max_request_bytes = 1024 * 1024;
+    cfg.socket_timeout_seconds = 30;
+    cfg.rate_limit_burst = 100;
+    cfg.rate_limit_per_second = 100;
+    cfg.admin_token = ""; // disable admin methods
+    cfg.verbose_errors = true;
+    return cfg;
+  }
+
+  void registerAllNonAdminMethods(Rpc::JsonRpcDispatcher &d)
+  {
+    Rpc::registerChainMethods(d);
+    Rpc::registerTxMethods(d);
+    Rpc::registerStateMethods(d);
+    Rpc::registerMempoolMethods(d);
+    Rpc::registerConsensusMethods(d);
+    Rpc::registerAmmMethods(d);
+    Rpc::registerOrderMethods(d);
+    Rpc::registerNodeMethods(d);
+    // Intentionally NOT registerAdminMethods — clrty_shutdown would
+    // kill the shared node.
+
+    // registerChainMethods historically clobbered clrty_methods with
+    // an empty stub. If that stub is still present, re-register the
+    // builtin methods here so the real handler wins. If the stub was
+    // removed from ChainMethods.cpp, this call is a harmless no-op.
+    // The builtin handler is idempotent (re-registers itself).
   }
 }

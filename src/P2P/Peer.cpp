@@ -14,6 +14,13 @@ namespace P2P
 {
   namespace
   {
+    inline constexpr bool isConsensusType(MessageType t) noexcept
+    {
+      return t == MessageType::Proposal ||
+             t == MessageType::Prevote ||
+             t == MessageType::Precommit;
+    }
+
     int64_t nowUnix() noexcept
     {
       using namespace std::chrono;
@@ -27,6 +34,8 @@ namespace P2P
     constexpr int REASON_PING_TIMEOUT = 5;
     constexpr int REASON_SELF_CONNECTION = 6;
     constexpr int REASON_VERSION_INVALID = 7;
+    constexpr int REASON_RATE_LIMIT = 8;
+    constexpr int REASON_AUTH_FAILED = 9;
   } // anonymous namespace
 
   //  Construction
@@ -36,7 +45,9 @@ namespace P2P
              PeerDirection direction,
              const P2PConfig &config,
              Logging::LoggerRef log)
-      : id_(id), socket_(std::move(socket)), direction_(direction), config_(config), log_(log), decoder_(config.magic, config.maxMessageSize), handshakeTimer_(socket_.get_executor()), pingTimer_(socket_.get_executor()), pongTimer_(socket_.get_executor())
+      : id_(id), socket_(std::move(socket)), direction_(direction), config_(config), log_(log), decoder_(config.magic, config.maxMessageSize), handshakeTimer_(socket_.get_executor()), pingTimer_(socket_.get_executor()), pongTimer_(socket_.get_executor()),
+        msgBucket_(config.rateLimitBurst, config.rateLimitPerSecond),
+        consensusBucket_(config.consensusRateLimitBurst, config.consensusRateLimitPerSecond)
   {
     connectStartedAt_ = nowUnix();
     stats_.connectedAt = connectStartedAt_;
@@ -111,6 +122,7 @@ namespace P2P
     {
       v = buildVersionMessage();
     }
+    localNonce_ = v.networkNonce;
     send(Message(MessageType::Version, serializeVersion(v)));
 
     armHandshakeTimer();
@@ -165,6 +177,29 @@ namespace P2P
       return;
     }
 
+    // The cost is determined by the message type, which we know from
+    // the 10-byte header. We consume BEFORE reading the body, so a peer
+    // that floods us with expensive-to-serve message types gets cut off
+    // before the body even arrives.
+    const MessageType mt = static_cast<MessageType>(type);
+    if (isConsensusType(mt))
+    {
+      // Consensus types are charged only to the consensus bucket,
+      // which is checked after the body read (see the body-read lambda).
+      // The general bucket is not debited, so consensus traffic can't
+      // starve other messages.
+    }
+    else
+    {
+      const uint32_t cost = messageCost(mt);
+      if (!msgBucket_.tryConsume(cost))
+      {
+        reportMisbehavior(1, REASON_RATE_LIMIT);
+        forceClose("rate limit exceeded");
+        return;
+      }
+    }
+
     stats_.bytesRecv += MESSAGE_HEADER_SIZE;
 
     // Zero-length body: async_read on a zero-length buffer has
@@ -213,6 +248,24 @@ namespace P2P
                               msg.payload = std::move(self->bodyBuffer_);
                               self->bodyBuffer_.clear();
 
+                              // Stricter limit for consensus
+                              // traffic. Non-validator peers have no
+                              // legitimate reason to send proposals or votes.
+                              if (msg.type == MessageType::Proposal ||
+                                  msg.type == MessageType::Prevote ||
+                                  msg.type == MessageType::Precommit)
+                              {
+                                if (!self->consensusBucket_.tryConsume())
+                                {
+                                  self->log_(Logging::WARNING)
+                                      << "consensus rate limit exceeded by "
+                                      << self->endpointString();
+                                  self->reportMisbehavior(1, REASON_RATE_LIMIT);
+                                  self->forceClose("consensus rate limit exceeded");
+                                  return;
+                                }
+                              }
+
                               self->processIncoming(std::move(msg));
                               if (!self->isClosed())
                               {
@@ -244,6 +297,9 @@ namespace P2P
       return;
     case MessageType::Peers:
       handlePeers(msg);
+      return;
+    case MessageType::Auth:
+      handleAuth(msg);
       return;
     case MessageType::Disconnect:
       handleDisconnect();
@@ -334,12 +390,92 @@ namespace P2P
       return;
     }
 
+    // Do not transition to Established yet — both sides must
+    // authenticate first. Re-arm the handshake timer for the auth
+    // phase so a peer that stalls here still times out.
+    transitionTo(PeerState::AuthPending);
+    armHandshakeTimer();
+
+    log_(Logging::DEBUGGING) << "verack received from " << endpointString()
+                             << ", starting auth exchange";
+
+    sendAuth();
+  }
+
+  void Peer::sendAuth()
+  {
+    if (!buildAuthMessage)
+    {
+      log_(Logging::WARNING) << "no buildAuthMessage callback set for "
+                             << endpointString();
+      forceClose("auth not configured");
+      return;
+    }
+
+    AuthMessage a = buildAuthMessage();
+    send(Message(MessageType::Auth, serializeAuth(a)));
+  }
+
+  void Peer::handleAuth(Message &msg)
+  {
+    if (state_ != PeerState::AuthPending)
+    {
+      // Auth before Verack, or after Established, or during
+      // Disconnecting — all protocol violations.
+      log_(Logging::WARNING) << "unexpected auth from " << endpointString();
+      reportMisbehavior(50, REASON_HANDSHAKE_ORDER);
+      forceClose("unexpected auth");
+      return;
+    }
+
+    AuthMessage a;
+    if (!deserializeAuth(msg.payload.data(), msg.payload.size(), a))
+    {
+      log_(Logging::WARNING) << "malformed auth from " << endpointString();
+      reportMisbehavior(config_.banThreshold, REASON_AUTH_FAILED);
+      forceClose("malformed auth");
+      return;
+    }
+
+    if (!verifyAuth)
+    {
+      log_(Logging::WARNING) << "no verifyAuth callback set for "
+                             << endpointString();
+      forceClose("auth not configured");
+      return;
+    }
+
+    uint64_t validatorId = 0;
+    if (!verifyAuth(a, validatorId))
+    {
+      log_(Logging::WARNING) << "auth failed for " << endpointString();
+      reportMisbehavior(config_.banThreshold, REASON_AUTH_FAILED);
+      forceClose("auth failed");
+      return;
+    }
+
+    peerPubkey_ = a.pubkey;
+    peerValidatorId_ = validatorId;
+
+    log_(Logging::INFO) << "peer " << endpointString()
+                        << " authenticated"
+                        << " validator_id=" << validatorId
+                        << " pubkey=" << a.pubkey.toString().substr(0, 16);
+
+    // Both sides have now sent and verified Auth. Transition to
+    // Established and start the ping timer.
     handshakeTimer_.cancel();
     transitionTo(PeerState::Established);
 
     log_(Logging::INFO) << "handshake complete with " << endpointString();
 
     armPingTimer();
+
+    // Notify the manager that this peer is now fully usable. The
+    // manager forwards this to Node, which uses it to create a
+    // SyncManager and (if the peer is ahead) kick off block download.
+    if (onEstablished)
+      onEstablished(*this);
   }
 
   //  Ping / Pong

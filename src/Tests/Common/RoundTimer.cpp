@@ -18,22 +18,22 @@ using namespace std::chrono_literals;
 //  Timeout formula
 // ============================================================================
 
-TEST(RoundTimer, TimeoutForRoundZero)
+TEST(Common_RoundTimer, TimeoutForRoundZero)
 {
   EXPECT_EQ(RoundTimer::timeoutForRound(0), BASE_TIMEOUT_MS);
 }
 
-TEST(RoundTimer, TimeoutForRoundOne)
+TEST(Common_RoundTimer, TimeoutForRoundOne)
 {
   EXPECT_EQ(RoundTimer::timeoutForRound(1), 2 * BASE_TIMEOUT_MS);
 }
 
-TEST(RoundTimer, TimeoutForRoundThree)
+TEST(Common_RoundTimer, TimeoutForRoundThree)
 {
   EXPECT_EQ(RoundTimer::timeoutForRound(3), 4 * BASE_TIMEOUT_MS);
 }
 
-TEST(RoundTimer, TimeoutIsCapped)
+TEST(Common_RoundTimer, TimeoutIsCapped)
 {
   // Whatever round we pick past the cap, the timeout must not exceed
   // MAX_TIMEOUT_MS.
@@ -48,14 +48,14 @@ TEST(RoundTimer, TimeoutIsCapped)
 //  Lifecycle
 // ============================================================================
 
-TEST(RoundTimer, NotRunningInitially)
+TEST(Common_RoundTimer, NotRunningInitially)
 {
   RoundTimer t([]() {});
   EXPECT_FALSE(t.isRunning());
   EXPECT_FALSE(t.isExpired());
 }
 
-TEST(RoundTimer, StartSetsRunning)
+TEST(Common_RoundTimer, StartSetsRunning)
 {
   RoundTimer t([]() {});
   t.start(0);
@@ -63,7 +63,7 @@ TEST(RoundTimer, StartSetsRunning)
   EXPECT_FALSE(t.isExpired());
 }
 
-TEST(RoundTimer, StopClearsRunning)
+TEST(Common_RoundTimer, StopClearsRunning)
 {
   RoundTimer t([]() {});
   t.start(0);
@@ -72,7 +72,7 @@ TEST(RoundTimer, StopClearsRunning)
   EXPECT_FALSE(t.isExpired());
 }
 
-TEST(RoundTimer, PollDoesNothingWhenNotRunning)
+TEST(Common_RoundTimer, PollDoesNothingWhenNotRunning)
 {
   int fired = 0;
   RoundTimer t([&fired]()
@@ -83,7 +83,7 @@ TEST(RoundTimer, PollDoesNothingWhenNotRunning)
   EXPECT_EQ(fired, 0);
 }
 
-TEST(RoundTimer, PollDoesNothingBeforeExpiry)
+TEST(Common_RoundTimer, PollDoesNothingBeforeExpiry)
 {
   int fired = 0;
   RoundTimer t([&fired]()
@@ -100,7 +100,7 @@ TEST(RoundTimer, PollDoesNothingBeforeExpiry)
 //  Actual expiry (short sleep)
 // ============================================================================
 
-TEST(RoundTimer, PollFiresAfterExpiry)
+TEST(Common_RoundTimer, PollFiresAfterExpiry)
 {
   // We can't control BASE_TIMEOUT_MS, so use the real value and sleep
   // for a fraction of it. We sleep much less than the timeout and only
@@ -132,7 +132,7 @@ TEST(RoundTimer, PollFiresAfterExpiry)
   EXPECT_FALSE(t.isRunning());
 }
 
-TEST(RoundTimer, PollAfterExpiryDoesNotFireAgain)
+TEST(Common_RoundTimer, PollAfterExpiryDoesNotFireAgain)
 {
   std::atomic<int> fired{0};
   RoundTimer t([&fired]()

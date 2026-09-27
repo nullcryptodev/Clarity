@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <optional>
 
 #include "Core/Account.h"
 #include "Core/AmmPool.h"
@@ -168,6 +169,25 @@ namespace State
     // BlockProcessor's expiry pass after processing every order in
     // the bucket, avoiding N read-modify-writes.
     void clearOrderExpiry(uint64_t height);
+
+    // Expose the SMT's historical root lookup. Returns the root
+    // committed at `version`, or nullopt if no root was saved for
+    // that version. This is a metadata lookup only — it does not
+    // enable historical key reads (see SparseMerkleTree::getAtVersion,
+    // which currently returns nullopt for any non-current version).
+    std::optional<Crypto::Hash> smtRootAtVersion(uint64_t version) const;
+
+    // Iterate all validator records. The visitor is called for each
+    // validator in no particular order. The value passed is the full
+    // deserialized ValidatorInfo, not the raw bytes.
+    //
+    // Reads through a read-only path, so it does not require an
+    // active txn. In txn-bound mode, reads see the txn's own writes.
+    //
+    // The visitor should not modify state. In practice we only use
+    // this from RPC and diagnostic code where modification isn't
+    // possible.
+    void forEachValidator(const std::function<void(const Core::ValidatorInfo &)> &fn) const;
 
   private:
     // Txn-aware storage helpers.

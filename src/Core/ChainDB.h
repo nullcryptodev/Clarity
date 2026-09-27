@@ -123,6 +123,27 @@ namespace Core
     size_t blockCount() const;
     void pruneBelowHeight(uint64_t height);
 
+    // ---- Transaction index ----
+    //
+    // Maps a confirmed tx's hash to its position in a block. Written
+    // atomically with the block during storeBlockTxn. Read by RPC's
+    // getTransactionByHash and getTransactionReceipt.
+    //
+    // The index is keyed by txid. If two txs in different blocks had
+    // the same txid (impossible in practice, since nonces are
+    // per-sender and monotonic), the later write would overwrite the
+    // earlier — the index is a convenience lookup, not a source of
+    // truth. The source of truth is the block itself.
+
+    struct TxLocation
+    {
+      Crypto::Hash block_hash{};
+      uint64_t block_height{0};
+      uint32_t tx_index{0};
+    };
+
+    std::optional<TxLocation> getTxLocation(const Crypto::Hash &txid) const;
+
   private:
     static Crypto::Hash computeBlockHash(const BlockHeader &header);
 
@@ -130,6 +151,9 @@ namespace Core
     static bool decodeU64(const uint8_t *data, size_t len, uint64_t &out);
     static std::vector<uint8_t> encodeHash(const Crypto::Hash &h);
     static bool decodeHash(const uint8_t *data, size_t len, Crypto::Hash &out);
+
+    static std::vector<uint8_t> encodeTxLocation(const TxLocation &loc);
+    static bool decodeTxLocation(const uint8_t *data, size_t len, TxLocation &out);
 
     State::StateDB &db_;
   };

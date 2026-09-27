@@ -9,11 +9,14 @@
 #include "Core/TransactionExecutor.h"
 #include "Consensus/Message.h"
 #include "P2P/MessageTypes.h"
+#include "P2P/VersionMessage.h"
 
 #include "Crypto/Ed25519.h"
 #include "Logging/ILogger.h"
 #include "Logging/LoggerRef.h"
+#include "Crypto/Random.h"
 
+#include <fstream>
 #include <chrono>
 #include <filesystem>
 #include <stdexcept>
@@ -30,7 +33,7 @@ namespace Node
   {
     validateConfig(config_);
 
-    (*log_)(Logging::INFO)
+    (*log_)(Logging::DEBUGGING)
         << "Node constructing: network=" << networkName(config_.network)
         << " chain_id=0x" << std::hex << config_.chain_id << std::dec
         << " data_dir=" << config_.data_dir
@@ -52,7 +55,7 @@ namespace Node
       return;
     }
 
-    (*log_)(Logging::INFO) << "Node starting";
+    (*log_)(Logging::INFO) << "Node starting...";
 
     try
     {
@@ -68,7 +71,7 @@ namespace Node
       throw;
     }
 
-    (*log_)(Logging::INFO)
+    (*log_)(Logging::DEBUGGING)
         << "Node started at height " << chain_->height()
         << " (validator: " << (config_.validator_id != 0 ? "yes" : "no") << ")";
   }
@@ -85,12 +88,13 @@ namespace Node
     // Kick off P2P listening and connection attempts.
     p2p_->start(config_.seeds);
 
-    // Consensus is started lazily by the poll loop: onConsensusPoll
-    // checks whether enough peers are Established to form a quorum
-    // and starts consensus on the first poll where the condition
-    // holds. This avoids starting consensus before the first peer's
-    // handshake completes, which would drop the first proposal.
-    scheduleConsensusPoll();
+    // Consensus is started lazily by the consensus poll timer:
+    // onConsensusPoll checks whether enough peers are Established to
+    // form a quorum and starts consensus on the first poll where the
+    // condition holds. This avoids starting consensus before the first
+    // peer's handshake completes, which would drop the first proposal.
+    armConsensusPollTimer();
+    armSyncTickTimer();
 
     // Run the event loop. Blocks until stop() is called.
     p2p_->run();
@@ -101,28 +105,29 @@ namespace Node
   void Node::stop()
   {
     if (stopping_.exchange(true))
-    {
-      return; // already stopping
-    }
+      return;
 
     if (!running_)
       return;
 
     (*log_)(Logging::INFO) << "Node stopping";
 
-    // Stop consensus first (it may hold locks).
+    // Cancel the poll timers first. Handlers that are already queued
+    // see the operation_aborted error and return without re-arming.
+    // This matters because P2PManager::stop() below may take up to
+    // one interval's worth of time to drain; we don't want the timer
+    // firing more work into the middle of the shutdown.
+    if (consensus_timer_)
+      consensus_timer_->cancel();
+    if (sync_timer_)
+      sync_timer_->cancel();
+
     if (consensus_)
-    {
       consensus_->stop();
-    }
 
-    // Stop P2P (drains sockets, closes acceptors).
     if (p2p_)
-    {
       p2p_->stop();
-    }
 
-    // Flush state and chain to disk.
     if (state_db_)
       state_db_->flush();
 
@@ -134,6 +139,20 @@ namespace Node
   {
     if (!consensus_)
       return; // not a validator
+
+    // Do not start (or restart) consensus while we're behind. A
+    // validator that's syncing doesn't know the current height, and
+    // a proposal made on a stale parent will be rejected by every
+    // up-to-date peer. Once sync catches up, the poll loop will call
+    // this again and consensus will start normally.
+    if (chain_ && chain_->isSyncing())
+    {
+      (*log_)(Logging::DEBUGGING)
+          << "Consensus deferred: syncing (height=" << chain_->height()
+          << " best_peer=" << chain_->bestPeerHeight() << ")";
+      consensus_started_ = false;
+      return;
+    }
 
     if (consensus_started_.exchange(true))
       return; // already started
@@ -175,7 +194,7 @@ namespace Node
 
   void Node::initStorage()
   {
-    (*log_)(Logging::INFO) << "Initializing storage";
+    (*log_)(Logging::INFO) << "Initializing storage...";
 
     // Create data directory if needed.
     std::filesystem::create_directories(config_.data_dir);
@@ -197,7 +216,7 @@ namespace Node
     // Mempool.
     mempool_ = std::make_unique<Core::Mempool>();
 
-    (*log_)(Logging::INFO)
+    (*log_)(Logging::DEBUGGING)
         << "Storage opened: state at " << state_path
         << " top height=" << chain_->height();
   }
@@ -237,15 +256,23 @@ namespace Node
     Core::applyGenesis(state, cfg);
     state.commit(0);
 
+    Core::applyGenesis(state, cfg);
+    state.commit(0);
+
     Core::Block genesis = Core::makeGenesisBlock(state, cfg);
-    chain_db_->storeBlock(genesis);
+    Crypto::Hash genesis_hash = genesis.hash();
+
+    auto txn = state_db_->beginWrite();
+    chain_db_->storeBlockTxn(txn, genesis, genesis_hash);
 
     Core::ChainDB::ChainHead ghead;
-    ghead.hash = genesis.hash();
+    ghead.hash = genesis_hash;
     ghead.height = 0;
-    chain_db_->setHead(ghead);
+    chain_db_->setHeadTxn(txn, ghead);
+    txn.commit();
+
     chain_db_->setChainId(config_.chain_id);
-    chain_db_->setGenesisHash(ghead.hash);
+    chain_db_->setGenesisHash(genesis_hash);
 
     (*log_)(Logging::INFO)
         << "Genesis applied: block hash="
@@ -261,7 +288,9 @@ namespace Node
       return;
     }
 
-    (*log_)(Logging::INFO) << "Initializing P2P";
+    (*log_)(Logging::INFO) << "Initializing P2P...";
+
+    loadOrCreateNodeKey();
 
     P2P::P2PConfig p2p_cfg;
 
@@ -292,18 +321,115 @@ namespace Node
     {
       onP2PPeerDisconnected(id, reason);
     };
+    p2p_->buildAuthMessage = [this](P2P::Peer &peer)
+    {
+      return buildAuthMessageForPeer(peer);
+    };
+    p2p_->verifyAuth = [this](P2P::Peer &peer, const P2P::AuthMessage &a,
+                              uint64_t &outValidatorId)
+    {
+      return verifyPeerAuth(peer, a, outValidatorId);
+    };
+    p2p_->onPeerEstablished = [this](
+                                  const P2P::P2PManager::PeerEstablishedInfo &info)
+    {
+      onP2PPeerEstablished(info);
+    };
+    p2p_->getChainHeight = [this]() -> uint64_t
+    {
+      return chain_ ? chain_->height() : 0;
+    };
 
-    (*log_)(Logging::INFO)
+    (*log_)(Logging::DEBUGGING)
         << "P2P initialized: magic=0x" << std::hex << p2p_cfg.magic << std::dec
         << " port=" << p2p_cfg.listenPort
         << " seeds=" << p2p_cfg.dnsSeeds.size();
+  }
+
+  P2P::AuthMessage Node::buildAuthMessageForPeer(P2P::Peer &peer)
+  {
+    P2P::AuthMessage a;
+
+    if (node_key_.isNull())
+    {
+      // Should not happen — initP2P calls loadOrCreateNodeKey()
+      // before any peer is created. Log and return null; the peer
+      // will fail auth and close.
+      (*log_)(Logging::ERROR)
+          << "buildAuthMessageForPeer: node key is null";
+      return a;
+    }
+
+    a.pubkey = Crypto::derivePublicKey(node_key_);
+
+    const uint64_t my_nonce = peer.localNonce();
+    const uint64_t their_nonce = peer.peerNonce();
+
+    P2P::AuthNonces nonces = P2P::orderNonces(
+        peer.direction(), my_nonce, their_nonce);
+
+    Crypto::Hash challenge = P2P::computeAuthChallenge(nonces, a.pubkey);
+
+    a.signature = Crypto::sign(challenge, node_key_);
+    return a;
+  }
+
+  bool Node::verifyPeerAuth(P2P::Peer &peer,
+                            const P2P::AuthMessage &a,
+                            uint64_t &outValidatorId)
+  {
+    outValidatorId = 0;
+
+    // Reject null keys/sigs outright. A null sig would verify against
+    // a null pubkey on some Ed25519 implementations, so guard
+    // explicitly.
+    if (a.pubkey.isNull() || a.signature.isNull())
+      return false;
+
+    const uint64_t my_nonce = peer.localNonce();
+    const uint64_t their_nonce = peer.peerNonce();
+
+    P2P::AuthNonces nonces = P2P::orderNonces(
+        peer.direction(), my_nonce, their_nonce);
+
+    Crypto::Hash challenge = P2P::computeAuthChallenge(nonces, a.pubkey);
+
+    if (!Crypto::verify(challenge, a.pubkey, a.signature))
+      return false;
+
+    // Signature is valid. Now decide whether this pubkey is a
+    // validator. A non-validator is still authenticated; it just
+    // gets validator_id = 0.
+    outValidatorId = validatorIdForAddress(a.pubkey);
+    return true;
+  }
+
+  uint64_t Node::validatorIdForAddress(const Crypto::PublicKey &pk) const
+  {
+    if (pk.isNull())
+      return 0;
+
+    State::StateAccess state(*state_db_, /*version=*/0);
+    auto active = loadActiveSetFromState(state);
+
+    for (Id vid : active)
+    {
+      Core::ValidatorInfo v;
+      if (!state.getValidator(vid, v))
+        continue;
+      // v1 convention: the validator's signing key IS its reward
+      // address. See getSignerPublicKey().
+      if (v.reward_address == pk)
+        return vid;
+    }
+    return 0;
   }
 
   void Node::initConsensus()
   {
     if (config_.validator_id == 0)
     {
-      (*log_)(Logging::INFO) << "Not a validator, consensus disabled";
+      (*log_)(Logging::WARNING) << "Not a validator, consensus disabled";
       return;
     }
 
@@ -643,34 +769,18 @@ namespace Node
         << "Applied committed block: height=" << block.header.height
         << " hash=" << block.hash().toString().substr(0, 16)
         << " txs=" << block.transactions.size();
+
+    // Announce to peers. This is the only path by which non-validator
+    // nodes learn about new blocks: they can't participate in consensus,
+    // so they never see a Proposal, and they need the post-commit
+    // Block message to advance.
+    broadcastBlock(block);
   }
 
   void Node::onHeightAdvanced(Height height)
   {
     (*log_)(Logging::DEBUGGING)
         << "Chain advanced to height " << height;
-  }
-
-  //  Consensus timer
-
-  void Node::scheduleConsensusPoll()
-  {
-    if (!consensus_ || stopping_.load())
-      return;
-
-    // P2P provides the io_context we post to. When P2P is disabled,
-    // the caller is responsible for driving consensus (usually by
-    // calling consensus_->pollTimers() directly). Tests do this.
-    if (!p2p_)
-      return;
-
-    auto interval = std::chrono::milliseconds(config_.consensus_poll_ms);
-    p2p_->post([this, interval]()
-               {
-    std::this_thread::sleep_for(interval);
-    if (stopping_.load()) return;
-    onConsensusPoll();
-    scheduleConsensusPoll(); });
   }
 
   void Node::onConsensusPoll()
@@ -718,13 +828,19 @@ namespace Node
       handleIncomingTx(msg);
       break;
     case P2P::MessageType::Block:
-      handleIncomingBlock(msg);
+      handleIncomingBlock(msg, from);
       break;
     case P2P::MessageType::GetHeaders:
       handleGetHeaders(msg, from);
       break;
     case P2P::MessageType::GetBlocks:
       handleGetBlocks(msg, from);
+      break;
+    case P2P::MessageType::Headers:
+      handleIncomingHeaders(msg, from);
+      break;
+    case P2P::MessageType::Blocks:
+      handleIncomingBlocks(msg, from);
       break;
     default:
       (*log_)(Logging::DEBUGGING)
@@ -750,6 +866,11 @@ namespace Node
   void Node::onP2PPeerDisconnected(P2P::PeerId id, const std::string &reason)
   {
     (*log_)(Logging::INFO) << "Peer disconnected: " << id << " (" << reason << ")";
+    // Drop the sync manager, if any. Any in-flight request dies with
+    // it; the next peer with a higher best_height will take over.
+    sync_managers_.erase(id);
+    peer_heights_.erase(id);
+    updateBestPeerHeight();
   }
 
   //  Consensus message handlers
@@ -808,6 +929,18 @@ namespace Node
       return;
     }
 
+    // Dedup before touching the mempool: if we already have this txid,
+    // drop it silently. Without this, a broadcast from every peer
+    // re-triggers a re-broadcast and the tx loops forever. The check
+    // and the subsequent add are not atomic, so a race is possible
+    // (two threads both see the tx as missing, both call add; add is
+    // mutex-guarded and one insert wins, the other hits the
+    // idempotent-accept path). The result is a duplicate broadcast,
+    // which is bounded and harmless.
+    const Crypto::Hash txid = tx.txid();
+    if (mempool_->contains(txid))
+      return;
+
     auto state_view = makeStateView();
     if (!state_view)
       return;
@@ -818,7 +951,12 @@ namespace Node
     {
       (*log_)(Logging::DEBUGGING)
           << "Tx accepted to mempool: "
-          << tx.txid().toString().substr(0, 16);
+          << txid.toString().substr(0, 16);
+
+      // Propagate to peers so the tx reaches validators who can
+      // include it. Every node that accepts a tx does this exactly
+      // once; the `contains` check above is what breaks the loop.
+      broadcastTransaction(tx);
     }
     else
     {
@@ -827,24 +965,167 @@ namespace Node
     }
   }
 
-  void Node::handleIncomingBlock(const P2P::Message &msg)
+  void Node::handleIncomingBlock(const P2P::Message &msg, P2P::PeerId from)
   {
-    // For v1, blocks arrive via consensus proposals, not as standalone
-    // Block messages. If we receive one, log and ignore.
-    (*log_)(Logging::DEBUGGING) << "Standalone Block message received (ignored)";
-    (void)msg;
+    // Relay path. A peer that has committed a block broadcasts the
+    // full block after applyCommittedBlock succeeds locally. We receive
+    // it here, apply it if it's the next one we need, and re-broadcast
+    // so it propagates through the network.
+    //
+    // Three cases:
+    //
+    //   Already have it       → drop silently, no re-broadcast.
+    //   Height == our + 1     → apply, then re-broadcast.
+    //   Height >  our + 1     → drop, rely on sync to fill the gap.
+    //                           The block will arrive again after we
+    //                           catch up.
+    //   Height <= our height  → fork. Ban the sender. This should not
+    //                           happen on a final chain; a peer that
+    //                           sends it is either buggy or malicious.
+
+    if (!chain_ || !chain_db_)
+      return;
+
+    Core::Block block;
+    if (!Core::Block::deserialize(msg.payload.data(), msg.payload.size(), block))
+    {
+      (*log_)(Logging::DEBUGGING) << "Malformed Block received (ignored)";
+      return;
+    }
+
+    const Crypto::Hash block_hash = block.hash();
+
+    // Already have it.
+    if (chain_db_->hasBlock(block_hash))
+      return;
+
+    const uint64_t our_height = chain_->height();
+
+    if (block.header.height <= our_height)
+    {
+      (*log_)(Logging::WARNING)
+          << "Block at height " << block.header.height
+          << " but our height is " << our_height
+          << " — possible fork, scoring sender";
+
+      if (p2p_)
+      {
+        auto *peer = p2p_->findPeer(from);
+        if (peer)
+          peer->reportMisbehavior(50, /*reason=*/0);
+      }
+      return;
+    }
+
+    if (block.header.height > our_height + 1)
+    {
+      // Gap. Sync will fill it. Drop.
+      (*log_)(Logging::DEBUGGING)
+          << "Block at height " << block.header.height
+          << " is ahead of our height " << our_height
+          << " by more than one — dropping, sync will catch up";
+      return;
+    }
+
+    // Height == our_height + 1. Apply.
+    std::string error;
+    if (!applyCommittedBlock(block, error))
+    {
+      (*log_)(Logging::WARNING)
+          << "Relayed block at height " << block.header.height
+          << " failed to apply: " << error;
+      return;
+    }
+
+    (*log_)(Logging::INFO)
+        << "Applied relayed block: height=" << block.header.height
+        << " hash=" << block_hash.toString().substr(0, 16);
+
+    // Re-broadcast so the block propagates one hop further. A node
+    // that's already seen it drops it silently.
+    broadcastBlock(block);
   }
 
-  void Node::handleGetHeaders(const P2P::Message & /*msg*/, P2P::PeerId from)
+  void Node::handleGetHeaders(const P2P::Message &msg, P2P::PeerId from)
   {
-    // TODO: sync support. For v1, we don't serve headers.
-    (void)from;
+    P2P::GetHeadersMessage req;
+    if (!P2P::deserializeGetHeaders(msg.payload.data(), msg.payload.size(), req))
+    {
+      (*log_)(Logging::DEBUGGING)
+          << "Malformed GetHeaders from peer " << from;
+      return;
+    }
+
+    if (!chain_ || !p2p_)
+      return;
+
+    // Clamp the request. A peer asking for 1 million headers gets
+    // MAX_HEADERS_PER_REQUEST.
+    const uint32_t limit = std::min(
+        req.limit, P2P::MAX_HEADERS_PER_REQUEST);
+
+    P2P::HeadersMessage resp;
+
+    const uint64_t our_h = chain_->height();
+    uint64_t h = req.startHeight;
+
+    for (uint32_t i = 0; i < limit; ++i)
+    {
+      if (h > our_h)
+        break;
+
+      auto hash = chain_db_->getHashByHeight(h);
+      if (!hash.has_value())
+        break;
+
+      P2P::HeadersEntry e;
+      e.height = h;
+      e.hash = *hash;
+      resp.entries.push_back(e);
+
+      ++h;
+    }
+
+    P2P::Message reply;
+    reply.type = P2P::MessageType::Headers;
+    reply.payload = P2P::serializeHeaders(resp);
+
+    p2p_->sendTo(from, reply);
   }
 
-  void Node::handleGetBlocks(const P2P::Message & /*msg*/, P2P::PeerId from)
+  void Node::handleGetBlocks(const P2P::Message &msg, P2P::PeerId from)
   {
-    // TODO: sync support. For v1, we don't serve blocks.
-    (void)from;
+    P2P::GetBlocksMessage req;
+    if (!P2P::deserializeGetBlocks(msg.payload.data(), msg.payload.size(), req))
+    {
+      (*log_)(Logging::DEBUGGING)
+          << "Malformed GetBlocks from peer " << from;
+      return;
+    }
+
+    if (!chain_ || !p2p_)
+      return;
+
+    P2P::BlocksMessage resp;
+    resp.blocks.reserve(req.hashes.size());
+
+    for (const auto &hash : req.hashes)
+    {
+      auto block = chain_db_->getBlock(hash);
+      if (!block.has_value())
+      {
+        // We don't have this block. The requester will re-request it
+        // from another peer, or from us later if we catch up.
+        continue;
+      }
+      resp.blocks.push_back(std::move(*block));
+    }
+
+    P2P::Message reply;
+    reply.type = P2P::MessageType::Blocks;
+    reply.payload = P2P::serializeBlocks(resp);
+
+    p2p_->sendTo(from, reply);
   }
 
   //  Block application
@@ -920,30 +1201,33 @@ namespace Node
 
   //  External API
 
-  bool Node::submitTransaction(const Core::Transaction &tx, std::string &error)
+  Core::MempoolAddResult Node::submitTransaction(const Core::Transaction &tx,
+                                                 std::string &error)
   {
+    error.clear();
+
     if (!mempool_)
-    {
-      error = "mempool not initialized";
-      return false;
-    }
+      throw std::runtime_error("submitTransaction: mempool not initialized");
 
     auto state_view = makeStateView();
     if (!state_view)
-    {
-      error = "could not build state view";
-      return false;
-    }
+      throw std::runtime_error("submitTransaction: could not build state view");
 
     auto result = mempool_->add(tx, *state_view, Core::FeeTier::Standard);
 
-    if (result == Core::MempoolAddResult::Accepted)
+    if (result != Core::MempoolAddResult::Accepted)
     {
-      return true;
+      error = Core::mempoolAddResultName(result);
+      return result;
     }
 
-    error = Core::mempoolAddResultName(result);
-    return false;
+    // Propagate to peers. The local mempool now has the tx; every
+    // other node will learn about it through this broadcast (or from
+    // one of the peers we broadcast to). If P2P is disabled, this is
+    // a no-op.
+    broadcastTransaction(tx);
+
+    return result;
   }
 
   Crypto::Hash Node::stateRoot() const
@@ -952,5 +1236,380 @@ namespace Node
       return Crypto::Hash{};
     State::StateAccess state(*state_db_, /*version=*/0);
     return state.stateRoot();
+  }
+
+  std::vector<P2P::P2PManager::PeerInfo> Node::p2pPeerList() const
+  {
+    if (!p2p_)
+      return {};
+    return p2p_->peerList();
+  }
+
+  void Node::loadOrCreateNodeKey()
+  {
+    if (node_key_loaded_)
+      return;
+    node_key_loaded_ = true;
+
+    // Explicit override wins — tests and tooling use this.
+    if (!config_.node_secret_key.isNull())
+    {
+      node_key_ = config_.node_secret_key;
+      (*log_)(Logging::DEBUGGING)
+          << "Using node_secret_key from config";
+      return;
+    }
+
+    // A validator's node identity IS its validator identity. This is
+    // what makes verifyPeerAuth() able to bind the peer to a validator
+    // ID: the pubkey we advertise in Auth derives to the validator's
+    // reward_address, which is what the active-set lookup matches on.
+    //
+    // Non-validator nodes fall through and get a fresh key, which
+    // authenticates them as "not a validator" (validator_id = 0).
+    if (!config_.validator_secret_key.isNull())
+    {
+      node_key_ = config_.validator_secret_key;
+      (*log_)(Logging::DEBUGGING)
+          << "Using validator_secret_key as node key";
+      return;
+    }
+
+    // Non-validator: load or create a persistent identity.
+    const std::string path = config_.data_dir + "/node_key";
+
+    // Try to load an existing key.
+    {
+      std::ifstream in(path, std::ios::binary);
+      if (in)
+      {
+        std::array<uint8_t, 32> raw{};
+        in.read(reinterpret_cast<char *>(raw.data()), raw.size());
+        if (in.gcount() == static_cast<std::streamsize>(raw.size()))
+        {
+          std::memcpy(node_key_.data.data(), raw.data(), raw.size());
+          (*log_)(Logging::INFO)
+              << "Loaded node key from " << path;
+          return;
+        }
+        (*log_)(Logging::WARNING)
+            << "node_key file at " << path
+            << " is truncated (" << in.gcount() << " bytes); regenerating";
+      }
+    }
+
+    // Generate a fresh key and persist it.
+    Crypto::KeyPair kp = Crypto::generateKeyPair();
+    node_key_ = kp.secretKey;
+
+    {
+      std::ofstream out(path, std::ios::binary | std::ios::trunc);
+      if (!out)
+      {
+        (*log_)(Logging::ERROR)
+            << "Failed to write node key to " << path;
+        // Fall back to the in-memory key. P2P will still work for
+        // this session, but the identity won't be stable across
+        // restarts. Log loudly.
+        return;
+      }
+      out.write(reinterpret_cast<const char *>(node_key_.data.data()),
+                node_key_.data.size());
+      out.close();
+
+      // Restrict permissions. Best-effort — some filesystems don't
+      // support this.
+      std::error_code ec;
+      std::filesystem::permissions(
+          path,
+          std::filesystem::perms::owner_read |
+              std::filesystem::perms::owner_write,
+          std::filesystem::perm_options::replace,
+          ec);
+      if (ec)
+      {
+        (*log_)(Logging::WARNING)
+            << "Could not restrict permissions on " << path
+            << ": " << ec.message();
+      }
+    }
+
+    (*log_)(Logging::INFO)
+        << "Generated new node key at " << path
+        << " pubkey="
+        << Crypto::derivePublicKey(node_key_).toString().substr(0, 16);
+  }
+
+  void Node::onP2PPeerEstablished(
+      const P2P::P2PManager::PeerEstablishedInfo &info)
+  {
+    (*log_)(Logging::INFO)
+        << "Peer established: " << info.id
+        << " best_height=" << info.best_height
+        << " validator_id=" << info.validator_id
+        << " agent=\"" << info.agent << "\"";
+
+    // Build the SyncManager. It has four callbacks into Node:
+    //   our_height    — reads chain height fresh on every use
+    //   send          — forwards to P2PManager::sendTo
+    //   apply_blocks  — hands blocks to applyCommittedBlock
+    //   on_misbehavior— scores the peer and, if the score crosses
+    //                   the ban threshold, disconnects.
+    auto mgr = std::make_unique<P2P::SyncManager>(
+        info.id, config_.max_block_bytes);
+
+    const P2P::PeerId peer_id = info.id;
+
+    mgr->our_height = [this]() -> uint64_t
+    {
+      return chain_ ? chain_->height() : 0;
+    };
+
+    // Record the peer's advertised best height. Chain::setBestPeerHeight
+    // persists it; Chain::isSyncing reads it. This is what feeds the
+    // consensus gate above and the best_peer_height field in status().
+    if (chain_)
+    {
+      uint64_t current = chain_->bestPeerHeight();
+      if (info.best_height > current)
+        chain_->setBestPeerHeight(info.best_height);
+    }
+    peer_heights_[info.id] = info.best_height;
+    updateBestPeerHeight();
+
+    mgr->send = [this, peer_id](const P2P::Message &m)
+    {
+      if (p2p_)
+        p2p_->sendTo(peer_id, m);
+    };
+
+    mgr->apply_blocks = [this](const std::vector<Core::Block> &blocks)
+        -> size_t
+    {
+      size_t applied = 0;
+      for (const auto &b : blocks)
+      {
+        std::string error;
+        if (!applyCommittedBlock(b, error))
+        {
+          (*log_)(Logging::WARNING)
+              << "Sync block at height " << b.header.height
+              << " failed to apply: " << error;
+          // Stop at the first failure. The count returned is
+          // "blocks before the failure" — the SyncManager treats
+          // any shortfall as a protocol violation and disconnects.
+          return applied;
+        }
+        ++applied;
+      }
+      return applied;
+    };
+
+    mgr->on_misbehavior = [this, peer_id](uint32_t score, const char *reason)
+    {
+      if (!p2p_)
+        return;
+
+      (*log_)(Logging::WARNING)
+          << "Sync misbehavior from peer " << peer_id
+          << " (+" << score << "): " << reason;
+
+      // Reach into the peer to record the score. reportMisbehavior
+      // already increments stats_.misbehaviors and invokes
+      // onMisbehaving (which P2PManager turns into a ban record).
+      //
+      // We deliberately do NOT forceClose from here — the score
+      // accumulates, and P2PManager::handlePeerDisconnected bans
+      // when the accumulated score crosses banThreshold. A peer
+      // that misses one request isn't banned; a peer that
+      // repeatedly lies about headers is.
+      auto *peer = p2p_->findPeer(peer_id);
+      if (peer)
+        peer->reportMisbehavior(score, /*reason=*/0);
+    };
+
+    // Record before starting so a racing message can find it.
+    sync_managers_[peer_id] = std::move(mgr);
+
+    // Kick off the initial sync. If the peer is at or below our
+    // height, this is a no-op.
+    sync_managers_[peer_id]->start();
+  }
+
+  void Node::handleIncomingHeaders(const P2P::Message &msg, P2P::PeerId from)
+  {
+    auto it = sync_managers_.find(from);
+    if (it == sync_managers_.end())
+      return; // Headers from a peer we didn't set up sync for
+
+    P2P::HeadersMessage headers;
+    if (!P2P::deserializeHeaders(msg.payload.data(), msg.payload.size(), headers))
+    {
+      (*log_)(Logging::WARNING)
+          << "Malformed Headers from peer " << from;
+      auto *peer = p2p_ ? p2p_->findPeer(from) : nullptr;
+      if (peer)
+        peer->reportMisbehavior(50, /*reason=*/0);
+      return;
+    }
+
+    it->second->onHeaders(headers);
+  }
+
+  void Node::handleIncomingBlocks(const P2P::Message &msg, P2P::PeerId from)
+  {
+    auto it = sync_managers_.find(from);
+    if (it == sync_managers_.end())
+      return;
+
+    P2P::BlocksMessage blocks;
+    if (!P2P::deserializeBlocks(msg.payload.data(), msg.payload.size(), blocks))
+    {
+      (*log_)(Logging::WARNING)
+          << "Malformed Blocks from peer " << from;
+      auto *peer = p2p_ ? p2p_->findPeer(from) : nullptr;
+      if (peer)
+        peer->reportMisbehavior(50, /*reason=*/0);
+      return;
+    }
+
+    it->second->onBlocks(blocks);
+  }
+
+  void Node::updateBestPeerHeight()
+  {
+    if (!chain_)
+      return;
+
+    uint64_t best = 0;
+    for (const auto &[id, h] : peer_heights_)
+    {
+      if (h > best)
+        best = h;
+    }
+
+    chain_->setBestPeerHeight(best);
+
+    (*log_)(Logging::DEBUGGING)
+        << "best_peer_height updated to " << best
+        << " across " << peer_heights_.size() << " peers";
+  }
+
+  void Node::broadcastBlock(const Core::Block &block)
+  {
+    if (!p2p_)
+      return;
+
+    P2P::Message msg;
+    msg.type = P2P::MessageType::Block;
+    msg.payload = block.serialize();
+
+    // broadcast() filters to Established peers only. A peer that's
+    // still handshaking or authenticating won't receive this; it will
+    // get the block from sync instead once it reaches Established.
+    p2p_->broadcast(msg);
+
+    (*log_)(Logging::DEBUGGING)
+        << "Broadcast block " << block.header.height
+        << " hash=" << block.hash().toString().substr(0, 16)
+        << " bytes=" << msg.payload.size();
+  }
+
+  void Node::broadcastTransaction(const Core::Transaction &tx)
+  {
+    if (!p2p_)
+      return;
+
+    P2P::Message msg;
+    msg.type = P2P::MessageType::Tx;
+    msg.payload = tx.serialize();
+
+    // broadcast() filters to Established peers only.
+    p2p_->broadcast(msg);
+
+    (*log_)(Logging::DEBUGGING)
+        << "Broadcast tx " << tx.txid().toString().substr(0, 16)
+        << " bytes=" << msg.payload.size();
+  }
+
+  void Node::onSyncTick()
+  {
+    // Runs on the io_context thread. sync_managers_ is only touched
+    // there, and asio guarantees handlers don't run concurrently, so
+    // the iteration is safe. The map may be modified by a later
+    // handler (onP2PPeerEstablished/Disconnected), but not by anything
+    // tick() does synchronously — those callbacks post their
+    // modifications to the event loop.
+    for (auto &[id, mgr] : sync_managers_)
+    {
+      if (mgr)
+        mgr->tick();
+    }
+  }
+
+  void Node::armConsensusPollTimer()
+  {
+    // No consensus instance means no poll timer. A non-validator
+    // node never needs to poll consensus.
+    if (!consensus_ || !p2p_ || stopping_.load())
+      return;
+
+    if (!consensus_timer_)
+    {
+      // Construct once. The timer's executor is the P2P io_context,
+      // so the handler runs on the event loop thread.
+      consensus_timer_ = std::make_unique<boost::asio::steady_timer>(
+          p2p_->executor());
+    }
+
+    auto interval = std::chrono::milliseconds(config_.consensus_poll_ms);
+    consensus_timer_->expires_after(interval);
+    consensus_timer_->async_wait(
+        [this](const boost::system::error_code &ec)
+        {
+          onConsensusPollTimer(ec);
+        });
+  }
+
+  void Node::onConsensusPollTimer(const boost::system::error_code &ec)
+  {
+    if (ec == boost::asio::error::operation_aborted || stopping_.load())
+      return; // cancelled by stop()
+
+    onConsensusPoll();
+
+    // Re-arm for the next tick.
+    armConsensusPollTimer();
+  }
+
+  void Node::armSyncTickTimer()
+  {
+    if (!p2p_ || stopping_.load())
+      return;
+
+    if (!sync_timer_)
+    {
+      sync_timer_ = std::make_unique<boost::asio::steady_timer>(
+          p2p_->executor());
+    }
+
+    auto interval = std::chrono::milliseconds(SYNC_TICK_INTERVAL_MS);
+    sync_timer_->expires_after(interval);
+    sync_timer_->async_wait(
+        [this](const boost::system::error_code &ec)
+        {
+          onSyncTickTimer(ec);
+        });
+  }
+
+  void Node::onSyncTickTimer(const boost::system::error_code &ec)
+  {
+    if (ec == boost::asio::error::operation_aborted || stopping_.load())
+      return; // cancelled by stop()
+
+    onSyncTick();
+
+    // Re-arm for the next tick.
+    armSyncTickTimer();
   }
 } // namespace Node

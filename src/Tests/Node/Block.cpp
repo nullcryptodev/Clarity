@@ -7,7 +7,7 @@
 
 #include <cstring>
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 #include "Tests/Utils.h"
 #include "Node/Node.h"
 
@@ -22,7 +22,7 @@ using namespace Tests;
 
 // Block application
 
-TEST_F(NodeBlockFixture, ApplyEmptyBlockAdvancesHeight)
+TEST_F(Node_BlockFixture, ApplyEmptyBlockAdvancesHeight)
 {
   Node::Node node(makeFixtureConfig(), logger_);
   node.start();
@@ -40,7 +40,7 @@ TEST_F(NodeBlockFixture, ApplyEmptyBlockAdvancesHeight)
   node.stop();
 }
 
-TEST_F(NodeBlockFixture, ApplyBlockUpdatesHead)
+TEST_F(Node_BlockFixture, ApplyBlockUpdatesHead)
 {
   Node::Node node(makeFixtureConfig(), logger_);
   node.start();
@@ -59,7 +59,7 @@ TEST_F(NodeBlockFixture, ApplyBlockUpdatesHead)
   node.stop();
 }
 
-TEST_F(NodeBlockFixture, ApplyBlockUpdatesStateRoot)
+TEST_F(Node_BlockFixture, ApplyBlockUpdatesStateRoot)
 {
   Node::Node node(makeFixtureConfig(), logger_);
   node.start();
@@ -78,7 +78,7 @@ TEST_F(NodeBlockFixture, ApplyBlockUpdatesStateRoot)
   node.stop();
 }
 
-TEST_F(NodeBlockFixture, ApplyBlockPersistsAcrossRestart)
+TEST_F(Node_BlockFixture, ApplyBlockPersistsAcrossRestart)
 {
   Node::NodeConfig cfg = makeFixtureConfig();
   Crypto::Hash expected_root;
@@ -121,7 +121,7 @@ TEST_F(NodeBlockFixture, ApplyBlockPersistsAcrossRestart)
 //  B. Transaction inclusion
 // ============================================================================
 
-TEST_F(NodeBlockFixture, ApplyBlockWithTransfer)
+TEST_F(Node_BlockFixture, ApplyBlockWithTransfer)
 {
   Node::Node node(makeFixtureConfig(), logger_);
   node.start();
@@ -136,7 +136,7 @@ TEST_F(NodeBlockFixture, ApplyBlockWithTransfer)
   node.stop();
 }
 
-TEST_F(NodeBlockFixture, ApplyBlockClearsIncludedMempoolEntries)
+TEST_F(Node_BlockFixture, ApplyBlockClearsIncludedMempoolEntries)
 {
   Node::Node node(makeFixtureConfig(), logger_);
   node.start();
@@ -153,7 +153,7 @@ TEST_F(NodeBlockFixture, ApplyBlockClearsIncludedMempoolEntries)
 //  C. Failure handling
 // ============================================================================
 
-TEST_F(NodeBlockFixture, RejectsBlockWithWrongStateRoot)
+TEST_F(Node_BlockFixture, RejectsBlockWithWrongStateRoot)
 {
   Node::Node node(makeFixtureConfig(), logger_);
   node.start();
@@ -176,7 +176,7 @@ TEST_F(NodeBlockFixture, RejectsBlockWithWrongStateRoot)
   node.stop();
 }
 
-TEST_F(NodeBlockFixture, RejectsBlockWithBadTxRoot)
+TEST_F(Node_BlockFixture, RejectsBlockWithBadTxRoot)
 {
   Node::Node node(makeFixtureConfig(), logger_);
   node.start();
@@ -202,7 +202,7 @@ TEST_F(NodeBlockFixture, RejectsBlockWithBadTxRoot)
 //  D. Multi-block sequences
 // ============================================================================
 
-TEST_F(NodeBlockFixture, ApplyThreeBlocksInSequence)
+TEST_F(Node_BlockFixture, ApplyThreeBlocksInSequence)
 {
   Node::Node node(makeFixtureConfig(), logger_);
   node.start();
@@ -221,7 +221,7 @@ TEST_F(NodeBlockFixture, ApplyThreeBlocksInSequence)
   node.stop();
 }
 
-TEST_F(NodeBlockFixture, StateRootChainAcrossBlocks)
+TEST_F(Node_BlockFixture, StateRootChainAcrossBlocks)
 {
   Node::Node node(makeFixtureConfig(), logger_);
   node.start();

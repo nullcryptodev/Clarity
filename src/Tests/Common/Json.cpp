@@ -9,7 +9,7 @@
 
 using namespace Common;
 
-TEST(Json, GetBoolOrDefault)
+TEST(Common_Json, GetBoolOrDefault)
 {
   Json j;
   j["flag"] = true;
@@ -21,7 +21,7 @@ TEST(Json, GetBoolOrDefault)
   EXPECT_TRUE(getBoolOrDefault(j, "missing", true));
 }
 
-TEST(Json, GetBoolOrDefaultWrongType)
+TEST(Common_Json, GetBoolOrDefaultWrongType)
 {
   Json j;
   j["not_bool"] = "hello";
@@ -30,7 +30,7 @@ TEST(Json, GetBoolOrDefaultWrongType)
   EXPECT_TRUE(getBoolOrDefault(j, "not_bool", true));
 }
 
-TEST(Json, GetIntOrDefault)
+TEST(Common_Json, GetIntOrDefault)
 {
   Json j;
   j["count"] = 42;
@@ -40,7 +40,7 @@ TEST(Json, GetIntOrDefault)
   EXPECT_EQ(getIntOrDefault(j, "missing", 99), 99);
 }
 
-TEST(Json, GetStringOrDefault)
+TEST(Common_Json, GetStringOrDefault)
 {
   Json j;
   j["name"] = "clarity";
@@ -50,7 +50,7 @@ TEST(Json, GetStringOrDefault)
   EXPECT_EQ(getStringOrDefault(j, "missing", "default"), "default");
 }
 
-TEST(Json, GetVectorOrDefaultStrings)
+TEST(Common_Json, GetVectorOrDefaultStrings)
 {
   Json j;
   j["items"] = {"one", "two", "three"};
@@ -62,7 +62,7 @@ TEST(Json, GetVectorOrDefaultStrings)
   EXPECT_EQ(v[2], "three");
 }
 
-TEST(Json, GetVectorOrDefaultInts)
+TEST(Common_Json, GetVectorOrDefaultInts)
 {
   Json j;
   j["nums"] = {1, 2, 3, 4};
@@ -73,7 +73,7 @@ TEST(Json, GetVectorOrDefaultInts)
   EXPECT_EQ(v[3], 4);
 }
 
-TEST(Json, GetVectorOrDefaultMissing)
+TEST(Common_Json, GetVectorOrDefaultMissing)
 {
   Json j;
   auto v = getVectorOrDefault<std::string>(j, "missing");

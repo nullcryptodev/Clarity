@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 #include "Tests/Utils.h"
 
 #include "Node/NodeConfig.h"
@@ -13,7 +13,7 @@
 using namespace Tests;
 
 
-TEST(NodeConfig, NetworkNames)
+TEST(Node_Config, NetworkNames)
 {
   EXPECT_STREQ(Node::networkName(Node::Network::Mainnet), "mainnet");
   EXPECT_STREQ(Node::networkName(Node::Network::Testnet), "testnet");
@@ -21,21 +21,21 @@ TEST(NodeConfig, NetworkNames)
 }
 
 
-TEST(NodeConfig, ChainIds)
+TEST(Node_Config, ChainIds)
 {
   EXPECT_EQ(Node::chainIdForNetwork(Node::Network::Mainnet), 0x434C5254u);
   EXPECT_EQ(Node::chainIdForNetwork(Node::Network::Testnet), 0x434C5454u);
   EXPECT_EQ(Node::chainIdForNetwork(Node::Network::Regtest), 0x434C5247u);
 }
 
-TEST(NodeConfig, ValidateRejectsEmptyDataDir)
+TEST(Node_Config, ValidateRejectsEmptyDataDir)
 {
   Node::NodeConfig cfg;
   cfg.data_dir = "";
   EXPECT_THROW(Node::validateConfig(cfg), std::runtime_error);
 }
 
-TEST(NodeConfig, ValidateFillsChainIdFromNetwork)
+TEST(Node_Config, ValidateFillsChainIdFromNetwork)
 {
   Node::NodeConfig cfg;
   cfg.network = Node::Network::Testnet;
@@ -45,7 +45,7 @@ TEST(NodeConfig, ValidateFillsChainIdFromNetwork)
   EXPECT_EQ(cfg.chain_id, 0x434C5454u);
 }
 
-TEST(NodeConfig, ValidateDoesNotOverrideExplicitChainId)
+TEST(Node_Config, ValidateDoesNotOverrideExplicitChainId)
 {
   Node::NodeConfig cfg;
   cfg.network = Node::Network::Testnet;
@@ -55,7 +55,7 @@ TEST(NodeConfig, ValidateDoesNotOverrideExplicitChainId)
   EXPECT_EQ(cfg.chain_id, 0xDEADBEEFu);
 }
 
-TEST(NodeConfig, ValidateRejectsTinyBlockBytes)
+TEST(Node_Config, ValidateRejectsTinyBlockBytes)
 {
   Node::NodeConfig cfg;
   cfg.data_dir = "/tmp/x";
@@ -63,7 +63,7 @@ TEST(NodeConfig, ValidateRejectsTinyBlockBytes)
   EXPECT_THROW(Node::validateConfig(cfg), std::runtime_error);
 }
 
-TEST(NodeConfig, ValidateRejectsHugeBlockBytes)
+TEST(Node_Config, ValidateRejectsHugeBlockBytes)
 {
   Node::NodeConfig cfg;
   cfg.data_dir = "/tmp/x";
@@ -71,7 +71,7 @@ TEST(NodeConfig, ValidateRejectsHugeBlockBytes)
   EXPECT_THROW(Node::validateConfig(cfg), std::runtime_error);
 }
 
-TEST(NodeConfig, ValidateRejectsZeroMaxBlockTxs)
+TEST(Node_Config, ValidateRejectsZeroMaxBlockTxs)
 {
   Node::NodeConfig cfg;
   cfg.data_dir = "/tmp/x";
@@ -79,7 +79,7 @@ TEST(NodeConfig, ValidateRejectsZeroMaxBlockTxs)
   EXPECT_THROW(Node::validateConfig(cfg), std::runtime_error);
 }
 
-TEST(NodeConfig, ValidateRejectsTinyPollInterval)
+TEST(Node_Config, ValidateRejectsTinyPollInterval)
 {
   Node::NodeConfig cfg;
   cfg.data_dir = "/tmp/x";
@@ -87,7 +87,7 @@ TEST(NodeConfig, ValidateRejectsTinyPollInterval)
   EXPECT_THROW(Node::validateConfig(cfg), std::runtime_error);
 }
 
-TEST(NodeConfig, ValidateRejectsHugePollInterval)
+TEST(Node_Config, ValidateRejectsHugePollInterval)
 {
   Node::NodeConfig cfg;
   cfg.data_dir = "/tmp/x";
@@ -95,7 +95,7 @@ TEST(NodeConfig, ValidateRejectsHugePollInterval)
   EXPECT_THROW(Node::validateConfig(cfg), std::runtime_error);
 }
 
-TEST(NodeConfig, ValidateRejectsValidatorWithoutKey)
+TEST(Node_Config, ValidateRejectsValidatorWithoutKey)
 {
   Node::NodeConfig cfg;
   cfg.data_dir = "/tmp/x";
@@ -104,14 +104,14 @@ TEST(NodeConfig, ValidateRejectsValidatorWithoutKey)
   EXPECT_THROW(Node::validateConfig(cfg), std::runtime_error);
 }
 
-TEST(NodeConfig, ValidateAcceptsMinimalValidConfig)
+TEST(Node_Config, ValidateAcceptsMinimalValidConfig)
 {
   Node::NodeConfig cfg;
   cfg.data_dir = "/tmp/x";
   EXPECT_NO_THROW(Node::validateConfig(cfg));
 }
 
-TEST(NodeConfig, ValidateAcceptsValidatorWithKey)
+TEST(Node_Config, ValidateAcceptsValidatorWithKey)
 {
   Node::NodeConfig cfg;
   cfg.data_dir = "/tmp/x";
@@ -123,7 +123,7 @@ TEST(NodeConfig, ValidateAcceptsValidatorWithKey)
 
 //  Fixture smoke test
 
-TEST_F(NodeTestFixture, MakeValidConfigIsValid)
+TEST_F(Node_Fixture, MakeValidConfigIsValid)
 {
   Node::NodeConfig cfg = makeValidConfig();
   EXPECT_NO_THROW(Node::validateConfig(cfg));

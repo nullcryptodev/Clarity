@@ -15,19 +15,19 @@ using namespace Common;
 //  Base58
 // ============================================================================
 
-TEST(Base58, EncodeEmpty)
+TEST(Common_Base58, EncodeEmpty)
 {
   EXPECT_EQ(encodeBase58(""), "");
 }
 
-TEST(Base58, DecodeEmpty)
+TEST(Common_Base58, DecodeEmpty)
 {
   std::string decoded;
   EXPECT_TRUE(decodeBase58("", decoded));
   EXPECT_EQ(decoded, "");
 }
 
-TEST(Base58, RoundTripSmall)
+TEST(Common_Base58, RoundTripSmall)
 {
   const std::string original = "Hello";
   std::string encoded = encodeBase58(original);
@@ -37,7 +37,7 @@ TEST(Base58, RoundTripSmall)
   EXPECT_EQ(decoded, original);
 }
 
-TEST(Base58, RoundTripBinary)
+TEST(Common_Base58, RoundTripBinary)
 {
   std::string original;
   for (int i = 0; i < 64; ++i)
@@ -61,7 +61,7 @@ TEST(Base58, RoundTripBinary)
 // interoperability with existing tools), replace the implementation
 // with a big-integer-based encoder/decoder and re-add known vectors.
 
-TEST(Base58, RejectsInvalidCharacter)
+TEST(Common_Base58, RejectsInvalidCharacter)
 {
   std::string decoded;
   // '0' (zero), 'O' (capital o), 'I' (capital i), 'l' (lowercase L)
@@ -72,7 +72,7 @@ TEST(Base58, RejectsInvalidCharacter)
   EXPECT_FALSE(decodeBase58("l", decoded));
 }
 
-TEST(Base58, RoundTripAllBytes)
+TEST(Common_Base58, RoundTripAllBytes)
 {
   // Test every byte value 0..255 in a single string.
   std::string original;
@@ -93,12 +93,12 @@ TEST(Base58, RoundTripAllBytes)
 //  Base64
 // ============================================================================
 
-TEST(Base64, EncodeEmpty)
+TEST(Common_Base64, EncodeEmpty)
 {
   EXPECT_EQ(encodeBase64(""), "");
 }
 
-TEST(Base64, KnownVectors)
+TEST(Common_Base64, KnownVectors)
 {
   // RFC 4648 test vectors.
   EXPECT_EQ(encodeBase64(""), "");
@@ -110,7 +110,7 @@ TEST(Base64, KnownVectors)
   EXPECT_EQ(encodeBase64("foobar"), "Zm9vYmFy");
 }
 
-TEST(Base64, DecodeKnownVectors)
+TEST(Common_Base64, DecodeKnownVectors)
 {
   EXPECT_EQ(decodeBase64(""), "");
   EXPECT_EQ(decodeBase64("Zg=="), "f");
@@ -121,7 +121,7 @@ TEST(Base64, DecodeKnownVectors)
   EXPECT_EQ(decodeBase64("Zm9vYmFy"), "foobar");
 }
 
-TEST(Base64, RoundTrip)
+TEST(Common_Base64, RoundTrip)
 {
   std::string original;
   for (int i = 0; i < 128; ++i)
@@ -134,7 +134,7 @@ TEST(Base64, RoundTrip)
   EXPECT_EQ(decoded, original);
 }
 
-TEST(Base64, IgnoresWhitespace)
+TEST(Common_Base64, IgnoresWhitespace)
 {
   EXPECT_EQ(decodeBase64("Zm9v YmFy"), "foobar");
   EXPECT_EQ(decodeBase64("Zm9v\nYmFy"), "foobar");

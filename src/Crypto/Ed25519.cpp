@@ -122,6 +122,21 @@ namespace Crypto
   bool verify(const uint8_t *msg, size_t msgLen,
               const PublicKey &pk, const Signature &sig) noexcept
   {
+    // Reject null inputs. Monocypher's crypto_ed25519_check accepts
+    // the all-zero public key and all-zero signature as a valid pair
+    // on some encodings — the curve equation is trivially satisfied.
+    // That's a primitive-level footgun: any caller that trusts
+    // verify() without checking for null will accept an all-zero
+    // "signature."
+    //
+    // Test coverage: Crypto_Ed25519.RejectsNullPubkey and
+    // Crypto_Ed25519.RejectsNullSig. See also
+    // Node_AuthSignature.NullPubkeyRejectedByVerify, which pins the
+    // Node-level guard that would otherwise be redundant after this
+    // change.
+    if (pk.isNull() || sig.isNull())
+      return false;
+
     return crypto_ed25519_check(sig.data.data(),
                                 pk.data.data(),
                                 msg,

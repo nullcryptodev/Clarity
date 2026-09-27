@@ -17,8 +17,7 @@
 #include <boost/asio.hpp>
 #include <gtest/gtest.h>
 
-#include "Tests/Logger.h"
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 #include "Tests/Utils.h"
 
 #include "P2P/P2PManager.h"
@@ -30,7 +29,7 @@ using namespace std::chrono_literals;
 using namespace P2P;
 using namespace Tests;
 
-TEST_F(P2PManagerFixture, StartsAndListens)
+TEST_F(P2P_ManagerFixture, StartsAndListens)
 {
   uint16_t port = pickFreePort();
   ManagerHarness h(port, "listen");
@@ -51,7 +50,7 @@ TEST_F(P2PManagerFixture, StartsAndListens)
 //  2. StopsCleanly
 // =====================================================================
 
-TEST_F(P2PManagerFixture, StopsCleanly)
+TEST_F(P2P_ManagerFixture, StopsCleanly)
 {
   uint16_t port = pickFreePort();
   ManagerHarness h(port, "stop");
@@ -73,7 +72,7 @@ TEST_F(P2PManagerFixture, StopsCleanly)
 //  because onPeerConnected fires at TCP connect time.
 // =====================================================================
 
-TEST_F(P2PManagerFixture, TwoManagersHandshake)
+TEST_F(P2P_ManagerFixture, TwoManagersHandshake)
 {
   uint16_t port_a = pickFreePort();
   ManagerHarness a(port_a, "handshake_a");
@@ -97,7 +96,7 @@ TEST_F(P2PManagerFixture, TwoManagersHandshake)
 //  4. PeerCountReflectsConnections
 // =====================================================================
 
-TEST_F(P2PManagerFixture, PeerCountReflectsConnections)
+TEST_F(P2P_ManagerFixture, PeerCountReflectsConnections)
 {
   uint16_t port_a = pickFreePort();
   ManagerHarness a(port_a, "count_a");
@@ -121,7 +120,7 @@ TEST_F(P2PManagerFixture, PeerCountReflectsConnections)
 //  5. DisconnectFiresCallback
 // =====================================================================
 
-TEST_F(P2PManagerFixture, DisconnectFiresCallback)
+TEST_F(P2P_ManagerFixture, DisconnectFiresCallback)
 {
   uint16_t port_a = pickFreePort();
   ManagerHarness a(port_a, "disc_a");
@@ -151,7 +150,7 @@ TEST_F(P2PManagerFixture, DisconnectFiresCallback)
 //  re-arm, C never connects.
 // =====================================================================
 
-TEST_F(P2PManagerFixture, AcceptLoopRearms)
+TEST_F(P2P_ManagerFixture, AcceptLoopRearms)
 {
   uint16_t port_a = pickFreePort();
   ManagerHarness a(port_a, "rearm_a");
@@ -191,7 +190,7 @@ TEST_F(P2PManagerFixture, AcceptLoopRearms)
 //  exactly what we want.
 // =====================================================================
 
-TEST_F(P2PManagerFixture, TwoManagersExchangeMessage)
+TEST_F(P2P_ManagerFixture, TwoManagersExchangeMessage)
 {
   uint16_t port_a = pickFreePort();
   ManagerHarness a(port_a, "msg_a");
@@ -231,7 +230,7 @@ TEST_F(P2PManagerFixture, TwoManagersExchangeMessage)
 //  event, not on timing of which side closes first.
 // =====================================================================
 
-TEST_F(P2PManagerFixture, SelfConnectionIsRejected)
+TEST_F(P2P_ManagerFixture, SelfConnectionIsRejected)
 {
   uint16_t port = pickFreePort();
   ManagerHarness a(port, "self");

@@ -3,7 +3,7 @@
 
 #include <cstring>
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 #include "Tests/Types.h"
 
 #include "Serialization/BinarySerializer.h"
@@ -15,7 +15,7 @@ using namespace Tests;
 
 // Primitive Type Tests
 
-TEST_F(BinarySerializerTestFixture, UInt8)
+TEST_F(Serialization_BinarySerializerFixture, UInt8)
 {
   uint8_t original = 0xFF;
   uint8_t result = 0;
@@ -24,7 +24,7 @@ TEST_F(BinarySerializerTestFixture, UInt8)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, UInt16)
+TEST_F(Serialization_BinarySerializerFixture, UInt16)
 {
   uint16_t original = 0xFFFF;
   uint16_t result = 0;
@@ -33,7 +33,7 @@ TEST_F(BinarySerializerTestFixture, UInt16)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, UInt32)
+TEST_F(Serialization_BinarySerializerFixture, UInt32)
 {
   uint32_t original = 0xFFFFFFFF;
   uint32_t result = 0;
@@ -42,7 +42,7 @@ TEST_F(BinarySerializerTestFixture, UInt32)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, UInt64)
+TEST_F(Serialization_BinarySerializerFixture, UInt64)
 {
   uint64_t original = 0xFFFFFFFFFFFFFFFFULL;
   uint64_t result = 0;
@@ -51,7 +51,7 @@ TEST_F(BinarySerializerTestFixture, UInt64)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, Int8)
+TEST_F(Serialization_BinarySerializerFixture, Int8)
 {
   int8_t original = -128;
   int8_t result = 0;
@@ -60,7 +60,7 @@ TEST_F(BinarySerializerTestFixture, Int8)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, Int16)
+TEST_F(Serialization_BinarySerializerFixture, Int16)
 {
   int16_t original = -32768;
   int16_t result = 0;
@@ -69,7 +69,7 @@ TEST_F(BinarySerializerTestFixture, Int16)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, Int32)
+TEST_F(Serialization_BinarySerializerFixture, Int32)
 {
   int32_t original = -2147483647 - 1;
   int32_t result = 0;
@@ -78,7 +78,7 @@ TEST_F(BinarySerializerTestFixture, Int32)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, Int64)
+TEST_F(Serialization_BinarySerializerFixture, Int64)
 {
   int64_t original = -9223372036854775807LL - 1;
   int64_t result = 0;
@@ -87,7 +87,7 @@ TEST_F(BinarySerializerTestFixture, Int64)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, Bool)
+TEST_F(Serialization_BinarySerializerFixture, Bool)
 {
   bool original = true;
   bool result = false;
@@ -100,7 +100,7 @@ TEST_F(BinarySerializerTestFixture, Bool)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, String)
+TEST_F(Serialization_BinarySerializerFixture, String)
 {
   std::string original = "Hello, World!";
   std::string result;
@@ -109,7 +109,7 @@ TEST_F(BinarySerializerTestFixture, String)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, EmptyString)
+TEST_F(Serialization_BinarySerializerFixture, EmptyString)
 {
   std::string original;
   std::string result;
@@ -118,7 +118,7 @@ TEST_F(BinarySerializerTestFixture, EmptyString)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, StringWithSpecialChars)
+TEST_F(Serialization_BinarySerializerFixture, StringWithSpecialChars)
 {
   std::string original = "Hello\nWorld\tTest\0Embedded";
   std::string result;
@@ -129,7 +129,7 @@ TEST_F(BinarySerializerTestFixture, StringWithSpecialChars)
 
 // SimpleType Tests
 
-TEST_F(BinarySerializerTestFixture, SimpleType)
+TEST_F(Serialization_BinarySerializerFixture, SimpleType)
 {
   SimpleType original;
   original.u8 = 0x12;
@@ -150,7 +150,7 @@ TEST_F(BinarySerializerTestFixture, SimpleType)
 
 // Vector Tests
 
-TEST_F(BinarySerializerTestFixture, VectorInt)
+TEST_F(Serialization_BinarySerializerFixture, VectorInt)
 {
   std::vector<int32_t> original = {1, 2, 3, 4, 5, 10, 20, 30, 100, 200, 300};
   std::vector<int32_t> result;
@@ -159,7 +159,7 @@ TEST_F(BinarySerializerTestFixture, VectorInt)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, EmptyVector)
+TEST_F(Serialization_BinarySerializerFixture, EmptyVector)
 {
   std::vector<int32_t> original;
   std::vector<int32_t> result;
@@ -168,7 +168,7 @@ TEST_F(BinarySerializerTestFixture, EmptyVector)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, VectorString)
+TEST_F(Serialization_BinarySerializerFixture, VectorString)
 {
   std::vector<std::string> original = {"one", "two", "three", "four", "five"};
   std::vector<std::string> result;
@@ -177,7 +177,7 @@ TEST_F(BinarySerializerTestFixture, VectorString)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, VectorUInt8)
+TEST_F(Serialization_BinarySerializerFixture, VectorUInt8)
 {
   std::vector<uint8_t> original = {0x01, 0x02, 0x03, 0x04, 0xFF, 0xFE};
   std::vector<uint8_t> result;
@@ -188,7 +188,7 @@ TEST_F(BinarySerializerTestFixture, VectorUInt8)
 
 // Map Tests
 
-TEST_F(BinarySerializerTestFixture, MapStringToUInt)
+TEST_F(Serialization_BinarySerializerFixture, MapStringToUInt)
 {
   std::map<std::string, uint64_t> original = {
       {"one", 1},
@@ -202,7 +202,7 @@ TEST_F(BinarySerializerTestFixture, MapStringToUInt)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, EmptyMap)
+TEST_F(Serialization_BinarySerializerFixture, EmptyMap)
 {
   std::map<std::string, uint64_t> original;
   std::map<std::string, uint64_t> result;
@@ -213,7 +213,7 @@ TEST_F(BinarySerializerTestFixture, EmptyMap)
 
 // NestedType Tests
 
-TEST_F(BinarySerializerTestFixture, NestedType)
+TEST_F(Serialization_BinarySerializerFixture, NestedType)
 {
   NestedType original;
   original.simple.u8 = 0x42;
@@ -236,7 +236,7 @@ TEST_F(BinarySerializerTestFixture, NestedType)
 
 // BinaryType Tests
 
-TEST_F(BinarySerializerTestFixture, BinaryType)
+TEST_F(Serialization_BinarySerializerFixture, BinaryType)
 {
   BinaryType original;
   original.data = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
@@ -250,7 +250,7 @@ TEST_F(BinarySerializerTestFixture, BinaryType)
 
 // EnumType Tests
 
-TEST_F(BinarySerializerTestFixture, EnumType)
+TEST_F(Serialization_BinarySerializerFixture, EnumType)
 {
   EnumType original;
   original.value = TestEnum::Two;
@@ -263,7 +263,7 @@ TEST_F(BinarySerializerTestFixture, EnumType)
 
 // Varint Tests (edge cases)
 
-TEST_F(BinarySerializerTestFixture, VarintSmall)
+TEST_F(Serialization_BinarySerializerFixture, VarintSmall)
 {
   uint64_t original = 0x00;
   uint64_t result = 0;
@@ -279,7 +279,7 @@ TEST_F(BinarySerializerTestFixture, VarintSmall)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, VarintMedium)
+TEST_F(Serialization_BinarySerializerFixture, VarintMedium)
 {
   uint64_t original = 0x80;
   uint64_t result = 0;
@@ -295,7 +295,7 @@ TEST_F(BinarySerializerTestFixture, VarintMedium)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, VarintLarge)
+TEST_F(Serialization_BinarySerializerFixture, VarintLarge)
 {
   uint64_t original = 0xFFFFFFFFFFFFFFFFULL;
   uint64_t result = 0;
@@ -305,7 +305,7 @@ TEST_F(BinarySerializerTestFixture, VarintLarge)
 
 // Negative Number Tests
 
-TEST_F(BinarySerializerTestFixture, NegativeInt32)
+TEST_F(Serialization_BinarySerializerFixture, NegativeInt32)
 {
   int32_t original = -1;
   int32_t result = 0;
@@ -317,7 +317,7 @@ TEST_F(BinarySerializerTestFixture, NegativeInt32)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, NegativeInt64)
+TEST_F(Serialization_BinarySerializerFixture, NegativeInt64)
 {
   int64_t original = -1;
   int64_t result = 0;
@@ -331,7 +331,7 @@ TEST_F(BinarySerializerTestFixture, NegativeInt64)
 
 // Large Array Tests
 
-TEST_F(BinarySerializerTestFixture, LargeVector)
+TEST_F(Serialization_BinarySerializerFixture, LargeVector)
 {
   std::vector<int32_t> original;
   for (int i = 0; i < 1000; ++i)
@@ -344,7 +344,7 @@ TEST_F(BinarySerializerTestFixture, LargeVector)
   EXPECT_EQ(original, result);
 }
 
-TEST_F(BinarySerializerTestFixture, LargeString)
+TEST_F(Serialization_BinarySerializerFixture, LargeString)
 {
   std::string original;
   for (int i = 0; i < 10000; ++i)

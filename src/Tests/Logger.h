@@ -2,18 +2,20 @@
 
 #include "Logging/ILogger.h"
 
+#include <iostream>
+
 namespace Tests
 {
   class NoopLogger : public Logging::ILogger
   {
   public:
     void operator()(const std::string & /*category*/,
-                    Logging::Level /*level*/,
-                    boost::posix_time::ptime /*time*/,
-                    const std::string & /*body*/) override
+                    Logging::Level level,
+                    boost::posix_time::ptime time,
+                    const std::string &body) override
     {
       // debug logs for testing:
-      // std::cerr << level << " - " << body << std::endl;
+      std::cerr << time << " - " << level << " - " << body << std::endl;
     }
 
     Logging::Level getLevel() const override

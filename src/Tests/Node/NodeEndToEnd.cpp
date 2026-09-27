@@ -17,7 +17,7 @@
 
 #include <boost/asio.hpp>
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 #include "Tests/Utils.h"
 #include "Node/Node.h"
 
@@ -40,7 +40,7 @@ using namespace Tests;
 
 // In-process consensus tests
 
-TEST_F(NodeEndToEndFixture, TwoNodesCommitOneBlock)
+TEST_F(Node_EndToEndFixture, TwoNodesCommitOneBlock)
 {
   makeValidators(2);
   startNodes();
@@ -69,7 +69,7 @@ TEST_F(NodeEndToEndFixture, TwoNodesCommitOneBlock)
   stopNodes();
 }
 
-TEST_F(NodeEndToEndFixture, RestartPreservesChainAfterBlock)
+TEST_F(Node_EndToEndFixture, RestartPreservesChainAfterBlock)
 {
   makeValidators(2);
 
@@ -103,7 +103,7 @@ TEST_F(NodeEndToEndFixture, RestartPreservesChainAfterBlock)
   stopNodes();
 }
 
-TEST_F(NodeEndToEndFixture, FourValidatorsOneOfflineReachesQuorum)
+TEST_F(Node_EndToEndFixture, FourValidatorsOneOfflineReachesQuorum)
 {
   makeValidators(4);
   startNodes();
@@ -138,7 +138,7 @@ TEST_F(NodeEndToEndFixture, FourValidatorsOneOfflineReachesQuorum)
   stopNodes();
 }
 
-TEST_F(NodeEndToEndFixture, FourValidatorsTwoOfflineNoCommit)
+TEST_F(Node_EndToEndFixture, FourValidatorsTwoOfflineNoCommit)
 {
   makeValidators(4);
   startNodes();
@@ -162,7 +162,7 @@ TEST_F(NodeEndToEndFixture, FourValidatorsTwoOfflineNoCommit)
 
 // Mempool-to-block tests
 
-TEST_F(NodeEndToEndFixture, SubmittedTransactionLandsInBlock)
+TEST_F(Node_EndToEndFixture, SubmittedTransactionLandsInBlock)
 {
   makeValidators(2);
   startNodes();
@@ -181,11 +181,15 @@ TEST_F(NodeEndToEndFixture, SubmittedTransactionLandsInBlock)
       alice, bob_addr, /*amount=*/100, /*fee=*/500, /*nonce=*/0);
 
   std::string error;
-  ASSERT_TRUE(nodes_[0]->submitTransaction(tx, error)) << error;
+  ASSERT_EQ(nodes_[0]->submitTransaction(tx, error),
+            Core::MempoolAddResult::Accepted)
+      << error;
 
   ASSERT_EQ(NodeTestAccess::mempool(*nodes_[0]).size(), 1u);
 
-  ASSERT_TRUE(nodes_[1]->submitTransaction(tx, error)) << error;
+  ASSERT_EQ(nodes_[1]->submitTransaction(tx, error),
+            Core::MempoolAddResult::Accepted)
+      << error;
 
   startAllConsensus(1);
   deliverAll();
@@ -217,7 +221,7 @@ TEST_F(NodeEndToEndFixture, SubmittedTransactionLandsInBlock)
   stopNodes();
 }
 
-TEST_F(NodeEndToEndFixture, CommittedTransactionNotReincluded)
+TEST_F(Node_EndToEndFixture, CommittedTransactionNotReincluded)
 {
   makeValidators(2);
   startNodes();
@@ -229,8 +233,12 @@ TEST_F(NodeEndToEndFixture, CommittedTransactionNotReincluded)
       alice, addressOf(bob), /*amount=*/100, /*fee=*/500, /*nonce=*/0);
 
   std::string error;
-  ASSERT_TRUE(nodes_[0]->submitTransaction(tx, error)) << error;
-  ASSERT_TRUE(nodes_[1]->submitTransaction(tx, error)) << error;
+  ASSERT_EQ(nodes_[0]->submitTransaction(tx, error),
+            Core::MempoolAddResult::Accepted)
+      << error;
+  ASSERT_EQ(nodes_[1]->submitTransaction(tx, error),
+            Core::MempoolAddResult::Accepted)
+      << error;
 
   startAllConsensus(1);
   deliverAll();
@@ -244,8 +252,13 @@ TEST_F(NodeEndToEndFixture, CommittedTransactionNotReincluded)
   ASSERT_EQ(NodeTestAccess::mempool(*nodes_[0]).size(), 0u);
   ASSERT_EQ(NodeTestAccess::mempool(*nodes_[1]).size(), 0u);
 
-  bool resubmitted = nodes_[0]->submitTransaction(tx, error);
-  EXPECT_FALSE(resubmitted) << "nonce-reused tx should be rejected";
+  // Resubmit. The tx is now confirmed; the sender's nonce is 1, so a
+  // tx with nonce 0 is below the account's next-expected nonce and
+  // must be rejected with NonceTooLow.
+  Core::MempoolAddResult resubmitted =
+      nodes_[0]->submitTransaction(tx, error);
+  EXPECT_EQ(resubmitted, Core::MempoolAddResult::Rejected_NonceTooLow)
+      << "expected NonceTooLow, got " << Core::mempoolAddResultName(resubmitted);
   EXPECT_FALSE(error.empty());
 
   stopNodes();
@@ -253,7 +266,7 @@ TEST_F(NodeEndToEndFixture, CommittedTransactionNotReincluded)
 
 // StateView lifetime
 
-TEST_F(NodeEndToEndFixture, StateViewLifetimeIsIndependent)
+TEST_F(Node_EndToEndFixture, StateViewLifetimeIsIndependent)
 {
   makeValidators(2);
   startNodes();
@@ -278,7 +291,7 @@ TEST_F(NodeEndToEndFixture, StateViewLifetimeIsIndependent)
 
 // State and chain head atomicity
 
-TEST_F(NodeEndToEndFixture, StateAndChainHeadAgreeAfterCommit)
+TEST_F(Node_EndToEndFixture, StateAndChainHeadAgreeAfterCommit)
 {
   makeValidators(2);
   startNodes();
@@ -317,7 +330,7 @@ TEST_F(NodeEndToEndFixture, StateAndChainHeadAgreeAfterCommit)
 
 // Consensus resume after restart
 
-TEST_F(NodeEndToEndFixture, ConsensusResumesAfterRestart)
+TEST_F(Node_EndToEndFixture, ConsensusResumesAfterRestart)
 {
   makeValidators(2);
 
@@ -374,7 +387,7 @@ TEST_F(NodeEndToEndFixture, ConsensusResumesAfterRestart)
 
 // Crash injection
 
-TEST_F(NodeEndToEndFixture, InjectionInsideTxnLeavesNothingPersisted)
+TEST_F(Node_EndToEndFixture, InjectionInsideTxnLeavesNothingPersisted)
 {
   makeValidators(2);
   startNodes();
@@ -418,7 +431,7 @@ TEST_F(NodeEndToEndFixture, InjectionInsideTxnLeavesNothingPersisted)
 
 // Real P2P consensus
 
-TEST_F(NodeEndToEndFixture, ConsensusOverRealP2P)
+TEST_F(Node_EndToEndFixture, ConsensusOverRealP2P)
 {
   makeValidators(2);
 

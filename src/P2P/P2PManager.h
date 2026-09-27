@@ -20,6 +20,9 @@
 #include "Peer.h"
 #include "PeerTable.h"
 #include "WorkerPool.h"
+#include "AuthMessage.h"
+
+#include "Crypto/Types.h"
 
 namespace Logging
 {
@@ -162,6 +165,78 @@ namespace P2P
     };
 
     Snapshot snapshot() const;
+
+    // Per-peer snapshot for RPC introspection. Aggregated by
+    // peerList(). Fields are copied out of the Peer at the moment of
+    // the call and are not kept in sync afterward.
+    struct PeerInfo
+    {
+      PeerId id{INVALID_PEER_ID};
+      std::string ip;
+      uint16_t port{0};
+      bool inbound{false};
+      std::string state; // "connecting", "handshaking", "established", "closing"
+      uint64_t best_height{0};
+      uint64_t validator_id{0};
+      std::string agent; // agent string from the version handshake
+      uint64_t connected_at_ms{0};
+      uint64_t last_recv_ms{0};
+      uint64_t last_send_ms{0};
+      uint32_t misbehaviors{0};
+    };
+
+    // Snapshot of every currently known peer. Thread-safety: this
+    // schedules a read on the event loop and waits for the result. It
+    // must not be called from the event loop thread itself (that
+    // would deadlock). RPC handlers run on RPC worker threads, which
+    // satisfies the constraint.
+    //
+    // Returns an empty vector if the manager is stopping or the
+    // event loop has exited.
+    std::vector<PeerInfo> peerList();
+
+    // ------------------------------------------------------------------
+    //  Authentication (set by the node before start())
+    //
+    //  Peer authentication is a signed challenge/response exchange that
+    //  runs after Verack and before Established. The manager doesn't
+    //  know the node's key or the validator index — it just forwards
+    //  these callbacks to each Peer at creation time. See AuthMessage.h
+    //  for the protocol.
+    // ------------------------------------------------------------------
+
+    // Builds this node's Auth message for a peer. Called once per peer,
+    // on the event loop thread, when the peer enters AuthPending.
+    std::function<AuthMessage(Peer &)> buildAuthMessage;
+
+    // Verifies a peer's Auth message. Returns true if the signature is
+    // valid and the pubkey is acceptable. On success, outValidatorId is
+    // set to the validator ID bound to this pubkey, or 0 if the peer is
+    // authenticated but not a validator. Called on the event loop thread.
+    std::function<bool(Peer &, const AuthMessage &, uint64_t &outValidatorId)>
+        verifyAuth;
+
+    // Fired when a peer completes the full handshake — TCP, Version,
+    // Verack, and Auth. At this point the peer has a verified identity
+    // and can exchange application messages. `info` carries the
+    // identity data the node needs to decide what to do with the peer
+    // (create a SyncManager, associate the peer with a validator ID,
+    // report it via RPC).
+    struct PeerEstablishedInfo
+    {
+      PeerId id{INVALID_PEER_ID};
+      uint64_t best_height{0};
+      uint64_t validator_id{0}; // 0 for an authenticated non-validator
+      std::string agent;
+      Crypto::PublicKey pubkey;
+    };
+    std::function<void(const PeerEstablishedInfo &)> onPeerEstablished;
+
+    // Returns the node's current chain height. Called when building the
+    // Version message for a new peer. If unset, the height defaults to 0.
+    std::function<uint64_t()> getChainHeight;
+
+    boost::asio::io_context::executor_type executor() noexcept { return io_.get_executor(); }
 
   private:
     // ------------------------------------------------------------------

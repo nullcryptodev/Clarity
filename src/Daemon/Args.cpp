@@ -242,6 +242,43 @@ namespace Daemon
         continue;
       }
 
+      // ---- RPC ----
+      if (arg == "--rpc")
+      {
+        args.rpc.enabled = true;
+        continue;
+      }
+      if (arg == "--no-rpc")
+      {
+        args.rpc.enabled = false;
+        continue;
+      }
+      if (arg == "--rpc-bind")
+      {
+        args.rpc.bind_address = next();
+        continue;
+      }
+      if (arg == "--rpc-port")
+      {
+        args.rpc.port = static_cast<uint16_t>(parseU64(next()));
+        continue;
+      }
+      if (arg == "--rpc-workers")
+      {
+        args.rpc.worker_threads = static_cast<uint32_t>(parseU64(next()));
+        continue;
+      }
+      if (arg == "--rpc-admin-token")
+      {
+        args.rpc.admin_token = next();
+        continue;
+      }
+      if (arg == "--rpc-verbose-errors")
+      {
+        args.rpc.verbose_errors = true;
+        continue;
+      }
+
       // ---- Diagnostics ----
       if (arg == "--print-config")
       {
@@ -284,6 +321,15 @@ namespace Daemon
         << "  --max-block-txs <count>    Max txs per block (default: 5000)\n"
         << "  --consensus-poll-ms <ms>   Consensus timer poll (default: 100)\n"
         << "\n"
+        << "RPC:\n"
+        << "  --rpc                      Enable the RPC server (default: on)\n"
+        << "  --no-rpc                   Disable the RPC server entirely\n"
+        << "  --rpc-bind <addr>          Bind address (default: 127.0.0.1)\n"
+        << "  --rpc-port <port>          Listen port (default: 9633; 0 = auto)\n"
+        << "  --rpc-workers <n>          Worker threads; 0 = auto (default: 4)\n"
+        << "  --rpc-admin-token <hex>    Admin bearer token (>=16 chars)\n"
+        << "  --rpc-verbose-errors       Include internal error text in responses\n"
+        << "\n"
         << "Logging:\n"
         << "  --log-level <level>        trace|debug|info|warn|error (default: info)\n"
         << "  --log-file <path>          Write logs to file (default: stderr)\n"
@@ -306,6 +352,7 @@ namespace Daemon
   void printConfig(const Args &args)
   {
     const auto &n = args.node;
+    const auto &r = args.rpc;
 
     std::cout << "Resolved configuration:\n";
     std::cout << "  network:              " << Node::networkName(n.network) << "\n";
@@ -330,6 +377,22 @@ namespace Daemon
     std::cout << "  consensus_poll_ms:    " << n.consensus_poll_ms << "\n";
     std::cout << "  apply_genesis:        "
               << (n.apply_genesis_on_start ? "yes" : "no") << "\n";
+
+    std::cout << "  rpc_enabled:          "
+              << (r.enabled ? "yes" : "no") << "\n";
+    if (r.enabled)
+    {
+      std::cout << "  rpc_bind:             " << r.bind_address << "\n";
+      std::cout << "  rpc_port:             " << r.port
+                << (r.port == 0 ? " (auto)" : "") << "\n";
+      std::cout << "  rpc_workers:          " << r.worker_threads
+                << (r.worker_threads == 0 ? " (auto)" : "") << "\n";
+      std::cout << "  rpc_admin_token:      "
+                << (r.admin_token.empty() ? "(none)" : "(set)") << "\n";
+      std::cout << "  rpc_verbose_errors:   "
+                << (r.verbose_errors ? "yes" : "no") << "\n";
+    }
+
     std::cout << "  log_level:            " << args.log_level << "\n";
     std::cout << "  log_file:             "
               << (args.log_file.empty() ? "(stderr)" : args.log_file) << "\n";

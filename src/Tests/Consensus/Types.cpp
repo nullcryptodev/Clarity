@@ -9,11 +9,7 @@
 
 using namespace Consensus;
 
-// ============================================================================
-//  stepName
-// ============================================================================
-
-TEST(ConsensusTypes, StepNames)
+TEST(Consensus_Types, StepNames)
 {
   EXPECT_STREQ(stepName(Step::NewHeight), "new-height");
   EXPECT_STREQ(stepName(Step::Propose), "propose");
@@ -22,7 +18,7 @@ TEST(ConsensusTypes, StepNames)
   EXPECT_STREQ(stepName(Step::Commit), "commit");
 }
 
-TEST(ConsensusTypes, StepNameUnknownReturnsString)
+TEST(Consensus_Types, StepNameUnknownReturnsString)
 {
   // Casting an arbitrary byte to Step and querying stepName must not
   // crash and must return a sentinel string.
@@ -32,18 +28,14 @@ TEST(ConsensusTypes, StepNameUnknownReturnsString)
   EXPECT_STREQ(name, "unknown");
 }
 
-// ============================================================================
-//  Vote::isValid
-// ============================================================================
-
-TEST(ConsensusTypes, DefaultVoteIsInvalid)
+TEST(Consensus_Types, DefaultVoteIsInvalid)
 {
   Vote v;
   EXPECT_FALSE(v.isValid());
   EXPECT_EQ(v.signer_index, INVALID_INDEX);
 }
 
-TEST(ConsensusTypes, VoteWithSignerAndSignatureIsValid)
+TEST(Consensus_Types, VoteWithSignerAndSignatureIsValid)
 {
   Vote v;
   v.signer_index = 3;
@@ -53,24 +45,20 @@ TEST(ConsensusTypes, VoteWithSignerAndSignatureIsValid)
   EXPECT_TRUE(v.isValid());
 }
 
-TEST(ConsensusTypes, VoteWithSignerButNoSignatureIsInvalid)
+TEST(Consensus_Types, VoteWithSignerButNoSignatureIsInvalid)
 {
   Vote v;
   v.signer_index = 3;
   EXPECT_FALSE(v.isValid());
 }
 
-// ============================================================================
-//  Proposal::isValid
-// ============================================================================
-
-TEST(ConsensusTypes, DefaultProposalIsInvalid)
+TEST(Consensus_Types, DefaultProposalIsInvalid)
 {
   Proposal p;
   EXPECT_FALSE(p.isValid());
 }
 
-TEST(ConsensusTypes, ProposalRequiresAllFields)
+TEST(Consensus_Types, ProposalRequiresAllFields)
 {
   Proposal p;
   p.signer_index = 1;
@@ -105,11 +93,7 @@ TEST(ConsensusTypes, ProposalRequiresAllFields)
   }
 }
 
-// ============================================================================
-//  Quorum
-// ============================================================================
-
-TEST(ConsensusTypes, QuorumCountMatchesVotes)
+TEST(Consensus_Types, QuorumCountMatchesVotes)
 {
   Quorum q;
   EXPECT_EQ(q.count(), 0u);

@@ -79,7 +79,7 @@ namespace Core
     result.block_hash = block.hash();
 
     std::string error;
-    if (!checkHeader(block, ctx, error))
+    if (!checkHeader(block, ctx, error)) // handles dry_run internally
     {
       result.error = error;
       return result;
@@ -199,7 +199,12 @@ namespace Core
                                    const BlockContext &ctx,
                                    std::string &error)
   {
-    if (!block.header.isWellFormed())
+    // Header well-formedness is a consensus-layer check for finalized
+    // blocks. During a dry run, the block's state_root and quorum
+    // signatures may not yet be populated. Skip the check during dry
+    // runs; the caller that submitted the block for real application
+    // will hit it and reject if the block is malformed.
+    if (!ctx.dry_run && !block.header.isWellFormed())
     {
       error = "block header not well-formed";
       return false;

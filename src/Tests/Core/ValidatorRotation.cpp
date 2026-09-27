@@ -16,7 +16,7 @@
 using namespace Core;
 using namespace Tests;
 
-TEST(BftQuorum, KnownValues)
+TEST(Core_BftQuorum, KnownValues)
 {
   EXPECT_EQ(bftQuorum(4), 3u);
   EXPECT_EQ(bftQuorum(7), 5u);
@@ -25,18 +25,18 @@ TEST(BftQuorum, KnownValues)
   EXPECT_EQ(bftQuorum(100), 67u);
 }
 
-TEST(RotationCount, ZeroSizeReturnsZero)
+TEST(Core_RotationCount, ZeroSizeReturnsZero)
 {
   EXPECT_EQ(computeRotationCount(0), 0u);
 }
 
-TEST(RotationCount, PositiveForNonEmpty)
+TEST(Core_RotationCount, PositiveForNonEmpty)
 {
   EXPECT_GE(computeRotationCount(21), 1u);
   EXPECT_GE(computeRotationCount(100), 1u);
 }
 
-TEST(RotationCount, NeverExceedsBftSafety)
+TEST(Core_RotationCount, NeverExceedsBftSafety)
 {
   for (uint64_t n : {11u, 21u, 50u, 100u})
   {
@@ -46,24 +46,24 @@ TEST(RotationCount, NeverExceedsBftSafety)
   }
 }
 
-TEST(TargetSize, ZeroTraffic)
+TEST(Core_TargetSize, ZeroTraffic)
 {
   EXPECT_EQ(computeTargetActiveSetSize(0), ACTIVE_SET_MIN);
 }
 
-TEST(TargetSize, SaturationTraffic)
+TEST(Core_TargetSize, SaturationTraffic)
 {
   EXPECT_EQ(computeTargetActiveSetSize(TRAFFIC_SATURATION_TX),
             ACTIVE_SET_MAX);
 }
 
-TEST(TargetSize, OverSaturation)
+TEST(Core_TargetSize, OverSaturation)
 {
   EXPECT_EQ(computeTargetActiveSetSize(TRAFFIC_SATURATION_TX * 10),
             ACTIVE_SET_MAX);
 }
 
-TEST(TargetSize, WithinBounds)
+TEST(Core_TargetSize, WithinBounds)
 {
   for (uint64_t traffic : {0u, 1u, 100u, 500u, 999u, 1000u, 5000u})
   {
@@ -75,7 +75,7 @@ TEST(TargetSize, WithinBounds)
 
 // planRotation, same-size rotation
 
-TEST(PlanRotation, SameSizeLowestUptimeRemoved)
+TEST(Core_PlanRotation, SameSizeLowestUptimeRemoved)
 {
   RotationBuilder b(30, 21);
 
@@ -106,7 +106,7 @@ TEST(PlanRotation, SameSizeLowestUptimeRemoved)
       << "lowest-uptime validator not scheduled for removal";
 }
 
-TEST(PlanRotation, HighestUptimeCandidatesAdded)
+TEST(Core_PlanRotation, HighestUptimeCandidatesAdded)
 {
   RotationBuilder b(30, 21);
   for (Id id = 22; id <= 30; ++id)
@@ -127,7 +127,7 @@ TEST(PlanRotation, HighestUptimeCandidatesAdded)
   EXPECT_EQ(plan.to_add[0], 25u);
 }
 
-TEST(PlanRotation, SeedsNeverRemoved)
+TEST(Core_PlanRotation, SeedsNeverRemoved)
 {
   RotationBuilder b(30, 21);
 
@@ -142,7 +142,7 @@ TEST(PlanRotation, SeedsNeverRemoved)
       << "seed validator was scheduled for removal";
 }
 
-TEST(PlanRotation, GrowSet)
+TEST(Core_PlanRotation, GrowSet)
 {
   // 10 active, 20 in pool. Traffic high enough that target > 10.
   RotationBuilder b(30, 10);
@@ -156,7 +156,7 @@ TEST(PlanRotation, GrowSet)
   EXPECT_EQ(plan.to_remove.size(), 0u);
 }
 
-TEST(PlanRotation, ShrinkSet)
+TEST(Core_PlanRotation, ShrinkSet)
 {
   // 50 active, low traffic.
   RotationBuilder b(50, 50);
@@ -169,7 +169,7 @@ TEST(PlanRotation, ShrinkSet)
   EXPECT_EQ(plan.to_add.size(), 0u);
 }
 
-TEST(PlanRotation, EmptyRegistry)
+TEST(Core_PlanRotation, EmptyRegistry)
 {
   ValidatorRegistry empty;
   auto plan = planRotation(empty, 500);
@@ -178,7 +178,7 @@ TEST(PlanRotation, EmptyRegistry)
   EXPECT_TRUE(plan.to_add.empty());
 }
 
-TEST(PlanRotation, InsufficientCandidates)
+TEST(Core_PlanRotation, InsufficientCandidates)
 {
   // 30 active, need to grow but no pool candidates.
   RotationBuilder b(30, 30);
@@ -190,7 +190,7 @@ TEST(PlanRotation, InsufficientCandidates)
   EXPECT_EQ(plan.to_add.size(), 0u);
 }
 
-TEST(ApplyRotation, RemovesFromActiveSet)
+TEST(Core_ApplyRotation, RemovesFromActiveSet)
 {
   RotationBuilder b(30, 21);
 
@@ -207,7 +207,7 @@ TEST(ApplyRotation, RemovesFromActiveSet)
   EXPECT_FALSE(b.reg.isActive(15));
 }
 
-TEST(ApplyRotation, AddsToActiveSet)
+TEST(Core_ApplyRotation, AddsToActiveSet)
 {
   RotationBuilder b(30, 10);
 
@@ -224,7 +224,7 @@ TEST(ApplyRotation, AddsToActiveSet)
   EXPECT_TRUE(b.reg.isActive(13));
 }
 
-TEST(ApplyRotation, UpdatesFlags)
+TEST(Core_ApplyRotation, UpdatesFlags)
 {
   RotationBuilder b(30, 21);
 
@@ -247,7 +247,7 @@ TEST(ApplyRotation, UpdatesFlags)
   }
 }
 
-TEST(ApplyRotation, PreservesTargetSize)
+TEST(Core_ApplyRotation, PreservesTargetSize)
 {
   RotationBuilder b(30, 21);
 
@@ -260,7 +260,7 @@ TEST(ApplyRotation, PreservesTargetSize)
   EXPECT_EQ(b.reg.last_rotation_height, 100u);
 }
 
-TEST(ApplyRotation, ActiveSetSortedAfter)
+TEST(Core_ApplyRotation, ActiveSetSortedAfter)
 {
   RotationBuilder b(30, 21);
 
@@ -278,7 +278,7 @@ TEST(ApplyRotation, ActiveSetSortedAfter)
   EXPECT_EQ(set, sorted);
 }
 
-TEST(OfflineRemoval, NoOpWhenAllOnline)
+TEST(Core_OfflineRemoval, NoOpWhenAllOnline)
 {
   RotationBuilder b(30, 21);
 
@@ -294,7 +294,7 @@ TEST(OfflineRemoval, NoOpWhenAllOnline)
   EXPECT_TRUE(plan.promoted.empty());
 }
 
-TEST(OfflineRemoval, IdentifiesOffline)
+TEST(Core_OfflineRemoval, IdentifiesOffline)
 {
   RotationBuilder b(30, 21);
 
@@ -311,7 +311,7 @@ TEST(OfflineRemoval, IdentifiesOffline)
   EXPECT_NE(it, plan.removed.end());
 }
 
-TEST(OfflineRemoval, IgnoresOnline)
+TEST(Core_OfflineRemoval, IgnoresOnline)
 {
   RotationBuilder b(30, 21);
 
@@ -328,7 +328,7 @@ TEST(OfflineRemoval, IgnoresOnline)
   }
 }
 
-TEST(OfflineRemoval, ProtectsSeeds)
+TEST(Core_OfflineRemoval, ProtectsSeeds)
 {
   RotationBuilder b(30, 21);
 
@@ -346,7 +346,7 @@ TEST(OfflineRemoval, ProtectsSeeds)
   EXPECT_EQ(it, plan.removed.end());
 }
 
-TEST(OfflineRemoval, PromotesFromPool)
+TEST(Core_OfflineRemoval, PromotesFromPool)
 {
   RotationBuilder b(30, 21);
 
@@ -364,7 +364,7 @@ TEST(OfflineRemoval, PromotesFromPool)
   EXPECT_EQ(plan.promoted.size(), 1u);
 }
 
-TEST(OfflineRemoval, EmptyPool)
+TEST(Core_OfflineRemoval, EmptyPool)
 {
   // All 21 active, no waiting pool.
   RotationBuilder b(21, 21);
@@ -381,7 +381,7 @@ TEST(OfflineRemoval, EmptyPool)
   EXPECT_TRUE(plan.promoted.empty());
 }
 
-TEST(OfflineRemoval, SkipsUnhealthyCandidates)
+TEST(Core_OfflineRemoval, SkipsUnhealthyCandidates)
 {
   RotationBuilder b(30, 21);
 
@@ -403,7 +403,7 @@ TEST(OfflineRemoval, SkipsUnhealthyCandidates)
   EXPECT_TRUE(plan.promoted.empty());
 }
 
-TEST(ApplyOfflineRemoval, RemovesFromActiveSet)
+TEST(Core_ApplyOfflineRemoval, RemovesFromActiveSet)
 {
   RotationBuilder b(30, 21);
 
@@ -422,7 +422,7 @@ TEST(ApplyOfflineRemoval, RemovesFromActiveSet)
   EXPECT_TRUE(b.reg.isActive(23));
 }
 
-TEST(ApplyOfflineRemoval, ShrinksWhenNoPromotions)
+TEST(Core_ApplyOfflineRemoval, ShrinksWhenNoPromotions)
 {
   RotationBuilder b(21, 21);
 
@@ -435,41 +435,41 @@ TEST(ApplyOfflineRemoval, ShrinksWhenNoPromotions)
   EXPECT_EQ(b.reg.active_set.size(), 19u);
 }
 
-TEST(UptimeScore, NoPingsLeavesUnchanged)
+TEST(Core_UptimeScore, NoPingsLeavesUnchanged)
 {
   uint16_t score = 5000;
   EXPECT_EQ(updateUptimeScore(score, 0, 0), score);
 }
 
-TEST(UptimeScore, PerfectUptimeIncreases)
+TEST(Core_UptimeScore, PerfectUptimeIncreases)
 {
   // Start below 10000, converge upward.
   uint16_t result = updateUptimeScore(5000, 100, 100);
   EXPECT_GT(result, 5000);
 }
 
-TEST(UptimeScore, ZeroUptimeDecreases)
+TEST(Core_UptimeScore, ZeroUptimeDecreases)
 {
   // Start high, converge downward.
   uint16_t result = updateUptimeScore(9000, 0, 100);
   EXPECT_LT(result, 9000);
 }
 
-TEST(UptimeScore, ClampedAtMax)
+TEST(Core_UptimeScore, ClampedAtMax)
 {
   // Even with impossible input, never above 10000.
   uint16_t result = updateUptimeScore(10000, 200, 100);
   EXPECT_LE(result, 10000);
 }
 
-TEST(UptimeScore, EMASmoothing)
+TEST(Core_UptimeScore, EMASmoothing)
 {
   // Starting from 10000, a single bad epoch of 0% should not drop to 0.
   uint16_t result = updateUptimeScore(10000, 0, 100);
   EXPECT_GT(result, 7000); // EMA smooths over one epoch
 }
 
-TEST(Infraction, FullMultiplierReduced)
+TEST(Core_Infraction, FullMultiplierReduced)
 {
   ValidatorInfo v;
   v.reward_multiplier = REWARD_MULTIPLIER_START;
@@ -483,7 +483,7 @@ TEST(Infraction, FullMultiplierReduced)
   EXPECT_EQ(v.last_infraction_height, 100u);
 }
 
-TEST(Infraction, ConvergesToFloor)
+TEST(Core_Infraction, ConvergesToFloor)
 {
   ValidatorInfo v;
   v.reward_multiplier = REWARD_MULTIPLIER_FLOOR + 500;
@@ -493,7 +493,7 @@ TEST(Infraction, ConvergesToFloor)
   EXPECT_EQ(v.reward_multiplier, REWARD_MULTIPLIER_FLOOR);
 }
 
-TEST(Infraction, AtFloorStaysAtFloor)
+TEST(Core_Infraction, AtFloorStaysAtFloor)
 {
   ValidatorInfo v;
   v.reward_multiplier = REWARD_MULTIPLIER_FLOOR;
@@ -506,7 +506,7 @@ TEST(Infraction, AtFloorStaysAtFloor)
   EXPECT_EQ(v.infraction_count, 1u);
 }
 
-TEST(Infraction, MultipleStack)
+TEST(Core_Infraction, MultipleStack)
 {
   ValidatorInfo v;
   v.reward_multiplier = 10'000;
@@ -530,7 +530,7 @@ TEST(Infraction, MultipleStack)
   EXPECT_EQ(v.infraction_count, 5u);
 }
 
-TEST(Unhealthy, IdentifiesBelowThreshold)
+TEST(Core_Unhealthy, IdentifiesBelowThreshold)
 {
   RotationBuilder b(10, 5);
   b.setUptime(3, UPTIME_REMOVAL_THRESHOLD_BPS - 1);
@@ -541,7 +541,7 @@ TEST(Unhealthy, IdentifiesBelowThreshold)
   EXPECT_NE(it, result.end());
 }
 
-TEST(Unhealthy, IgnoresHealthy)
+TEST(Core_Unhealthy, IgnoresHealthy)
 {
   RotationBuilder b(10, 5);
   b.setUptime(3, 9000);
@@ -552,7 +552,7 @@ TEST(Unhealthy, IgnoresHealthy)
   EXPECT_EQ(it, result.end());
 }
 
-TEST(Unhealthy, ProtectsSeeds)
+TEST(Core_Unhealthy, ProtectsSeeds)
 {
   RotationBuilder b(10, 5);
   b.setUptime(1, UPTIME_REMOVAL_THRESHOLD_BPS - 1);
@@ -564,14 +564,14 @@ TEST(Unhealthy, ProtectsSeeds)
   EXPECT_EQ(it, result.end());
 }
 
-TEST(Unhealthy, EmptyRegistry)
+TEST(Core_Unhealthy, EmptyRegistry)
 {
   ValidatorRegistry empty;
   auto result = findUnhealthy(empty);
   EXPECT_TRUE(result.empty());
 }
 
-TEST(Integration, SingleOfflineValidator)
+TEST(Core_Integration, SingleOfflineValidator)
 {
   RotationBuilder b(30, 21);
 
@@ -592,7 +592,7 @@ TEST(Integration, SingleOfflineValidator)
   EXPECT_TRUE(b.reg.isActive(plan.promoted[0]));
 }
 
-TEST(Integration, MultipleOfflineValidators)
+TEST(Core_Integration, MultipleOfflineValidators)
 {
   RotationBuilder b(40, 21);
 
@@ -622,7 +622,7 @@ TEST(Integration, MultipleOfflineValidators)
   EXPECT_EQ(b.reg.active_set.size(), 21u);
 }
 
-TEST(Integration, SeedNodeAlwaysActive)
+TEST(Core_Integration, SeedNodeAlwaysActive)
 {
   RotationBuilder b(30, 21);
   b.setSeed(1);
@@ -647,7 +647,7 @@ TEST(Integration, SeedNodeAlwaysActive)
   }
 }
 
-TEST(Integration, RotationCyclePreservesSetSize)
+TEST(Core_Integration, RotationCyclePreservesSetSize)
 {
   RotationBuilder b(30, 21);
   b.setTargetSize(21);

@@ -9,7 +9,7 @@
 
 using namespace P2P;
 
-TEST(PeerState, Names)
+TEST(P2P_PeerState, Names)
 {
   EXPECT_EQ(peerStateName(PeerState::Connecting), "connecting");
   EXPECT_EQ(peerStateName(PeerState::Handshaking), "handshaking");
@@ -19,7 +19,7 @@ TEST(PeerState, Names)
   EXPECT_EQ(peerStateName(PeerState::Closed), "closed");
 }
 
-TEST(PeerState, IsOperational)
+TEST(P2P_PeerState, IsOperational)
 {
   EXPECT_FALSE(isOperational(PeerState::Connecting));
   EXPECT_FALSE(isOperational(PeerState::Handshaking));
@@ -29,7 +29,7 @@ TEST(PeerState, IsOperational)
   EXPECT_FALSE(isOperational(PeerState::Closed));
 }
 
-TEST(PeerState, IsTerminal)
+TEST(P2P_PeerState, IsTerminal)
 {
   EXPECT_FALSE(isTerminal(PeerState::Connecting));
   // ============================================================================

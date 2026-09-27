@@ -3,7 +3,7 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 
 #include "State/StateAccess.h"
 
@@ -23,7 +23,7 @@ using namespace Tests;
 //  A. Accounts
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, AccountRoundTrip)
+TEST_F(State_StateAccessFixture, AccountRoundTrip)
 {
   auto addr = makeAddress(1);
 
@@ -43,7 +43,7 @@ TEST_F(StateAccessTestFixture, AccountRoundTrip)
   EXPECT_EQ(got.created_at_height, 3u);
 }
 
-TEST_F(StateAccessTestFixture, MissingAccountIsEmpty)
+TEST_F(State_StateAccessFixture, MissingAccountIsEmpty)
 {
   auto addr = makeAddress(123);
   Core::Account got = s().getAccount(addr);
@@ -52,7 +52,7 @@ TEST_F(StateAccessTestFixture, MissingAccountIsEmpty)
   EXPECT_EQ(got.nonce, 0u);
 }
 
-TEST_F(StateAccessTestFixture, AccountExistsReflectsWrites)
+TEST_F(State_StateAccessFixture, AccountExistsReflectsWrites)
 {
   auto addr = makeAddress(1);
 
@@ -65,7 +65,7 @@ TEST_F(StateAccessTestFixture, AccountExistsReflectsWrites)
   EXPECT_TRUE(s().accountExists(addr));
 }
 
-TEST_F(StateAccessTestFixture, DeleteAccountRemovesIt)
+TEST_F(State_StateAccessFixture, DeleteAccountRemovesIt)
 {
   auto addr = makeAddress(1);
 
@@ -79,7 +79,7 @@ TEST_F(StateAccessTestFixture, DeleteAccountRemovesIt)
   EXPECT_TRUE(s().getAccount(addr).isEmpty());
 }
 
-TEST_F(StateAccessTestFixture, MultipleAccountsIndependent)
+TEST_F(State_StateAccessFixture, MultipleAccountsIndependent)
 {
   auto a = makeAddress(1);
   auto b = makeAddress(2);
@@ -101,7 +101,7 @@ TEST_F(StateAccessTestFixture, MultipleAccountsIndependent)
   EXPECT_EQ(s().getAccount(c).balance, 300u);
 }
 
-TEST_F(StateAccessTestFixture, UpdatingAccountOverwrites)
+TEST_F(State_StateAccessFixture, UpdatingAccountOverwrites)
 {
   auto addr = makeAddress(1);
 
@@ -124,7 +124,7 @@ TEST_F(StateAccessTestFixture, UpdatingAccountOverwrites)
 //  tests verify the maintenance logic directly.
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, PutAccountMaintainsTotalStaked)
+TEST_F(State_StateAccessFixture, PutAccountMaintainsTotalStaked)
 {
   auto a = makeAddress(0xAA);
 
@@ -168,7 +168,7 @@ TEST_F(StateAccessTestFixture, PutAccountMaintainsTotalStaked)
   }
 }
 
-TEST_F(StateAccessTestFixture, PutAccountMaintainsStakerCount)
+TEST_F(State_StateAccessFixture, PutAccountMaintainsStakerCount)
 {
   auto a = makeAddress(0xAA);
   auto b = makeAddress(0xBB);
@@ -194,7 +194,7 @@ TEST_F(StateAccessTestFixture, PutAccountMaintainsStakerCount)
   EXPECT_EQ(readU64Global(s(), "staker_count"), 1u);
 }
 
-TEST_F(StateAccessTestFixture, PutAccountSetsStakerSinceHeight)
+TEST_F(State_StateAccessFixture, PutAccountSetsStakerSinceHeight)
 {
   setVersion(500);
 
@@ -222,7 +222,7 @@ TEST_F(StateAccessTestFixture, PutAccountSetsStakerSinceHeight)
 //  B. Token balances
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, TokenBalanceRoundTrip)
+TEST_F(State_StateAccessFixture, TokenBalanceRoundTrip)
 {
   auto addr = makeAddress(1);
   Id token = 42;
@@ -233,7 +233,7 @@ TEST_F(StateAccessTestFixture, TokenBalanceRoundTrip)
   EXPECT_EQ(s().getTokenBalance(addr, token), 12'345u);
 }
 
-TEST_F(StateAccessTestFixture, TokenBalanceZeroDeletes)
+TEST_F(State_StateAccessFixture, TokenBalanceZeroDeletes)
 {
   auto addr = makeAddress(1);
   Id token = 42;
@@ -245,7 +245,7 @@ TEST_F(StateAccessTestFixture, TokenBalanceZeroDeletes)
   EXPECT_EQ(s().getTokenBalance(addr, token), 0u);
 }
 
-TEST_F(StateAccessTestFixture, DeleteTokenBalanceExplicit)
+TEST_F(State_StateAccessFixture, DeleteTokenBalanceExplicit)
 {
   auto addr = makeAddress(1);
   Id token = 42;
@@ -255,7 +255,7 @@ TEST_F(StateAccessTestFixture, DeleteTokenBalanceExplicit)
   EXPECT_EQ(s().getTokenBalance(addr, token), 0u);
 }
 
-TEST_F(StateAccessTestFixture, MultipleTokensPerAddress)
+TEST_F(State_StateAccessFixture, MultipleTokensPerAddress)
 {
   auto addr = makeAddress(1);
 
@@ -269,7 +269,7 @@ TEST_F(StateAccessTestFixture, MultipleTokensPerAddress)
   EXPECT_EQ(s().getTokenBalance(addr, 40), 0u);
 }
 
-TEST_F(StateAccessTestFixture, SameTokenDifferentAddresses)
+TEST_F(State_StateAccessFixture, SameTokenDifferentAddresses)
 {
   auto a = makeAddress(1);
   auto b = makeAddress(2);
@@ -286,7 +286,7 @@ TEST_F(StateAccessTestFixture, SameTokenDifferentAddresses)
 //  C. Token metadata
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, TokenMetadataRoundTrip)
+TEST_F(State_StateAccessFixture, TokenMetadataRoundTrip)
 {
   Core::TokenInfo token;
   token.id = 100;
@@ -311,13 +311,13 @@ TEST_F(StateAccessTestFixture, TokenMetadataRoundTrip)
   EXPECT_EQ(got.royaltyBps, 50);
 }
 
-TEST_F(StateAccessTestFixture, MissingTokenReturnsFalse)
+TEST_F(State_StateAccessFixture, MissingTokenReturnsFalse)
 {
   Core::TokenInfo got;
   EXPECT_FALSE(s().getToken(999, got));
 }
 
-TEST_F(StateAccessTestFixture, TokenWithFingerprint)
+TEST_F(State_StateAccessFixture, TokenWithFingerprint)
 {
   Core::TokenInfo token;
   token.id = 100;
@@ -339,7 +339,7 @@ TEST_F(StateAccessTestFixture, TokenWithFingerprint)
 //  D. Validators
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, ValidatorRoundTrip)
+TEST_F(State_StateAccessFixture, ValidatorRoundTrip)
 {
   Core::ValidatorInfo v;
   v.id = 5;
@@ -360,7 +360,7 @@ TEST_F(StateAccessTestFixture, ValidatorRoundTrip)
   EXPECT_TRUE(got.is_active);
 }
 
-TEST_F(StateAccessTestFixture, MissingValidatorReturnsFalse)
+TEST_F(State_StateAccessFixture, MissingValidatorReturnsFalse)
 {
   Core::ValidatorInfo got;
   EXPECT_FALSE(s().getValidator(999, got));
@@ -370,7 +370,7 @@ TEST_F(StateAccessTestFixture, MissingValidatorReturnsFalse)
 //  E. Orders
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, OrderRoundTrip)
+TEST_F(State_StateAccessFixture, OrderRoundTrip)
 {
   Core::Order o;
   o.id = 7;
@@ -391,7 +391,7 @@ TEST_F(StateAccessTestFixture, OrderRoundTrip)
   EXPECT_EQ(got.buy_token, 100u);
 }
 
-TEST_F(StateAccessTestFixture, DeleteOrderRemovesIt)
+TEST_F(State_StateAccessFixture, DeleteOrderRemovesIt)
 {
   Core::Order o;
   o.id = 7;
@@ -414,7 +414,7 @@ TEST_F(StateAccessTestFixture, DeleteOrderRemovesIt)
 //  F. AMM pools
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, AmmPoolRoundTrip)
+TEST_F(State_StateAccessFixture, AmmPoolRoundTrip)
 {
   Core::AmmPool p;
   p.id = 1;
@@ -440,7 +440,7 @@ TEST_F(StateAccessTestFixture, AmmPoolRoundTrip)
   EXPECT_TRUE(got.active);
 }
 
-TEST_F(StateAccessTestFixture, MissingPoolReturnsFalse)
+TEST_F(State_StateAccessFixture, MissingPoolReturnsFalse)
 {
   Core::AmmPool got;
   EXPECT_FALSE(s().getAmmPool(999, got));
@@ -450,7 +450,7 @@ TEST_F(StateAccessTestFixture, MissingPoolReturnsFalse)
 //  G. AMM positions
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, AmmPositionRoundTrip)
+TEST_F(State_StateAccessFixture, AmmPositionRoundTrip)
 {
   Core::AmmPosition pos;
   pos.id = 3;
@@ -469,7 +469,7 @@ TEST_F(StateAccessTestFixture, AmmPositionRoundTrip)
   EXPECT_EQ(got.liquidity, 500u);
 }
 
-TEST_F(StateAccessTestFixture, DeleteAmmPosition)
+TEST_F(State_StateAccessFixture, DeleteAmmPosition)
 {
   Core::AmmPosition pos;
   pos.id = 3;
@@ -488,7 +488,7 @@ TEST_F(StateAccessTestFixture, DeleteAmmPosition)
 //  H. Receipts
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, ReceiptRoundTrip)
+TEST_F(State_StateAccessFixture, ReceiptRoundTrip)
 {
   auto hash = makeHash(999);
   Core::Receipt r;
@@ -503,7 +503,7 @@ TEST_F(StateAccessTestFixture, ReceiptRoundTrip)
   EXPECT_EQ(got.fee_paid, 42u);
 }
 
-TEST_F(StateAccessTestFixture, MissingReceiptReturnsFalse)
+TEST_F(State_StateAccessFixture, MissingReceiptReturnsFalse)
 {
   Core::Receipt got;
   EXPECT_FALSE(s().getReceipt(makeHash(1), got));
@@ -513,7 +513,7 @@ TEST_F(StateAccessTestFixture, MissingReceiptReturnsFalse)
 //  I. Global state
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, GlobalRoundTrip)
+TEST_F(State_StateAccessFixture, GlobalRoundTrip)
 {
   std::vector<uint8_t> value = {1, 2, 3, 4, 5};
   s().putGlobal("test_key", value);
@@ -523,13 +523,13 @@ TEST_F(StateAccessTestFixture, GlobalRoundTrip)
   EXPECT_EQ(got, value);
 }
 
-TEST_F(StateAccessTestFixture, MissingGlobalReturnsFalse)
+TEST_F(State_StateAccessFixture, MissingGlobalReturnsFalse)
 {
   std::vector<uint8_t> got;
   EXPECT_FALSE(s().getGlobal("nonexistent", got));
 }
 
-TEST_F(StateAccessTestFixture, GlobalOverwrites)
+TEST_F(State_StateAccessFixture, GlobalOverwrites)
 {
   s().putGlobal("k", {1, 2});
   s().putGlobal("k", {3, 4, 5});
@@ -539,7 +539,7 @@ TEST_F(StateAccessTestFixture, GlobalOverwrites)
   EXPECT_EQ(got, std::vector<uint8_t>({3, 4, 5}));
 }
 
-TEST_F(StateAccessTestFixture, MultipleGlobals)
+TEST_F(State_StateAccessFixture, MultipleGlobals)
 {
   s().putGlobal("a", {1});
   s().putGlobal("b", {2});
@@ -558,7 +558,7 @@ TEST_F(StateAccessTestFixture, MultipleGlobals)
 //  J. Raw SMT access
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, RawRoundTrip)
+TEST_F(State_StateAccessFixture, RawRoundTrip)
 {
   auto key = makeHash(42);
   std::vector<uint8_t> value = {9, 8, 7};
@@ -570,7 +570,7 @@ TEST_F(StateAccessTestFixture, RawRoundTrip)
   EXPECT_EQ(*got, value);
 }
 
-TEST_F(StateAccessTestFixture, RawDelete)
+TEST_F(State_StateAccessFixture, RawDelete)
 {
   auto key = makeHash(42);
   s().putRaw(key, {1, 2, 3});
@@ -582,7 +582,7 @@ TEST_F(StateAccessTestFixture, RawDelete)
 //  K. State root
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, StateRootChangesOnWrite)
+TEST_F(State_StateAccessFixture, StateRootChangesOnWrite)
 {
   auto before = s().stateRoot();
 
@@ -594,7 +594,7 @@ TEST_F(StateAccessTestFixture, StateRootChangesOnWrite)
   EXPECT_NE(before, after);
 }
 
-TEST_F(StateAccessTestFixture, StateRootIsDeterministicForSameWrites)
+TEST_F(State_StateAccessFixture, StateRootIsDeterministicForSameWrites)
 {
   auto addr = makeAddress(1);
 
@@ -614,7 +614,7 @@ TEST_F(StateAccessTestFixture, StateRootIsDeterministicForSameWrites)
 
 namespace
 {
-  class AutocommitStateAccessTestFixture : public ::testing::Test
+  class AutocommitState_StateAccessFixture : public ::testing::Test
   {
   protected:
     void SetUp() override
@@ -631,7 +631,7 @@ namespace
   };
 } // anonymous namespace
 
-TEST_F(AutocommitStateAccessTestFixture, AccountRoundTripInAutocommit)
+TEST_F(AutocommitState_StateAccessFixture, AccountRoundTripInAutocommit)
 {
   auto addr = makeAddress(1);
 
@@ -645,7 +645,7 @@ TEST_F(AutocommitStateAccessTestFixture, AccountRoundTripInAutocommit)
   EXPECT_EQ(got.nonce, 3u);
 }
 
-TEST_F(AutocommitStateAccessTestFixture, GlobalRoundTripInAutocommit)
+TEST_F(AutocommitState_StateAccessFixture, GlobalRoundTripInAutocommit)
 {
   s().putGlobal("k", {1, 2, 3});
 
@@ -658,7 +658,7 @@ TEST_F(AutocommitStateAccessTestFixture, GlobalRoundTripInAutocommit)
 //  M. Staker index
 // ============================================================================
 
-TEST_F(StateAccessTestFixture, StakerIndexRoundTrip)
+TEST_F(State_StateAccessFixture, StakerIndexRoundTrip)
 {
   auto a = makeAddress(1);
   auto b = makeAddress(2);
@@ -684,7 +684,7 @@ TEST_F(StateAccessTestFixture, StakerIndexRoundTrip)
   EXPECT_TRUE(has_b);
 }
 
-TEST_F(StateAccessTestFixture, UnindexStakerRemoves)
+TEST_F(State_StateAccessFixture, UnindexStakerRemoves)
 {
   auto a = makeAddress(1);
   auto b = makeAddress(2);

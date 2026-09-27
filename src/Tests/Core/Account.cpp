@@ -14,7 +14,7 @@ using namespace Core;
 //  Default state
 // ============================================================================
 
-TEST(Account, DefaultIsEmpty)
+TEST(Core_Account, DefaultIsEmpty)
 {
   Account a;
   EXPECT_TRUE(a.isEmpty());
@@ -30,7 +30,7 @@ TEST(Account, DefaultIsEmpty)
 //  State codec
 // ============================================================================
 
-TEST(Account, SerializeRoundTrip)
+TEST(Core_Account, SerializeRoundTrip)
 {
   Account a;
   a.nonce = 42;
@@ -58,7 +58,7 @@ TEST(Account, SerializeRoundTrip)
   EXPECT_EQ(b.staking_opted_out, a.staking_opted_out);
 }
 
-TEST(Account, SerializeOptedOutRoundTrip)
+TEST(Core_Account, SerializeOptedOutRoundTrip)
 {
   Account original;
   original.balance = 500;
@@ -71,14 +71,14 @@ TEST(Account, SerializeOptedOutRoundTrip)
   EXPECT_TRUE(restored.staking_opted_out);
 }
 
-TEST(Account, DeserializeRejectsShortBuffer)
+TEST(Core_Account, DeserializeRejectsShortBuffer)
 {
   std::vector<uint8_t> tiny(Account::STATE_SIZE - 1, 0);
   Account restored;
   EXPECT_FALSE(Account::deserializeState(tiny.data(), tiny.size(), restored));
 }
 
-TEST(Account, SerializedSizeIsConstant)
+TEST(Core_Account, SerializedSizeIsConstant)
 {
   // 7 uint64 fields + 1 byte flag.
   EXPECT_EQ(Account::STATE_SIZE, 8 * 7 + 1); // 57
@@ -88,7 +88,7 @@ TEST(Account, SerializedSizeIsConstant)
   EXPECT_EQ(a.serializeState().size(), 57u);
 }
 
-TEST(Account, SerializeIncludesStakerSinceHeight)
+TEST(Core_Account, SerializeIncludesStakerSinceHeight)
 {
   Account a;
   a.staker_since_height = 12'345;
@@ -103,7 +103,7 @@ TEST(Account, SerializeIncludesStakerSinceHeight)
 //  recalculateStaked
 // ============================================================================
 
-TEST(Account, RecalculateStakedBelowThreshold)
+TEST(Core_Account, RecalculateStakedBelowThreshold)
 {
   Account a;
   a.balance = AUTO_STAKE_THRESHOLD - 1;
@@ -111,7 +111,7 @@ TEST(Account, RecalculateStakedBelowThreshold)
   EXPECT_EQ(a.staked, 0u);
 }
 
-TEST(Account, RecalculateStakedAtThreshold)
+TEST(Core_Account, RecalculateStakedAtThreshold)
 {
   Account a;
   a.balance = AUTO_STAKE_THRESHOLD;
@@ -119,7 +119,7 @@ TEST(Account, RecalculateStakedAtThreshold)
   EXPECT_EQ(a.staked, a.balance);
 }
 
-TEST(Account, RecalculateStakedAboveThreshold)
+TEST(Core_Account, RecalculateStakedAboveThreshold)
 {
   Account a;
   a.balance = AUTO_STAKE_THRESHOLD * 10;
@@ -127,7 +127,7 @@ TEST(Account, RecalculateStakedAboveThreshold)
   EXPECT_EQ(a.staked, a.balance);
 }
 
-TEST(Account, RecalculateStakedOptedOut)
+TEST(Core_Account, RecalculateStakedOptedOut)
 {
   Account a;
   a.balance = AUTO_STAKE_THRESHOLD * 10;
@@ -136,7 +136,7 @@ TEST(Account, RecalculateStakedOptedOut)
   EXPECT_EQ(a.staked, 0u);
 }
 
-TEST(Account, RecalculateStakedPreservesBalance)
+TEST(Core_Account, RecalculateStakedPreservesBalance)
 {
   Account a;
   a.balance = AUTO_STAKE_THRESHOLD * 5;
@@ -146,7 +146,7 @@ TEST(Account, RecalculateStakedPreservesBalance)
   EXPECT_EQ(a.staked, AUTO_STAKE_THRESHOLD * 5);
 }
 
-TEST(Account, RecalculateStakedDoesNotTouchStakerSinceHeight)
+TEST(Core_Account, RecalculateStakedDoesNotTouchStakerSinceHeight)
 {
   // recalculateStaked only modifies `staked`. The transition tracking
   // is the responsibility of StateAccess::putAccount.
@@ -163,7 +163,7 @@ TEST(Account, RecalculateStakedDoesNotTouchStakerSinceHeight)
 //  Value helpers
 // ============================================================================
 
-TEST(Account, TotalValueIncludesPendingRewards)
+TEST(Core_Account, TotalValueIncludesPendingRewards)
 {
   Account a;
   a.balance = 1000;
@@ -171,7 +171,7 @@ TEST(Account, TotalValueIncludesPendingRewards)
   EXPECT_EQ(a.totalValue(), 1250u);
 }
 
-TEST(Account, TotalValueZeroForEmpty)
+TEST(Core_Account, TotalValueZeroForEmpty)
 {
   Account a;
   EXPECT_EQ(a.totalValue(), 0u);
@@ -181,42 +181,42 @@ TEST(Account, TotalValueZeroForEmpty)
 //  isEmpty boundary cases
 // ============================================================================
 
-TEST(Account, NonZeroNonceNotEmpty)
+TEST(Core_Account, NonZeroNonceNotEmpty)
 {
   Account a;
   a.nonce = 1;
   EXPECT_FALSE(a.isEmpty());
 }
 
-TEST(Account, NonZeroBalanceNotEmpty)
+TEST(Core_Account, NonZeroBalanceNotEmpty)
 {
   Account a;
   a.balance = 1;
   EXPECT_FALSE(a.isEmpty());
 }
 
-TEST(Account, NonZeroPendingRewardsNotEmpty)
+TEST(Core_Account, NonZeroPendingRewardsNotEmpty)
 {
   Account a;
   a.pending_rewards = 1;
   EXPECT_FALSE(a.isEmpty());
 }
 
-TEST(Account, OptedOutNotEmpty)
+TEST(Core_Account, OptedOutNotEmpty)
 {
   Account a;
   a.staking_opted_out = true;
   EXPECT_FALSE(a.isEmpty());
 }
 
-TEST(Account, OnlyStakedNotEmpty)
+TEST(Core_Account, OnlyStakedNotEmpty)
 {
   Account a;
   a.staked = 1;
   EXPECT_FALSE(a.isEmpty());
 }
 
-TEST(Account, OnlyStakerSinceHeightNotEmpty)
+TEST(Core_Account, OnlyStakerSinceHeightNotEmpty)
 {
   // staker_since_height alone doesn't make the account non-empty in
   // the current isEmpty() implementation, because it's a derived

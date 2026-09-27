@@ -20,8 +20,10 @@ add_subdirectory(Crypto)
 add_subdirectory(Logging)
 add_subdirectory(Node)
 add_subdirectory(P2P)
+add_subdirectory(RPC)
 add_subdirectory(Serialization)
 add_subdirectory(State)
+add_subdirectory(Wallet)
 
 #Include directories
 include_directories(SYSTEM ${CMAKE_SOURCE_DIR}/external/parallel_hashmap)
@@ -36,8 +38,10 @@ add_library(CoreLibs STATIC
   $<TARGET_OBJECTS:Logging>
   $<TARGET_OBJECTS:Node>
   $<TARGET_OBJECTS:P2P>
+  $<TARGET_OBJECTS:RPC>
   $<TARGET_OBJECTS:Serialization>
   $<TARGET_OBJECTS:State>
+  $<TARGET_OBJECTS:Wallet>
 )
 
 # Set output name

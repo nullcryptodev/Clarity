@@ -12,7 +12,7 @@
 using namespace P2P;
 using namespace Tests;
 
-TEST(BanList, InitiallyEmpty)
+TEST(P2P_BanList, InitiallyEmpty)
 {
   TempFile f;
   BanList bl(f.path(), /*threshold=*/100, /*durationSec=*/3600);
@@ -21,7 +21,7 @@ TEST(BanList, InitiallyEmpty)
   EXPECT_EQ(bl.size(), 0u);
 }
 
-TEST(BanList, RecordMisbehaviorBelowThreshold)
+TEST(P2P_BanList, RecordMisbehaviorBelowThreshold)
 {
   TempFile f;
   BanList bl(f.path(), 100, 3600);
@@ -30,7 +30,7 @@ TEST(BanList, RecordMisbehaviorBelowThreshold)
   EXPECT_FALSE(bl.isBanned("10.0.0.1"));
 }
 
-TEST(BanList, RecordMisbehaviorReachesThreshold)
+TEST(P2P_BanList, RecordMisbehaviorReachesThreshold)
 {
   TempFile f;
   BanList bl(f.path(), 100, 3600);
@@ -40,7 +40,7 @@ TEST(BanList, RecordMisbehaviorReachesThreshold)
   EXPECT_TRUE(bl.isBanned("10.0.0.1"));
 }
 
-TEST(BanList, ExplicitBan)
+TEST(P2P_BanList, ExplicitBan)
 {
   TempFile f;
   BanList bl(f.path(), 100, 3600);
@@ -49,7 +49,7 @@ TEST(BanList, ExplicitBan)
   EXPECT_TRUE(bl.isBanned("192.168.0.5"));
 }
 
-TEST(BanList, Unban)
+TEST(P2P_BanList, Unban)
 {
   TempFile f;
   BanList bl(f.path(), 100, 3600);
@@ -62,7 +62,7 @@ TEST(BanList, Unban)
   EXPECT_EQ(bl.size(), 0u);
 }
 
-TEST(BanList, BanIsNotIdempotentOnScore)
+TEST(P2P_BanList, BanIsNotIdempotentOnScore)
 {
   TempFile f;
   BanList bl(f.path(), 100, 3600);
@@ -73,7 +73,7 @@ TEST(BanList, BanIsNotIdempotentOnScore)
   EXPECT_EQ(bl.size(), 1u);
 }
 
-TEST(BanList, MultipleIPs)
+TEST(P2P_BanList, MultipleIPs)
 {
   TempFile f;
   BanList bl(f.path(), 100, 3600);
@@ -88,7 +88,7 @@ TEST(BanList, MultipleIPs)
   EXPECT_EQ(bl.size(), 3u);
 }
 
-TEST(BanList, PersistAndReload)
+TEST(P2P_BanList, PersistAndReload)
 {
   TempFile f;
   {
@@ -104,7 +104,7 @@ TEST(BanList, PersistAndReload)
   EXPECT_EQ(bl2.size(), 2u);
 }
 
-TEST(BanList, PurgeExpiredWithZeroScore)
+TEST(P2P_BanList, PurgeExpiredWithZeroScore)
 {
   TempFile f;
   BanList bl(f.path(), 100, /*durationSec=*/0);
@@ -118,7 +118,7 @@ TEST(BanList, PurgeExpiredWithZeroScore)
   EXPECT_EQ(bl.size(), 1u);
 }
 
-TEST(BanList, PurgeExpiredEmptyIsSafe)
+TEST(P2P_BanList, PurgeExpiredEmptyIsSafe)
 {
   TempFile f;
   BanList bl(f.path(), 100, 3600);

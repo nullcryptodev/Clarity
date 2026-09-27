@@ -344,12 +344,45 @@ namespace State
     Crypto::Hash key = Keys::validator(validator.id);
     auto value = validator.serializeState();
     smt_.update(key, value, version_);
+
+    // Maintain the validator index table. Value is a single byte
+    // sentinel; the id is the key. The table is used by
+    // forEachValidator and, potentially, by rotation code that needs
+    // to enumerate the pool.
+    static const uint8_t SENTINEL[1] = {0x01};
+    uint8_t id_key[8];
+    for (int i = 0; i < 8; ++i)
+      id_key[i] = uint8_t(validator.id >> (i * 8));
+
+    if (txn_)
+    {
+      txn_->put(StateDB::TBL_INDEX_VALIDATORS,
+                id_key, sizeof(id_key), SENTINEL, sizeof(SENTINEL));
+    }
+    else
+    {
+      db_.rawPut(StateDB::TBL_INDEX_VALIDATORS,
+                 id_key, sizeof(id_key), SENTINEL, sizeof(SENTINEL));
+    }
   }
 
   void StateAccess::deleteValidator(uint64_t validator_id)
   {
     Crypto::Hash key = Keys::validator(validator_id);
     smt_.remove(key, version_);
+
+    uint8_t id_key[8];
+    for (int i = 0; i < 8; ++i)
+      id_key[i] = uint8_t(validator_id >> (i * 8));
+
+    if (txn_)
+    {
+      txn_->del(StateDB::TBL_INDEX_VALIDATORS, id_key, sizeof(id_key));
+    }
+    else
+    {
+      db_.rawDel(StateDB::TBL_INDEX_VALIDATORS, id_key, sizeof(id_key));
+    }
   }
 
   //  Validator by address
@@ -688,4 +721,44 @@ namespace State
     return db_.getMeta(key, out);
   }
 
+  std::optional<Crypto::Hash> StateAccess::smtRootAtVersion(uint64_t version) const
+  {
+    return smt_.rootAtVersion(version);
+  }
+
+  void StateAccess::forEachValidator(
+      const std::function<void(const Core::ValidatorInfo &)> &fn) const
+  {
+    std::vector<uint64_t> ids;
+
+    auto visitor = [&ids](const std::vector<uint8_t> &key,
+                          const std::vector<uint8_t> & /*value*/)
+    {
+      if (key.size() != 8)
+        return true;
+      uint64_t id = 0;
+      for (int i = 0; i < 8; ++i)
+        id |= uint64_t(key[i]) << (i * 8);
+      ids.push_back(id);
+      return true;
+    };
+
+    if (txn_)
+    {
+      txn_->forEach(StateDB::TBL_INDEX_VALIDATORS, visitor);
+    }
+    else
+    {
+      db_.forEachEntry(StateDB::TBL_INDEX_VALIDATORS, visitor);
+    }
+
+    // Look up each record after the cursor is done and the mutex is
+    // released.
+    for (uint64_t id : ids)
+    {
+      Core::ValidatorInfo v;
+      if (getValidator(id, v))
+        fn(v);
+    }
+  }
 } // namespace State

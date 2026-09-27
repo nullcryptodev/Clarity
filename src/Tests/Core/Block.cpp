@@ -17,46 +17,46 @@ using namespace Tests;
 //  BlockHeader
 // ============================================================================
 
-TEST(BlockHeader, WellFormedBaseline)
+TEST(Core_BlockHeader, WellFormedBaseline)
 {
   EXPECT_TRUE(makeHeader().isWellFormed());
 }
 
-TEST(BlockHeader, RejectsWrongVersion)
+TEST(Core_BlockHeader, RejectsWrongVersion)
 {
   BlockHeader h = makeHeader();
   h.version = 999;
   EXPECT_FALSE(h.isWellFormed());
 }
 
-TEST(BlockHeader, RejectsZeroChainId)
+TEST(Core_BlockHeader, RejectsZeroChainId)
 {
   BlockHeader h = makeHeader();
   h.chain_id = 0;
   EXPECT_FALSE(h.isWellFormed());
 }
 
-TEST(BlockHeader, RejectsNullProposer)
+TEST(Core_BlockHeader, RejectsNullProposer)
 {
   BlockHeader h = makeHeader();
   h.proposer = Crypto::Address{};
   EXPECT_FALSE(h.isWellFormed());
 }
 
-TEST(BlockHeader, RejectsZeroActiveValidators)
+TEST(Core_BlockHeader, RejectsZeroActiveValidators)
 {
   BlockHeader h = makeHeader();
   h.active_validator_count = 0;
   EXPECT_FALSE(h.isWellFormed());
 }
 
-TEST(BlockHeader, HashIsDeterministic)
+TEST(Core_BlockHeader, HashIsDeterministic)
 {
   BlockHeader h = makeHeader();
   EXPECT_EQ(h.hash().toString(), h.hash().toString());
 }
 
-TEST(BlockHeader, HashCaches)
+TEST(Core_BlockHeader, HashCaches)
 {
   BlockHeader h = makeHeader();
   auto first = h.hash();
@@ -65,7 +65,7 @@ TEST(BlockHeader, HashCaches)
   EXPECT_EQ(first.toString(), second.toString());
 }
 
-TEST(BlockHeader, HashChangesWithContent)
+TEST(Core_BlockHeader, HashChangesWithContent)
 {
   BlockHeader h1 = makeHeader();
   BlockHeader h2 = makeHeader();
@@ -74,7 +74,7 @@ TEST(BlockHeader, HashChangesWithContent)
   EXPECT_NE(h1.hash().toString(), h2.hash().toString());
 }
 
-TEST(BlockHeader, SerializeRoundTrip)
+TEST(Core_BlockHeader, SerializeRoundTrip)
 {
   BlockHeader original = makeHeader();
 
@@ -99,7 +99,7 @@ TEST(BlockHeader, SerializeRoundTrip)
   EXPECT_EQ(restored.active_validator_count, original.active_validator_count);
 }
 
-TEST(BlockHeader, SerializeDeterministic)
+TEST(Core_BlockHeader, SerializeDeterministic)
 {
   BlockHeader h = makeHeader();
   EXPECT_EQ(h.serialize(), h.serialize());

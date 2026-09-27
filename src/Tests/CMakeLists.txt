@@ -45,5 +45,6 @@ target_link_libraries(${TEST_TARGET}
 )
 
 target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+target_compile_options(${TEST_TARGET} PRIVATE -g -O0)
 
 add_test(NAME ${TEST_TARGET} COMMAND ${TEST_TARGET})

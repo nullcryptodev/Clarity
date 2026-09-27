@@ -11,8 +11,35 @@
 
 #include <chrono>
 #include <stdexcept>
+#include <condition_variable>
+#include <mutex>
 
 using namespace std::chrono_literals;
+
+namespace
+{
+  const char *peerStateName(P2P::PeerState s) noexcept
+  {
+    switch (s)
+    {
+    case P2P::PeerState::Connecting:
+      return "connecting";
+    case P2P::PeerState::Handshaking:
+      return "handshaking";
+    case P2P::PeerState::VerackPending:
+      return "verack-pending";
+    case P2P::PeerState::AuthPending:
+      return "auth-pending";
+    case P2P::PeerState::Established:
+      return "established";
+    case P2P::PeerState::Disconnecting:
+      return "disconnecting";
+    case P2P::PeerState::Closed:
+      return "closed";
+    }
+    return "unknown";
+  }
+}
 
 namespace P2P
 {
@@ -32,7 +59,7 @@ namespace P2P
     // Keep io_.run() alive when there's no pending work.
     workGuard_ = std::make_unique<boost::asio::io_context::work>(io_);
 
-    (*log_)(Logging::INFO)
+    (*log_)(Logging::DEBUGGING)
         << "P2P initialized: nonce=0x" << std::hex << networkNonce_ << std::dec
         << " workers=" << workers_.threadCount()
         << " knownAddresses=" << addressBook_.size()
@@ -289,9 +316,51 @@ namespace P2P
                          ? config_.listenPort
                          : config_.defaultPort;
       v.agentString = config_.agentString;
-      v.bestHeight = 0; // TODO: plumb node height through a setter.
+      v.bestHeight = getChainHeight ? getChainHeight() : 0;
       v.peerNonce = 0;
       return v;
+    };
+
+    // Auth exchange. The manager owns the protocol; the node owns the
+    // crypto and the validator index. Each Peer gets lambdas that close
+    // over `this` (the manager), which in turn calls the node-provided
+    // callbacks. If the node didn't set them (P2P-only tests), the peer
+    // will fail auth with "auth not configured" and close — which is
+    // the correct behavior: an unauthenticated peer must not reach
+    // Established.
+    peer->buildAuthMessage = [this, p = peer.get()]()
+    {
+      if (!buildAuthMessage)
+      {
+        return AuthMessage{};
+      }
+      return buildAuthMessage(*p);
+    };
+
+    peer->verifyAuth = [this, p = peer.get()](const AuthMessage &a,
+                                              uint64_t &outValidatorId)
+    {
+      if (!verifyAuth)
+        return false;
+      return verifyAuth(*p, a, outValidatorId);
+    };
+
+    // The peer tells us when it's fully established. We translate
+    // that into a PeerEstablishedInfo and forward it to the node.
+    // The node uses this to instantiate a SyncManager for the peer.
+    peer->onEstablished = [this](Peer &established_peer)
+    {
+      if (!onPeerEstablished)
+        return;
+
+      PeerEstablishedInfo info;
+      info.id = established_peer.id();
+      info.best_height = established_peer.bestHeight();
+      info.validator_id = established_peer.validatorId();
+      info.agent = established_peer.agent();
+      info.pubkey = established_peer.pubkey();
+
+      onPeerEstablished(info);
     };
 
     peers_.add(peer);
@@ -499,4 +568,57 @@ namespace P2P
     return s;
   }
 
+  std::vector<P2PManager::PeerInfo> P2PManager::peerList()
+  {
+    if (stopping_.load())
+      return {};
+
+    struct Holder
+    {
+      std::mutex m;
+      std::condition_variable cv;
+      std::vector<PeerInfo> out;
+      bool done{false};
+    };
+    auto holder = std::make_shared<Holder>();
+
+    boost::asio::post(io_, [this, holder]()
+                      {
+      std::vector<PeerInfo> peers;
+      for (auto &[id, p] : peers_)
+      {
+        if (!p)
+          continue;
+
+        PeerInfo info;
+        info.id = id;
+        info.ip = p->remoteIp();
+        info.port = p->remotePort();
+        info.inbound = (p->direction() == PeerDirection::Inbound);
+        info.state = peerStateName(p->state());
+        info.best_height = p->bestHeight();
+        info.validator_id = p->validatorId();
+        info.misbehaviors = p->stats().misbehaviors;
+
+        // agentString and the timestamps are not currently exposed by
+        // Peer. Leave them at their defaults for now; add the
+        // accessors to Peer.h and populate them when the fields are
+        // needed.
+
+        peers.push_back(std::move(info));
+      }
+
+      std::lock_guard<std::mutex> lock(holder->m);
+      holder->out = std::move(peers);
+      holder->done = true;
+      holder->cv.notify_one(); });
+
+    std::unique_lock<std::mutex> lock(holder->m);
+    holder->cv.wait_for(lock, std::chrono::seconds(2),
+                        [&]
+                        { return holder->done; });
+    if (!holder->done)
+      return {};
+    return std::move(holder->out);
+  }
 } // namespace P2P

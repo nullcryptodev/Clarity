@@ -9,13 +9,13 @@
 
 using namespace Consensus;
 
-TEST(ProposerSelection, EmptySetReturnsZero)
+TEST(Consensus_ProposerSelection, EmptySetReturnsZero)
 {
   EXPECT_EQ(proposerIndex(0, 0, 0), 0u);
   EXPECT_EQ(proposerIndex(100, 5, 0), 0u);
 }
 
-TEST(ProposerSelection, FormulaHeightPlusRound)
+TEST(Consensus_ProposerSelection, FormulaHeightPlusRound)
 {
   // (height + round) % active_size
   EXPECT_EQ(proposerIndex(0, 0, 4), 0u);
@@ -28,26 +28,26 @@ TEST(ProposerSelection, FormulaHeightPlusRound)
   EXPECT_EQ(proposerIndex(3, 1, 4), 0u); // (3+1)%4
 }
 
-TEST(ProposerSelection, LargeHeight)
+TEST(Consensus_ProposerSelection, LargeHeight)
 {
   EXPECT_EQ(proposerIndex(1'000'000, 0, 7), 1'000'000u % 7u);
   EXPECT_EQ(proposerIndex(1'000'000, 3, 7), (1'000'000u + 3u) % 7u);
 }
 
-TEST(ProposerSelection, SingleValidatorAlwaysZero)
+TEST(Consensus_ProposerSelection, SingleValidatorAlwaysZero)
 {
   EXPECT_EQ(proposerIndex(0, 0, 1), 0u);
   EXPECT_EQ(proposerIndex(999, 0, 1), 0u);
   EXPECT_EQ(proposerIndex(999, 999, 1), 0u);
 }
 
-TEST(ProposerSelection, EmptyActiveSetReturnsInvalidId)
+TEST(Consensus_ProposerSelection, EmptyActiveSetReturnsInvalidId)
 {
   std::vector<Id> empty;
   EXPECT_EQ(proposerFor(0, 0, empty), INVALID_ID);
 }
 
-TEST(ProposerSelection, ProposerForSelectsRightValidator)
+TEST(Consensus_ProposerSelection, ProposerForSelectsRightValidator)
 {
   std::vector<Id> active = {10, 20, 30, 40};
 
@@ -59,7 +59,7 @@ TEST(ProposerSelection, ProposerForSelectsRightValidator)
   EXPECT_EQ(proposerFor(0, 1, active), 20u);
 }
 
-TEST(ProposerSelection, RotatesWithRoundIncrement)
+TEST(Consensus_ProposerSelection, RotatesWithRoundIncrement)
 {
   std::vector<Id> active = {10, 20, 30};
   auto p0 = proposerFor(5, 0, active);

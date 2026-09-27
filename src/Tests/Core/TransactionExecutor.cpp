@@ -5,14 +5,14 @@
 
 #include <gtest/gtest.h>
 
-#include "Tests/Fixtures.h"
+#include "Fixtures.h"
 
 using namespace Core;
 using namespace Tests;
 
 // Common validation (applies to every tx type)
 
-TEST_F(ExecutorTestFixture, RejectsMalformedTx)
+TEST_F(Core_ExecutorFixture, RejectsMalformedTx)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::Transfer)
@@ -28,7 +28,7 @@ TEST_F(ExecutorTestFixture, RejectsMalformedTx)
   EXPECT_EQ(r.status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, RejectsWrongChainId)
+TEST_F(Core_ExecutorFixture, RejectsWrongChainId)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::Transfer)
@@ -46,7 +46,7 @@ TEST_F(ExecutorTestFixture, RejectsWrongChainId)
   EXPECT_EQ(balanceOf(alice_.publicKey), before);
 }
 
-TEST_F(ExecutorTestFixture, RejectsBadSignature)
+TEST_F(Core_ExecutorFixture, RejectsBadSignature)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::Transfer)
@@ -66,7 +66,7 @@ TEST_F(ExecutorTestFixture, RejectsBadSignature)
   EXPECT_EQ(balanceOf(alice_.publicKey), before);
 }
 
-TEST_F(ExecutorTestFixture, RejectsExpiredTx)
+TEST_F(Core_ExecutorFixture, RejectsExpiredTx)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::Transfer)
@@ -83,7 +83,7 @@ TEST_F(ExecutorTestFixture, RejectsExpiredTx)
   EXPECT_EQ(r.status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, RejectsLowNonce)
+TEST_F(Core_ExecutorFixture, RejectsLowNonce)
 {
   for (uint64_t n = 0; n < 5; ++n)
   {
@@ -112,7 +112,7 @@ TEST_F(ExecutorTestFixture, RejectsLowNonce)
   EXPECT_EQ(run(stale).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, RejectsHighNonce)
+TEST_F(Core_ExecutorFixture, RejectsHighNonce)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::Transfer)
@@ -127,7 +127,7 @@ TEST_F(ExecutorTestFixture, RejectsHighNonce)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, RejectsInsufficientFee)
+TEST_F(Core_ExecutorFixture, RejectsInsufficientFee)
 {
   setBalance(alice_.publicKey, 5);
 
@@ -144,7 +144,7 @@ TEST_F(ExecutorTestFixture, RejectsInsufficientFee)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, BumpsNonceOnSuccess)
+TEST_F(Core_ExecutorFixture, BumpsNonceOnSuccess)
 {
   ASSERT_EQ(nonceOf(alice_.publicKey), 0u);
 
@@ -162,7 +162,7 @@ TEST_F(ExecutorTestFixture, BumpsNonceOnSuccess)
   EXPECT_EQ(nonceOf(alice_.publicKey), 1u);
 }
 
-TEST_F(ExecutorTestFixture, DoesNotBumpNonceOnFailure)
+TEST_F(Core_ExecutorFixture, DoesNotBumpNonceOnFailure)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::Transfer)
@@ -178,7 +178,7 @@ TEST_F(ExecutorTestFixture, DoesNotBumpNonceOnFailure)
   EXPECT_EQ(nonceOf(alice_.publicKey), 0u);
 }
 
-TEST_F(ExecutorTestFixture, ChargesFeeOnSuccess)
+TEST_F(Core_ExecutorFixture, ChargesFeeOnSuccess)
 {
   uint64_t before = balanceOf(alice_.publicKey);
 
@@ -200,7 +200,7 @@ TEST_F(ExecutorTestFixture, ChargesFeeOnSuccess)
 
 // Transfer
 
-TEST_F(ExecutorTestFixture, NativeTransfer)
+TEST_F(Core_ExecutorFixture, NativeTransfer)
 {
   uint64_t a_before = balanceOf(alice_.publicKey);
   uint64_t b_before = balanceOf(bob_.publicKey);
@@ -220,7 +220,7 @@ TEST_F(ExecutorTestFixture, NativeTransfer)
   EXPECT_EQ(balanceOf(bob_.publicKey), b_before + 500);
 }
 
-TEST_F(ExecutorTestFixture, SelfTransfer)
+TEST_F(Core_ExecutorFixture, SelfTransfer)
 {
   uint64_t before = balanceOf(alice_.publicKey);
 
@@ -238,7 +238,7 @@ TEST_F(ExecutorTestFixture, SelfTransfer)
   EXPECT_EQ(balanceOf(alice_.publicKey), before - 3);
 }
 
-TEST_F(ExecutorTestFixture, TransferExactBalance)
+TEST_F(Core_ExecutorFixture, TransferExactBalance)
 {
   setBalance(alice_.publicKey, 100 + 5);
 
@@ -256,7 +256,7 @@ TEST_F(ExecutorTestFixture, TransferExactBalance)
   EXPECT_EQ(balanceOf(alice_.publicKey), 0u);
 }
 
-TEST_F(ExecutorTestFixture, TransferInsufficientFunds)
+TEST_F(Core_ExecutorFixture, TransferInsufficientFunds)
 {
   setBalance(alice_.publicKey, 50);
 
@@ -273,7 +273,7 @@ TEST_F(ExecutorTestFixture, TransferInsufficientFunds)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, TransferZeroAmountRejected)
+TEST_F(Core_ExecutorFixture, TransferZeroAmountRejected)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::Transfer)
@@ -288,7 +288,7 @@ TEST_F(ExecutorTestFixture, TransferZeroAmountRejected)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, TransferNullRecipientRejected)
+TEST_F(Core_ExecutorFixture, TransferNullRecipientRejected)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::Transfer)
@@ -303,7 +303,7 @@ TEST_F(ExecutorTestFixture, TransferNullRecipientRejected)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, TokenTransfer)
+TEST_F(Core_ExecutorFixture, TokenTransfer)
 {
   const Id token = 42;
   state_->putTokenBalance(alice_.publicKey, token, 1000);
@@ -328,7 +328,7 @@ TEST_F(ExecutorTestFixture, TokenTransfer)
 
 // Staking
 
-TEST_F(ExecutorTestFixture, OptInClearsOptOut)
+TEST_F(Core_ExecutorFixture, OptInClearsOptOut)
 {
   {
     Transaction tx = TransactionBuilder()
@@ -361,7 +361,7 @@ TEST_F(ExecutorTestFixture, OptInClearsOptOut)
   EXPECT_FALSE(state_->getAccount(alice_.publicKey).staking_opted_out);
 }
 
-TEST_F(ExecutorTestFixture, OptOutSetsFlag)
+TEST_F(Core_ExecutorFixture, OptOutSetsFlag)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::OptOutStaking)
@@ -377,7 +377,7 @@ TEST_F(ExecutorTestFixture, OptOutSetsFlag)
   EXPECT_TRUE(state_->getAccount(alice_.publicKey).staking_opted_out);
 }
 
-TEST_F(ExecutorTestFixture, OptOutDoesNotMoveFunds)
+TEST_F(Core_ExecutorFixture, OptOutDoesNotMoveFunds)
 {
   uint64_t before = balanceOf(alice_.publicKey);
 
@@ -397,7 +397,7 @@ TEST_F(ExecutorTestFixture, OptOutDoesNotMoveFunds)
 
 // Register validator
 
-TEST_F(ExecutorTestFixture, RegistersBelowMinimum)
+TEST_F(Core_ExecutorFixture, RegistersBelowMinimum)
 {
   Core::Account acct = state_->getAccount(alice_.publicKey);
   acct.balance = VALIDATOR_MIN_STAKE - 1;
@@ -417,7 +417,7 @@ TEST_F(ExecutorTestFixture, RegistersBelowMinimum)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, RegistersSuccessfully)
+TEST_F(Core_ExecutorFixture, RegistersSuccessfully)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::RegisterValidator)
@@ -446,7 +446,7 @@ TEST_F(ExecutorTestFixture, RegistersSuccessfully)
   EXPECT_TRUE(found);
 }
 
-TEST_F(ExecutorTestFixture, RejectsEmptyPayload)
+TEST_F(Core_ExecutorFixture, RejectsEmptyPayload)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::RegisterValidator)
@@ -463,7 +463,7 @@ TEST_F(ExecutorTestFixture, RejectsEmptyPayload)
 
 // Create token
 
-TEST_F(ExecutorTestFixture, CreatesNativeStyleToken)
+TEST_F(Core_ExecutorFixture, CreatesNativeStyleToken)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::CreateToken)
@@ -493,7 +493,7 @@ TEST_F(ExecutorTestFixture, CreatesNativeStyleToken)
   EXPECT_TRUE(found);
 }
 
-TEST_F(ExecutorTestFixture, CreateTokenRespectsMaxSupply)
+TEST_F(Core_ExecutorFixture, CreateTokenRespectsMaxSupply)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::CreateToken)
@@ -522,7 +522,7 @@ TEST_F(ExecutorTestFixture, CreateTokenRespectsMaxSupply)
   EXPECT_TRUE(found);
 }
 
-TEST_F(ExecutorTestFixture, CreateTokenRejectsInvalidSymbol)
+TEST_F(Core_ExecutorFixture, CreateTokenRejectsInvalidSymbol)
 {
   std::string long_symbol(64, 'X');
 
@@ -540,7 +540,7 @@ TEST_F(ExecutorTestFixture, CreateTokenRejectsInvalidSymbol)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, CreateTokenRejectsMalformedPayload)
+TEST_F(Core_ExecutorFixture, CreateTokenRejectsMalformedPayload)
 {
   std::vector<uint8_t> truncated = {8, 0, 4};
 
@@ -558,7 +558,7 @@ TEST_F(ExecutorTestFixture, CreateTokenRejectsMalformedPayload)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, CreateTokenRejectsShortSymbol)
+TEST_F(Core_ExecutorFixture, CreateTokenRejectsShortSymbol)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::CreateToken)
@@ -576,7 +576,7 @@ TEST_F(ExecutorTestFixture, CreateTokenRejectsShortSymbol)
 
 // Mint / Burn
 
-TEST_F(ExecutorTestFixture, OnlyCreatorCanMint)
+TEST_F(Core_ExecutorFixture, OnlyCreatorCanMint)
 {
   const Id token = createTokenDirect(alice_, "Gold", "GLD");
 
@@ -595,7 +595,7 @@ TEST_F(ExecutorTestFixture, OnlyCreatorCanMint)
   EXPECT_EQ(state_->getTokenBalance(bob_.publicKey, token), 0u);
 }
 
-TEST_F(ExecutorTestFixture, MintRespectsMaxSupply)
+TEST_F(Core_ExecutorFixture, MintRespectsMaxSupply)
 {
   const Id token =
       createTokenDirect(alice_, "Capped", "CAP", /*max_supply=*/1000);
@@ -630,7 +630,7 @@ TEST_F(ExecutorTestFixture, MintRespectsMaxSupply)
   }
 }
 
-TEST_F(ExecutorTestFixture, BurnReducesBalance)
+TEST_F(Core_ExecutorFixture, BurnReducesBalance)
 {
   const Id token = createTokenDirect(alice_, "Gold", "GLD");
   state_->putTokenBalance(alice_.publicKey, token, 500);
@@ -650,7 +650,7 @@ TEST_F(ExecutorTestFixture, BurnReducesBalance)
   EXPECT_EQ(state_->getTokenBalance(alice_.publicKey, token), 300u);
 }
 
-TEST_F(ExecutorTestFixture, BurnInsufficientBalance)
+TEST_F(Core_ExecutorFixture, BurnInsufficientBalance)
 {
   const Id token = createTokenDirect(alice_, "Gold", "GLD");
   state_->putTokenBalance(alice_.publicKey, token, 50);
@@ -672,7 +672,7 @@ TEST_F(ExecutorTestFixture, BurnInsufficientBalance)
 
 // AMM
 
-TEST_F(ExecutorTestFixture, CreatePool)
+TEST_F(Core_ExecutorFixture, CreatePool)
 {
   const Id token_a = NATIVE_TOKEN_ID;
   const Id token_b = 100;
@@ -698,7 +698,7 @@ TEST_F(ExecutorTestFixture, CreatePool)
   EXPECT_EQ(state_->getTokenBalance(alice_.publicKey, token_b), 9'000u);
 }
 
-TEST_F(ExecutorTestFixture, CreatePoolLiquidityIsSqrt)
+TEST_F(Core_ExecutorFixture, CreatePoolLiquidityIsSqrt)
 {
   const Id token_b = 100;
   state_->putTokenBalance(alice_.publicKey, token_b, 1000);
@@ -712,7 +712,7 @@ TEST_F(ExecutorTestFixture, CreatePoolLiquidityIsSqrt)
   EXPECT_EQ(pool.total_liquidity, 100u);
 }
 
-TEST_F(ExecutorTestFixture, CreatePoolRejectsSameTokens)
+TEST_F(Core_ExecutorFixture, CreatePoolRejectsSameTokens)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::CreatePool)
@@ -731,7 +731,7 @@ TEST_F(ExecutorTestFixture, CreatePoolRejectsSameTokens)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, AddLiquidity)
+TEST_F(Core_ExecutorFixture, AddLiquidity)
 {
   const Id token_b = 100;
   state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
@@ -764,7 +764,7 @@ TEST_F(ExecutorTestFixture, AddLiquidity)
   EXPECT_GT(after.total_liquidity, before.total_liquidity);
 }
 
-TEST_F(ExecutorTestFixture, RemoveLiquidity)
+TEST_F(Core_ExecutorFixture, RemoveLiquidity)
 {
   const Id token_b = 100;
   state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
@@ -826,7 +826,7 @@ TEST_F(ExecutorTestFixture, RemoveLiquidity)
   EXPECT_EQ(pos_after.liquidity, 0u);
 }
 
-TEST_F(ExecutorTestFixture, SwapXForY)
+TEST_F(Core_ExecutorFixture, SwapXForY)
 {
   const Id token_b = 100;
   state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
@@ -875,7 +875,7 @@ TEST_F(ExecutorTestFixture, SwapXForY)
   EXPECT_EQ(pool_after.reserve_b, 1000u - expected_out);
 }
 
-TEST_F(ExecutorTestFixture, SwapSlippageExceeded)
+TEST_F(Core_ExecutorFixture, SwapSlippageExceeded)
 {
   const Id token_b = 100;
   state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
@@ -913,7 +913,7 @@ TEST_F(ExecutorTestFixture, SwapSlippageExceeded)
   EXPECT_EQ(pool_after.reserve_b, pool_before.reserve_b);
 }
 
-TEST_F(ExecutorTestFixture, SwapUnknownPool)
+TEST_F(Core_ExecutorFixture, SwapUnknownPool)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::Swap)
@@ -932,7 +932,7 @@ TEST_F(ExecutorTestFixture, SwapUnknownPool)
 
 // Orders
 
-TEST_F(ExecutorTestFixture, CreateOrderLocksFunds)
+TEST_F(Core_ExecutorFixture, CreateOrderLocksFunds)
 {
   const Id buy_token = 200;
 
@@ -974,7 +974,7 @@ TEST_F(ExecutorTestFixture, CreateOrderLocksFunds)
   EXPECT_TRUE(found);
 }
 
-TEST_F(ExecutorTestFixture, CreateOrderRejectsSameTokens)
+TEST_F(Core_ExecutorFixture, CreateOrderRejectsSameTokens)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::CreateOrder)
@@ -995,7 +995,7 @@ TEST_F(ExecutorTestFixture, CreateOrderRejectsSameTokens)
   EXPECT_EQ(balanceOf(alice_.publicKey), alice_before - 1);
 }
 
-TEST_F(ExecutorTestFixture, CreateOrderRejectsInvalidMode)
+TEST_F(Core_ExecutorFixture, CreateOrderRejectsInvalidMode)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::CreateOrder)
@@ -1015,7 +1015,7 @@ TEST_F(ExecutorTestFixture, CreateOrderRejectsInvalidMode)
   EXPECT_EQ(balanceOf(alice_.publicKey), alice_before - 1);
 }
 
-TEST_F(ExecutorTestFixture, CancelOrderRefunds)
+TEST_F(Core_ExecutorFixture, CancelOrderRefunds)
 {
   uint64_t alice_before = balanceOf(alice_.publicKey);
 
@@ -1068,7 +1068,7 @@ TEST_F(ExecutorTestFixture, CancelOrderRefunds)
   EXPECT_FALSE(state_->getOrder(order_id, o));
 }
 
-TEST_F(ExecutorTestFixture, CancelOrderWrongOwner)
+TEST_F(Core_ExecutorFixture, CancelOrderWrongOwner)
 {
   {
     Transaction tx = TransactionBuilder()
@@ -1116,7 +1116,7 @@ TEST_F(ExecutorTestFixture, CancelOrderWrongOwner)
   EXPECT_TRUE(state_->getOrder(order_id, o));
 }
 
-TEST_F(ExecutorTestFixture, CancelOrderUnknown)
+TEST_F(Core_ExecutorFixture, CancelOrderUnknown)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::CancelOrder)
@@ -1134,7 +1134,7 @@ TEST_F(ExecutorTestFixture, CancelOrderUnknown)
 
 // Integration
 
-TEST_F(ExecutorTestFixture, FullTransferSequence)
+TEST_F(Core_ExecutorFixture, FullTransferSequence)
 {
   uint64_t alice_before = balanceOf(alice_.publicKey);
   uint64_t bob_before = balanceOf(bob_.publicKey);
@@ -1163,7 +1163,7 @@ TEST_F(ExecutorTestFixture, FullTransferSequence)
   EXPECT_EQ(nonceOf(alice_.publicKey), 5u);
 }
 
-TEST_F(ExecutorTestFixture, AMMSwapAfterCreate)
+TEST_F(Core_ExecutorFixture, AMMSwapAfterCreate)
 {
   const Id token_b = 100;
   state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
@@ -1201,7 +1201,7 @@ TEST_F(ExecutorTestFixture, AMMSwapAfterCreate)
   EXPECT_GE(k_after, k_before);
 }
 
-TEST_F(ExecutorTestFixture, OrderLifecycle)
+TEST_F(Core_ExecutorFixture, OrderLifecycle)
 {
   uint64_t alice_before = balanceOf(alice_.publicKey);
 
@@ -1252,7 +1252,7 @@ TEST_F(ExecutorTestFixture, OrderLifecycle)
   EXPECT_EQ(nonceOf(alice_.publicKey), 2u);
 }
 
-TEST_F(ExecutorTestFixture, MintAfterTransferRespectsMaxSupply)
+TEST_F(Core_ExecutorFixture, MintAfterTransferRespectsMaxSupply)
 {
   // The bug that the supply counter fixes: mint to cap, transfer
   // tokens away, mint again. The old code checked the minter's
@@ -1318,7 +1318,7 @@ TEST_F(ExecutorTestFixture, MintAfterTransferRespectsMaxSupply)
   EXPECT_EQ(state_->getTokenSupply(token), 1000u);
 }
 
-TEST_F(ExecutorTestFixture, MintIncreasesTokenSupply)
+TEST_F(Core_ExecutorFixture, MintIncreasesTokenSupply)
 {
   const Id token = createTokenDirect(alice_, "Gold", "GLD");
 
@@ -1339,7 +1339,7 @@ TEST_F(ExecutorTestFixture, MintIncreasesTokenSupply)
   EXPECT_EQ(state_->getTokenSupply(token), 250u);
 }
 
-TEST_F(ExecutorTestFixture, BurnReducesTokenSupply)
+TEST_F(Core_ExecutorFixture, BurnReducesTokenSupply)
 {
   const Id token = createTokenDirect(alice_, "Gold", "GLD");
   state_->putTokenBalance(alice_.publicKey, token, 500);
@@ -1360,7 +1360,7 @@ TEST_F(ExecutorTestFixture, BurnReducesTokenSupply)
   EXPECT_EQ(state_->getTokenSupply(token), 300u);
 }
 
-TEST_F(ExecutorTestFixture, BurnBelowTrackedSupplyClampsAtZero)
+TEST_F(Core_ExecutorFixture, BurnBelowTrackedSupplyClampsAtZero)
 {
   // Defensive: if burn exceeds the tracked supply (inconsistent state
   // that shouldn't be reachable), the counter clamps at zero rather
@@ -1384,7 +1384,7 @@ TEST_F(ExecutorTestFixture, BurnBelowTrackedSupplyClampsAtZero)
   EXPECT_EQ(state_->getTokenSupply(token), 0u);
 }
 
-TEST_F(ExecutorTestFixture, MintNativeTokenRejected)
+TEST_F(Core_ExecutorFixture, MintNativeTokenRejected)
 {
   uint64_t native_before = balanceOf(alice_.publicKey);
 
@@ -1403,7 +1403,7 @@ TEST_F(ExecutorTestFixture, MintNativeTokenRejected)
   EXPECT_EQ(balanceOf(alice_.publicKey), native_before - 1);
 }
 
-TEST_F(ExecutorTestFixture, BurnNativeTokenRejected)
+TEST_F(Core_ExecutorFixture, BurnNativeTokenRejected)
 {
   uint64_t native_before = balanceOf(alice_.publicKey);
 
@@ -1424,7 +1424,7 @@ TEST_F(ExecutorTestFixture, BurnNativeTokenRejected)
 
 // LP position index
 
-TEST_F(ExecutorTestFixture, AddLiquidityMergesIntoExistingPosition)
+TEST_F(Core_ExecutorFixture, AddLiquidityMergesIntoExistingPosition)
 {
   const Id token_b = 100;
   state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
@@ -1470,7 +1470,7 @@ TEST_F(ExecutorTestFixture, AddLiquidityMergesIntoExistingPosition)
   EXPECT_EQ(pos_after.created_at_height, pos_before.created_at_height);
 }
 
-TEST_F(ExecutorTestFixture, AddLiquidityFromDifferentOwnerCreatesNewPosition)
+TEST_F(Core_ExecutorFixture, AddLiquidityFromDifferentOwnerCreatesNewPosition)
 {
   const Id token_b = 100;
   state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
@@ -1503,7 +1503,7 @@ TEST_F(ExecutorTestFixture, AddLiquidityFromDifferentOwnerCreatesNewPosition)
   EXPECT_NE(alice_pos, bob_pos);
 }
 
-TEST_F(ExecutorTestFixture, RemoveLiquidityClearsPositionIndex)
+TEST_F(Core_ExecutorFixture, RemoveLiquidityClearsPositionIndex)
 {
   const Id token_b = 100;
   state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
@@ -1555,7 +1555,7 @@ TEST_F(ExecutorTestFixture, RemoveLiquidityClearsPositionIndex)
 
 // Validator address index
 
-TEST_F(ExecutorTestFixture, RegisterValidatorWritesAddressIndex)
+TEST_F(Core_ExecutorFixture, RegisterValidatorWritesAddressIndex)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::RegisterValidator)
@@ -1584,7 +1584,7 @@ TEST_F(ExecutorTestFixture, RegisterValidatorWritesAddressIndex)
 
 // Order expiry index
 
-TEST_F(ExecutorTestFixture, CreateOrderAddsToExpiryIndex)
+TEST_F(Core_ExecutorFixture, CreateOrderAddsToExpiryIndex)
 {
   const Id buy_token = 200;
   const uint64_t expires_at = 500;
@@ -1625,7 +1625,7 @@ TEST_F(ExecutorTestFixture, CreateOrderAddsToExpiryIndex)
   EXPECT_EQ(expiring[0], order_id);
 }
 
-TEST_F(ExecutorTestFixture, CreateOrderWithZeroExpiryIsNotIndexed)
+TEST_F(Core_ExecutorFixture, CreateOrderWithZeroExpiryIsNotIndexed)
 {
   const Id buy_token = 200;
 
@@ -1653,7 +1653,7 @@ TEST_F(ExecutorTestFixture, CreateOrderWithZeroExpiryIsNotIndexed)
   EXPECT_TRUE(state_->getOrdersExpiringAt(500).empty());
 }
 
-TEST_F(ExecutorTestFixture, CancelOrderRemovesFromExpiryIndex)
+TEST_F(Core_ExecutorFixture, CancelOrderRemovesFromExpiryIndex)
 {
   const Id buy_token = 200;
   const uint64_t expires_at = 500;
@@ -1712,7 +1712,7 @@ TEST_F(ExecutorTestFixture, CancelOrderRemovesFromExpiryIndex)
 
 // Claim Rewards
 
-TEST_F(ExecutorTestFixture, ClaimMovesRewardsToBalance)
+TEST_F(Core_ExecutorFixture, ClaimMovesRewardsToBalance)
 {
   setPendingRewards(alice_.publicKey, 500);
 
@@ -1737,7 +1737,7 @@ TEST_F(ExecutorTestFixture, ClaimMovesRewardsToBalance)
   EXPECT_EQ(state_->getAccount(alice_.publicKey).pending_rewards, 0u);
 }
 
-TEST_F(ExecutorTestFixture, ClaimZeroRewardsSucceeds)
+TEST_F(Core_ExecutorFixture, ClaimZeroRewardsSucceeds)
 {
   uint64_t before = balanceOf(alice_.publicKey);
 
@@ -1757,7 +1757,7 @@ TEST_F(ExecutorTestFixture, ClaimZeroRewardsSucceeds)
   EXPECT_EQ(balanceOf(alice_.publicKey), before - 2);
 }
 
-TEST_F(ExecutorTestFixture, ClaimPreservesTotalValue)
+TEST_F(Core_ExecutorFixture, ClaimPreservesTotalValue)
 {
   setPendingRewards(alice_.publicKey, 1000);
 
@@ -1783,7 +1783,7 @@ TEST_F(ExecutorTestFixture, ClaimPreservesTotalValue)
   EXPECT_EQ(total_after + 3, total_before);
 }
 
-TEST_F(ExecutorTestFixture, ClaimRecomputesStaked)
+TEST_F(Core_ExecutorFixture, ClaimRecomputesStaked)
 {
   // Set balance just below auto-stake threshold, with a reward that
   // pushes it above.
@@ -1816,7 +1816,7 @@ TEST_F(ExecutorTestFixture, ClaimRecomputesStaked)
 
 // Unregister Validator
 
-TEST_F(ExecutorTestFixture, UnregisterReturnsStake)
+TEST_F(Core_ExecutorFixture, UnregisterReturnsStake)
 {
   seedValidator(alice_, /*id=*/5);
   bumpNextValidatorId(6);
@@ -1839,7 +1839,7 @@ TEST_F(ExecutorTestFixture, UnregisterReturnsStake)
   EXPECT_EQ(balanceOf(alice_.publicKey), before + VALIDATOR_MIN_STAKE - 2);
 }
 
-TEST_F(ExecutorTestFixture, UnregisterRejectsSeed)
+TEST_F(Core_ExecutorFixture, UnregisterRejectsSeed)
 {
   seedValidator(alice_, /*id=*/1, /*is_seed=*/true);
   bumpNextValidatorId(2);
@@ -1862,7 +1862,7 @@ TEST_F(ExecutorTestFixture, UnregisterRejectsSeed)
   EXPECT_EQ(balanceOf(alice_.publicKey), before - 2);
 }
 
-TEST_F(ExecutorTestFixture, UnregisterRejectsUnknown)
+TEST_F(Core_ExecutorFixture, UnregisterRejectsUnknown)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::UnregisterValidator)
@@ -1877,7 +1877,7 @@ TEST_F(ExecutorTestFixture, UnregisterRejectsUnknown)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, UnregisterClearsAddressIndex)
+TEST_F(Core_ExecutorFixture, UnregisterClearsAddressIndex)
 {
   seedValidator(alice_, /*id=*/5);
   bumpNextValidatorId(6);
@@ -1901,7 +1901,7 @@ TEST_F(ExecutorTestFixture, UnregisterClearsAddressIndex)
   EXPECT_FALSE(state_->getValidator(5, v));
 }
 
-TEST_F(ExecutorTestFixture, UnregisterRemovesFromActiveSet)
+TEST_F(Core_ExecutorFixture, UnregisterRemovesFromActiveSet)
 {
   // Set up: two named validators (Alice seed, Bob non-seed) plus
   // enough synthetic validators that removing Bob leaves the set at
@@ -1955,7 +1955,7 @@ TEST_F(ExecutorTestFixture, UnregisterRemovesFromActiveSet)
   EXPECT_EQ(ids.size(), ACTIVE_SET_MIN); // 11, the floor
 }
 
-TEST_F(ExecutorTestFixture, UnregisterRejectsIfSetWouldDropBelowMin)
+TEST_F(Core_ExecutorFixture, UnregisterRejectsIfSetWouldDropBelowMin)
 {
   // Set up: exactly ACTIVE_SET_MIN validators, all active. Removing
   // any one would drop below the minimum.
@@ -1997,7 +1997,7 @@ TEST_F(ExecutorTestFixture, UnregisterRejectsIfSetWouldDropBelowMin)
 
 // Update Reward Address
 
-TEST_F(ExecutorTestFixture, UpdateRewardAddressMovesIndex)
+TEST_F(Core_ExecutorFixture, UpdateRewardAddressMovesIndex)
 {
   seedValidator(alice_, /*id=*/5);
   bumpNextValidatorId(6);
@@ -2031,7 +2031,7 @@ TEST_F(ExecutorTestFixture, UpdateRewardAddressMovesIndex)
   EXPECT_EQ(v.owner, bob_.publicKey);
 }
 
-TEST_F(ExecutorTestFixture, UpdateRewardAddressRejectsCollision)
+TEST_F(Core_ExecutorFixture, UpdateRewardAddressRejectsCollision)
 {
   seedValidator(alice_, /*id=*/5);
   seedValidator(bob_, /*id=*/6);
@@ -2052,7 +2052,7 @@ TEST_F(ExecutorTestFixture, UpdateRewardAddressRejectsCollision)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, UpdateRewardAddressRejectsNonValidator)
+TEST_F(Core_ExecutorFixture, UpdateRewardAddressRejectsNonValidator)
 {
   Transaction tx = TransactionBuilder()
                        .type(TxType::UpdateRewardAddress)
@@ -2069,7 +2069,7 @@ TEST_F(ExecutorTestFixture, UpdateRewardAddressRejectsNonValidator)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, UpdateRewardAddressRejectsNull)
+TEST_F(Core_ExecutorFixture, UpdateRewardAddressRejectsNull)
 {
   seedValidator(alice_, /*id=*/5);
   bumpNextValidatorId(6);
@@ -2088,7 +2088,7 @@ TEST_F(ExecutorTestFixture, UpdateRewardAddressRejectsNull)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, UpdateRewardAddressRejectsWrongPayloadSize)
+TEST_F(Core_ExecutorFixture, UpdateRewardAddressRejectsWrongPayloadSize)
 {
   seedValidator(alice_, /*id=*/5);
   bumpNextValidatorId(6);
@@ -2109,7 +2109,7 @@ TEST_F(ExecutorTestFixture, UpdateRewardAddressRejectsWrongPayloadSize)
 
 // Update Token Meta
 
-TEST_F(ExecutorTestFixture, UpdateTokenMetaChangesName)
+TEST_F(Core_ExecutorFixture, UpdateTokenMetaChangesName)
 {
   const Id token =
       createTokenDirect(alice_, "Gold", "GLD");
@@ -2142,7 +2142,7 @@ TEST_F(ExecutorTestFixture, UpdateTokenMetaChangesName)
   EXPECT_EQ(t.symbol, "GLD"); // unchanged
 }
 
-TEST_F(ExecutorTestFixture, UpdateTokenMetaChangesSymbol)
+TEST_F(Core_ExecutorFixture, UpdateTokenMetaChangesSymbol)
 {
   const Id token =
       createTokenDirect(alice_, "Gold", "GLD");
@@ -2174,7 +2174,7 @@ TEST_F(ExecutorTestFixture, UpdateTokenMetaChangesSymbol)
   EXPECT_EQ(t.symbol, "BAR");
 }
 
-TEST_F(ExecutorTestFixture, UpdateTokenMetaChangesRoyalty)
+TEST_F(Core_ExecutorFixture, UpdateTokenMetaChangesRoyalty)
 {
   const Id token =
       createTokenDirect(alice_, "Gold", "GLD");
@@ -2204,7 +2204,7 @@ TEST_F(ExecutorTestFixture, UpdateTokenMetaChangesRoyalty)
   EXPECT_EQ(t.royaltyBps, 250u);
 }
 
-TEST_F(ExecutorTestFixture, UpdateTokenMetaEmptyMeansNoChange)
+TEST_F(Core_ExecutorFixture, UpdateTokenMetaEmptyMeansNoChange)
 {
   const Id token =
       createTokenDirect(alice_, "Gold", "GLD");
@@ -2233,7 +2233,7 @@ TEST_F(ExecutorTestFixture, UpdateTokenMetaEmptyMeansNoChange)
   EXPECT_EQ(t.royaltyBps, 0u);
 }
 
-TEST_F(ExecutorTestFixture, UpdateTokenMetaRejectsNonCreator)
+TEST_F(Core_ExecutorFixture, UpdateTokenMetaRejectsNonCreator)
 {
   const Id token =
       createTokenDirect(alice_, "Gold", "GLD");
@@ -2255,7 +2255,7 @@ TEST_F(ExecutorTestFixture, UpdateTokenMetaRejectsNonCreator)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, UpdateTokenMetaRejectsNative)
+TEST_F(Core_ExecutorFixture, UpdateTokenMetaRejectsNative)
 {
   std::vector<uint8_t> payload = {3, 'B', 'a', 'r', 0, 0, 0};
 
@@ -2274,7 +2274,7 @@ TEST_F(ExecutorTestFixture, UpdateTokenMetaRejectsNative)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, UpdateTokenMetaRejectsInvalidSymbol)
+TEST_F(Core_ExecutorFixture, UpdateTokenMetaRejectsInvalidSymbol)
 {
   const Id token =
       createTokenDirect(alice_, "Gold", "GLD");
@@ -2302,7 +2302,7 @@ TEST_F(ExecutorTestFixture, UpdateTokenMetaRejectsInvalidSymbol)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(ExecutorTestFixture, UpdateTokenMetaDoesNotChangeMaxSupply)
+TEST_F(Core_ExecutorFixture, UpdateTokenMetaDoesNotChangeMaxSupply)
 {
   const Id token =
       createTokenDirect(alice_, "Capped", "CAP", /*max_supply=*/1000);
