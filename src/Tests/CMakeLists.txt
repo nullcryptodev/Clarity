@@ -1,31 +1,35 @@
-# All tests for the Clarity codebase, built as a single binary.
+cmake_minimum_required(VERSION 3.12)
 
 set(TEST_TARGET "clarity_tests")
 
-file(GLOB_RECURSE TEST_SOURCES
-  ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp
+# Build each test folder as its own OBJECT library. This gives CMake
+# a per-folder build graph instead of a single 125-source target, so
+# a change to one test file recompiles one .o and relinks the
+# executable — it doesn't touch the rest of the suite.
+add_subdirectory(Common)
+add_subdirectory(Consensus)
+add_subdirectory(Core)
+add_subdirectory(Crypto)
+add_subdirectory(Node)
+add_subdirectory(P2P)
+add_subdirectory(RPC)
+add_subdirectory(Serialization)
+add_subdirectory(State)
+add_subdirectory(Wallet)
+
+# Top-level test files: main, shared utils, the transaction builder.
+add_executable(${TEST_TARGET}
+  main.cpp
+  TransactionBuilder.cpp
+  Utils.cpp
 )
 
-if(NOT TEST_SOURCES)
-  message(FATAL_ERROR "No test sources in ${CMAKE_CURRENT_SOURCE_DIR}")
-endif()
-
-add_executable(${TEST_TARGET} ${TEST_SOURCES})
-
-# Our own headers — normal include path, warnings apply.
 target_include_directories(${TEST_TARGET}
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src
 )
 
-# System headers — warnings suppressed.
-#
-# gtest's headers use bare #if GTEST_OS_WINDOWS etc., where the macro
-# is undefined on non-Windows and evaluates to 0. That's correct C
-# preprocessor semantics, but -Wundef flags every such use. Marking
-# the directory as SYSTEM is the fix that suppresses the warning
-# without also suppressing -Wundef in our own code.
 target_include_directories(${TEST_TARGET}
   SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/external/gtest/include
@@ -33,6 +37,16 @@ target_include_directories(${TEST_TARGET}
 
 target_link_libraries(${TEST_TARGET}
   PRIVATE
+    TestsCommon
+    TestsConsensus
+    TestsCore
+    TestsCrypto
+    TestsNode
+    TestsP2P
+    TestsRpc
+    TestsSerialization
+    TestsState
+    TestsWallet
     CoreLibs
     gtest
     gtest_main

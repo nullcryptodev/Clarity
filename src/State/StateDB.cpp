@@ -48,6 +48,8 @@ namespace State
       return "blocks_by_hash";
     case TBL_BLOCKS_BY_HEIGHT:
       return "blocks_by_height";
+    case TBL_MEMPOOL:
+      return "mempool";
     default:
       return "<unknown>";
     }

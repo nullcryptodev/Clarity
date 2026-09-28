@@ -7,6 +7,9 @@
 
 #include <cstdint>
 #include <string_view>
+#include <vector>
+
+#include "Common/Put.h"
 
 namespace Core
 {
@@ -90,5 +93,4 @@ namespace Core
 
   // Human-readable name for logging and error messages.
   std::string_view txTypeName(TxType t) noexcept;
-
 } // namespace Core

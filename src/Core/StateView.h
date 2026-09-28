@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "Account.h"
+#include "ValidatorTypes.h"
 #include "Crypto/Types.h"
 
 namespace Core
@@ -43,6 +44,8 @@ namespace Core
 
     // Get the chain ID.
     virtual uint64_t chainId() const = 0;
+
+    virtual bool getValidator(Id validator_id, ValidatorInfo &out) const = 0;
   };
 
 } // namespace Core

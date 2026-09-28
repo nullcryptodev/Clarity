@@ -72,6 +72,14 @@ namespace Wallet
     // restore matched the original wallet without decrypting.
     virtual SeedFingerprint fingerprint() const = 0;
 
+    //  Bech32m address of the keystore's default account.
+    //
+    //  Every concrete keystore should be able to answer this from
+    //  its on-disk metadata without unlocking. The value is public
+    //  information — it's already in the JSON file — so returning it
+    //  on the base interface is safe.
+    virtual std::string address() const = 0;
+
     // ---- Lock state ----
 
     // True after successful unlock() and before lock(). While locked,
@@ -172,6 +180,14 @@ namespace Wallet
       Network network,
       uint32_t strength_bits,
       std::string &out_mnemonic,
+      WalletStatus *error_out = nullptr);
+
+  std::optional<std::unique_ptr<KeyStore>> createEncryptedKeyStoreFromMnemonic(
+      const std::string &path,
+      std::string_view password,
+      Network network,
+      std::string_view mnemonic,
+      std::string_view passphrase,
       WalletStatus *error_out = nullptr);
 
   //  Factory: open an existing encrypted keystore.

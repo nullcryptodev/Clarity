@@ -61,6 +61,9 @@ namespace GlobalConfig
   inline constexpr uint64_t GENESIS_TIMESTAMP_MS = 1767225600000ULL;
 
   // The genesis supply gets split multiple addresses
+  // Current config splits 100k into 3 addresses, 60k to "treasury", 20k into "community"
+  // and 20k to the first seed. The seed can go without this reward, but funds could be
+  // used to bootstrap the network 
   inline constexpr Amount GENESIS_SUPPLY = ATOMIC_UNITS_PER_COIN * 100'000; // 100k
 
   inline constexpr const char *COMMUNITY_FUND_ADDRESS = "0000000000000000000000000000000000000000000000000000000000000001"; // address
@@ -68,6 +71,15 @@ namespace GlobalConfig
 
   inline constexpr Amount COMMUNITY_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 20'000;
   inline constexpr Amount TREASURY_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 60'000;
+
+  // Genesis block hashes, one per network. Computed once and pinned.
+  // If a change to genesis construction produces a different hash,
+  // these checks fail at node startup with a clear "genesis mismatch"
+  // error, instead of silently diverging from other nodes on the same
+  // network.
+  inline constexpr const char *MAINNET_GENESIS_HASH = "b2b3730c1ec92cb6be0670ee961b13d7e0108e122e7cf97bcb675e6b709793c3";
+  inline constexpr const char *TESTNET_GENESIS_HASH = "08e5b2658d69f0853a87e0d165d705fb79392443ba8d367004dec3b0ffd079fd";
+  inline constexpr const char *REGTEST_GENESIS_HASH = "3e80bff4887f7e1aff5423ad6d59e6f4dfced21a7c55f5d296f6b03059ffc063";
 
   // Seed
 

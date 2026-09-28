@@ -64,6 +64,33 @@ namespace Wallet
         std::string_view kdf = KDF_ARGON2ID,
         WalletStatus *error_out = nullptr);
 
+    // Create a new keystore on disk from an existing mnemonic.
+    //
+    // Equivalent to create() except the mnemonic is supplied by the
+    // caller rather than generated. Used by the "import" flow in the
+    // wallet CLI and by any tool that needs to materialize a keystore
+    // from a backup phrase.
+    //
+    // The mnemonic is validated before use. If it fails validation,
+    // the function returns nullopt and error_out is populated with
+    // the specific validation error (InvalidWordCount, InvalidWord,
+    // or InvalidChecksum).
+    //
+    // `passphrase` is the BIP-39 passphrase, the optional "25th word".
+    // Most users leave it empty; the API requires it explicitly so
+    // callers can't accidentally omit it.
+    //
+    // The `kdf` argument selects the KDF used to encrypt the seed.
+    // Defaults to Argon2id, same as create().
+    static std::optional<std::unique_ptr<EncryptedKeyStore>> createFromMnemonic(
+        const std::string &path,
+        std::string_view password,
+        Network network,
+        std::string_view mnemonic,
+        std::string_view passphrase,
+        std::string_view kdf = KDF_ARGON2ID,
+        WalletStatus *error_out = nullptr);
+
     // Open an existing keystore from disk. The returned keystore is
     // locked; call unlock() before deriving.
     static std::optional<std::unique_ptr<EncryptedKeyStore>> open(
@@ -94,8 +121,9 @@ namespace Wallet
 
     WalletError changePassword(std::string_view new_password) override;
 
+    std::string address() const override { return file_.address; }
+
     //  Metadata for callers that don't want to reach into the file.
-    const std::string &address() const noexcept { return file_.address; }
     const std::string &label() const noexcept { return file_.label; }
     const std::string &id() const noexcept { return file_.id; }
 

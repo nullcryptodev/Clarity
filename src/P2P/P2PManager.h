@@ -10,7 +10,7 @@
 #include <memory>
 #include <string>
 #include <vector>
-
+#include <unordered_map>
 #include <boost/asio.hpp>
 
 #include "AddressBook.h"
@@ -271,6 +271,17 @@ namespace P2P
     void handlePeerMessage(Peer &peer, const Message &msg);
     void handlePeerMisbehaving(Peer &peer, uint32_t score, int reason);
 
+    //  Peer deduplication
+    //
+    //  Called when a peer transitions to Established. Checks whether
+    //  we already have an Established peer with the same authenticated
+    //  pubkey; if so, decides which to keep and closes the other.
+    //
+    //  Returns true if the calling peer should be treated as
+    //  established (either it's the only one, or it won the tie-break).
+    //  Returns false if the calling peer should be closed and dropped.
+    bool deduplicatePeer(Peer &peer);
+
     // ------------------------------------------------------------------
     //  Periodic maintenance
     // ------------------------------------------------------------------
@@ -293,6 +304,15 @@ namespace P2P
     PeerTable peers_;
     PeerId nextPeerId_ = 1;
     uint64_t networkNonce_ = 0;
+
+    //  Established peers, keyed by authenticated pubkey.
+    //
+    //  Populated in onEstablished after a peer finishes the Auth
+    //  exchange. Used to detect duplicate connections when two nodes
+    //  dial each other at the same time.
+    //
+    //  Only touched on the event loop thread; no lock needed.
+    std::unordered_map<Crypto::PublicKey, PeerId> established_by_pubkey_;
 
     BanList banList_;
     AddressBook addressBook_;

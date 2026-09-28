@@ -61,6 +61,7 @@ namespace Node
     {
       initStorage();
       initGenesis();
+      initMempool();
       initP2P();
       initConsensus();
     }
@@ -213,12 +214,40 @@ namespace Node
     // Chain wrapper.
     chain_ = std::make_unique<Core::Chain>(*chain_db_);
 
-    // Mempool.
-    mempool_ = std::make_unique<Core::Mempool>();
+    // Mempool. Attached to the state DB so pending transactions
+    // survive a restart. See initMempool() for the load path.
+    mempool_ = std::make_unique<Core::Mempool>(*state_db_);
 
     (*log_)(Logging::DEBUGGING)
         << "Storage opened: state at " << state_path
         << " top height=" << chain_->height();
+  }
+
+  void Node::initMempool()
+  {
+    if (!mempool_)
+      return;
+
+    // Build a state view at the current chain height. makeStateView()
+    // returns null only if state_db_ or chain_ is missing, both of
+    // which are guaranteed by initStorage having run first.
+    auto view = makeStateView();
+    if (!view)
+    {
+      (*log_)(Logging::WARNING)
+          << "initMempool: could not build state view, skipping load";
+      return;
+    }
+
+    // load() re-adds each persisted entry through the normal validation
+    // path. Entries that fail (nonce too low, insufficient funds,
+    // expired) are dropped and their persisted rows deleted. This is
+    // what filters out transactions that were mined while we were
+    // offline.
+    mempool_->load(*view);
+
+    (*log_)(Logging::INFO)
+        << "Mempool loaded: " << mempool_->size() << " pending txs";
   }
 
   void Node::initGenesis()
@@ -261,6 +290,35 @@ namespace Node
 
     Core::Block genesis = Core::makeGenesisBlock(state, cfg);
     Crypto::Hash genesis_hash = genesis.hash();
+
+    // Pinned-hash check: refuse to start if genesis construction has
+    // drifted from the canonical value. Skipped when the caller supplied
+    // a genesis override — that's a test or a private chain, and the
+    // override is explicitly saying "use this genesis, not the network's."
+    if (!config_.test_genesis_override.has_value())
+    {
+      Crypto::Hash expected = Core::expectedGenesisHash(cfg);
+      if (!expected.isNull() && genesis_hash != expected)
+      {
+        throw std::runtime_error(
+            "node: genesis hash mismatch — genesis construction has "
+            "changed since this network was defined. "
+            "Expected " +
+            expected.toString() +
+            ", got " + genesis_hash.toString() +
+            ". This is a consensus-breaking change; do not proceed.");
+      }
+
+      if (expected.isNull())
+      {
+        (*log_)(Logging::WARNING)
+            << "No pinned genesis hash for chain_id 0x"
+            << std::hex << cfg.chain_id << std::dec
+            << ". Computed hash: " << genesis_hash.toString()
+            << ". Consider pinning it in GlobalConfig to catch future "
+               "genesis-construction drift.";
+      }
+    }
 
     auto txn = state_db_->beginWrite();
     chain_db_->storeBlockTxn(txn, genesis, genesis_hash);
@@ -523,6 +581,13 @@ namespace Node
     { return getActiveSet(); };
     deps.signer_public_key = [this](Index idx)
     { return getSignerPublicKey(idx); };
+
+    deps.state_lookup_validator =
+        [this](Id id, Core::ValidatorInfo &out) -> bool
+    {
+      auto state = makeStateView();
+      return state->getValidator(id, out);
+    };
 
     // ---- chain_id ----
     // Needed by propose() to stamp block.header.chain_id. Without this,

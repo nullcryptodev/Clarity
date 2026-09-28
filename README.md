@@ -1,4 +1,4 @@
-![Known Tests](https://img.shields.io/badge/Passing_Tests-1%2C500%20%28100%25%29-blue)
+![Known Tests](https://img.shields.io/badge/Passing_Tests-1%2C540%20%28100%25%29-blue)
 
 ## Build
 
@@ -6,7 +6,7 @@
 git clone https://github.com/nullcryptodev/Clarity
 cd Clarity
 
-# remove and read bugged external
+# remove and re-add bugged external
 rm -rf external/json
 git clone --branch v3.11.3 --depth 1 https://github.com/nlohmann/json.git external/json
 
@@ -39,7 +39,7 @@ Crypto           hashes, signatures, AEAD, key types
 Common           encodings (Base58, Base64, hex), CRC32, JSON, varint, rate limiter
 Serialization    binary, KV-binary, JSON serializers
 State            MDBX storage, sparse Merkle tree, state access, proofs
-Core             blocks, transactions, execution, block processing, rewards
+Core             blocks, transactions, execution, block processing, rewards, equivocation proofs
 Consensus        BFT state machine, proposer selection, message encoding
 P2P              TCP transport, peer management, message framing, auth, sync, relay
 Node             assembles everything into a running daemon
@@ -111,7 +111,13 @@ Every transaction is signed with Ed25519 by the sender, has a nonce for replay p
 
 **Total supply:** Increases by the block reward each block. Genesis has an initial supply of 100M CLRTY on mainnet (10M on testnet, 1M on regtest). Genesis distributes to a community fund (60M), development (20M), treasury (10M), and two seed validators (5M each). Total supply grows without a cap, but the growth rate is bounded by the block reward.
 
-**Uptime and slashing:** Each validator has an uptime score, an EMA updated based on how many pings they respond to. Below a threshold, they're removed from the active set. Infractions (proven misbehavior) reduce the validator's `reward_multiplier`, with a floor of 20%. No automatic recovery.
+**Uptime and penalties:** Each validator has an uptime score, an EMA updated based on how many pings they respond to. Below a threshold, they're removed from the active set. Infractions reduce the validator's `reward_multiplier`, with a floor of 20%. No automatic recovery from a multiplier penalty.
+
+**Stake slashing for equivocation:** A validator that signs two conflicting votes at the same `(height, round)` loses 5% of its stake (`SLASH_AMOUNT_BPS = 500`). The slashed stake is credited to the staker pot. The validator's reward multiplier is also reduced by the standard penalty (`REWARD_MULTIPLIER_PENALTY`), so the economic cost is both a one-time loss of principal and a persistent reduction in future earnings. Seed validators are exempt (`SEED_SLASH_EXEMPT`).
+
+A validator whose post-slash stake falls below `VALIDATOR_MIN_STAKE` becomes ineligible for the active set via the existing `canBeActive` check, and rotation removes it on the next epoch boundary.
+
+**How equivocation is detected and slashed:** Nodes detect conflicting votes during the prevote phase, retain the evidence across height transitions, and the proposer includes a `TxType::Slash` transaction carrying the proof in the next block it builds. Every node independently verifies the proof during block application — same proof, same result, same state on every honest node. Verification checks framing, `(height, round, signer)` agreement, value disagreement, signer range, validator registration, and both Ed25519 signatures over the domain-separated vote hash. A block containing an invalid Slash proof is rejected.
 
 ## Network: how nodes talk
 
@@ -197,9 +203,9 @@ Every transaction is signed with Ed25519 by the sender, has a nonce for replay p
 
 **No automatic key rotation for validators.** A validator's signing key is its reward address, and neither changes during operation. Key compromise means the operator has to unregister, re-register with a new key, and re-earn their uptime score.
 
-**No slashing for equivocation.** Infractions reduce `reward_multiplier`, but there's no stake-slashing mechanism. A validator that signs two blocks at the same height loses rewards but keeps their stake. This is a deliberate v1 trade-off; production BFT chains generally slash.
+**Slashing does not cover unregistered validators.** A validator that equivocates and then unregisters before the proof lands in a block loses nothing — the record is gone, so `executeSystemSlash` cannot collect. The window is narrow (evidence is included by the next proposer), but a determined attacker can exploit it. A permanent infraction registry or a pending-withdrawal state would close it.
 
-**No genesis-hash pinning.** Genesis is computed deterministically from `GenesisConfig`, but the resulting hash isn't hardcoded. A change to genesis construction (a field added, a field reordered) will produce a different genesis, and existing databases are rejected with "chain ID mismatch" rather than "genesis mismatch." Pinning the hash would catch this at build time.
+**Slashing does not survive rotation.** A proof's `signer_index` resolves against the active set at the block being applied. If rotation runs between detection and inclusion, the proof fails and the proposer's `state_lookup_validator` filter drops it before inclusion. A versioned active-set store would let a proof resolve against the set at the height it names.
 
 **No wallet CLI.** The wallet layer is a library. There's no `clarity-wallet` binary, no interactive key management, no transaction signing UI, no address book management. Integrators drive the library directly.
 
@@ -228,3 +234,5 @@ Every transaction is signed with Ed25519 by the sender, has a nonce for replay p
 **Proposals for future rounds are queued.** A proposal for round N+1 arriving at a validator in round N is stashed and delivered when the local round advances, rather than dropped. This is what makes the round-crossing case (a validator that timed out in round N while a proposer moved on to N+1) work on a real network with jitter.
 
 **Messages are weighted for rate limiting.** The per-peer token bucket charges by message type: cheap control messages cost 1, `Tx` costs 5, `GetHeaders` and `GetBlocks` cost 20. This reflects the asymmetry of work — a `GetHeaders` is 12 bytes on the wire but causes the server to do up to 2000 lookups. Consensus messages use a separate, stricter bucket.
+
+**Slashing is automatic, not voted.** A proof of equivocation is a mathematical fact — two valid signatures over conflicting values at the same `(height, round)`. It isn't subject to a vote, because a Byzantine majority could vote to slash an honest validator but cannot forge a signature. Automatic application means the safety argument of BFT is economically enforced: a validator that equivocates loses stake and earnings, regardless of what the other validators think about it.

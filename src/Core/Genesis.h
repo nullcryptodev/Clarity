@@ -135,4 +135,8 @@ namespace Core
   // a chain fork.
   Block makeGenesisBlock(State::StateAccess &state, const GenesisConfig &config);
 
+  // The expected genesis block hash for this network. Used at startup
+  // to detect drift in genesis construction. See GlobalConfig.h for the
+  // pinned values.
+  Crypto::Hash expectedGenesisHash(const GenesisConfig &config) noexcept;
 } // namespace Core

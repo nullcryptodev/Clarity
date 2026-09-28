@@ -246,3 +246,85 @@ TEST_F(Consensus_NetworkFixture, AllValidatorsCommitSameHash)
   // hashes (heights 0 and 1). No fork.
   EXPECT_LE(hashes.size(), 2u);
 }
+
+TEST_F(Consensus_NetworkFixture, EquivocationProducesSlashTxInCommittedBlock)
+{
+  constexpr size_t N = 4;
+  constexpr size_t EQUIVOCATOR_IDX = 2;
+
+  ConsensusNetwork net(N, logger_);
+  net.startAll(/*height=*/1);
+
+  //  One advanceAllTimers drives the network through a full height:
+  //  propose -> prevote -> precommit -> commit -> next height.
+  //  After it returns, every node is at height 2, round 0.
+  net.advanceAllTimers();
+
+  //  Read the actual (height, round) the nodes are at. The injected
+  //  votes must carry these values, or handlePrevote will reject them
+  //  with the height/round guard.
+  auto probe = net.instance(0).state();
+  const uint64_t H = probe.height;
+  const uint64_t R = probe.round;
+
+  const auto &eq = net.validator(EQUIVOCATOR_IDX);
+  const Index signer_index = static_cast<Index>(EQUIVOCATOR_IDX);
+
+  Consensus::Vote vote_a;
+  vote_a.height = H;
+  vote_a.round = R;
+  vote_a.signer_index = signer_index;
+  vote_a.is_nil = false;
+  vote_a.block_hash = makeHash(0xAAAA);
+  vote_a.signature = eq.sign(
+      Consensus::voteSigningHash(H, R, false, vote_a.block_hash));
+
+  Consensus::Vote vote_b;
+  vote_b.height = H;
+  vote_b.round = R;
+  vote_b.signer_index = signer_index;
+  vote_b.is_nil = false;
+  vote_b.block_hash = makeHash(0xBBBB);
+  vote_b.signature = eq.sign(
+      Consensus::voteSigningHash(H, R, false, vote_b.block_hash));
+
+  //  Inject both votes on every node. If the nodes are in Propose
+  //  step, the votes are buffered and delivered when they enter
+  //  Prevote. If they're already in Prevote, the votes are recorded
+  //  immediately (and the second is a conflict). Either way the
+  //  evidence lands by the end of round (H, R).
+  for (size_t i = 0; i < N; ++i)
+    net.instance(i).onPrevote(vote_a);
+  for (size_t i = 0; i < N; ++i)
+    net.instance(i).onPrevote(vote_b);
+
+  //  Now advance until a Slash tx appears. The evidence was recorded
+  //  at height H, so the first proposer at height > H whose evidence
+  //  vector survives resetForNewHeight will include it.
+  bool found_slash = false;
+  for (int pass = 0; pass < 8 && !found_slash; ++pass)
+  {
+    net.advanceAllTimers();
+
+    for (size_t i = 0; i < N && !found_slash; ++i)
+    {
+      for (const auto &block : net.committed(i))
+      {
+        for (const auto &tx : block.transactions)
+        {
+          if (tx.tx_type == Core::TxType::Slash)
+          {
+            found_slash = true;
+            break;
+          }
+        }
+        if (found_slash)
+          break;
+      }
+    }
+  }
+
+  EXPECT_TRUE(found_slash)
+      << "no committed block contained a Slash tx after an "
+         "equivocation was recorded";
+}

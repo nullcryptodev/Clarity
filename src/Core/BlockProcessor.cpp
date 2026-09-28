@@ -13,6 +13,7 @@
 #include "TransactionTypes.h"
 #include "ValidatorRotation.h"
 #include "ValidatorTypes.h"
+#include "EquivocationProof.h"
 
 #include "Crypto/Blake2b.h"
 #include "Crypto/Ed25519.h"
@@ -119,7 +120,8 @@ namespace Core
     std::vector<Receipt> receipts;
     std::vector<Crypto::Hash> tx_hashes;
 
-    if (!applyTransactions(state, block, ctx, receipts, tx_hashes, error))
+    if (!applyTransactions(state, block, ctx, active_set,
+                           receipts, tx_hashes, error))
     {
       result.error = error;
       return result;
@@ -333,10 +335,10 @@ namespace Core
   }
 
   //  Transaction application
-
   bool BlockProcessor::applyTransactions(State::StateAccess &state,
                                          const Block &block,
                                          const BlockContext &ctx,
+                                         const std::vector<Id> &active_set,
                                          std::vector<Receipt> &receipts,
                                          std::vector<Crypto::Hash> &tx_hashes,
                                          std::string &error)
@@ -350,6 +352,22 @@ namespace Core
 
       if (isSystemTx(tx.tx_type))
       {
+        //  Slash is the only system tx that carries semantic content
+        //  today. It must be verified and applied. Every other system
+        //  type (BlockReward, OrderExpired) is a marker: their effects
+        //  are computed by the block processor itself, not carried in
+        //  the tx. Those fall through to the no-op receipt.
+        if (tx.tx_type == TxType::Slash)
+        {
+          std::string slash_err;
+          if (!applySlash(state, tx, active_set, ctx, slash_err))
+          {
+            error = "slash failed at index " + std::to_string(i) +
+                    ": " + slash_err;
+            return false;
+          }
+        }
+
         Receipt r{ReceiptStatus::Success, 0};
         receipts.push_back(r);
         tx_hashes.push_back(tx.txid());
@@ -371,7 +389,8 @@ namespace Core
 
       if (r.status != ReceiptStatus::Success)
       {
-        error = "transaction failed at index " + std::to_string(i) + " (type=" + std::string(txTypeName(tx.tx_type)) + ")";
+        error = "transaction failed at index " + std::to_string(i) +
+                " (type=" + std::string(txTypeName(tx.tx_type)) + ")";
         return false;
       }
 
@@ -923,5 +942,35 @@ namespace Core
       }
     }
     state.putGlobal("active_set", set_bytes);
+  }
+
+  bool BlockProcessor::applySlash(State::StateAccess &state,
+                                  const Transaction &tx,
+                                  const std::vector<Id> &active_set,
+                                  const BlockContext &ctx,
+                                  std::string &error)
+  {
+    auto decoded = verifyEquivocationProof(tx.payload, active_set, state);
+    if (!decoded.has_value())
+    {
+      error = "invalid equivocation proof";
+      return false;
+    }
+
+    TxExecutionContext exec_ctx;
+    exec_ctx.current_height = ctx.current_height;
+    exec_ctx.chain_id = ctx.chain_id;
+    exec_ctx.tx_index_in_block = 0;
+
+    Receipt r = TransactionExecutor::executeSystemSlash(
+        state, *decoded, ctx.current_height, exec_ctx);
+
+    if (r.status != ReceiptStatus::Success)
+    {
+      error = "executeSystemSlash returned failure";
+      return false;
+    }
+
+    return true;
   }
 } // namespace Core

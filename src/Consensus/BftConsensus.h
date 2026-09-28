@@ -27,6 +27,14 @@
 
 namespace Consensus
 {
+  //  Maximum number of equivocation evidence entries retained per
+  //  consensus instance. Evidence survives height transitions so
+  //  that a proposer at height H+1 can still include a conflict it
+  //  observed at height H. The bound prevents a peer that feeds
+  //  conflicting votes from growing the buffer without limit. In
+  //  practice this is never reached.
+  inline constexpr size_t MAX_EQUIVOCATION_EVIDENCE = 256;
+
   struct Callbacks
   {
     std::function<void(const Proposal &)> broadcast_proposal;
@@ -55,6 +63,7 @@ namespace Consensus
     std::function<Crypto::Signature(const Crypto::Hash &)> sign;
     std::function<Height()> current_height;
     std::function<std::vector<Id>()> active_set;
+    std::function<bool(Id, Core::ValidatorInfo &)> state_lookup_validator;
 
     std::function<std::optional<Crypto::PublicKey>(Index)> signer_public_key;
 
@@ -122,6 +131,8 @@ namespace Consensus
     };
 
     State state() const;
+
+    size_t equivocationCount() const;
 
   private:
     void enterNewHeight(Height height);
@@ -215,6 +226,17 @@ namespace Consensus
     // Cleared in resetForNewHeight. Retained across rounds within a
     // height.
     std::unordered_map<Round, Proposal> future_proposals_;
+
+    // Votes received for our current height/round but before we entered
+    // the corresponding step. Delivered when we enter the step.
+    std::vector<Vote> pending_prevotes_;
+    std::vector<Vote> pending_precommits_;
+
+    // Evidence of equivocation seen at the current height. Cleared in
+    // resetForNewHeight. Appended to (never overwritten) in
+    // recordVote when a second vote from a signer conflicts with the
+    // first. Drained by the proposer when it builds a block.
+    std::vector<EquivocationEvidence> equivocations_;
   };
 
 } // namespace Consensus

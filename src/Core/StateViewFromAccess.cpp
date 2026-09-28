@@ -30,4 +30,9 @@ namespace Core
     return access_->getTokenBalance(address, token_id);
   }
 
+  bool Core::StateViewFromAccess::getValidator(Id validator_id,
+                                               ValidatorInfo &out) const
+  {
+    return access_->getValidator(validator_id, out);
+  }
 } // namespace Core

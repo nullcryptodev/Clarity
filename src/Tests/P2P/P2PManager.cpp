@@ -250,3 +250,62 @@ TEST_F(P2P_ManagerFixture, SelfConnectionIsRejected)
   EXPECT_TRUE(a.waitForDisconnected(1, kWait))
       << "self-connection was not rejected";
 }
+
+TEST_F(P2P_ManagerFixture, SimultaneousDialLeavesOnePeer)
+{
+  // Two managers dial each other at the same time. Both should end up
+  // with exactly one Established peer, and it must be the *same*
+  // physical connection from both sides (which the count alone
+  // doesn't prove, but is what the nonce tie-break guarantees).
+  //
+  // Without deduplication, both sides would end up with two peers.
+  // With the buggy "always keep outbound" rule, both sides would end
+  // up with one peer but on different TCP connections, and messages
+  // would be silently dropped. The nonce tie-break is what makes
+  // this test pass *and* keep the two sides talking to each other.
+
+  const uint16_t port_a = pickFreePort();
+  const uint16_t port_b = pickFreePort();
+
+  ManagerHarness a(port_a, "dedup_a");
+  ManagerHarness b(port_b, "dedup_b");
+
+  // Wait for both to be listening before dialing.
+  ASSERT_TRUE(waitFor([&] { return canConnect(port_a); }, 2s));
+  ASSERT_TRUE(waitFor([&] { return canConnect(port_b); }, 2s));
+
+  // Simultaneous dial. Both post the connectTo to their own event
+  // loops; the ordering across the two loops is nondeterministic,
+  // which is exactly the race we're testing.
+  a.mgr().post([&a, port_b]
+               { a.mgr().connectTo("127.0.0.1", port_b); });
+  b.mgr().post([&b, port_a]
+               { b.mgr().connectTo("127.0.0.1", port_a); });
+
+  // Both sides should establish at least one peer.
+  ASSERT_TRUE(a.waitForEstablished(1, 5s));
+  ASSERT_TRUE(b.waitForEstablished(1, 5s));
+
+  // Give the dedup logic a moment to fire. It runs synchronously in
+  // the onEstablished callback, so by the time the second peer
+  // establishes on each side, the map has already been updated and
+  // the loser's forceClose has been called. A short sleep lets the
+  // resulting removePeer post run.
+  std::this_thread::sleep_for(300ms);
+
+  // Each side should have exactly one Established peer.
+  const auto snap_a = a.mgr().snapshot();
+  const auto snap_b = b.mgr().snapshot();
+
+  EXPECT_EQ(snap_a.established, 1u)
+      << "side A has " << snap_a.established << " established peers";
+  EXPECT_EQ(snap_b.established, 1u)
+      << "side B has " << snap_b.established << " established peers";
+
+  // Total peer count should also be 1 on each side — no lingering
+  // Closed peers that haven't been cleaned up yet. Give them a moment.
+  std::this_thread::sleep_for(200ms);
+
+  EXPECT_EQ(a.mgr().peerCount(), 1u);
+  EXPECT_EQ(b.mgr().peerCount(), 1u);
+}

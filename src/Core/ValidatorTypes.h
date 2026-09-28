@@ -73,12 +73,37 @@ namespace Core
 
     bool canBeActive() const noexcept
     {
-      return isHealthy() && uptime_score >= UPTIME_ACTIVE_MIN_BPS;
+      return isHealthy() && uptime_score >= UPTIME_ACTIVE_MIN_BPS && meetsStakeRequirement();
     }
 
     bool meetsStakeRequirement() const noexcept
     {
       return stake >= VALIDATOR_MIN_STAKE;
+    }
+
+    // Apply the persistent penalty for a proven infraction.
+    //
+    // Decrements reward_multiplier by REWARD_MULTIPLIER_PENALTY,
+    // clamped at REWARD_MULTIPLIER_FLOOR, and records the infraction.
+    // Idempotent only in the sense that calling it twice applies two
+    // penalties — the caller is responsible for calling it once per
+    // proven infraction.
+    //
+    // The stake itself is not touched here. Stake reduction is a
+    // separate, consensus-layer decision (see TransactionExecutor::
+    // executeSystemSlash).
+    void applyInfractionPenalty(uint64_t height) noexcept
+    {
+      infraction_count++;
+
+      const uint32_t penalized =
+          static_cast<uint32_t>(reward_multiplier) - REWARD_MULTIPLIER_PENALTY;
+
+      reward_multiplier = static_cast<uint16_t>(
+          penalized < REWARD_MULTIPLIER_FLOOR ? REWARD_MULTIPLIER_FLOOR
+                                              : penalized);
+
+      last_infraction_height = height;
     }
 
     // True if the validator has been offline too long.

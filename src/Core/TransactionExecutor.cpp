@@ -10,6 +10,8 @@
 #include "Order.h"
 #include "TokenTypes.h"
 #include "ValidatorTypes.h"
+#include "GlobalState.h"
+#include "RewardTypes.h"
 
 #include "State/StateAccess.h"
 #include "Crypto/Ed25519.h"
@@ -1528,4 +1530,80 @@ namespace Core
     return {ReceiptStatus::Success, tx.fee};
   }
 
+  //  System: Slash
+  //
+  //  Applied when the consensus layer has verified an equivocation
+  //  proof against a validator. The proof is not re-verified here; see
+  //  the header for the contract.
+  //
+  //  Effects, in order:
+  //    1. Load the validator. Reject if not registered.
+  //    2. Reject if seed and SEED_SLASH_EXEMPT.
+  //    3. Compute slash_amount = applyBps(stake, SLASH_AMOUNT_BPS).
+  //    4. Reduce stake by slash_amount. If stake is already zero,
+  //       slash_amount is zero and this is a no-op.
+  //    5. Apply the reward-multiplier penalty (persistent record).
+  //    6. Write the validator back.
+  //    7. Credit the pot with slash_amount.
+  //
+  //  Note on balance vs. stake: the validator's `stake` field is the
+  //  slashable principal, held in the validator record and returned to
+  //  the owner's account balance on unregister. It is NOT the same as
+  //  the owner's current account balance. The slash reduces stake only;
+  //  the account balance is untouched until unregister.
+  //
+  //  Note on state root: crediting the pot is a global-state write and
+  //  therefore changes the state root, exactly as maintaining
+  //  total_staked does in putAccount. A slash is not root-neutral.
+
+  Receipt TransactionExecutor::executeSystemSlash(State::StateAccess &state,
+                                                  uint64_t validator_id,
+                                                  uint64_t slash_height,
+                                                  const TxExecutionContext & /*ctx*/)
+  {
+    Receipt failure{ReceiptStatus::Failure, 0};
+
+    ValidatorInfo validator;
+    if (!state.getValidator(validator_id, validator))
+      return failure;
+
+    if (SEED_SLASH_EXEMPT && validator.is_seed)
+      return failure;
+
+    // Compute the stake reduction. applyBps is overflow-safe and
+    // floors, which is the correct direction: a validator is never
+    // slashed more than the configured fraction.
+    const uint64_t slash_amount =
+        applyBps(validator.stake, SLASH_AMOUNT_BPS);
+
+    // Stake is uint64_t and slash_amount <= stake, so this cannot
+    // underflow. Guard anyway — a future change to SLASH_AMOUNT_BPS
+    // or to how stake is computed could break the invariant, and a
+    // silent underflow here would be a consensus split.
+    if (slash_amount <= validator.stake)
+      validator.stake -= slash_amount;
+
+    // The multiplier penalty is applied unconditionally. The proof is
+    // valid; the infraction is recorded even if there was nothing left
+    // to slash from the stake.
+    validator.applyInfractionPenalty(slash_height);
+
+    state.putValidator(validator);
+
+    // Credit the pot. The pot is credited every block by
+    // BlockProcessor::distributeRewards with the reward-multiplier
+    // penalty proceeds and the staker share; a slash is a one-time
+    // additional contribution to the same pot.
+    if (slash_amount > 0)
+    {
+      GlobalStateReader reader(state);
+      GlobalStateWriter writer(state);
+
+      uint64_t pot = reader.pot();
+      pot += slash_amount;
+      writer.setPot(pot);
+    }
+
+    return {ReceiptStatus::Success, 0};
+  }
 } // namespace Core

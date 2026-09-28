@@ -4,7 +4,7 @@
 
 #include "Crypto/Blake2b.h"
 
-#include "Tests/Utils.h"
+#include "Utils.h"
 
 namespace Tests
 {
@@ -32,6 +32,9 @@ namespace Tests
       seed2_ = deterministicKey(2);
 
       genesis_config_ = makeFixtureGenesis(seed1_, seed2_);
+
+      validator_keys_[1] = seed1_;
+      validator_keys_[2] = seed2_;
 
       {
         auto t = db_->beginWrite();
@@ -354,25 +357,54 @@ namespace Tests
 
     Crypto::Address validatorAddress(Id id)
     {
+      // Genesis validators are in the config.
       for (const auto &v : genesis_config_.validators)
       {
         if (v.id == id)
           return v.reward_address;
       }
-      return Crypto::Address{};
-    }
 
+      // Post-genesis validators (like the slash-test targets) are only
+      // in state.
+      Crypto::Address result;
+      readState([&](State::StateAccess &s)
+                {
+        Core::ValidatorInfo v;
+        if (s.getValidator(id, v))
+          result = v.reward_address; });
+      return result;
+    }
     // ---- Real quorum signatures ----
 
     // Produces a set of quorum signatures over the block's hash,
-    // signed by the fixture's seed keypairs. `block` must already
-    // have its final `commit_round` and `state_root` set — the
-    // signature covers the block hash, which covers both.
+    // signed by the given keypairs. `block` must already have its
+    // final `commit_round` and `state_root` set — the signature covers
+    // the block hash, which covers both.
+    //
+    // Signature i is produced by keys[i], and is tagged with
+    // signer_index i. The caller is responsible for passing a key list
+    // whose i-th entry corresponds to active_set[i]; that's what
+    // BlockProcessor::checkQuorum verifies against.
+    //
+    // Empty key set: returns an empty signature list. bftQuorum(0)
+    // evaluates to 1 by the formula, and the old code would then index
+    // keys[0] on a zero-length vector. That was a segfault.
     std::vector<Crypto::ValidatorSignature>
     makeQuorumForBlock(const Core::Block &block,
                        const std::vector<Crypto::KeyPair> &keys)
     {
+      if (keys.empty())
+        return {};
+
       size_t needed = Core::bftQuorum(keys.size());
+
+      //  Defensive: bftQuorum(n) can exceed n for pathological n
+      //  (bftQuorum(0) = 1). The empty case is handled above; this
+      //  cap protects against a future change to bftQuorum's formula
+      //  that would make it exceed n for some small n > 0.
+      if (needed > keys.size())
+        needed = keys.size();
+
       std::vector<Crypto::ValidatorSignature> sigs;
       sigs.reserve(needed);
 
@@ -465,7 +497,22 @@ namespace Tests
         b.header.receipts_root = Crypto::Hash{};
       }
 
-      b.quorum_signatures = makeQuorumForBlock(b, {seed1_, seed2_});
+      //  Resolve the signing key for each active-set entry. Every
+      //  validator in the active set must have a key registered here;
+      //  a missing key produces a default-constructed KeyPair whose
+      //  signature will fail verification. That's a loud failure at
+      //  checkQuorum, which is where test bugs should surface.
+      std::vector<Crypto::KeyPair> quorum_keys;
+      quorum_keys.reserve(active_set.size());
+      for (Id vid : active_set)
+      {
+        auto it = validator_keys_.find(vid);
+        quorum_keys.push_back(it != validator_keys_.end()
+                                  ? it->second
+                                  : Crypto::KeyPair{});
+      }
+
+      b.quorum_signatures = makeQuorumForBlock(b, quorum_keys);
 
       return b;
     }
@@ -501,6 +548,59 @@ namespace Tests
       return r;
     }
 
+    Core::BlockResult applyBlock(uint64_t height,
+                                 const Crypto::Hash &parent,
+                                 const std::vector<Core::Transaction> &txs,
+                                 bool dry_run,
+                                 const std::vector<Id> &active_set)
+    {
+      Core::Block b = makeProcessableBlock(height, parent, txs, active_set);
+      Core::BlockContext ctx = makeContext(height, dry_run);
+
+      auto t = db_->beginWrite();
+      State::StateAccess s(*db_, t, 0);
+      Core::BlockResult r = Core::BlockProcessor::applyBlock(s, b, ctx);
+      if (r.valid)
+      {
+        s.commit(/*version=*/0);
+        t.commit();
+      }
+      else
+      {
+        t.abort();
+      }
+
+      return r;
+    }
+
+    // Register a non-seed validator with a known keypair so its
+    // quorum signature can be produced by the fixture. Also inserts
+    // the key into validator_keys_ so makeProcessableBlock can sign
+    // for it.
+    void registerValidatorWithKey(Id id,
+                                  const Crypto::KeyPair &kp,
+                                  uint64_t stake = 1'000'000'000ULL,
+                                  bool is_seed = false)
+    {
+      Crypto::Address addr = addressOf(kp);
+
+      Core::ValidatorInfo v;
+      v.id = id;
+      v.reward_address = addr;
+      v.owner = addr;
+      v.stake = stake;
+      v.reward_multiplier = Core::REWARD_MULTIPLIER_START;
+      v.uptime_score = 10'000;
+      v.is_seed = is_seed;
+      v.is_active = true;
+
+      withState([&](State::StateAccess &s)
+                {
+        s.putValidator(v);
+        s.putValidatorByAddress(addr, id); });
+
+      validator_keys_[id] = kp;
+    }
     // ---- Members ----
 
     std::filesystem::path test_dir_;
@@ -510,6 +610,7 @@ namespace Tests
     Crypto::KeyPair carol_;
     Crypto::KeyPair seed1_;
     Crypto::KeyPair seed2_;
+    std::unordered_map<Id, Crypto::KeyPair> validator_keys_;
     Core::GenesisConfig genesis_config_;
     Crypto::Hash genesis_hash_;
   };

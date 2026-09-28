@@ -117,9 +117,17 @@ namespace Core
     // ---- Application steps ----
 
     // Apply all transactions, generating receipts.
+    //
+    // `active_set` is required because TxType::Slash transactions must
+    // resolve a signer_index to a validator id, and that resolution is
+    // "active_set[signer_index]". The set is loaded once by applyBlock
+    // and passed in — reloading it here would double the state reads
+    // per block and risk a mid-block inconsistency if rotation ran
+    // between the two loads.
     static bool applyTransactions(State::StateAccess &state,
                                   const Block &block,
                                   const BlockContext &ctx,
+                                  const std::vector<Id> &active_set,
                                   std::vector<Receipt> &receipts,
                                   std::vector<Crypto::Hash> &tx_hashes,
                                   std::string &error);
@@ -173,6 +181,17 @@ namespace Core
 
     static void runOfflineCheck(State::StateAccess &state,
                                 const BlockContext &ctx);
+
+    // Verify and apply a TxType::Slash transaction.
+    //
+    // The proof is re-verified here on every node, independently of
+    // the proposer. A malformed or forged proof causes the block to
+    // be rejected — a proposer cannot sneak a slash past validation.
+    static bool applySlash(State::StateAccess &state,
+                           const Transaction &tx,
+                           const std::vector<Id> &active_set,
+                           const BlockContext &ctx,
+                           std::string &error);
   };
 
 } // namespace Core

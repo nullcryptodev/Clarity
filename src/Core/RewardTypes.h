@@ -171,4 +171,15 @@ namespace Core
   static_assert(REWARD_MULTIPLIER_PENALTY > 0,
                 "Penalty must be positive");
 
+  // ---- Slashing ----
+
+  // Fraction of stake slashed on proven equivocation.
+  inline constexpr uint16_t SLASH_AMOUNT_BPS = 500; // 5%
+
+  // Seeds are exempt from slashing. The trust anchor must not be
+  // slashable — a slash against a seed is a governance attack vector.
+  inline constexpr bool SEED_SLASH_EXEMPT = true;
+
+  static_assert(SLASH_AMOUNT_BPS > 0 && SLASH_AMOUNT_BPS <= 10'000,
+                "Slash amount must be in (0, 100%]");
 } // namespace Core

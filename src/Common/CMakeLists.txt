@@ -1,12 +1,9 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.12)
 
 # Collect files
 file(GLOB_RECURSE COMMON_SOURCES 
   ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp
 )
-
-# Remove Tests directory from the sources
-list(FILTER COMMON_SOURCES EXCLUDE REGEX ".*/Tests/.*")
 
 # Check if we found any sources
 if(NOT COMMON_SOURCES)
@@ -17,9 +14,6 @@ endif()
 file(GLOB_RECURSE COMMON_HEADERS
   ${CMAKE_CURRENT_SOURCE_DIR}/*.h
 )
-
-# Remove Tests headers
-list(FILTER COMMON_HEADERS EXCLUDE REGEX ".*/Tests/.*")
 
 # Define Common as an OBJECT library
 add_library(Common OBJECT ${COMMON_SOURCES})

@@ -59,6 +59,17 @@ namespace Core
                            const Transaction &tx,
                            const TxExecutionContext &ctx);
 
+    // Applies a consensus-generated slash. Bypasses the user-tx prechecks
+    // (signature, nonce, fee) because the proof has already been verified
+    // by the consensus layer that produced it.
+    //
+    // Returns Success if the slash was applied, Failure if the target
+    // was ineligible (unregistered, seed, nothing left to slash).
+    static Receipt executeSystemSlash(State::StateAccess &state,
+                                      uint64_t validator_id,
+                                      uint64_t slash_height,
+                                      const TxExecutionContext &ctx);
+
   private:
     // Per-type handlers. Each returns Success on success, and reports
     // failure by returning a Failure receipt (without exception).

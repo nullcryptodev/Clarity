@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "P2PManager.h"
+#include "Peer.h"
 #include "Nonce.h"
 #include "VersionMessage.h"
 #include "Logging/ILogger.h"
@@ -18,6 +19,47 @@ using namespace std::chrono_literals;
 
 namespace
 {
+  //  Decide which of two Established peers with the same pubkey to keep.
+  //
+  //  Both sides of a duplicate connection must independently arrive at
+  //  the same answer, or they'll keep different TCP sockets and be
+  //  unable to talk to each other. The rule that achieves this:
+  //
+  //    Keep the connection dialed by the node with the *lower* network
+  //    nonce.
+  //
+  //  "Lower nonce" is a stable property of the node, so both sides
+  //  compute the same answer. The direction is used as a proxy for
+  //  "who dialed," but is interpreted from each side's own view.
+  //
+  //  `our_nonce` — this node's networkNonce_.
+  //  `candidate` — the peer whose fate we're deciding.
+  //
+  //  Returns true if the caller should KEEP `candidate` (and close any
+  //  other peer with the same pubkey).
+  bool shouldKeepConnection(const P2P::Peer &candidate, uint64_t our_nonce)
+  {
+    const uint64_t their_nonce = candidate.peerNonce();
+
+    if (our_nonce == their_nonce)
+    {
+      // Self-connections are caught during the version handshake, so
+      // this shouldn't happen. If it does, keep the outbound by
+      // convention (deterministic, and the caller's caller doesn't
+      // care).
+      return candidate.direction() == P2P::PeerDirection::Outbound;
+    }
+
+    const bool we_dialed = (candidate.direction() == P2P::PeerDirection::Outbound);
+    const bool we_have_lower_nonce = (our_nonce < their_nonce);
+
+    //  The connection to keep is the one dialed by the lower-nonce
+    //  node. From our perspective:
+    //    - If we have the lower nonce, that connection is our outbound.
+    //    - If we have the higher nonce, that connection is our inbound.
+    return we_have_lower_nonce ? we_dialed : !we_dialed;
+  }
+
   const char *peerStateName(P2P::PeerState s) noexcept
   {
     switch (s)
@@ -350,6 +392,13 @@ namespace P2P
     // The node uses this to instantiate a SyncManager for the peer.
     peer->onEstablished = [this](Peer &established_peer)
     {
+      //  Peer deduplication. If we already have an Established peer
+      //  with the same authenticated pubkey, one of the two must go.
+      //  deduplicatePeer() decides which and closes the other; it
+      //  returns false if *this* peer is the one being closed.
+      if (!deduplicatePeer(established_peer))
+        return;
+
       if (!onPeerEstablished)
         return;
 
@@ -394,6 +443,19 @@ namespace P2P
     (*log_)(Logging::INFO) << "peer " << id << " (" << ip << ":" << port
                            << ") disconnected: " << reason
                            << " (misbehaviors=" << score << ")";
+
+    //  Peer deduplication cleanup. Only erase the map entry if it
+    //  still points at *this* peer. If it points at a different peer
+    //  with the same pubkey (this one was closed in favor of a
+    //  duplicate, or vice versa), leave the entry alone.
+    {
+      const Crypto::PublicKey pubkey = peer.pubkey();
+      auto it = established_by_pubkey_.find(pubkey);
+      if (it != established_by_pubkey_.end() && it->second == id)
+      {
+        established_by_pubkey_.erase(it);
+      }
+    }
 
     // Persist ban if the peer crossed the threshold.
     if (score >= config_.banThreshold)
@@ -620,5 +682,64 @@ namespace P2P
     if (!holder->done)
       return {};
     return std::move(holder->out);
+  }
+
+  bool P2PManager::deduplicatePeer(Peer &peer)
+  {
+    const Crypto::PublicKey pubkey = peer.pubkey();
+
+    auto it = established_by_pubkey_.find(pubkey);
+
+    if (it == established_by_pubkey_.end())
+    {
+      //  First peer with this pubkey. Record it and keep it.
+      established_by_pubkey_.emplace(pubkey, peer.id());
+      return true;
+    }
+
+    const PeerId existing_id = it->second;
+
+    //  If the map entry points to a peer we no longer have (stale
+    //  entry from a peer that closed but whose disconnect handler
+    //  hasn't run yet), replace it.
+    Peer *existing = peers_.find(existing_id);
+    if (!existing || !existing->isOperational())
+    {
+      it->second = peer.id();
+      return true;
+    }
+
+    //  Real duplicate. Decide which side keeps its connection.
+    if (shouldKeepConnection(peer, networkNonce_))
+    {
+      (*log_)(Logging::INFO)
+          << "duplicate peer: replacing " << existing_id
+          << " with " << peer.id()
+          << " (pubkey=" << pubkey.toString().substr(0, 16) << ")";
+
+      //  The new peer wins. Close the old one. `forceClose` will
+      //  trigger the old peer's disconnect handler, which will
+      //  clean up its own entry in the map.
+      existing->forceClose("duplicate-peer");
+
+      //  Point the map at the new peer before returning, so a racing
+      //  disconnect handler for the old peer doesn't erase the entry
+      //  we're about to occupy.
+      it->second = peer.id();
+      return true;
+    }
+    else
+    {
+      (*log_)(Logging::INFO)
+          << "duplicate peer: keeping " << existing_id
+          << ", closing " << peer.id()
+          << " (pubkey=" << pubkey.toString().substr(0, 16) << ")";
+
+      //  The existing peer wins. Close the new one. The caller
+      //  (onEstablished) checks the return value and skips the rest
+      //  of the establishment flow for this peer.
+      peer.forceClose("duplicate-peer");
+      return false;
+    }
   }
 } // namespace P2P

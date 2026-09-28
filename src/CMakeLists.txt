@@ -88,8 +88,9 @@ elseif(MINGW)
 endif()
 
 # Build executables
-add_subdirectory(Daemon)
+add_subdirectory(Apps)
 
+# Build Tests if enabled
 if(BUILD_TESTS)
   add_subdirectory(Tests)
 endif()

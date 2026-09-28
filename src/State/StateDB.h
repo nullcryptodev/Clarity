@@ -48,7 +48,8 @@ namespace State
       TBL_TX_INDEX = 12,
       TBL_BLOCKS_BY_HASH = 13,
       TBL_BLOCKS_BY_HEIGHT = 14,
-      TBL_COUNT = 15,
+      TBL_MEMPOOL = 15,
+      TBL_COUNT = 16,
     };
 
     using EntryVisitor = std::function<bool(const std::vector<uint8_t> &key,

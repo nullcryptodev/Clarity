@@ -63,4 +63,36 @@ namespace Consensus
     size_t count() const noexcept { return votes.size(); }
   };
 
+  // Evidence of a validator signing two conflicting votes at the
+  // same (height, round). Produced by BftConsensus::recordVote when
+  // a second vote from the same signer disagrees with the first.
+  // Consumed by the proposer when building a block: it becomes the
+  // payload of a TxType::Slash system transaction.
+  struct EquivocationEvidence
+  {
+    Vote vote_a;
+    Vote vote_b;
+
+    // The validator the evidence is against. Both votes must share
+    // this signer for the evidence to be usable.
+    Index signer_index{INVALID_INDEX};
+
+    // Convenience: does this evidence describe a real conflict?
+    // Same (height, round, signer) and different (block_hash, is_nil).
+    bool isValid() const noexcept
+    {
+      if (vote_a.height != vote_b.height)
+        return false;
+      if (vote_a.round != vote_b.round)
+        return false;
+      if (vote_a.signer_index != vote_b.signer_index)
+        return false;
+      if (vote_a.signer_index == INVALID_INDEX)
+        return false;
+      if (vote_a.is_nil == vote_b.is_nil &&
+          vote_a.block_hash == vote_b.block_hash)
+        return false;
+      return true;
+    }
+  };
 } // namespace Consensus

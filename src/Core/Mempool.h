@@ -18,6 +18,11 @@
 #include "StateView.h"
 #include "Transaction.h"
 
+namespace State
+{
+  class StateDB;
+}
+
 namespace Core
 {
   //  Mempool
@@ -39,6 +44,20 @@ namespace Core
   //  Thread safety:
   //    - Mempool is internally synchronized via a mutex
   //    - All public methods are safe to call from multiple threads
+  //
+  //  Persistence:
+  //    - Optionally attached to a State::StateDB. When attached, every
+  //      mutation writes through to TBL_MEMPOOL in the same operation.
+  //      When not attached, the pool is purely in-memory.
+  //    - On startup, `load(state)` rebuilds the pool from persisted
+  //      rows by re-adding each through the normal validation path.
+  //      Entries that fail validation (nonce too low, insufficient
+  //      funds, expired) are dropped and their rows deleted. This is
+  //      what filters out transactions that were mined while the node
+  //      was offline.
+  //    - Persistence stores the full Entry (tx + tier + fee rate +
+  //      sequence + add time), not just the tx, so eviction ordering
+  //      and priority status survive a restart.
 
   // ---- Fee policy constants ----
 
@@ -88,17 +107,40 @@ namespace Core
     Mempool() = default;
     ~Mempool() = default;
 
+    // Construct attached to a DB. Equivalent to default construction
+    // followed by attach().
+    explicit Mempool(State::StateDB &db);
+
     Mempool(const Mempool &) = delete;
     Mempool &operator=(const Mempool &) = delete;
+
+    // ---- Persistence ----
+
+    // Attach a DB for write-through persistence. Idempotent. The DB
+    // must outlive the Mempool.
+    //
+    // If called while the pool already holds entries, those entries
+    // are NOT retroactively persisted. attach() only affects future
+    // mutations. Typical usage is to attach once at construction.
+    void attach(State::StateDB &db);
+
+    // Rebuild the pool from persisted rows. Reads TBL_MEMPOOL, and for
+    // each stored Entry, re-adds it through the normal `add` path with
+    // the supplied StateView. Entries that fail validation (nonce too
+    // low, insufficient funds, expired, already on chain) are dropped
+    // and their rows deleted.
+    //
+    // No-op if no DB is attached. Typically called once at node startup.
+    void load(const StateView &state);
 
     // ---- Add / Remove ----
 
     // Validate and add a transaction. Uses the provided StateView to check
     // nonce, balance, and current chain height.
     //
-    // The `is_priority` flag indicates whether the sender paid the priority
-    // surcharge. This is enforced by the caller (wallet sets the fee
-    // accordingly, node verifies the surcharge was included in tx.fee).
+    // The `tier` indicates whether the sender paid the priority surcharge.
+    // This is enforced by the caller (wallet sets the fee accordingly,
+    // node verifies the surcharge was included in tx.fee).
     MempoolAddResult add(const Transaction &tx,
                          const StateView &state,
                          FeeTier tier);
@@ -113,7 +155,7 @@ namespace Core
     // Remove transactions that have expired at the given height.
     void purgeExpired(uint64_t current_height);
 
-    // Wipe the entire pool.
+    // Wipe the entire pool, in-memory and persisted.
     void clear();
 
     // ---- Query ----
@@ -230,6 +272,21 @@ namespace Core
     // Build a nonce key from (address, nonce).
     static std::string nonceKey(const Crypto::Address &from, uint64_t nonce);
 
+    // ---- Persistence helpers. No-ops when db_ is null. ----
+    //
+    // All of these are called from inside public methods that already
+    // hold mutex_. They take the StateDB's own lock internally; there
+    // is no cross-lock dependency because the Mempool never calls into
+    // a StateDB method that would call back into the Mempool.
+
+    void persistEntry(const Crypto::Hash &txid, const Entry &e);
+    void unpersistEntry(const Crypto::Hash &txid);
+    void unpersistBatch(const std::vector<Crypto::Hash> &txids);
+
+    // Serialize / deserialize an Entry for storage.
+    static std::vector<uint8_t> serializeEntry(const Entry &e);
+    static bool deserializeEntry(const uint8_t *data, size_t len, Entry &out);
+
     // ---- Members ----
 
     mutable std::mutex mutex_;
@@ -248,6 +305,10 @@ namespace Core
 
     // Monotonic sequence counter for FIFO tie-breaking.
     uint64_t next_sequence_{1};
+
+    // The DB the pool persists to. Null when persistence is disabled.
+    // Owned by the caller; must outlive the Mempool.
+    State::StateDB *db_{nullptr};
   };
 
 } // namespace Core

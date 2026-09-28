@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "Tests/Utils.h"
+#include "Utils.h"
 
 namespace Tests
 {

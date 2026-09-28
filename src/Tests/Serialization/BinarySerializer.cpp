@@ -4,7 +4,7 @@
 #include <cstring>
 
 #include "Fixtures.h"
-#include "Tests/Types.h"
+#include "Types.h"
 
 #include "Serialization/BinarySerializer.h"
 #include "Serialization/MemoryStream.h"

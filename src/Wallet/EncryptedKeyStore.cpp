@@ -178,6 +178,139 @@ namespace Wallet
     return ks;
   }
 
+  std::optional<std::unique_ptr<EncryptedKeyStore>> EncryptedKeyStore::createFromMnemonic(
+      const std::string &path,
+      std::string_view password,
+      Network network,
+      std::string_view mnemonic,
+      std::string_view passphrase,
+      std::string_view kdf,
+      WalletStatus *error_out)
+  {
+    auto fail = [&](WalletError code, std::string detail)
+        -> std::optional<std::unique_ptr<EncryptedKeyStore>>
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(code, std::move(detail));
+      return std::nullopt;
+    };
+
+    if (error_out)
+      *error_out = WalletStatus::success();
+
+    if (password.empty())
+      return fail(WalletError::BadArgument, "password must not be empty");
+
+    if (mnemonic.empty())
+      return fail(WalletError::BadArgument, "mnemonic must not be empty");
+
+    if (kdf != KDF_ARGON2ID && kdf != KDF_PBKDF2_HMAC_SHA512)
+      return fail(WalletError::KeyStoreUnsupportedKdf,
+                  "unsupported kdf: '" + std::string(kdf) + "'");
+
+    // Validate the mnemonic up front. SeedMaterial::fromMnemonic also
+    // validates, but doing it here gives us a cleaner error to hand
+    // back (the specific validation code, not a wrapped one).
+    {
+      WalletError err = validateMnemonic(mnemonic);
+      if (err != WalletError::Ok)
+        return fail(err,
+                    std::string("mnemonic invalid: ") +
+                        walletErrorMessage(err));
+    }
+
+    // Build the seed material from the supplied mnemonic. This is the
+    // one line that differs from create(), which calls
+    // generateMnemonic() and passes the result here.
+    WalletStatus status;
+    auto material = SeedMaterial::fromMnemonic(mnemonic, passphrase, &status);
+    if (!material)
+      return fail(status.code, std::move(status.detail));
+
+    auto ks = std::unique_ptr<EncryptedKeyStore>(new EncryptedKeyStore());
+    ks->path_ = path;
+    ks->network_ = network;
+
+    ks->file_.version = KEYSTORE_VERSION;
+    ks->file_.id = generateUuidV4();
+    if (ks->file_.id.empty())
+      return fail(WalletError::Internal,
+                  "RNG failure generating keystore id");
+    ks->file_.label = "";
+    ks->file_.network = networkToString(network);
+    ks->file_.chain_id = chainIdForNetwork(network);
+    ks->file_.created_at_ms = nowMs();
+
+    ks->file_.crypto.cipher = CIPHER_XCHACHA20_POLY1305;
+    ks->file_.crypto.aad = KEYSTORE_AAD;
+    ks->file_.crypto.kdf = std::string(kdf);
+
+    // KDF parameters. Same as create(): fresh salt, defaults for the
+    // chosen KDF.
+    if (kdf == KDF_ARGON2ID)
+    {
+      Argon2ParamsJson params;
+      params.salt.assign(KEYSTORE_SALT_LENGTH, 0);
+      if (!Crypto::randomBytes(params.salt.data(), params.salt.size()))
+        return fail(WalletError::Internal, "RNG failure generating salt");
+      params.m_cost_kib = KEYSTORE_ARGON2_M_COST_KIB;
+      params.t_cost = KEYSTORE_ARGON2_T_COST;
+      params.p_cost = KEYSTORE_ARGON2_P_COST;
+      ks->file_.crypto.argon2 = std::move(params);
+    }
+    else
+    {
+      Pbkdf2ParamsJson params;
+      params.salt.assign(KEYSTORE_SALT_LENGTH, 0);
+      if (!Crypto::randomBytes(params.salt.data(), params.salt.size()))
+        return fail(WalletError::Internal, "RNG failure generating salt");
+      params.iterations = KEYSTORE_PBKDF2_ITERATIONS;
+      ks->file_.crypto.pbkdf2 = std::move(params);
+    }
+
+    // Derive the default account's public key. Identical to create().
+    const HdPath default_path = clrtyPath(0, 0, 0);
+    auto key = material->deriveKey(default_path, &status);
+    if (!key)
+      return fail(status.code, std::move(status.detail));
+
+    ks->file_.pubkey.assign(key->pubkey.data.begin(),
+                            key->pubkey.data.end());
+    ks->file_.address = encodeAddress(key->pubkey, network);
+    if (ks->file_.address.empty())
+      return fail(WalletError::Internal, "address encoding failed");
+
+    Crypto::secureZero(key->secret.data.data(), 32);
+
+    // Fingerprint and default path.
+    ks->fingerprint_ = material->fingerprint();
+    ks->file_.hd.seed_fingerprint.assign(
+        ks->fingerprint_.bytes,
+        ks->fingerprint_.bytes + 4);
+    ks->file_.hd.default_path = default_path.toString();
+
+    // Derive the KEK and encrypt the seed.
+    auto kek = ks->deriveKek(password);
+    if (!kek)
+      return fail(WalletError::Internal, "KEK derivation failed");
+
+    const WalletError ee = ks->encryptSeed(material->seed(), *kek);
+    Crypto::secureZero(kek->data(), kek->size());
+    if (ee != WalletError::Ok)
+      return fail(ee, walletErrorMessage(ee));
+
+    // Persist.
+    WalletStatus save_status;
+    if (!writeKeyStoreFile(path, ks->file_, &save_status))
+      return fail(save_status.code, std::move(save_status.detail));
+
+    // Move the material in so the returned keystore is unlocked, same
+    // as create().
+    ks->material_ = std::move(*material);
+
+    return ks;
+  }
+
   std::optional<std::unique_ptr<EncryptedKeyStore>>
   EncryptedKeyStore::open(const std::string &path,
                           WalletStatus *error_out)
@@ -479,6 +612,19 @@ namespace Wallet
     return EncryptedKeyStore::create(path, password, network,
                                      strength_bits, out_mnemonic,
                                      KDF_ARGON2ID, error_out);
+  }
+
+  std::optional<std::unique_ptr<KeyStore>> createEncryptedKeyStoreFromMnemonic(
+      const std::string &path,
+      std::string_view password,
+      Network network,
+      std::string_view mnemonic,
+      std::string_view passphrase,
+      WalletStatus *error_out)
+  {
+    return EncryptedKeyStore::createFromMnemonic(
+        path, password, network, mnemonic, passphrase,
+        KDF_ARGON2ID, error_out);
   }
 
   std::optional<std::unique_ptr<KeyStore>> openEncryptedKeyStore(

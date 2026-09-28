@@ -5,7 +5,7 @@
 #include <cstring>
 
 #include "Fixtures.h"
-#include "Tests/Types.h"
+#include "Types.h"
 
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/SerializationTools.h"

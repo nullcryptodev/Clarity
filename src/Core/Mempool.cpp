@@ -7,6 +7,7 @@
 
 #include "Crypto/Ed25519.h"
 #include "RewardTypes.h"
+#include "State/StateDB.h"
 
 #include <chrono>
 #include <cstring>
@@ -61,6 +62,16 @@ namespace Core
     }
   } // anonymous namespace
 
+  //  Construction
+
+  Mempool::Mempool(State::StateDB &db) : db_(&db) {}
+
+  void Mempool::attach(State::StateDB &db)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    db_ = &db;
+  }
+
   std::string Mempool::nonceKey(const Crypto::Address &from, uint64_t nonce)
   {
     // Key = (32-byte address || 8-byte LE nonce).
@@ -86,6 +97,177 @@ namespace Core
     (void)tier;
 
     return effective_fee / size;
+  }
+
+  //  Entry serialization
+  //
+  //  Wire format (little-endian):
+  //    [4]  tx_size
+  //    [N]  tx serialized bytes
+  //    [1]  tier
+  //    [8]  fee_rate
+  //    [8]  sequence
+  //    [8]  added_at_ms
+  //    [4]  cached tx_size
+  //
+  //  Total: 33 + N bytes.
+
+  std::vector<uint8_t> Mempool::serializeEntry(const Entry &e)
+  {
+    auto tx_bytes = e.tx.serialize();
+
+    std::vector<uint8_t> out;
+    out.reserve(4 + tx_bytes.size() + 1 + 8 + 8 + 8 + 4);
+
+    uint32_t txs = static_cast<uint32_t>(tx_bytes.size());
+    out.push_back(uint8_t(txs));
+    out.push_back(uint8_t(txs >> 8));
+    out.push_back(uint8_t(txs >> 16));
+    out.push_back(uint8_t(txs >> 24));
+
+    out.insert(out.end(), tx_bytes.begin(), tx_bytes.end());
+
+    out.push_back(static_cast<uint8_t>(e.tier));
+
+    for (int i = 0; i < 8; ++i)
+      out.push_back(uint8_t(e.fee_rate >> (i * 8)));
+    for (int i = 0; i < 8; ++i)
+      out.push_back(uint8_t(e.sequence >> (i * 8)));
+    for (int i = 0; i < 8; ++i)
+      out.push_back(uint8_t(e.added_at_ms >> (i * 8)));
+
+    out.push_back(uint8_t(e.tx_size));
+    out.push_back(uint8_t(e.tx_size >> 8));
+    out.push_back(uint8_t(e.tx_size >> 16));
+    out.push_back(uint8_t(e.tx_size >> 24));
+
+    return out;
+  }
+
+  bool Mempool::deserializeEntry(const uint8_t *data, size_t len, Entry &out)
+  {
+    if (len < 4)
+      return false;
+
+    size_t off = 0;
+    uint32_t txs = uint32_t(data[off]) |
+                   (uint32_t(data[off + 1]) << 8) |
+                   (uint32_t(data[off + 2]) << 16) |
+                   (uint32_t(data[off + 3]) << 24);
+    off += 4;
+
+    if (txs == 0 || off + txs + 1 + 8 + 8 + 8 + 4 > len)
+      return false;
+
+    Transaction tx;
+    if (!Transaction::deserialize(data + off, txs, tx))
+      return false;
+    off += txs;
+
+    out.tx = std::move(tx);
+
+    uint8_t tier_byte = data[off++];
+    if (tier_byte > 1)
+      return false;
+    out.tier = static_cast<FeeTier>(tier_byte);
+
+    auto readU64 = [&]() -> uint64_t
+    {
+      uint64_t v = 0;
+      for (int i = 0; i < 8; ++i)
+        v |= uint64_t(data[off + i]) << (i * 8);
+      off += 8;
+      return v;
+    };
+
+    out.fee_rate = readU64();
+    out.sequence = readU64();
+    out.added_at_ms = readU64();
+
+    out.tx_size = uint32_t(data[off]) |
+                  (uint32_t(data[off + 1]) << 8) |
+                  (uint32_t(data[off + 2]) << 16) |
+                  (uint32_t(data[off + 3]) << 24);
+
+    return true;
+  }
+
+  //  Persistence helpers
+
+  void Mempool::persistEntry(const Crypto::Hash &txid, const Entry &e)
+  {
+    if (!db_)
+      return;
+
+    auto bytes = serializeEntry(e);
+    db_->rawPut(State::StateDB::TBL_MEMPOOL,
+                txid.data.data(), txid.data.size(),
+                bytes.data(), bytes.size());
+  }
+
+  void Mempool::unpersistEntry(const Crypto::Hash &txid)
+  {
+    if (!db_)
+      return;
+    db_->rawDel(State::StateDB::TBL_MEMPOOL,
+                txid.data.data(), txid.data.size());
+  }
+
+  void Mempool::unpersistBatch(const std::vector<Crypto::Hash> &txids)
+  {
+    if (!db_)
+      return;
+    for (const auto &txid : txids)
+    {
+      db_->rawDel(State::StateDB::TBL_MEMPOOL,
+                  txid.data.data(), txid.data.size());
+    }
+  }
+
+  //  Load
+
+  void Mempool::load(const StateView &state)
+  {
+    if (!db_)
+      return;
+
+    // Collect persisted entries under the mutex, then release it
+    // before re-adding. `add` takes the mutex again, so we cannot hold
+    // it across the re-add loop. This also means we must collect first
+    // because the callback runs while StateDB holds its own lock.
+    std::vector<Entry> persisted;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      db_->forEachEntry(
+          State::StateDB::TBL_MEMPOOL,
+          [&persisted](const std::vector<uint8_t> & /*key*/,
+                       const std::vector<uint8_t> &value)
+          {
+            Entry e;
+            if (deserializeEntry(value.data(), value.size(), e))
+              persisted.push_back(std::move(e));
+            return true;
+          });
+    }
+
+    // Re-add through the normal validation path. Entries that fail
+    // (nonce too low, insufficient funds, expired, already on chain)
+    // are silently dropped and their persisted rows are deleted.
+    //
+    // `add` persists an accepted entry with a fresh sequence number,
+    // so a successful re-add leaves the persisted row overwritten with
+    // a current version. A failed re-add leaves the stale row, which
+    // we delete here.
+    std::vector<Crypto::Hash> stale;
+    for (const auto &e : persisted)
+    {
+      auto result = add(e.tx, state, e.tier);
+      if (result != MempoolAddResult::Accepted)
+      {
+        stale.push_back(e.tx.txid());
+      }
+    }
+    unpersistBatch(stale);
   }
 
   //  Validation
@@ -232,6 +414,7 @@ namespace Core
             total_bytes_ -= existing.tx_size;
             entries_.erase(existing_it);
             nonce_index_.erase(it);
+            unpersistEntry(existing_txid);
           }
           // Same tier, strictly higher fee rate: replace.
           else if (tier == existing.tier && fee_rate > existing.fee_rate)
@@ -239,6 +422,7 @@ namespace Core
             total_bytes_ -= existing.tx_size;
             entries_.erase(existing_it);
             nonce_index_.erase(it);
+            unpersistEntry(existing_txid);
           }
           // Otherwise: reject with conflict.
           else
@@ -282,6 +466,9 @@ namespace Core
     item.txid = txid;
     heap_.push(item);
 
+    // Write through to persistence.
+    persistEntry(txid, entries_.at(txid));
+
     return MempoolAddResult::Accepted;
   }
 
@@ -301,6 +488,7 @@ namespace Core
     nonce_index_.erase(nk);
 
     entries_.erase(it);
+    unpersistEntry(txid);
     return true;
   }
 
@@ -320,6 +508,7 @@ namespace Core
       nonce_index_.erase(nk);
 
       entries_.erase(it);
+      unpersistEntry(txid);
     }
   }
 
@@ -350,12 +539,35 @@ namespace Core
       nonce_index_.erase(nk);
 
       entries_.erase(it);
+      unpersistEntry(txid);
     }
   }
 
   void Mempool::clear()
   {
     std::lock_guard<std::mutex> lock(mutex_);
+
+    // Wipe persisted rows. Collect the txids first — the forEachEntry
+    // callback runs while StateDB holds its own lock, and rawDel would
+    // try to take it again.
+    if (db_)
+    {
+      std::vector<Crypto::Hash> all;
+      db_->forEachEntry(
+          State::StateDB::TBL_MEMPOOL,
+          [&all](const std::vector<uint8_t> &key,
+                 const std::vector<uint8_t> & /*value*/)
+          {
+            if (key.size() == 32)
+            {
+              Crypto::Hash h;
+              std::memcpy(h.data.data(), key.data(), 32);
+              all.push_back(h);
+            }
+            return true;
+          });
+      unpersistBatch(all);
+    }
 
     entries_.clear();
     nonce_index_.clear();
@@ -679,6 +891,7 @@ namespace Core
                               entries_[victim_txid].tx.nonce);
     nonce_index_.erase(nk);
     entries_.erase(victim_txid);
+    unpersistEntry(victim_txid);
 
     return true;
   }

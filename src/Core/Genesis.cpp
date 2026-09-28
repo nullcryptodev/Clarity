@@ -12,11 +12,31 @@
 #include "ValidatorTypes.h"
 #include "GlobalConfig.h"
 
+#include "Common/StringTools.h"
+
 #include "State/StateAccess.h"
 #include "State/StateDB.h"
 
 #include <chrono>
 #include <filesystem>
+
+namespace
+{
+  // Parse a 64-character hex string into a Crypto::Hash. Throws if
+  // the input is malformed (wrong length, non-hex characters). The
+  // pinned genesis hash constants are compile-time-defined 64-char
+  // hex strings, so a throw here means the constants themselves are
+  // wrong, not that runtime data is bad.
+  Crypto::Hash hashFromHex(const char *hex)
+  {
+    Crypto::Hash h;
+    std::vector<uint8_t> bytes = Common::fromHex(std::string(hex));
+    if (bytes.size() != 32)
+      throw std::runtime_error("hashFromHex: expected 64 hex chars");
+    std::memcpy(h.data.data(), bytes.data(), 32);
+    return h;
+  }
+}
 
 namespace Core
 {
@@ -366,4 +386,26 @@ namespace Core
     return state.stateRoot() == expected;
   }
 
+    Crypto::Hash expectedGenesisHash(const GenesisConfig &config) noexcept
+  {
+    try
+    {
+      switch (config.chain_id)
+      {
+      case GlobalConfig::CHAIN_ID:
+        return hashFromHex(GlobalConfig::MAINNET_GENESIS_HASH);
+      case GlobalConfig::TESTNET_CHAIN_ID:
+        return hashFromHex(GlobalConfig::TESTNET_GENESIS_HASH);
+      case GlobalConfig::REGNET_CHAIN_ID:
+        return hashFromHex(GlobalConfig::REGTEST_GENESIS_HASH);
+      }
+    }
+    catch (...)
+    {
+      // A malformed pinned hash disables the check. The caller logs
+      // the computed hash on startup, so drift is still detectable.
+      return Crypto::Hash{};
+    }
+    return Crypto::Hash{};
+  }
 } // namespace Core

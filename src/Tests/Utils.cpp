@@ -111,6 +111,17 @@ namespace Tests
     return v;
   }
 
+  uint64_t readU64GlobalSV(State::StateAccess &s, std::string_view name)
+  {
+    std::vector<uint8_t> bytes;
+    if (!s.getGlobal(std::string(name), bytes) || bytes.size() != 8)
+      return 0;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i)
+      v |= uint64_t(bytes[i]) << (i * 8);
+    return v;
+  }
+
   // Creates a KVBinarySerializer from a stream (for exception testing)
   void createKVBinarySerializer(Serialization::MemoryInputStream &stream)
   {

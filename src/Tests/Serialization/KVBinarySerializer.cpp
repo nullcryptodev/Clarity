@@ -5,7 +5,7 @@
 #include <gtest/gtest.h>
 
 #include "Fixtures.h"
-#include "Tests/Types.h"
+#include "Types.h"
 
 #include "Serialization/KVBinarySerializer.h"
 #include "Serialization/MemoryStream.h"

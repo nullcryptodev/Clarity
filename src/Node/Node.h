@@ -119,6 +119,7 @@ namespace Node
 
     void initStorage();
     void initGenesis();
+    void initMempool();
     void initP2P();
     void initConsensus();
 
