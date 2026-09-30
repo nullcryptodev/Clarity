@@ -41,7 +41,7 @@ namespace Tests
     {
       auto &a = accounts_[addr.toString()];
       a.balance = balance;
-      a.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+      a.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
     }
 
     void setNonce(const Crypto::Address &addr, uint64_t nonce)

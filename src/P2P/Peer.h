@@ -201,6 +201,14 @@ namespace P2P
     // Rate limiters. One bucket for all inbound messages, one
     // stricter bucket for consensus messages only. Both are disabled
     // when their config pair is zero.
+    //
+    // NOT thread-safe by design (see Common/RateLimiter.h). Safe here
+    // because they are only touched from the socket's read completion
+    // handlers, and asio guarantees at most one completion handler per
+    // socket runs at a time. If the socket is ever wrapped in a strand
+    // (needed to allow concurrent read/write on the same socket, or to
+    // multiplex multiple logical peers onto one socket), this is still
+    // safe; if the buckets are ever shared across Peers, it is not.
     Common::RateLimiter msgBucket_;
     Common::RateLimiter consensusBucket_;
 

@@ -78,7 +78,7 @@ namespace Core
 
     bool meetsStakeRequirement() const noexcept
     {
-      return stake >= VALIDATOR_MIN_STAKE;
+      return stake >= GlobalConfig::VALIDATOR_MIN_STAKE;
     }
 
     // Apply the persistent penalty for a proven infraction.
@@ -164,7 +164,7 @@ namespace Core
     std::vector<Id> active_set;
     Id next_id{1};
     uint64_t last_rotation_height{0};
-    uint64_t target_size{ACTIVE_SET_DEFAULT};
+    uint64_t target_size{GlobalConfig::ACTIVE_SET_DEFAULT};
 
     // Find a validator by id. Linear scan over the vector rather than
     // index-based lookup, so gaps in the id space (created by unregister

@@ -11,6 +11,11 @@
 #include "GlobalConfig.h"
 #include "Crypto/Types.h"
 
+namespace Core
+{
+  struct ValidatorInfo;
+}
+
 namespace Consensus
 {
   enum class Step : uint8_t
@@ -117,4 +122,49 @@ namespace Consensus
              vote_b.block_hash == other.vote_b.block_hash;
     }
   };
+
+  struct TimeoutVote
+  {
+    Height height{0};
+    Round round{0};
+    Index signer_index{INVALID_INDEX};
+    Crypto::Signature signature{};
+  };
+
+  struct TimeoutCertificate
+  {
+    std::vector<TimeoutVote> votes;
+
+    std::vector<uint8_t> serialize() const;
+    static bool deserialize(const uint8_t *data, size_t len,
+                            TimeoutCertificate &out);
+  };
+
+  Crypto::Hash timeoutVoteSigningHash(Height height, Round round);
+
+  std::vector<uint8_t> encodeTimeoutVote(const TimeoutVote &tv);
+  std::optional<TimeoutVote> decodeTimeoutVote(const uint8_t *data, size_t len);
+
+  //  Verify a timeout certificate against a committed set.
+  //
+  //  lookup_validator resolves a validator id to its ValidatorInfo (for
+  //  the reward_address / consensus key). Returns false if the id is
+  //  unknown. Using a callback lets both the on-chain verifier (which
+  //  reads from StateAccess) and the consensus object (which reads from
+  //  deps_.state_lookup_validator) share this one implementation.
+  //
+  //  `cert_height` is the block's height. `cert_round` is the block's
+  //  emergency_rotation. Both must match every vote in the certificate.
+  //
+  //  `required_signers` is f+1 for the committed set. The caller
+  //  computes it because f depends on n, and n is the committed set
+  //  size at the height the certificate was issued — which the caller
+  //  already has.
+  bool verifyTimeoutCertificate(
+      const TimeoutCertificate &cert,
+      const std::vector<Id> &committed_set,
+      Height cert_height,
+      Round cert_round,
+      const std::function<bool(Id, Core::ValidatorInfo &)> &lookup_validator,
+      std::string &error);
 } // namespace Consensus

@@ -9,8 +9,6 @@
 #include <string_view>
 #include <vector>
 
-#include "Common/Put.h"
-
 namespace Core
 {
   //  Transaction type

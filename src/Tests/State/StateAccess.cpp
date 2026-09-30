@@ -131,8 +131,8 @@ TEST_F(State_StateAccessFixture, PutAccountMaintainsTotalStaked)
   // Below auto-stake threshold: no stake, no contribution to total.
   {
     Core::Account acct;
-    acct.balance = Core::AUTO_STAKE_THRESHOLD - 1;
-    acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+    acct.balance = GlobalConfig::AUTO_STAKE_THRESHOLD - 1;
+    acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
     s().putAccount(a, acct);
     EXPECT_EQ(readU64Global(s(), "total_staked"), 0u);
   }
@@ -140,29 +140,29 @@ TEST_F(State_StateAccessFixture, PutAccountMaintainsTotalStaked)
   // At threshold: becomes a staker, total picks up the full balance.
   {
     Core::Account acct;
-    acct.balance = Core::AUTO_STAKE_THRESHOLD;
-    acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+    acct.balance = GlobalConfig::AUTO_STAKE_THRESHOLD;
+    acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
     s().putAccount(a, acct);
     EXPECT_EQ(readU64Global(s(), "total_staked"),
-              Core::AUTO_STAKE_THRESHOLD);
+              GlobalConfig::AUTO_STAKE_THRESHOLD);
   }
 
   // Increase balance: total grows by the delta.
   {
     Core::Account acct;
-    acct.balance = Core::AUTO_STAKE_THRESHOLD * 3;
-    acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+    acct.balance = GlobalConfig::AUTO_STAKE_THRESHOLD * 3;
+    acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
     s().putAccount(a, acct);
     EXPECT_EQ(readU64Global(s(), "total_staked"),
-              Core::AUTO_STAKE_THRESHOLD * 3);
+              GlobalConfig::AUTO_STAKE_THRESHOLD * 3);
   }
 
   // Opt out: no longer a staker, total drops to 0.
   {
     Core::Account acct;
-    acct.balance = Core::AUTO_STAKE_THRESHOLD * 3;
+    acct.balance = GlobalConfig::AUTO_STAKE_THRESHOLD * 3;
     acct.staking_opted_out = true;
-    acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+    acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
     s().putAccount(a, acct);
     EXPECT_EQ(readU64Global(s(), "total_staked"), 0u);
   }
@@ -174,8 +174,8 @@ TEST_F(State_StateAccessFixture, PutAccountMaintainsStakerCount)
   auto b = makeAddress(0xBB);
 
   Core::Account acct;
-  acct.balance = Core::AUTO_STAKE_THRESHOLD;
-  acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+  acct.balance = GlobalConfig::AUTO_STAKE_THRESHOLD;
+  acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
 
   s().putAccount(a, acct);
   EXPECT_EQ(readU64Global(s(), "staker_count"), 1u);
@@ -189,7 +189,7 @@ TEST_F(State_StateAccessFixture, PutAccountMaintainsStakerCount)
 
   // Opting out decrements.
   acct.staking_opted_out = true;
-  acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+  acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
   s().putAccount(a, acct);
   EXPECT_EQ(readU64Global(s(), "staker_count"), 1u);
 }
@@ -201,19 +201,19 @@ TEST_F(State_StateAccessFixture, PutAccountSetsStakerSinceHeight)
   auto a = makeAddress(0xAA);
 
   Core::Account acct;
-  acct.balance = Core::AUTO_STAKE_THRESHOLD;
-  acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+  acct.balance = GlobalConfig::AUTO_STAKE_THRESHOLD;
+  acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
 
   s().putAccount(a, acct);
   EXPECT_EQ(s().getAccount(a).staker_since_height, 500u);
 
-  acct.balance = Core::AUTO_STAKE_THRESHOLD * 2;
-  acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+  acct.balance = GlobalConfig::AUTO_STAKE_THRESHOLD * 2;
+  acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
   s().putAccount(a, acct);
   EXPECT_EQ(s().getAccount(a).staker_since_height, 500u);
 
   acct.staking_opted_out = true;
-  acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+  acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
   s().putAccount(a, acct);
   EXPECT_EQ(s().getAccount(a).staker_since_height, 0u);
 }

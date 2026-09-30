@@ -7,10 +7,11 @@
 #include "TransactionTypes.h"
 #include "RewardTypes.h"
 
+#include "Consensus/Types.h"
+
 #include "Crypto/Blake2b.h"
 
-#include "Common/Put.h"
-#include "Common/Reader.h"
+#include "Common/Wire.h"
 
 #include <cstring>
 #include <sstream>
@@ -81,54 +82,64 @@ namespace Core
   std::vector<uint8_t> BlockHeader::serialize() const
   {
     std::vector<uint8_t> out;
-    out.reserve(258);
+    out.reserve(258 + 4 + timeout_certificate.serialize().size());
 
-    Common::putU16(out, version);
-    Common::putU64(out, chain_id);
-    Common::putU64(out, height);
-    Common::putBytes(out, parent_hash.data.data(), parent_hash.data.size());
-    Common::putU64(out, timestamp_ms);
-    Common::putBytes(out, proposer.data.data(), proposer.data.size());
-    Common::putU64(out, epoch);
-    Common::putU64(out, rotation_index);
-    Common::putU64(out, commit_round);
-    Common::putU64(out, emergency_rotation);
-    Common::putBytes(out, state_root.data.data(), state_root.data.size());
-    Common::putBytes(out, tx_root.data.data(), tx_root.data.size());
-    Common::putBytes(out, receipts_root.data.data(), receipts_root.data.size());
-    Common::putBytes(out, validator_set_root.data.data(), validator_set_root.data.size());
-    Common::putU64(out, total_fees);
-    Common::putU32(out, tx_count);
-    Common::putU32(out, active_validator_count);
+    Common::Writer w(out);
+    w.writeU16(version);
+    w.writeU64(chain_id);
+    w.writeU64(height);
+    w.writeBytes(parent_hash.data.data(), parent_hash.data.size());
+    w.writeU64(timestamp_ms);
+    w.writeBytes(proposer.data.data(), proposer.data.size());
+    w.writeU64(epoch);
+    w.writeU64(rotation_index);
+    w.writeU64(commit_round);
+    w.writeU64(emergency_rotation);
+    w.writeBytes(state_root.data.data(), state_root.data.size());
+    w.writeBytes(tx_root.data.data(), tx_root.data.size());
+    w.writeBytes(receipts_root.data.data(), receipts_root.data.size());
+    w.writeBytes(validator_set_root.data.data(), validator_set_root.data.size());
+    w.writeU64(total_fees);
+    w.writeU32(tx_count);
+    w.writeU32(active_validator_count);
+
+    // Length-prefixed certificate. Always present in the wire format,
+    // even when empty (length 0), so the header layout is fixed for
+    // all blocks and the decoder doesn't need a conditional. A
+    // length-0 certificate serializes as 4 bytes (the u32 zero).
+    auto cert_bytes = timeout_certificate.serialize();
+    w.writeU32(static_cast<uint32_t>(cert_bytes.size()));
+    w.writeBytes(cert_bytes.data(), cert_bytes.size());
 
     return out;
   }
 
   std::vector<uint8_t> BlockHeader::serializeForHash() const
   {
-    // Same field order as serialize(), but without commit_round.
-    // This is what hash() hashes; the wire format (serialize())
-    // includes commit_round.
+    // Same field order as serialize(), but without commit_round and
+    // without the timeout certificate. The hash commits to the block
+    // identity, not to the evidence attached to it.
     std::vector<uint8_t> out;
     out.reserve(250);
 
-    Common::putU16(out, version);
-    Common::putU64(out, chain_id);
-    Common::putU64(out, height);
-    Common::putBytes(out, parent_hash.data.data(), parent_hash.data.size());
-    Common::putU64(out, timestamp_ms);
-    Common::putBytes(out, proposer.data.data(), proposer.data.size());
-    Common::putU64(out, epoch);
-    Common::putU64(out, rotation_index);
+    Common::Writer w(out);
+    w.writeU16(version);
+    w.writeU64(chain_id);
+    w.writeU64(height);
+    w.writeBytes(parent_hash.data.data(), parent_hash.data.size());
+    w.writeU64(timestamp_ms);
+    w.writeBytes(proposer.data.data(), proposer.data.size());
+    w.writeU64(epoch);
+    w.writeU64(rotation_index);
     // commit_round omitted from the hash.
-    Common::putU64(out, emergency_rotation);
-    Common::putBytes(out, state_root.data.data(), state_root.data.size());
-    Common::putBytes(out, tx_root.data.data(), tx_root.data.size());
-    Common::putBytes(out, receipts_root.data.data(), receipts_root.data.size());
-    Common::putBytes(out, validator_set_root.data.data(), validator_set_root.data.size());
-    Common::putU64(out, total_fees);
-    Common::putU32(out, tx_count);
-    Common::putU32(out, active_validator_count);
+    w.writeU64(emergency_rotation);
+    w.writeBytes(state_root.data.data(), state_root.data.size());
+    w.writeBytes(tx_root.data.data(), tx_root.data.size());
+    w.writeBytes(receipts_root.data.data(), receipts_root.data.size());
+    w.writeBytes(validator_set_root.data.data(), validator_set_root.data.size());
+    w.writeU64(total_fees);
+    w.writeU32(tx_count);
+    w.writeU32(active_validator_count);
 
     return out;
   }
@@ -140,36 +151,52 @@ namespace Core
     out.version = r.readU16();
     out.chain_id = r.readU64();
     out.height = r.readU64();
-
     r.readBytes(out.parent_hash.data.data(), out.parent_hash.data.size());
-
     out.timestamp_ms = r.readU64();
-
     r.readBytes(out.proposer.data.data(), out.proposer.data.size());
-
     out.epoch = r.readU64();
     out.rotation_index = r.readU64();
     out.commit_round = r.readU64();
     out.emergency_rotation = r.readU64();
-
     r.readBytes(out.state_root.data.data(), out.state_root.data.size());
     r.readBytes(out.tx_root.data.data(), out.tx_root.data.size());
     r.readBytes(out.receipts_root.data.data(), out.receipts_root.data.size());
     r.readBytes(out.validator_set_root.data.data(), out.validator_set_root.data.size());
-
     out.total_fees = r.readU64();
     out.tx_count = r.readU32();
     out.active_validator_count = r.readU32();
 
     if (!r.ok())
+      return false;
+
+    //  Certificate. Length-prefixed; may be zero. Enforce a hard cap
+    //  on the encoded size so a hostile header can't make us allocate
+    //  arbitrarily before we've validated anything. The cap is generous
+    //  relative to the maximum legitimate certificate (f+1 votes at
+    //  n=100 is roughly 34 * 82 + 4 ≈ 2.8 KiB) but small enough to
+    //  bound memory.
+    constexpr uint32_t MAX_CERT_BYTES = 32 * 1024;
+    const uint32_t cert_len = r.readU32();
+    if (!r.ok() || cert_len > MAX_CERT_BYTES)
+      return false;
+
+    if (r.remaining() < cert_len)
+      return false;
+
+    std::vector<uint8_t> cert_bytes = r.readVector(cert_len);
+    if (!r.ok())
+      return false;
+
+    if (!Consensus::TimeoutCertificate::deserialize(
+            cert_bytes.data(), cert_bytes.size(), out.timeout_certificate))
     {
       return false;
     }
 
-    // NOTE: We deliberately do NOT call isWellFormed() here. That's a
-    // consensus-layer check; the storage layer's job is to round-trip
-    // bytes faithfully. Callers that need validation (block processor,
-    // mempool) call isWellFormed() explicitly after deserializing.
+    // No trailing bytes tolerated after the certificate.
+    if (r.remaining() != 0)
+      return false;
+
     return true;
   }
 
@@ -218,29 +245,31 @@ namespace Core
     std::vector<uint8_t> out;
     out.reserve(serializedSize());
 
-    auto hdr = header.serialize();
-    Common::putU32(out, static_cast<uint32_t>(hdr.size()));
-    Common::putBytes(out, hdr.data(), hdr.size());
+    Common::Writer w(out);
 
-    Common::putU32(out, static_cast<uint32_t>(transactions.size()));
+    auto hdr = header.serialize();
+    w.writeU32(static_cast<uint32_t>(hdr.size()));
+    w.writeBytes(hdr.data(), hdr.size());
+
+    w.writeU32(static_cast<uint32_t>(transactions.size()));
     for (const auto &tx : transactions)
     {
       auto txbytes = tx.serialize();
-      Common::putU32(out, static_cast<uint32_t>(txbytes.size()));
-      Common::putBytes(out, txbytes.data(), txbytes.size());
+      w.writeU32(static_cast<uint32_t>(txbytes.size()));
+      w.writeBytes(txbytes.data(), txbytes.size());
     }
 
-    Common::putU32(out, static_cast<uint32_t>(quorum_signatures.size()));
+    w.writeU32(static_cast<uint32_t>(quorum_signatures.size()));
     for (const auto &sig : quorum_signatures)
     {
-      Common::putU16(out, sig.signer_index);
-      Common::putBytes(out, sig.signature.data.data(), sig.signature.data.size());
+      w.writeU16(sig.signer_index);
+      w.writeBytes(sig.signature.data.data(), sig.signature.data.size());
     }
 
-    Common::putU32(out, static_cast<uint32_t>(participants.size()));
+    w.writeU32(static_cast<uint32_t>(participants.size()));
     for (auto vid : participants)
     {
-      Common::putU64(out, vid);
+      w.writeU64(vid);
     }
 
     return out;
@@ -251,7 +280,7 @@ namespace Core
     Common::Reader r(data, len);
 
     uint32_t hdr_size = r.readU32();
-    if (hdr_size > 1024 || !r.ok())
+    if (hdr_size > MAX_HEADER_BYTES || !r.ok())
       return false;
 
     std::vector<uint8_t> hdr(hdr_size);
@@ -322,8 +351,10 @@ namespace Core
       out.participants.push_back(vid);
     }
 
-    if (!r.ok())
+    // No trailing bytes tolerated after the last section.
+    if (r.remaining() != 0)
       return false;
+
     return true;
   }
 

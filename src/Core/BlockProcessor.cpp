@@ -82,6 +82,16 @@ namespace Core
 
   //  Public entry points
 
+  std::vector<Id> BlockProcessor::resolveActiveSet(
+      State::StateAccess &state,
+      const std::vector<Id> &committed_set,
+      uint64_t current_height,
+      bool force_rotation)
+  {
+    return Core::resolveActiveSet(state, committed_set,
+                                  current_height, force_rotation);
+  }
+
   BlockResult BlockProcessor::applyBlock(State::StateAccess &state,
                                          const Block &block,
                                          const BlockContext &ctx)
@@ -116,6 +126,17 @@ namespace Core
     //  drift.
     std::vector<Id> committed_set = loadActiveSet(state);
     const bool is_emergency = (block.header.emergency_rotation > 0);
+
+    if (is_emergency)
+    {
+      if (!checkTimeoutCertificate(state, block, committed_set,
+                                   ctx.current_height, error))
+      {
+        result.error = error;
+        return result;
+      }
+    }
+
     std::vector<Id> active_set = is_emergency
                                      ? resolveActiveSet(state, committed_set, ctx.current_height, true)
                                      : committed_set;
@@ -264,6 +285,27 @@ namespace Core
     result.tx_hashes = std::move(tx_hashes);
 
     return result;
+  }
+
+  bool BlockProcessor::checkTimeoutCertificate(
+      State::StateAccess &state,
+      const Block &block,
+      const std::vector<Id> &committed_set,
+      uint64_t current_height,
+      std::string &error)
+  {
+    auto lookup = [&state](Id vid, ValidatorInfo &out) -> bool
+    {
+      return state.getValidator(vid, out);
+    };
+
+    return Consensus::verifyTimeoutCertificate(
+        block.header.timeout_certificate,
+        committed_set,
+        /*cert_height=*/current_height,
+        /*cert_round=*/block.header.emergency_rotation,
+        lookup,
+        error);
   }
 
   BlockResult BlockProcessor::validateBlock(State::StateAccess &state,
@@ -793,7 +835,7 @@ namespace Core
     rctx.pot = pot;
     rctx.fees_this_block = 0;
     rctx.block_reward_atomic = GlobalConfig::BLOCK_REWARD;
-    rctx.apy_base_bps = APY_BASE_BPS;
+    rctx.apy_base_bps = GlobalConfig::APY_BASE_BPS;
     rctx.apy_activity_bps = apy_activity_bps;
     rctx.apy_pot_bonus_bps = apy_pot_bonus_bps;
 
@@ -838,10 +880,10 @@ namespace Core
         return;
 
       uint64_t weight = acct.staked;
-      if (acct.staked >= BALANCE_BONUS_THRESHOLD)
+      if (acct.staked >= GlobalConfig::BALANCE_BONUS_THRESHOLD)
       {
         __uint128_t w = static_cast<__uint128_t>(weight) *
-                        (10'000 + BALANCE_BONUS_BPS);
+                        (10'000 + GlobalConfig::BALANCE_BONUS_BPS);
         weight = static_cast<uint64_t>(w / 10'000);
       }
 
@@ -859,10 +901,10 @@ namespace Core
         return;
 
       uint64_t weight = acct.staked;
-      if (acct.staked >= BALANCE_BONUS_THRESHOLD)
+      if (acct.staked >= GlobalConfig::BALANCE_BONUS_THRESHOLD)
       {
         __uint128_t w = static_cast<__uint128_t>(weight) *
-                        (10'000 + BALANCE_BONUS_BPS);
+                        (10'000 + GlobalConfig::BALANCE_BONUS_BPS);
         weight = static_cast<uint64_t>(w / 10'000);
       }
 

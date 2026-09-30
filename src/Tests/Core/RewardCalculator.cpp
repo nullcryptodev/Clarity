@@ -521,7 +521,7 @@ TEST(Core_RewardIntegration, TypicalEpoch)
 {
   RewardContext ctx = makeContext();
   ctx.total_staked = 50'000'000 * 100'000ULL; // 50M CLRTY staked
-  ctx.apy_base_bps = APY_BASE_BPS;            // 5%
+  ctx.apy_base_bps = GlobalConfig::APY_BASE_BPS; // 5%
   ctx.apy_activity_bps = 300;                 // medium activity
   ctx.apy_pot_bonus_bps = 0;
 
@@ -552,15 +552,14 @@ TEST(Core_ComputeActivityBps, ZeroTxReturnsZero)
 
 TEST(Core_ComputeActivityBps, AtSaturationReturnsMax)
 {
-  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX), APY_ACTIVITY_MAX_BPS);
+  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX), GlobalConfig::APY_ACTIVITY_MAX_BPS);
 }
 
 TEST(Core_ComputeActivityBps, AboveSaturationClampsToMax)
 {
-  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX + 1), APY_ACTIVITY_MAX_BPS);
-  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX * 100), APY_ACTIVITY_MAX_BPS);
-  EXPECT_EQ(computeActivityBps(std::numeric_limits<uint64_t>::max()),
-            APY_ACTIVITY_MAX_BPS);
+  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX + 1), GlobalConfig::APY_ACTIVITY_MAX_BPS);
+  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX * 100), GlobalConfig::APY_ACTIVITY_MAX_BPS);
+  EXPECT_EQ(computeActivityBps(std::numeric_limits<uint64_t>::max()), GlobalConfig::APY_ACTIVITY_MAX_BPS);
 }
 
 TEST(Core_ComputeActivityBps, LinearInterpolation)
@@ -596,7 +595,7 @@ TEST(Core_ComputeActivityBps, NeverExceedsMax)
   // Sweep a range and confirm the cap holds.
   for (uint64_t tx = 0; tx <= TRAFFIC_SATURATION_TX * 2; tx += 50)
   {
-    EXPECT_LE(computeActivityBps(tx), APY_ACTIVITY_MAX_BPS)
+    EXPECT_LE(computeActivityBps(tx), GlobalConfig::APY_ACTIVITY_MAX_BPS)
         << "tx=" << tx;
   }
 }
@@ -640,7 +639,7 @@ TEST(Core_ComputePotBonusBps, MidpointInterpolates)
 
   // Halfway between POT_HIGH and POT_MAX → half the max bonus.
   const uint64_t midpoint = pot_high + (pot_max - pot_high) / 2;
-  const uint16_t expected = APY_POT_BONUS_MAX_BPS / 2;
+  const uint16_t expected = GlobalConfig::APY_POT_BONUS_MAX_BPS / 2;
 
   // Allow ±1 for integer rounding.
   uint16_t actual = computePotBonusBps(midpoint, baseline);
@@ -653,7 +652,7 @@ TEST(Core_ComputePotBonusBps, AtPotMaxReturnsMax)
   const uint64_t baseline = 100;
   const uint64_t pot_max = baseline * POT_MAX_EPOCHS;
 
-  EXPECT_EQ(computePotBonusBps(pot_max, baseline), APY_POT_BONUS_MAX_BPS);
+  EXPECT_EQ(computePotBonusBps(pot_max, baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS);
 }
 
 TEST(Core_ComputePotBonusBps, AbovePotMaxClampsToMax)
@@ -661,10 +660,9 @@ TEST(Core_ComputePotBonusBps, AbovePotMaxClampsToMax)
   const uint64_t baseline = 100;
   const uint64_t pot_max = baseline * POT_MAX_EPOCHS;
 
-  EXPECT_EQ(computePotBonusBps(pot_max + 1, baseline), APY_POT_BONUS_MAX_BPS);
-  EXPECT_EQ(computePotBonusBps(pot_max * 10, baseline), APY_POT_BONUS_MAX_BPS);
-  EXPECT_EQ(computePotBonusBps(std::numeric_limits<uint64_t>::max(), baseline),
-            APY_POT_BONUS_MAX_BPS);
+  EXPECT_EQ(computePotBonusBps(pot_max + 1, baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS);
+  EXPECT_EQ(computePotBonusBps(pot_max * 10, baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS);
+  EXPECT_EQ(computePotBonusBps(std::numeric_limits<uint64_t>::max(), baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS);
 }
 
 TEST(Core_ComputePotBonusBps, MonotonicallyNonDecreasing)
@@ -686,7 +684,7 @@ TEST(Core_ComputePotBonusBps, MonotonicallyNonDecreasing)
   }
 
   // The top of the ramp is exactly APY_POT_BONUS_MAX_BPS.
-  EXPECT_EQ(computePotBonusBps(pot_max, baseline), APY_POT_BONUS_MAX_BPS);
+  EXPECT_EQ(computePotBonusBps(pot_max, baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS);
 }
 
 TEST(Core_ComputePotBonusBps, NeverExceedsMax)
@@ -696,7 +694,7 @@ TEST(Core_ComputePotBonusBps, NeverExceedsMax)
   // Sweep a huge range and confirm the cap holds.
   for (uint64_t pot = 0; pot < 1'000'000'000ULL; pot += 50'000'000ULL)
   {
-    EXPECT_LE(computePotBonusBps(pot, baseline), APY_POT_BONUS_MAX_BPS)
+    EXPECT_LE(computePotBonusBps(pot, baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS)
         << "pot=" << pot;
   }
 }

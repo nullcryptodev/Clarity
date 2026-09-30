@@ -75,10 +75,10 @@ namespace Core
     uint32_t apy = ctx.apy_base_bps;
 
     // Activity component (0..APY_ACTIVITY_MAX_BPS).
-    apy += std::min<uint32_t>(ctx.apy_activity_bps, APY_ACTIVITY_MAX_BPS);
+    apy += std::min<uint32_t>(ctx.apy_activity_bps, GlobalConfig::APY_ACTIVITY_MAX_BPS);
 
     // Pot bonus (0..APY_POT_BONUS_MAX_BPS).
-    apy += std::min<uint32_t>(ctx.apy_pot_bonus_bps, APY_POT_BONUS_MAX_BPS);
+    apy += std::min<uint32_t>(ctx.apy_pot_bonus_bps, GlobalConfig::APY_POT_BONUS_MAX_BPS);
 
     // Cap at uint16 range.
     if (apy > 65535)
@@ -113,16 +113,16 @@ namespace Core
       return 0;
 
     if (avg_tx_per_block >= TRAFFIC_SATURATION_TX)
-      return APY_ACTIVITY_MAX_BPS;
+      return GlobalConfig::APY_ACTIVITY_MAX_BPS;
 
     // Linear interpolation from 0 at 0 tx to APY_ACTIVITY_MAX_BPS at
     // TRAFFIC_SATURATION_TX.
     __uint128_t scaled = static_cast<__uint128_t>(avg_tx_per_block) *
-                         APY_ACTIVITY_MAX_BPS;
+                         GlobalConfig::APY_ACTIVITY_MAX_BPS;
     uint32_t result = static_cast<uint32_t>(scaled / TRAFFIC_SATURATION_TX);
 
-    if (result > APY_ACTIVITY_MAX_BPS)
-      result = APY_ACTIVITY_MAX_BPS;
+    if (result > GlobalConfig::APY_ACTIVITY_MAX_BPS)
+      result = GlobalConfig::APY_ACTIVITY_MAX_BPS;
 
     return static_cast<uint16_t>(result);
   }
@@ -141,7 +141,7 @@ namespace Core
       return 0;
 
     if (pot >= pot_max)
-      return APY_POT_BONUS_MAX_BPS;
+      return GlobalConfig::APY_POT_BONUS_MAX_BPS;
 
     const uint64_t span = pot_max - pot_high;
     if (span == 0)
@@ -149,11 +149,11 @@ namespace Core
 
     const uint64_t offset = pot - pot_high;
     __uint128_t scaled = static_cast<__uint128_t>(offset) *
-                         APY_POT_BONUS_MAX_BPS;
+                         GlobalConfig::APY_POT_BONUS_MAX_BPS;
     uint32_t result = static_cast<uint32_t>(scaled / span);
 
-    if (result > APY_POT_BONUS_MAX_BPS)
-      result = APY_POT_BONUS_MAX_BPS;
+    if (result > GlobalConfig::APY_POT_BONUS_MAX_BPS)
+      result = GlobalConfig::APY_POT_BONUS_MAX_BPS;
 
     return static_cast<uint16_t>(result);
   }

@@ -307,7 +307,7 @@ namespace Core
     // Opt-in to staking simply clears the opt-out flag.
     Account acct = state.getAccount(tx.from);
     acct.staking_opted_out = false;
-    acct.recalculateStaked(AUTO_STAKE_THRESHOLD);
+    acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
     state.putAccount(tx.from, acct);
 
     return {ReceiptStatus::Success, tx.fee};
@@ -321,7 +321,7 @@ namespace Core
   {
     Account acct = state.getAccount(tx.from);
     acct.staking_opted_out = true;
-    acct.recalculateStaked(AUTO_STAKE_THRESHOLD);
+    acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
     state.putAccount(tx.from, acct);
 
     return {ReceiptStatus::Success, tx.fee};
@@ -351,7 +351,7 @@ namespace Core
 
     // The balance grew; recompute the staked amount to reflect the new
     // balance under the auto-stake rule.
-    acct.recalculateStaked(AUTO_STAKE_THRESHOLD);
+    acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
 
     state.putAccount(tx.from, acct);
 
@@ -369,7 +369,7 @@ namespace Core
     Account acct = state.getAccount(tx.from);
 
     // Must meet minimum stake requirement.
-    if (acct.balance < VALIDATOR_MIN_STAKE)
+    if (acct.balance < GlobalConfig::VALIDATOR_MIN_STAKE)
       return failure;
 
     // The payload contains the node public key (32 bytes).
@@ -471,7 +471,7 @@ namespace Core
       // censorship resistance. A validator that wants to leave when
       // the set is at the floor must wait for rotation to promote
       // replacements first.
-      if (new_set.size() < ACTIVE_SET_MIN)
+      if (new_set.size() < GlobalConfig::ACTIVE_SET_MIN)
         return failure;
 
       saveActiveSet(state, new_set);
@@ -482,7 +482,7 @@ namespace Core
     // time, and it has been held out of balance ever since.
     Account acct = state.getAccount(validator.owner);
     acct.balance += validator.stake;
-    acct.recalculateStaked(AUTO_STAKE_THRESHOLD);
+    acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
     state.putAccount(validator.owner, acct);
 
     // Remove the address index.

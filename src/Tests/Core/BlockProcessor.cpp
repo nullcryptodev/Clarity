@@ -657,7 +657,7 @@ TEST_F(Core_BlockProcessorFixture, NonParticipantsUnaffected)
     v3.reward_address = carol_.publicKey;
     v3.owner = carol_.publicKey;
     v3.registered_at_height = 0;
-    v3.stake = VALIDATOR_MIN_STAKE;
+    v3.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
     v3.is_active = false;
     v3.last_seen_height = 0;
     s.putValidator(v3); });
@@ -726,7 +726,7 @@ TEST_F(Core_BlockProcessorFixture, RotationPromotesWaitingValidator)
   waiting.reward_address = carol_.publicKey;
   waiting.owner = carol_.publicKey;
   waiting.registered_at_height = 0;
-  waiting.stake = VALIDATOR_MIN_STAKE;
+  waiting.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
   waiting.uptime_score = 10'000;
   waiting.is_seed = false;
   waiting.is_active = false;
@@ -756,7 +756,7 @@ TEST_F(Core_BlockProcessorFixture, RotationDoesNotRunMidEpoch)
   waiting.reward_address = carol_.publicKey;
   waiting.owner = carol_.publicKey;
   waiting.registered_at_height = 0;
-  waiting.stake = VALIDATOR_MIN_STAKE;
+  waiting.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
   waiting.uptime_score = 10'000;
   waiting.is_seed = false;
   waiting.is_active = false;
@@ -809,7 +809,7 @@ TEST_F(Core_BlockProcessorFixture, RotationPersistsTargetSize)
   waiting.reward_address = carol_.publicKey;
   waiting.owner = carol_.publicKey;
   waiting.registered_at_height = 0;
-  waiting.stake = VALIDATOR_MIN_STAKE;
+  waiting.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
   waiting.uptime_score = 10'000;
   waiting.is_seed = false;
   waiting.is_active = false;
@@ -823,7 +823,7 @@ TEST_F(Core_BlockProcessorFixture, RotationPersistsTargetSize)
   // ACTIVE_SET_DEFAULT (21). computeTargetActiveSetSize interpolates
   // linearly from MIN at zero traffic to MAX at saturation.
   const uint64_t expected_target = computeTargetActiveSetSize(0);
-  EXPECT_EQ(expected_target, ACTIVE_SET_MIN)
+  EXPECT_EQ(expected_target, GlobalConfig::ACTIVE_SET_MIN)
       << "sanity: zero traffic should target the minimum";
 
   EXPECT_EQ(readActiveSetSize(), expected_target);

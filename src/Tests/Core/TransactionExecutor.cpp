@@ -400,7 +400,7 @@ TEST_F(Core_ExecutorFixture, OptOutDoesNotMoveFunds)
 TEST_F(Core_ExecutorFixture, RegistersBelowMinimum)
 {
   Core::Account acct = state_->getAccount(alice_.publicKey);
-  acct.balance = VALIDATOR_MIN_STAKE - 1;
+  acct.balance = GlobalConfig::VALIDATOR_MIN_STAKE - 1;
   state_->putAccount(alice_.publicKey, acct);
 
   Transaction tx = TransactionBuilder()
@@ -1788,9 +1788,9 @@ TEST_F(Core_ExecutorFixture, ClaimRecomputesStaked)
   // Set balance just below auto-stake threshold, with a reward that
   // pushes it above.
   Core::Account acct = state_->getAccount(alice_.publicKey);
-  acct.balance = AUTO_STAKE_THRESHOLD - 100;
+  acct.balance = GlobalConfig::AUTO_STAKE_THRESHOLD - 100;
   acct.pending_rewards = 500;
-  acct.recalculateStaked(AUTO_STAKE_THRESHOLD);
+  acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
   state_->putAccount(alice_.publicKey, acct);
 
   EXPECT_EQ(state_->getAccount(alice_.publicKey).staked, 0u);
@@ -1810,7 +1810,7 @@ TEST_F(Core_ExecutorFixture, ClaimRecomputesStaked)
   // Balance is now (AUTO_STAKE_THRESHOLD - 100) + 500 - 1, above the
   // threshold. staked should equal balance.
   Core::Account after = state_->getAccount(alice_.publicKey);
-  EXPECT_GT(after.balance, AUTO_STAKE_THRESHOLD);
+  EXPECT_GT(after.balance, GlobalConfig::AUTO_STAKE_THRESHOLD);
   EXPECT_EQ(after.staked, after.balance);
 }
 
@@ -1836,7 +1836,7 @@ TEST_F(Core_ExecutorFixture, UnregisterReturnsStake)
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
   // Balance gained the stake back, lost the fee.
-  EXPECT_EQ(balanceOf(alice_.publicKey), before + VALIDATOR_MIN_STAKE - 2);
+  EXPECT_EQ(balanceOf(alice_.publicKey), before + GlobalConfig::VALIDATOR_MIN_STAKE - 2);
 }
 
 TEST_F(Core_ExecutorFixture, UnregisterRejectsSeed)
@@ -1911,13 +1911,13 @@ TEST_F(Core_ExecutorFixture, UnregisterRemovesFromActiveSet)
   bumpNextValidatorId(3);
 
   std::vector<Id> active = {1, 2};
-  for (uint64_t id = 3; id <= ACTIVE_SET_MIN + 1; ++id)
+  for (uint64_t id = 3; id <= GlobalConfig::ACTIVE_SET_MIN + 1; ++id)
   {
     ValidatorInfo v;
     v.id = id;
     v.reward_address = Crypto::Address{};
     v.reward_address.data[0] = uint8_t(id);
-    v.stake = VALIDATOR_MIN_STAKE;
+    v.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
     v.uptime_score = 10'000;
     v.is_seed = false;
     v.is_active = true;
@@ -1925,7 +1925,7 @@ TEST_F(Core_ExecutorFixture, UnregisterRemovesFromActiveSet)
     active.push_back(id);
   }
   setActiveSet(active);
-  bumpNextValidatorId(ACTIVE_SET_MIN + 2);
+  bumpNextValidatorId(GlobalConfig::ACTIVE_SET_MIN + 2);
 
   // Bob unregisters.
   Transaction tx = TransactionBuilder()
@@ -1952,7 +1952,7 @@ TEST_F(Core_ExecutorFixture, UnregisterRemovesFromActiveSet)
     ids.push_back(id);
   }
   EXPECT_EQ(std::find(ids.begin(), ids.end(), 2u), ids.end());
-  EXPECT_EQ(ids.size(), ACTIVE_SET_MIN); // 11, the floor
+  EXPECT_EQ(ids.size(), GlobalConfig::ACTIVE_SET_MIN); // 2, the floor
 }
 
 TEST_F(Core_ExecutorFixture, UnregisterRejectsIfSetWouldDropBelowMin)
@@ -1960,7 +1960,7 @@ TEST_F(Core_ExecutorFixture, UnregisterRejectsIfSetWouldDropBelowMin)
   // Set up: exactly ACTIVE_SET_MIN validators, all active. Removing
   // any one would drop below the minimum.
   std::vector<Id> active;
-  for (uint64_t id = 1; id <= ACTIVE_SET_MIN; ++id)
+  for (uint64_t id = 1; id <= GlobalConfig::ACTIVE_SET_MIN; ++id)
   {
     Crypto::KeyPair kp = (id == 1) ? alice_ : bob_;
     ValidatorInfo v;
@@ -1971,7 +1971,7 @@ TEST_F(Core_ExecutorFixture, UnregisterRejectsIfSetWouldDropBelowMin)
       v.reward_address = Crypto::Address{};
       v.reward_address.data[0] = uint8_t(id);
     }
-    v.stake = VALIDATOR_MIN_STAKE;
+    v.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
     v.uptime_score = 10'000;
     v.is_seed = false;
     v.is_active = true;
@@ -1979,7 +1979,7 @@ TEST_F(Core_ExecutorFixture, UnregisterRejectsIfSetWouldDropBelowMin)
     active.push_back(id);
   }
   setActiveSet(active);
-  bumpNextValidatorId(ACTIVE_SET_MIN + 1);
+  bumpNextValidatorId(GlobalConfig::ACTIVE_SET_MIN + 1);
 
   // Alice (id=1) tries to unregister.
   Transaction tx = TransactionBuilder()

@@ -18,19 +18,6 @@ namespace Core
 
   inline constexpr uint64_t ROTATION_INTERVAL = 60;      // blocks per epoch
   inline constexpr uint64_t TARGET_ROTATION_EPOCHS = 21; // full set turns over
-  inline constexpr uint64_t ACTIVE_SET_MIN = 11;         // BFT minimum (7 of 11)
-  inline constexpr uint64_t ACTIVE_SET_MAX = 100;        // BFT ceiling
-  inline constexpr uint64_t ACTIVE_SET_DEFAULT = 21;
-  inline constexpr uint64_t SEED_NODES = 2; // always active
-
-  static_assert(ACTIVE_SET_MIN >= 4,
-                "BFT needs at least 4 validators");
-  static_assert(ACTIVE_SET_MIN <= ACTIVE_SET_DEFAULT,
-                "Default must be >= minimum");
-  static_assert(ACTIVE_SET_DEFAULT <= ACTIVE_SET_MAX,
-                "Default must be <= maximum");
-  static_assert(SEED_NODES <= ACTIVE_SET_MIN,
-                "Seeds must fit within the minimum active set");
 
   // BFT quorum: 2n/3 + 1
   constexpr uint64_t bftQuorum(uint64_t n) noexcept
@@ -48,21 +35,6 @@ namespace Core
 
   // Target transaction count per block at which the active set reaches MAX.
   inline constexpr uint64_t TRAFFIC_SATURATION_TX = 1000;
-
-  // ---- Staker APY (basis points) ----
-
-  inline constexpr uint16_t APY_BASE_BPS = 500;          // 5.00% (gov)
-  inline constexpr uint16_t APY_ACTIVITY_MAX_BPS = 500;  // +5.00% max
-  inline constexpr uint16_t APY_POT_BONUS_MAX_BPS = 300; // +3.00% max
-
-  // Balance bonus: stakers holding >= threshold get +3% weight
-  inline constexpr uint16_t BALANCE_BONUS_BPS = 300;                        // 3.00%
-  inline constexpr uint64_t BALANCE_BONUS_THRESHOLD = 1000ULL * 100'000ULL; // 1000 CLRTY
-
-  // ---- Staking thresholds ----
-
-  inline constexpr uint64_t AUTO_STAKE_THRESHOLD = 100ULL * 100'000ULL; // 100 CLRTY
-  inline constexpr uint64_t VALIDATOR_MIN_STAKE = 1000ULL * 100'000ULL; // 1000 CLRTY
 
   // ---- Uptime scoring ----
 

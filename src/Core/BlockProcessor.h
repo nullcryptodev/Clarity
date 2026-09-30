@@ -99,6 +99,21 @@ namespace Core
 
     static ValidatorRegistry loadValidatorRegistry(State::StateAccess &state);
 
+    //  Resolve the active set for a block.
+    //
+    //  When force_rotation is false, returns the committed set from
+    //  state — same as loadActiveSet. When true, derives the emergency
+    //  set from (committed_set, validator registry, height).
+    //
+    //  The derivation must be a pure function of state and height: the
+    //  proposer (via Node::buildConsensusDeps::active_set) and every
+    //  verifier call this with the same inputs, and any dependence on
+    //  node-local data would make them diverge.
+    static std::vector<Id> resolveActiveSet(State::StateAccess &state,
+                                            const std::vector<Id> &committed_set,
+                                            uint64_t current_height,
+                                            bool force_rotation);
+
   private:
     // ---- Pre-checks (before any state mutation) ----
 
@@ -197,6 +212,12 @@ namespace Core
                            const std::vector<Id> &active_set,
                            const BlockContext &ctx,
                            std::string &error);
+
+    static bool checkTimeoutCertificate(State::StateAccess &state,
+                                        const Block &block,
+                                        const std::vector<Id> &committed_set,
+                                        uint64_t current_height,
+                                        std::string &error);
   };
 
 } // namespace Core

@@ -69,8 +69,8 @@ namespace GlobalConfig
   inline constexpr const char *COMMUNITY_FUND_ADDRESS = "0000000000000000000000000000000000000000000000000000000000000001"; // address
   inline constexpr const char *TREASURY_FUND_ADDRESS = "0000000000000000000000000000000000000000000000000000000000000001";  // address
 
-  inline constexpr Amount COMMUNITY_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 20'000;
-  inline constexpr Amount TREASURY_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 60'000;
+  inline constexpr Amount COMMUNITY_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 40'000;
+  inline constexpr Amount TREASURY_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 58'000; // pay for seed validator
 
   // Genesis block hashes, one per network. Computed once and pinned.
   // If a change to genesis construction produces a different hash,
@@ -84,8 +84,36 @@ namespace GlobalConfig
   // Seed
 
   inline constexpr const char *SEED_ADDRESS = "0000000000000000000000000000000000000000000000000000000000000001"; // address
-  inline constexpr Amount SEED_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 20'000;
+  inline constexpr Amount SEED_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 1'000;                                       // just fund the seed as to be a validator
+  inline constexpr const char *SEED_ADDRESS_TWO = "0000000000000000000000000000000000000000000000000000000000000001"; // address
+  inline constexpr Amount SEED_FUND_AMOUNT_TWO = ATOMIC_UNITS_PER_COIN * 1'000;                                       // just fund the seed as to be a validator
 
   inline constexpr const char *SEED_NODE = "1111111111111111111111111111111111111111111111111111111111111111"; // pubkey
+  inline constexpr const char *SEED_NODE_TWO = "1111111111111111111111111111111111111111111111111111111111111111"; // pubkey
   inline constexpr uint32_t INITIAL_SET_SIZE = 1;
+
+  // Validator set
+
+  inline constexpr uint64_t VALIDATOR_MIN_STAKE = 1000ULL * ATOMIC_UNITS_PER_COIN; // 1000 CLRTY
+
+  inline constexpr uint64_t SEED_NODES_COUNT = 2;              // always active
+  inline constexpr uint64_t ACTIVE_SET_MIN = SEED_NODES_COUNT; // BFT minimum (2 of 2)
+  inline constexpr uint64_t ACTIVE_SET_MAX = 100;              // BFT ceiling
+  inline constexpr uint64_t ACTIVE_SET_DEFAULT = 11;
+
+  static_assert(ACTIVE_SET_MIN >= 2, "BFT needs at least 2 validators");
+  static_assert(ACTIVE_SET_MIN <= ACTIVE_SET_DEFAULT, "Default must be >= minimum");
+  static_assert(ACTIVE_SET_DEFAULT <= ACTIVE_SET_MAX, "Default must be <= maximum");
+  static_assert(SEED_NODES_COUNT <= ACTIVE_SET_MIN, "Seeds must fit within the minimum active set");
+
+  // Staking
+
+  inline constexpr uint64_t AUTO_STAKE_THRESHOLD = 100ULL * ATOMIC_UNITS_PER_COIN; // 100 CLRTY
+  inline constexpr uint16_t APY_BASE_BPS = 500;                                    // 5.00% (gov)
+  inline constexpr uint16_t APY_ACTIVITY_MAX_BPS = 500;                            // +5.00% max
+  inline constexpr uint16_t APY_POT_BONUS_MAX_BPS = 300;                           // +3.00% max
+
+  // Balance bonus: stakers holding >= threshold get +3% weight
+  inline constexpr uint16_t BALANCE_BONUS_BPS = 300;                                   // 3.00%
+  inline constexpr uint64_t BALANCE_BONUS_THRESHOLD = 1000ULL * ATOMIC_UNITS_PER_COIN; // 1000 CLRTY
 }

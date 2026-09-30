@@ -318,6 +318,12 @@ namespace Rpc
     if (disabled)
       return true;
 
+    // The lock covers both the map lookup AND the tryConsume() call.
+    // That's deliberate: RateLimiter is not thread-safe by design, and
+    // this mutex is the single point where per-IP buckets are
+    // serialized. If this lock ever moves (e.g. per-bucket locks for
+    // scalability), RateLimiter must be made thread-safe at the same
+    // time. See Common/RateLimiter.h for the ownership contract.
     std::lock_guard<std::mutex> lock(rate_limit_mutex_);
 
     auto it = rate_limiters_.find(ip);

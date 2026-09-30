@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "Utils.h"
+#include "Consensus/Types.h"
 
 namespace Tests
 {
@@ -93,7 +94,7 @@ namespace Tests
             std::memcpy(out.reward_address.data.data(),
                         v.pubkey().data.data(), 32);
             out.owner = out.reward_address;
-            out.stake = Core::VALIDATOR_MIN_STAKE;
+            out.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
             out.uptime_score = 10'000;
             out.is_active = true;
             return true;
@@ -113,6 +114,8 @@ namespace Tests
       { broadcast_prevotes.push_back(v); };
       cb.broadcast_precommit = [this](const Consensus::Vote &v)
       { broadcast_precommits.push_back(v); };
+      cb.broadcast_timeout_vote = [this](const Consensus::TimeoutVote &tv)
+      { broadcast_timeout_votes.push_back(tv); };
       cb.select_transactions = [](uint64_t, uint64_t)
       { return std::vector<Core::Transaction>{}; };
       cb.on_block_committed = [this](const Core::Block &b)
@@ -220,6 +223,67 @@ namespace Tests
       emergency_ids_ = std::move(ids);
     }
 
+    // ------------------------------------------------------------------
+    //  Timeout certificate helpers
+    // ------------------------------------------------------------------
+
+    //  Sign `hash` with validator `signer_index`'s private key. The
+    //  index is a position in the committed set, matching the
+    //  convention used by makeSignedVote and by the consensus object
+    //  when it resolves a signer through active_set[signer_index].
+    Crypto::Signature signForValidator(Index signer_index,
+                                       const Crypto::Hash &hash)
+    {
+      if (signer_index >= validators_.size())
+        return Crypto::Signature{};
+      return validators_[signer_index].sign(hash);
+    }
+
+    //  Build a TimeoutCertificate for (height, round) with one vote
+    //  per signer index in `signers`. Signatures are produced by
+    //  signForValidator, so a certificate built here verifies against
+    //  the fixture's key material and against the fixture's
+    //  state_lookup_validator, which exposes each validator's pubkey
+    //  as its reward_address.
+    Consensus::TimeoutCertificate makeTimeoutCertificate(
+        Height height, Round round, const std::vector<Index> &signers)
+    {
+      Consensus::TimeoutCertificate cert;
+      cert.votes.reserve(signers.size());
+
+      const Crypto::Hash signing_hash =
+          Consensus::timeoutVoteSigningHash(height, round);
+
+      for (Index idx : signers)
+      {
+        Consensus::TimeoutVote tv;
+        tv.height = height;
+        tv.round = round;
+        tv.signer_index = idx;
+        tv.signature = signForValidator(idx, signing_hash);
+        cert.votes.push_back(tv);
+      }
+
+      return cert;
+    }
+
+    //  Build a signed TimeoutVote for `signer_index` and deliver it to
+    //  the consensus object via onTimeoutVote — equivalent to what a
+    //  peer's P2P message would do.
+    void deliverTimeoutVote(Index signer_index, Height height, Round round)
+    {
+      const Crypto::Hash signing_hash =
+          Consensus::timeoutVoteSigningHash(height, round);
+
+      Consensus::TimeoutVote tv;
+      tv.height = height;
+      tv.round = round;
+      tv.signer_index = signer_index;
+      tv.signature = signForValidator(signer_index, signing_hash);
+
+      consensus_->onTimeoutVote(tv);
+    }
+
     NoopLogger logger_;
     std::unique_ptr<Logging::LoggerRef> log_ref_;
     std::vector<TestValidator> validators_;
@@ -229,6 +293,7 @@ namespace Tests
     std::vector<Consensus::Proposal> broadcast_proposals;
     std::vector<Consensus::Vote> broadcast_prevotes;
     std::vector<Consensus::Vote> broadcast_precommits;
+    std::vector<Consensus::TimeoutVote> broadcast_timeout_votes;
     std::vector<Core::Block> committed_blocks;
     std::vector<Height> height_advances;
 

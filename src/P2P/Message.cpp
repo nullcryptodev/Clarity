@@ -5,8 +5,7 @@
 
 #include "Message.h"
 
-#include "Common/Put.h"
-#include "Common/Read.h"
+#include "Common/Wire.h"
 
 #include <cstring>
 #include <stdexcept>
@@ -25,13 +24,14 @@ namespace P2P
     std::vector<uint8_t> out;
     out.reserve(MESSAGE_HEADER_SIZE + msg.payload.size());
 
-    Common::putU32(out, magic);                                     // [0..3]
-    Common::putU16(out, static_cast<uint16_t>(msg.type));           // [4..5]
-    Common::putU32(out, static_cast<uint32_t>(msg.payload.size())); // [6..9]
+    Common::Writer w(out);
+    w.writeU32(magic);                                     // [0..3]
+    w.writeU16(static_cast<uint16_t>(msg.type));           // [4..5]
+    w.writeU32(static_cast<uint32_t>(msg.payload.size())); // [6..9]
 
     if (!msg.payload.empty())
     {
-      out.insert(out.end(), msg.payload.begin(), msg.payload.end());
+      w.writeBytes(msg.payload.data(), msg.payload.size());
     }
 
     return out;
@@ -51,10 +51,14 @@ namespace P2P
       return {DecodeStatus::NeedMoreData, std::nullopt};
     }
 
+    //  Peek at the header without consuming. The streaming decoder
+    //  can't use Reader here because Reader has no "peek" and no
+    //  "don't advance on failure" — both of which this decoder needs.
+    //  The primitives are exactly the right tool.
     const uint8_t *p = buffer_.data();
-    uint32_t magic = Common::readU32(p + 0);
-    uint16_t type =  Common::readU16(p + 4);
-    uint32_t size =  Common::readU32(p + 6);
+    const uint32_t magic = Common::readU32(p + 0);
+    const uint16_t type = Common::readU16(p + 4);
+    const uint32_t size = Common::readU32(p + 6);
 
     if (magic != magic_)
     {

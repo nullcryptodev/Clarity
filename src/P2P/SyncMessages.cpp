@@ -5,34 +5,12 @@
 
 #include "SyncMessages.h"
 
-#include "Common/Reader.h"
+#include "Common/Wire.h"
 
 #include <cstring>
 
 namespace P2P
 {
-  namespace
-  {
-    inline void appendU32(std::vector<uint8_t> &out, uint32_t v)
-    {
-      out.push_back(uint8_t(v));
-      out.push_back(uint8_t(v >> 8));
-      out.push_back(uint8_t(v >> 16));
-      out.push_back(uint8_t(v >> 24));
-    }
-
-    inline void appendU64(std::vector<uint8_t> &out, uint64_t v)
-    {
-      for (int i = 0; i < 8; ++i)
-        out.push_back(uint8_t(v >> (i * 8)));
-    }
-
-    inline void appendHash(std::vector<uint8_t> &out, const Crypto::Hash &h)
-    {
-      out.insert(out.end(), h.data.begin(), h.data.end());
-    }
-  } // anonymous namespace
-
   // ---- Headers ----
 
   std::vector<uint8_t> serializeHeaders(const HeadersMessage &m)
@@ -47,11 +25,13 @@ namespace P2P
     std::vector<uint8_t> out;
     out.reserve(4 + count * 40);
 
-    appendU32(out, count);
+    Common::Writer w(out);
+    w.writeU32(count);
+
     for (uint32_t i = 0; i < count; ++i)
     {
-      appendU64(out, m.entries[i].height);
-      appendHash(out, m.entries[i].hash);
+      w.writeU64(m.entries[i].height);
+      w.writeBytes(m.entries[i].hash.data.data(), m.entries[i].hash.data.size());
     }
 
     return out;
@@ -81,7 +61,7 @@ namespace P2P
     {
       HeadersEntry e;
       e.height = r.readU64();
-      r.readBytes(e.hash.data.data(), 32);
+      r.readBytes(e.hash.data.data(), e.hash.data.size());
       if (!r.ok())
         return false;
       out.entries.push_back(e);
@@ -101,9 +81,11 @@ namespace P2P
     std::vector<uint8_t> out;
     out.reserve(4 + count * 32);
 
-    appendU32(out, count);
+    Common::Writer w(out);
+    w.writeU32(count);
+
     for (uint32_t i = 0; i < count; ++i)
-      appendHash(out, m.hashes[i]);
+      w.writeBytes(m.hashes[i].data.data(), m.hashes[i].data.size());
 
     return out;
   }
@@ -128,7 +110,7 @@ namespace P2P
     for (uint32_t i = 0; i < count && r.ok(); ++i)
     {
       Crypto::Hash h;
-      r.readBytes(h.data.data(), 32);
+      r.readBytes(h.data.data(), h.data.size());
       if (!r.ok())
         return false;
       out.hashes.push_back(h);
@@ -146,13 +128,15 @@ namespace P2P
                                                  : m.blocks.size());
 
     std::vector<uint8_t> out;
-    appendU32(out, count);
+
+    Common::Writer w(out);
+    w.writeU32(count);
 
     for (uint32_t i = 0; i < count; ++i)
     {
       std::vector<uint8_t> bytes = m.blocks[i].serialize();
-      appendU32(out, static_cast<uint32_t>(bytes.size()));
-      out.insert(out.end(), bytes.begin(), bytes.end());
+      w.writeU32(static_cast<uint32_t>(bytes.size()));
+      w.writeBytes(bytes.data(), bytes.size());
     }
 
     return out;

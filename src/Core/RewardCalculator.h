@@ -32,7 +32,7 @@ namespace Core
     uint64_t pot{0};
     uint64_t fees_this_block{0};
     uint64_t block_reward_atomic{GlobalConfig::BLOCK_REWARD};
-    uint16_t apy_base_bps{APY_BASE_BPS};
+    uint16_t apy_base_bps{GlobalConfig::APY_BASE_BPS};
     uint16_t apy_activity_bps{0};
     uint16_t apy_pot_bonus_bps{0};
   };

@@ -7,7 +7,7 @@
 #include "Crypto/Hmac.h"
 #include "Crypto/Pbkdf2.h"
 
-#include "Common/Put.h"
+#include "Common/Wire.h"
 
 #include "RPC/Methods/Methods.h"
 
@@ -79,7 +79,7 @@ namespace Tests
       v.node_key.data[i] = static_cast<uint8_t>(0x80 + i);
     v.owner = v.reward_address;
     v.registered_at_height = 100;
-    v.stake = Core::VALIDATOR_MIN_STAKE;
+    v.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
     v.uptime_score = 9'800;
     v.last_ping_height = 150;
     v.pings_responded_this_epoch = 55;
@@ -105,10 +105,7 @@ namespace Tests
     std::vector<uint8_t> bytes;
     if (!s.getGlobal(name, bytes) || bytes.size() != 8)
       return 0;
-    uint64_t v = 0;
-    for (int i = 0; i < 8; ++i)
-      v |= uint64_t(bytes[i]) << (i * 8);
-    return v;
+    return Common::readU64(bytes.data());
   }
 
   uint64_t readU64GlobalSV(State::StateAccess &s, std::string_view name)
@@ -116,10 +113,7 @@ namespace Tests
     std::vector<uint8_t> bytes;
     if (!s.getGlobal(std::string(name), bytes) || bytes.size() != 8)
       return 0;
-    uint64_t v = 0;
-    for (int i = 0; i < 8; ++i)
-      v |= uint64_t(bytes[i]) << (i * 8);
-    return v;
+    return Common::readU64(bytes.data());
   }
 
   // Creates a KVBinarySerializer from a stream (for exception testing)
@@ -352,7 +346,7 @@ namespace Tests
     ctx.pot = 0;
     ctx.fees_this_block = 0;
     ctx.block_reward_atomic = GlobalConfig::BLOCK_REWARD;
-    ctx.apy_base_bps = Core::APY_BASE_BPS;
+    ctx.apy_base_bps = GlobalConfig::APY_BASE_BPS;
     ctx.apy_activity_bps = 0;
     ctx.apy_pot_bonus_bps = 0;
     return ctx;
@@ -374,7 +368,7 @@ namespace Tests
     {
       Core::ValidatorInfo v;
       v.id = static_cast<Id>(i + 1);
-      v.stake = Core::VALIDATOR_MIN_STAKE;
+      v.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
       v.uptime_score = 10'000;
       v.reward_multiplier = Core::REWARD_MULTIPLIER_START;
       v.is_active = true;
@@ -386,8 +380,8 @@ namespace Tests
   }
 
   std::vector<uint8_t> makeCreatePoolPayload(uint32_t token_b,
-                                                    uint64_t amount_b,
-                                                    uint16_t fee_bps)
+                                             uint64_t amount_b,
+                                             uint16_t fee_bps)
   {
     std::vector<uint8_t> p;
     Common::putU32(p, token_b);
@@ -427,7 +421,7 @@ namespace Tests
   }
 
   std::vector<uint8_t> makeAddLiquidityPayload(uint64_t pool_id,
-                                                      uint64_t amount_b)
+                                               uint64_t amount_b)
   {
     std::vector<uint8_t> p;
     Common::putU64(p, pool_id);
@@ -436,7 +430,7 @@ namespace Tests
   }
 
   std::vector<uint8_t> makeSwapPayload(uint64_t pool_id,
-                                              uint64_t min_amount_out)
+                                       uint64_t min_amount_out)
   {
     std::vector<uint8_t> p;
     Common::putU64(p, pool_id);
@@ -468,9 +462,9 @@ namespace Tests
 
   // Single order condition, encoded as [1] type, [8] param1, [4] param2.
   void appendOrderCondition(std::vector<uint8_t> &p,
-                                   Core::OrderConditionType type,
-                                   uint64_t param1,
-                                   uint32_t param2)
+                            Core::OrderConditionType type,
+                            uint64_t param1,
+                            uint32_t param2)
   {
     p.push_back(static_cast<uint8_t>(type));
     Common::putU64(p, param1);
@@ -501,9 +495,9 @@ namespace Tests
   //  changes and the tests don't, the anchor tests fail. That's the point.
 
   uint64_t expectedSwapOutput(uint64_t reserve_in,
-                                     uint64_t reserve_out,
-                                     uint64_t amount_in,
-                                     uint16_t fee_bps)
+                              uint64_t reserve_out,
+                              uint64_t amount_in,
+                              uint16_t fee_bps)
   {
     uint64_t in_with_fee = amount_in * (10'000 - fee_bps) / 10'000;
     __uint128_t num = static_cast<__uint128_t>(reserve_out) * in_with_fee;
@@ -579,8 +573,8 @@ namespace Tests
   }
 
   Core::Block makeTestBlock(Core::BlockHeader header,
-                                   std::vector<Core::Transaction> txs,
-                                   std::vector<Id> participants)
+                            std::vector<Core::Transaction> txs,
+                            std::vector<Id> participants)
   {
     Core::Block b;
     b.header = header;
@@ -601,10 +595,10 @@ namespace Tests
   }
 
   Core::Transaction makeTestTx(const Crypto::KeyPair &kp,
-                                      uint64_t nonce,
-                                      uint64_t amount,
-                                      uint64_t fee,
-                                      uint64_t chain_id)
+                               uint64_t nonce,
+                               uint64_t amount,
+                               uint64_t fee,
+                               uint64_t chain_id)
   {
     Core::Transaction tx;
     tx.version = GlobalConfig::CURRENT_TRANSACTION_VERSION;
@@ -626,7 +620,6 @@ namespace Tests
     tx.signature = Crypto::sign(sighash, kp.secretKey);
     return tx;
   }
-
 
   // Bbuild a minimal well-formed transaction.
   Core::Transaction makeTx()

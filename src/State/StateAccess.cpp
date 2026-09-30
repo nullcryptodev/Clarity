@@ -114,7 +114,7 @@ namespace State
                                const Core::Account &account)
   {
     Core::Account copy = account;
-    copy.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+    copy.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
 
     Core::Account old = getAccount(address);
 

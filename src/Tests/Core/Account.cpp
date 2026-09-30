@@ -106,44 +106,44 @@ TEST(Core_Account, SerializeIncludesStakerSinceHeight)
 TEST(Core_Account, RecalculateStakedBelowThreshold)
 {
   Account a;
-  a.balance = AUTO_STAKE_THRESHOLD - 1;
-  a.recalculateStaked(AUTO_STAKE_THRESHOLD);
+  a.balance = GlobalConfig::AUTO_STAKE_THRESHOLD - 1;
+  a.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
   EXPECT_EQ(a.staked, 0u);
 }
 
 TEST(Core_Account, RecalculateStakedAtThreshold)
 {
   Account a;
-  a.balance = AUTO_STAKE_THRESHOLD;
-  a.recalculateStaked(AUTO_STAKE_THRESHOLD);
+  a.balance = GlobalConfig::AUTO_STAKE_THRESHOLD;
+  a.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
   EXPECT_EQ(a.staked, a.balance);
 }
 
 TEST(Core_Account, RecalculateStakedAboveThreshold)
 {
   Account a;
-  a.balance = AUTO_STAKE_THRESHOLD * 10;
-  a.recalculateStaked(AUTO_STAKE_THRESHOLD);
+  a.balance = GlobalConfig::AUTO_STAKE_THRESHOLD * 10;
+  a.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
   EXPECT_EQ(a.staked, a.balance);
 }
 
 TEST(Core_Account, RecalculateStakedOptedOut)
 {
   Account a;
-  a.balance = AUTO_STAKE_THRESHOLD * 10;
+  a.balance = GlobalConfig::AUTO_STAKE_THRESHOLD * 10;
   a.staking_opted_out = true;
-  a.recalculateStaked(AUTO_STAKE_THRESHOLD);
+  a.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
   EXPECT_EQ(a.staked, 0u);
 }
 
 TEST(Core_Account, RecalculateStakedPreservesBalance)
 {
   Account a;
-  a.balance = AUTO_STAKE_THRESHOLD * 5;
-  a.recalculateStaked(AUTO_STAKE_THRESHOLD);
+  a.balance = GlobalConfig::AUTO_STAKE_THRESHOLD * 5;
+  a.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
 
-  EXPECT_EQ(a.balance, AUTO_STAKE_THRESHOLD * 5);
-  EXPECT_EQ(a.staked, AUTO_STAKE_THRESHOLD * 5);
+  EXPECT_EQ(a.balance, GlobalConfig::AUTO_STAKE_THRESHOLD * 5);
+  EXPECT_EQ(a.staked, GlobalConfig::AUTO_STAKE_THRESHOLD * 5);
 }
 
 TEST(Core_Account, RecalculateStakedDoesNotTouchStakerSinceHeight)
@@ -151,10 +151,10 @@ TEST(Core_Account, RecalculateStakedDoesNotTouchStakerSinceHeight)
   // recalculateStaked only modifies `staked`. The transition tracking
   // is the responsibility of StateAccess::putAccount.
   Account a;
-  a.balance = AUTO_STAKE_THRESHOLD;
+  a.balance = GlobalConfig::AUTO_STAKE_THRESHOLD;
   a.staker_since_height = 42;
 
-  a.recalculateStaked(AUTO_STAKE_THRESHOLD);
+  a.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
 
   EXPECT_EQ(a.staker_since_height, 42u);
 }

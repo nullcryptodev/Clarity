@@ -482,6 +482,9 @@ namespace Tests
         case Envelope::Precommit:
           c.onPrecommit(e.vote);
           break;
+        case Envelope::TimeoutVote:
+          c.onTimeoutVote(e.timeout_vote);
+          break;
         case Envelope::Restart:
           c.start(e.restart_height);
           break;

@@ -183,7 +183,7 @@ namespace Tests
       acct.balance += amount;
       if (acct.created_at_height == 0)
         acct.created_at_height = 1;
-      acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+      acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
       state.putAccount(addr, acct);
     }
 
@@ -454,12 +454,7 @@ namespace Tests
         vs.signature = Crypto::sign(signing_hash, keys[i].secretKey);
         sigs.push_back(vs);
       }
-      std::cerr << "makeQuorum: block.h=" << block.header.height
-                << " block.em=" << block.header.emergency_rotation
-                << " block.hash=" << block.hash().toString().substr(0, 16)
-                << " signing_hash=" << signing_hash.toString().substr(0, 16)
-                << " keys=" << keys.size()
-                << "\n";
+
       return sigs;
     }
 
@@ -807,7 +802,7 @@ namespace Tests
       acct.balance += amount;
       if (acct.created_at_height == 0)
         acct.created_at_height = 1;
-      acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+      acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
       state_->putAccount(addr, acct);
     }
 
@@ -918,7 +913,7 @@ namespace Tests
       v.id = id;
       v.reward_address = owner.publicKey;
       v.owner = owner.publicKey;
-      v.stake = Core::VALIDATOR_MIN_STAKE;
+      v.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
       v.registered_at_height = 1;
       v.uptime_score = 10'000;
       v.is_seed = is_seed;
@@ -954,7 +949,7 @@ namespace Tests
     {
       Core::Account acct = state_->getAccount(addr);
       acct.pending_rewards = amount;
-      acct.recalculateStaked(Core::AUTO_STAKE_THRESHOLD);
+      acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
       state_->putAccount(addr, acct);
     }
 

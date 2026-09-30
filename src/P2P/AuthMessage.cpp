@@ -6,46 +6,37 @@
 #include "AuthMessage.h"
 #include "Peer.h"
 
-#include "Common/Reader.h"
+#include "Common/Wire.h"
+
 #include "Crypto/Blake2b.h"
 
 #include <cstring>
 
 namespace P2P
 {
-  namespace
-  {
-    inline void appendBytes(std::vector<uint8_t> &out,
-                            const uint8_t *p, size_t n)
-    {
-      out.insert(out.end(), p, p + n);
-    }
-
-    inline void appendU64(std::vector<uint8_t> &out, uint64_t v)
-    {
-      for (int i = 0; i < 8; ++i)
-        out.push_back(uint8_t(v >> (i * 8)));
-    }
-  } // anonymous namespace
-
   std::vector<uint8_t> serializeAuth(const AuthMessage &m)
   {
     std::vector<uint8_t> out;
     out.reserve(32 + 64);
-    appendBytes(out, m.pubkey.data.data(), 32);
-    appendBytes(out, m.signature.data.data(), 64);
+
+    Common::Writer w(out);
+    w.writeBytes(m.pubkey.data.data(), m.pubkey.data.size());
+    w.writeBytes(m.signature.data.data(), m.signature.data.size());
+
     return out;
   }
 
   bool deserializeAuth(const uint8_t *data, size_t len, AuthMessage &out)
   {
     // Fixed-size message: 32 + 64. Anything else is malformed.
-    if (len != 32 + 64)
+    constexpr size_t AUTH_WIRE_SIZE = 32 + 64;
+    if (len != AUTH_WIRE_SIZE)
       return false;
 
-    std::memcpy(out.pubkey.data.data(), data, 32);
-    std::memcpy(out.signature.data.data(), data + 32, 64);
-    return true;
+    Common::Reader r(data, len);
+    r.readBytes(out.pubkey.data.data(), out.pubkey.data.size());
+    r.readBytes(out.signature.data.data(), out.signature.data.size());
+    return r.ok();
   }
 
   Crypto::Hash computeAuthChallenge(uint64_t localNonce,
@@ -54,9 +45,10 @@ namespace P2P
   {
     std::vector<uint8_t> buf;
     buf.reserve(8 + 8 + 32);
-    appendU64(buf, localNonce);
-    appendU64(buf, remoteNonce);
-    appendBytes(buf, pubkey.data.data(), 32);
+
+    Common::putU64(buf, localNonce);
+    Common::putU64(buf, remoteNonce);
+    Common::putBytes(buf, pubkey.data.data(), pubkey.data.size());
 
     Crypto::Hash h;
     Crypto::blake2b(buf.data(), buf.size(), h.data.data(), 32);
@@ -77,9 +69,10 @@ namespace P2P
   {
     std::vector<uint8_t> buf;
     buf.reserve(8 + 8 + 32);
-    appendU64(buf, n.initiator);
-    appendU64(buf, n.responder);
-    appendBytes(buf, pubkey.data.data(), 32);
+
+    Common::putU64(buf, n.initiator);
+    Common::putU64(buf, n.responder);
+    Common::putBytes(buf, pubkey.data.data(), pubkey.data.size());
 
     Crypto::Hash h;
     Crypto::blake2b(buf.data(), buf.size(), h.data.data(), 32);

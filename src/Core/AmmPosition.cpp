@@ -5,10 +5,7 @@
 
 #include "AmmPosition.h"
 
-#include "Common/Put.h"
-#include "Common/Read.h"
-
-#include <cstring>
+#include "Common/Wire.h"
 
 namespace Core
 {
@@ -17,11 +14,12 @@ namespace Core
     std::vector<uint8_t> out;
     out.reserve(STATE_SIZE);
 
-    Common::putU64(out, id);
-    Common::putBytes(out, owner.data.data(), owner.data.size());
-    Common::putU64(out, pool_id);
-    Common::putU64(out, liquidity);
-    Common::putU64(out, created_at_height);
+    Common::Writer w(out);
+    w.writeU64(id);
+    w.writeBytes(owner.data.data(), owner.data.size());
+    w.writeU64(pool_id);
+    w.writeU64(liquidity);
+    w.writeU64(created_at_height);
 
     return out;
   }
@@ -29,20 +27,21 @@ namespace Core
   bool AmmPosition::deserializeState(const uint8_t *data, size_t len,
                                      AmmPosition &out)
   {
-    if (len < STATE_SIZE)
+    //  Exact-length check. A serialized AmmPosition is exactly
+    //  STATE_SIZE bytes; anything else is malformed.
+    if (len != STATE_SIZE)
       return false;
 
-    size_t off = 0;
-    out.id = Common::readU64(data + off);
-    off += 8;
-    std::memcpy(out.owner.data.data(), data + off, 32);
-    off += 32;
-    out.pool_id = Common::readU64(data + off);
-    off += 8;
-    out.liquidity = Common::readU64(data + off);
-    off += 8;
-    out.created_at_height = Common::readU64(data + off);
-    off += 8;
+    Common::Reader r(data, len);
+
+    out.id = r.readU64();
+    r.readBytes(out.owner.data.data(), out.owner.data.size());
+    out.pool_id = r.readU64();
+    out.liquidity = r.readU64();
+    out.created_at_height = r.readU64();
+
+    if (!r.ok())
+      return false;
 
     return out.isValid();
   }

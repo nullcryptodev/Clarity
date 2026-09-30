@@ -10,8 +10,7 @@
 
 #include "Crypto/Blake2b.h"
 
-#include "Common/Put.h"
-#include "Common/Read.h"
+#include "Common/Wire.h"
 
 namespace State
 {
@@ -37,22 +36,23 @@ namespace State
     std::vector<uint8_t> out;
     out.reserve(serializedSize());
 
-    out.insert(out.end(), key.data.begin(), key.data.end());
-    out.push_back(value.has_value() ? 1 : 0);
+    Common::Writer w(out);
+    w.writeBytes(key.data.data(), key.data.size());
+    w.writeU8(value.has_value() ? 1 : 0);
 
-    uint32_t value_size = value.has_value()
-                              ? static_cast<uint32_t>(value->size())
-                              : 0;
-    Common::putU32(out, value_size);
+    const uint32_t value_size = value.has_value()
+                                    ? static_cast<uint32_t>(value->size())
+                                    : 0;
+    w.writeU32(value_size);
 
     if (value.has_value() && !value->empty())
     {
-      out.insert(out.end(), value->begin(), value->end());
+      w.writeBytes(value->data(), value->size());
     }
 
     for (const auto &sib : siblings)
     {
-      out.insert(out.end(), sib.data.begin(), sib.data.end());
+      w.writeBytes(sib.data.data(), sib.data.size());
     }
 
     return out;
@@ -60,35 +60,39 @@ namespace State
 
   bool SmtProof::deserialize(const uint8_t *data, size_t len, SmtProof &out)
   {
-    if (len < 32 + 1 + 4 + 32 * PROOF_SIBLINGS)
+    //  Minimum-size check: key(32) + has_value(1) + value_size(4)
+    //  + 256 siblings * 32 bytes. Anything shorter can't be a proof.
+    constexpr size_t MIN_SIZE = 32 + 1 + 4 + 32 * PROOF_SIBLINGS;
+    if (len < MIN_SIZE)
       return false;
 
-    size_t off = 0;
+    Common::Reader r(data, len);
 
-    std::memcpy(out.key.data.data(), data + off, 32);
-    off += 32;
+    r.readBytes(out.key.data.data(), out.key.data.size());
 
-    uint8_t has_value = data[off++];
+    const uint8_t has_value = r.readU8();
 
-    uint32_t value_size = Common::readU32(data + off);
-    off += 4;
-
-    if (value_size > 64 * 1024)
+    const uint32_t value_size = r.readU32();
+    if (!r.ok() || value_size > 64 * 1024)
       return false;
 
-    if (off + value_size + 32 * PROOF_SIBLINGS > len)
+    //  Bound the value read against what's actually left, rather than
+    //  against the raw `off + value_size + ...` sum. The original
+    //  arithmetic could overflow size_t on pathological inputs; here
+    //  the comparison is between two quantities that are both already
+    //  known to fit in size_t, so no overflow is possible.
+    if (r.remaining() < static_cast<size_t>(value_size) + 32 * PROOF_SIBLINGS)
       return false;
 
     if (has_value)
     {
-      std::vector<uint8_t> v(data + off, data + off + value_size);
-      out.value = std::move(v);
+      out.value = r.readVector(value_size);
     }
     else
     {
       out.value.reset();
+      r.skip(value_size);
     }
-    off += value_size;
 
     out.siblings.clear();
     out.siblings.reserve(PROOF_SIBLINGS);
@@ -96,10 +100,16 @@ namespace State
     for (size_t i = 0; i < PROOF_SIBLINGS; ++i)
     {
       Crypto::Hash sib;
-      std::memcpy(sib.data.data(), data + off, 32);
-      off += 32;
+      r.readBytes(sib.data.data(), sib.data.size());
       out.siblings.push_back(sib);
     }
+
+    if (!r.ok())
+      return false;
+
+    // No trailing bytes tolerated. A proof is self-contained.
+    if (r.remaining() != 0)
+      return false;
 
     return true;
   }

@@ -58,6 +58,10 @@ namespace Core
                             GlobalConfig::SEED_FUND_AMOUNT,
                             "seed validator 1"});
 
+    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+                            GlobalConfig::SEED_FUND_AMOUNT_TWO,
+                            "seed validator 2"});
+
     // Add more if needed
     //cfg.accounts.push_back({
     // GlobalConfig::SEED_ADDRESS_TWO
@@ -68,6 +72,11 @@ namespace Core
     cfg.validators.push_back({1,
                               Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS),
                               Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE),
+                              true});
+
+    cfg.validators.push_back({2,
+                              Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+                              Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE_TWO),
                               true});
 
     // Add more if needed
@@ -102,6 +111,10 @@ namespace Core
                             GlobalConfig::SEED_FUND_AMOUNT,
                             "seed validator 1"});
 
+    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+                            GlobalConfig::SEED_FUND_AMOUNT_TWO,
+                            "seed validator 2"});
+
     // Add more if needed
     // cfg.accounts.push_back({
     // GlobalConfig::SEED_ADDRESS_TWO
@@ -112,6 +125,11 @@ namespace Core
     cfg.validators.push_back({1,
                               Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS),
                               Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE),
+                              true});
+
+    cfg.validators.push_back({2,
+                              Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+                              Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE_TWO),
                               true});
 
     // Add more if needed
@@ -146,6 +164,10 @@ namespace Core
                             GlobalConfig::SEED_FUND_AMOUNT,
                             "seed validator 1"});
 
+    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+                            GlobalConfig::SEED_FUND_AMOUNT_TWO,
+                            "seed validator 2"});
+
     // Add more if needed
     // cfg.accounts.push_back({
     // GlobalConfig::SEED_ADDRESS_TWO
@@ -156,6 +178,11 @@ namespace Core
     cfg.validators.push_back({1,
                               Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS),
                               Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE),
+                              true});
+
+    cfg.validators.push_back({2,
+                              Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+                              Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE_TWO),
                               true});
 
     // Add more if needed
@@ -197,7 +224,7 @@ namespace Core
       a.nonce = 0;
       a.staking_opted_out = false;
       a.created_at_height = 0;
-      a.recalculateStaked(AUTO_STAKE_THRESHOLD);
+      a.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
       state.putAccount(acc.address, a);
     }
 
@@ -215,7 +242,7 @@ namespace Core
       vi.node_key = v.node_key;
       vi.owner = v.reward_address;
       vi.registered_at_height = 0;
-      vi.stake = VALIDATOR_MIN_STAKE;
+      vi.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
       vi.uptime_score = 10'000;
       vi.is_seed = v.is_seed;
       vi.is_active = true;

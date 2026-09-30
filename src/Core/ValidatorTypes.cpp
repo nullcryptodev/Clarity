@@ -5,10 +5,7 @@
 
 #include "ValidatorTypes.h"
 
-#include "Common/Put.h"
-#include "Common/Read.h"
-
-#include <cstring>
+#include "Common/Wire.h"
 
 namespace Core
 {
@@ -19,33 +16,34 @@ namespace Core
     std::vector<uint8_t> out;
     out.reserve(STATE_SIZE);
 
-    Common::putU64(out, id);
-    Common::putBytes(out, reward_address.data.data(), reward_address.data.size());
-    Common::putBytes(out, node_key.data.data(), node_key.data.size());
-    Common::putBytes(out, owner.data.data(), owner.data.size());
-    Common::putU64(out, registered_at_height);
-    Common::putU64(out, stake);
-    Common::putU16(out, uptime_score);
-    Common::putU64(out, last_ping_height);
-    Common::putU32(out, pings_responded_this_epoch);
-    Common::putU32(out, pings_sent_this_epoch);
-    Common::putU64(out, last_seen_height);
-    Common::putU16(out, reward_multiplier);
-    Common::putU16(out, infraction_count);
-    Common::putU64(out, last_infraction_height);
-    Common::putU64(out, total_blocks_produced);
-    Common::putU64(out, total_rewards_earned);
-    Common::putU64(out, epochs_active);
+    Common::Writer w(out);
+    w.writeU64(id);
+    w.writeBytes(reward_address.data.data(), reward_address.data.size());
+    w.writeBytes(node_key.data.data(), node_key.data.size());
+    w.writeBytes(owner.data.data(), owner.data.size());
+    w.writeU64(registered_at_height);
+    w.writeU64(stake);
+    w.writeU16(uptime_score);
+    w.writeU64(last_ping_height);
+    w.writeU32(pings_responded_this_epoch);
+    w.writeU32(pings_sent_this_epoch);
+    w.writeU64(last_seen_height);
+    w.writeU16(reward_multiplier);
+    w.writeU16(infraction_count);
+    w.writeU64(last_infraction_height);
+    w.writeU64(total_blocks_produced);
+    w.writeU64(total_rewards_earned);
+    w.writeU64(epochs_active);
 
     uint8_t flags = 0;
     if (is_seed)
       flags |= 0x01;
     if (is_active)
       flags |= 0x02;
-    out.push_back(flags);
+    w.writeU8(flags);
 
-    Common::putU64(out, became_active_at);
-    Common::putU64(out, last_active_at);
+    w.writeU64(became_active_at);
+    w.writeU64(last_active_at);
 
     return out;
   }
@@ -53,57 +51,40 @@ namespace Core
   bool ValidatorInfo::deserializeState(const uint8_t *data, size_t len,
                                        ValidatorInfo &out)
   {
-    if (len < STATE_SIZE)
+    //  Exact-length check. A serialized ValidatorInfo is exactly
+    //  STATE_SIZE bytes; anything else is malformed.
+    if (len != STATE_SIZE)
       return false;
 
-    size_t off = 0;
+    Common::Reader r(data, len);
 
-    out.id = Common::readU64(data + off);
-    off += 8;
-    std::memcpy(out.reward_address.data.data(), data + off, 32);
-    off += 32;
-    std::memcpy(out.node_key.data.data(), data + off, 32);
-    off += 32;
-    std::memcpy(out.owner.data.data(), data + off, 32);
-    off += 32;
+    out.id = r.readU64();
+    r.readBytes(out.reward_address.data.data(), out.reward_address.data.size());
+    r.readBytes(out.node_key.data.data(), out.node_key.data.size());
+    r.readBytes(out.owner.data.data(), out.owner.data.size());
 
-    out.registered_at_height = Common::readU64(data + off);
-    off += 8;
-    out.stake = Common::readU64(data + off);
-    off += 8;
-    out.uptime_score = Common::readU16(data + off);
-    off += 2;
-    out.last_ping_height = Common::readU64(data + off);
-    off += 8;
-    out.pings_responded_this_epoch = Common::readU32(data + off);
-    off += 4;
-    out.pings_sent_this_epoch = Common::readU32(data + off);
-    off += 4;
-    out.last_seen_height = Common::readU64(data + off);
-    off += 8;
-    out.reward_multiplier = Common::readU16(data + off);
-    off += 2;
-    out.infraction_count = Common::readU16(data + off);
-    off += 2;
-    out.last_infraction_height = Common::readU64(data + off);
-    off += 8;
-    out.total_blocks_produced = Common::readU64(data + off);
-    off += 8;
-    out.total_rewards_earned = Common::readU64(data + off);
-    off += 8;
-    out.epochs_active = Common::readU64(data + off);
-    off += 8;
+    out.registered_at_height = r.readU64();
+    out.stake = r.readU64();
+    out.uptime_score = r.readU16();
+    out.last_ping_height = r.readU64();
+    out.pings_responded_this_epoch = r.readU32();
+    out.pings_sent_this_epoch = r.readU32();
+    out.last_seen_height = r.readU64();
+    out.reward_multiplier = r.readU16();
+    out.infraction_count = r.readU16();
+    out.last_infraction_height = r.readU64();
+    out.total_blocks_produced = r.readU64();
+    out.total_rewards_earned = r.readU64();
+    out.epochs_active = r.readU64();
 
-    uint8_t flags = data[off++];
+    const uint8_t flags = r.readU8();
     out.is_seed = (flags & 0x01) != 0;
     out.is_active = (flags & 0x02) != 0;
 
-    out.became_active_at = Common::readU64(data + off);
-    off += 8;
-    out.last_active_at = Common::readU64(data + off);
-    off += 8;
+    out.became_active_at = r.readU64();
+    out.last_active_at = r.readU64();
 
-    return true;
+    return r.ok();
   }
 
   //  Framework serialization

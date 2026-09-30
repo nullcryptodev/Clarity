@@ -166,13 +166,20 @@ namespace Tests
       Proposal,
       Prevote,
       Precommit,
+      TimeoutVote,
       Restart
     } kind;
-    size_t to;
-    size_t from;
+    size_t from{0};
+    size_t to{0};
     Consensus::Proposal proposal;
     Consensus::Vote vote;
-    uint64_t restart_height{0};
+    Consensus::TimeoutVote timeout_vote;
+    Height restart_height{0};
+
+    //  True when the proposal carries the emergency flag. Set by the
+    //  proposer's broadcast_proposal callback so deliverAll can honor
+    //  proposal suppression without decoding the block itself.
+    bool is_emergency{false};
   };
 
   //  Registry builder for rotation tests.
@@ -195,7 +202,7 @@ namespace Tests
       {
         Core::ValidatorInfo v;
         v.id = static_cast<Id>(i + 1);
-        v.stake = Core::VALIDATOR_MIN_STAKE;
+        v.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
         v.uptime_score = 10'000;
         v.reward_multiplier = Core::REWARD_MULTIPLIER_START;
         v.is_active = false;

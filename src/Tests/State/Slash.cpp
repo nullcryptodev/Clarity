@@ -189,7 +189,7 @@ TEST_F(State_StateAccessFixture, SystemSlash_MultipleSlashes_Accumulate)
 
 TEST_F(State_StateAccessFixture, SystemSlash_DropsBelowMinStake_CannotBeActive)
 {
-  seedValidator(s(), 1, Core::VALIDATOR_MIN_STAKE);
+  seedValidator(s(), 1, GlobalConfig::VALIDATOR_MIN_STAKE);
 
   Core::ValidatorInfo before;
   ASSERT_TRUE(s().getValidator(1, before));

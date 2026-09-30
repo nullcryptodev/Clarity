@@ -69,6 +69,11 @@ namespace Consensus
     std::function<void(const Vote &)> broadcast_prevote;
     std::function<void(const Vote &)> broadcast_precommit;
 
+    //  Timeout attestations, broadcast when a round times out. The
+    //  node routes these to the P2P layer as their own message type;
+    //  peers feed them back to onTimeoutVote.
+    std::function<void(const TimeoutVote &)> broadcast_timeout_vote;
+
     std::function<std::vector<Core::Transaction>(uint64_t max_bytes,
                                                  uint64_t max_txs)>
         select_transactions;
@@ -133,6 +138,7 @@ namespace Consensus
     void onProposal(const Proposal &p);
     void onPrevote(const Vote &v);
     void onPrecommit(const Vote &v);
+    void onTimeoutVote(const TimeoutVote &tv);
 
     void pollTimers();
     void tryPropose();
@@ -170,6 +176,12 @@ namespace Consensus
     //  block.header.emergency_rotation when this is true.
     bool emergencyRotationActive() const;
 
+    bool verifyTimeoutCertificate(const Core::Block &block,
+                                  const std::vector<Id> &committed_set,
+                                  Height height) const;
+
+    std::optional<Proposal> currentProposalForTest() const;
+
   private:
     void enterNewHeight(Height height);
     void enterPropose(Height height, Round round);
@@ -180,6 +192,8 @@ namespace Consensus
     void handleProposal(const Proposal &p);
     void handlePrevote(const Vote &v);
     void handlePrecommit(const Vote &v);
+
+    void handleTimeoutVote(const TimeoutVote &tv);
 
     void onProposeTimeout();
     void onPrevoteTimeout();
@@ -201,6 +215,20 @@ namespace Consensus
     void broadcastPrevote(bool is_nil, const Crypto::Hash &block_hash);
     void broadcastPrecommit(bool is_nil, const Crypto::Hash &block_hash);
 
+    //  Broadcast a timeout attestation for `round`. Called from the
+    //  three timeout handlers before the round advances; a no-op if
+    //  we are not a validator or if no broadcast callback is wired.
+    void broadcastTimeoutVote(Round round);
+
+    //  Assemble an f+1 certificate for the smallest round at or above
+    //  EMERGENCY_ROTATION_ROUNDS for which we hold enough distinct
+    //  signers from the committed set. Returns false if we can't. On
+    //  success, `out_round` is set to the round the certificate
+    //  attests to — the proposer must stamp that value into
+    //  block.header.emergency_rotation, since the verifier checks the
+    //  certificate against the header's round.
+    bool assembleTimeoutCertificate(Round &out_round, TimeoutCertificate &out) const;
+
     void resetForNewHeight(Height height);
     void resetForNewRound(Round round);
 
@@ -213,6 +241,11 @@ namespace Consensus
     //  hold a vote from the same signer — in that case it's a
     //  potential equivocation and must reach recordVote.
     void drainPendingVotes(bool is_precommit);
+
+    //  Deliver any buffered votes and the proposal for the current
+    //  height. Called from resetForNewHeight after height_ is updated.
+    void drainFutureHeightVotes();
+    void drainFutureHeightProposal();
 
     //  True if we can verify the signature of a vote — that is, if we
     //  know which active set the round ran on, and thus which key to
@@ -286,6 +319,27 @@ namespace Consensus
     std::vector<Vote> pending_prevotes_;
     std::vector<Vote> pending_precommits_;
 
+    //  Votes received for height_ + 1 while we are still finishing
+    //  height_. Under randomized delivery (and under a brief partition)
+    //  a fast validator can broadcast its next-height prevotes and
+    //  precommits before a slow validator has finished committing the
+    //  current height. Those votes would otherwise be silently dropped
+    //  by the `v.height != height_` guard, and the slow validator would
+    //  have no way to form quorum at the new height except by timing
+    //  out and hoping a live proposer exists.
+    //
+    //  We buffer at most one height ahead. A vote for height_ + 2 cannot
+    //  be verified (we don't yet know the round set for height_ + 1, and
+    //  the vote's signature commits to a round set we can't resolve), so
+    //  buffering further ahead would just be a memory-growth vector for
+    //  a peer feeding us garbage.
+    //
+    //  Cleared on height transition, after draining into the pending
+    //  buffers for the new height.
+    std::unordered_map<Height, std::vector<Vote>> future_height_prevotes_;
+    std::unordered_map<Height, std::vector<Vote>> future_height_precommits_;
+    std::unordered_map<Height, Proposal> future_height_proposals_;
+
     //  For each (height, round) we've accepted a proposal for, the
     //  block hash of that proposal. Lets vote verification look up the
     //  emergency flag from the block that the round ran on, rather
@@ -303,6 +357,13 @@ namespace Consensus
     //  MAX_EQUIVOCATION_EVIDENCE to prevent unbounded growth from a
     //  peer that feeds conflicting votes.
     std::vector<EquivocationEvidence> equivocations_;
+
+    //  Timeout attestations seen at the current height, at rounds >=
+    //  EMERGENCY_ROTATION_ROUNDS. Collected from the network; used by
+    //  the proposer to assemble a TimeoutCertificate. Cleared on
+    //  height transition, NOT on round transition — votes from
+    //  earlier rounds at this height accumulate toward a certificate.
+    std::vector<TimeoutVote> timeout_votes_;
 
     //  Consecutive rounds that ended without a commit, counted at the
     //  current height. Reset to zero when a block commits. When this

@@ -8,8 +8,7 @@
 #include "Crypto/Blake2b.h"
 #include "Crypto/SecureZero.h"
 
-#include "Common/Put.h"
-#include "Common/Reader.h"
+#include "Common/Wire.h"
 
 #include <cstring>
 #include <sstream>
@@ -26,7 +25,7 @@ namespace Core
 
   //  Validation
 
-    bool Transaction::isWellFormed() const noexcept
+  bool Transaction::isWellFormed() const noexcept
   {
     // Version must be exactly current for now. Future: allow a range.
     if (version != GlobalConfig::CURRENT_TRANSACTION_VERSION)
@@ -108,19 +107,20 @@ namespace Core
     std::vector<uint8_t> out;
     out.reserve(179 + payload.size());
 
-    Common::putU16(out, version);
-    Common::putU64(out, chain_id);
-    out.push_back(static_cast<uint8_t>(tx_type));
-    Common::putU64(out, nonce);
-    Common::putU64(out, valid_until_height);
-    Common::putBytes(out, from.data.data(), from.data.size());
-    Common::putBytes(out, to.data.data(), to.data.size());
-    Common::putU32(out, token_id);
-    Common::putU64(out, amount);
-    Common::putU64(out, fee);
+    Common::Writer w(out);
+    w.writeU16(version);
+    w.writeU64(chain_id);
+    w.writeU8(static_cast<uint8_t>(tx_type));
+    w.writeU64(nonce);
+    w.writeU64(valid_until_height);
+    w.writeBytes(from.data.data(), from.data.size());
+    w.writeBytes(to.data.data(), to.data.size());
+    w.writeU32(token_id);
+    w.writeU64(amount);
+    w.writeU64(fee);
 
-    Common::putU32(out, static_cast<uint32_t>(payload.size()));
-    Common::putBytes(out, payload.data(), payload.size());
+    w.writeU32(static_cast<uint32_t>(payload.size()));
+    w.writeBytes(payload.data(), payload.size());
 
     return out;
   }
@@ -144,17 +144,27 @@ namespace Core
     out.amount = r.readU64();
     out.fee = r.readU64();
 
-    uint32_t payload_size = r.readU32();
-    if (payload_size > TX_MAX_PAYLOAD_SIZE)
-    {
+    if (!r.ok())
       return false;
-    }
+
+    //  Bounds-check the payload length before allocating. readVector
+    //  already bounds-checks against the remaining input, but a bogus
+    //  TX_MAX_PAYLOAD_SIZE-sized length would still allocate up to
+    //  that much before readVector decided the input was too short.
+    //  Checking TX_MAX_PAYLOAD_SIZE here caps the allocation.
+    const uint32_t payload_size = r.readU32();
+    if (!r.ok() || payload_size > TX_MAX_PAYLOAD_SIZE)
+      return false;
 
     out.payload = r.readVector(payload_size);
 
     r.readBytes(out.signature.data.data(), out.signature.data.size());
 
     if (!r.ok())
+      return false;
+
+    // No trailing bytes tolerated. A transaction is self-contained.
+    if (r.remaining() != 0)
       return false;
 
     return out.isWellFormed();

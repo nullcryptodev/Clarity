@@ -48,19 +48,19 @@ TEST(Core_RotationCount, NeverExceedsBftSafety)
 
 TEST(Core_TargetSize, ZeroTraffic)
 {
-  EXPECT_EQ(computeTargetActiveSetSize(0), ACTIVE_SET_MIN);
+  EXPECT_EQ(computeTargetActiveSetSize(0), GlobalConfig::ACTIVE_SET_MIN);
 }
 
 TEST(Core_TargetSize, SaturationTraffic)
 {
   EXPECT_EQ(computeTargetActiveSetSize(TRAFFIC_SATURATION_TX),
-            ACTIVE_SET_MAX);
+            GlobalConfig::ACTIVE_SET_MAX);
 }
 
 TEST(Core_TargetSize, OverSaturation)
 {
   EXPECT_EQ(computeTargetActiveSetSize(TRAFFIC_SATURATION_TX * 10),
-            ACTIVE_SET_MAX);
+            GlobalConfig::ACTIVE_SET_MAX);
 }
 
 TEST(Core_TargetSize, WithinBounds)
@@ -68,8 +68,8 @@ TEST(Core_TargetSize, WithinBounds)
   for (uint64_t traffic : {0u, 1u, 100u, 500u, 999u, 1000u, 5000u})
   {
     uint64_t size = computeTargetActiveSetSize(traffic);
-    EXPECT_GE(size, ACTIVE_SET_MIN);
-    EXPECT_LE(size, ACTIVE_SET_MAX);
+    EXPECT_GE(size, GlobalConfig::ACTIVE_SET_MIN);
+    EXPECT_LE(size, GlobalConfig::ACTIVE_SET_MAX);
   }
 }
 

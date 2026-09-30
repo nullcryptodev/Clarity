@@ -13,6 +13,8 @@
 #include "ValidatorTypes.h"
 #include "GlobalConfig.h"
 
+#include "Consensus/Types.h"
+
 namespace Core
 {
   //  Block Header
@@ -40,8 +42,10 @@ namespace Core
   //    [8]  total_fees
   //    [4]  tx_count
   //    [4]  active_validator_count
+  //    [4]  timeout_cert_len       // length of the encoded certificate
+  //    [..] timeout_cert_bytes     // encoded TimeoutCertificate
   //
-  //  Total: 266 bytes.
+  //  Total: 270 bytes + certificate size.
   //
   //  commit_round is the round in which the precommit quorum formed. It
   //  may differ from the round the block was proposed in when the round
@@ -95,6 +99,24 @@ namespace Core
     //  with identical header-except-emergency_rotation are different
     //  blocks.
     uint64_t emergency_rotation{0};
+
+    //  Timeout certificate.
+    //
+    //  Present only when emergency_rotation > 0. Contains f+1 signed
+    //  timeout attestations at rounds >= EMERGENCY_ROTATION_ROUNDS,
+    //  drawn from the committed set. Empty otherwise.
+    //
+    //  Excluded from the block hash. The certificate is evidence
+    //  attached to the block, not part of the block's identity — the
+    //  same treatment commit_round and quorum_signatures get. If it
+    //  were in the hash, a proposer could change the certificate
+    //  without changing the block hash, which is exactly the wrong
+    //  property.
+    //
+    //  The certificate IS in the wire format (serialize()), so it
+    //  travels with the block. Verifiers read it from the deserialized
+    //  header and check it before honouring emergency_rotation.
+    Consensus::TimeoutCertificate timeout_certificate{};
 
     // ---- Commitments ----
     Crypto::Hash state_root{};
@@ -173,4 +195,16 @@ namespace Core
   Crypto::Hash computeTxRoot(const std::vector<Transaction> &txs);
   Crypto::Hash computeValidatorSetRoot(const std::vector<Id> &active_set);
 
+  //  Maximum serialized header size.
+  //
+  //  The fixed portion of the header is 266 bytes. A timeout
+  //  certificate is 4 + 82*(f+1) bytes, where f = (n-1)/3 and n is
+  //  the committed-set size. At ACTIVE_SET_MAX = 100, f = 33, so
+  //  f+1 = 34, giving 4 + 34*82 = 2792 bytes. Total ~3058.
+  //
+  //  Allow generous slack for future growth — a larger active set, or
+  //  a future change that carries attestations from a couple of
+  //  heights during a multi-round stall — without allowing an
+  //  unbounded allocation from a hostile peer.
+  constexpr uint32_t MAX_HEADER_BYTES = 8 * 1024;
 } // namespace Core

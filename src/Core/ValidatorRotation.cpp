@@ -3,11 +3,12 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include "ValidatorRotation.h"
-#include "State/StateAccess.h"
-
 #include <algorithm>
 #include <unordered_set>
+
+#include "GlobalConfig.h"
+#include "ValidatorRotation.h"
+#include "State/StateAccess.h"
 
 namespace Core
 {
@@ -44,14 +45,14 @@ namespace Core
   {
     if (avg_tx_per_block >= TRAFFIC_SATURATION_TX)
     {
-      return ACTIVE_SET_MAX;
+      return GlobalConfig::ACTIVE_SET_MAX;
     }
 
-    uint64_t range = ACTIVE_SET_MAX - ACTIVE_SET_MIN;
+    uint64_t range = GlobalConfig::ACTIVE_SET_MAX - GlobalConfig::ACTIVE_SET_MIN;
     uint64_t scaled = (avg_tx_per_block * range) / TRAFFIC_SATURATION_TX;
-    uint64_t target = ACTIVE_SET_MIN + scaled;
+    uint64_t target = GlobalConfig::ACTIVE_SET_MIN + scaled;
 
-    return std::clamp(target, ACTIVE_SET_MIN, ACTIVE_SET_MAX);
+    return std::clamp(target, GlobalConfig::ACTIVE_SET_MIN, GlobalConfig::ACTIVE_SET_MAX);
   }
 
   //  Planning
@@ -83,8 +84,8 @@ namespace Core
     RotationPlan plan;
 
     uint64_t target_size = computeTargetActiveSetSize(avg_tx_per_block);
-    if (target_size < SEED_NODES)
-      target_size = SEED_NODES;
+    if (target_size < GlobalConfig::SEED_NODES_COUNT)
+      target_size = GlobalConfig::SEED_NODES_COUNT;
     plan.new_target_size = target_size;
 
     const uint64_t current_size = registry.active_set.size();

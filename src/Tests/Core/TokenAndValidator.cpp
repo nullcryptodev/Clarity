@@ -132,7 +132,7 @@ TEST(Core_ValidatorInfo, MeetsStakeRequirement)
   ValidatorInfo v = makeValidator();
   EXPECT_TRUE(v.meetsStakeRequirement());
 
-  v.stake = VALIDATOR_MIN_STAKE - 1;
+  v.stake = GlobalConfig::VALIDATOR_MIN_STAKE - 1;
   EXPECT_FALSE(v.meetsStakeRequirement());
 }
 

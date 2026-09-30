@@ -3,12 +3,11 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <cstring>
+
 #include "AmmPool.h"
 
-#include "Common/Put.h"
-#include "Common/Read.h"
-
-#include <cstring>
+#include "Common/Wire.h"
 
 namespace Core
 {
@@ -17,47 +16,44 @@ namespace Core
     std::vector<uint8_t> out;
     out.reserve(STATE_SIZE);
 
-    Common::putU64(out, id);
-    Common::putBytes(out, creator.data.data(), creator.data.size());
-    Common::putU32(out, token_a);
-    Common::putU32(out, token_b);
-    Common::putU64(out, reserve_a);
-    Common::putU64(out, reserve_b);
-    Common::putU64(out, total_liquidity);
-    Common::putU16(out, fee_bps);
-    Common::putU64(out, created_at_height);
-    Common::putU8(out, active ? 1 : 0);
+    Common::Writer w(out);
+    w.writeU64(id);
+    w.writeBytes(creator.data.data(), creator.data.size());
+    w.writeU32(token_a);
+    w.writeU32(token_b);
+    w.writeU64(reserve_a);
+    w.writeU64(reserve_b);
+    w.writeU64(total_liquidity);
+    w.writeU16(fee_bps);
+    w.writeU64(created_at_height);
+    w.writeU8(active ? 1 : 0);
 
     return out;
   }
 
   bool AmmPool::deserializeState(const uint8_t *data, size_t len, AmmPool &out)
   {
-    if (len < STATE_SIZE)
+    //  Exact-length check. A serialized AmmPool is exactly STATE_SIZE
+    //  bytes; anything else is malformed (either truncated or carrying
+    //  trailing bytes from a caller bug).
+    if (len != STATE_SIZE)
       return false;
 
-    size_t off = 0;
+    Common::Reader r(data, len);
 
-    out.id = Common::readU64(data + off);
-    off += 8;
-    std::memcpy(out.creator.data.data(), data + off, 32);
-    off += 32;
-    out.token_a = Common::readU32(data + off);
-    off += 4;
-    out.token_b = Common::readU32(data + off);
-    off += 4;
-    out.reserve_a = Common::readU64(data + off);
-    off += 8;
-    out.reserve_b = Common::readU64(data + off);
-    off += 8;
-    out.total_liquidity = Common::readU64(data + off);
-    off += 8;
-    out.fee_bps = Common::readU16(data + off);
-    off += 2;
-    out.created_at_height = Common::readU64(data + off);
-    off += 8;
-    out.active = (Common::readU8(data + off) != 0);
-    off += 1;
+    out.id = r.readU64();
+    r.readBytes(out.creator.data.data(), out.creator.data.size());
+    out.token_a = r.readU32();
+    out.token_b = r.readU32();
+    out.reserve_a = r.readU64();
+    out.reserve_b = r.readU64();
+    out.total_liquidity = r.readU64();
+    out.fee_bps = r.readU16();
+    out.created_at_height = r.readU64();
+    out.active = (r.readU8() != 0);
+
+    if (!r.ok())
+      return false;
 
     return out.isValid();
   }

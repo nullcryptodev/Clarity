@@ -97,13 +97,6 @@ namespace
       {
         established = NodeTestAccess::p2pSnapshot(*nodes[i]).established;
       }
-
-      std::cerr << "[" << tag << "] node" << i
-                << " height=" << s.height
-                << " peers=" << s.peer_count
-                << " established=" << established
-                << " cons_step=" << s.consensus_step
-                << "\n";
     }
   }
 } // anonymous namespace

@@ -5,10 +5,7 @@
 
 #include "Account.h"
 
-#include "Common/Put.h"
-#include "Common/Read.h"
-
-#include <cstring>
+#include "Common/Wire.h"
 
 namespace Core
 {
@@ -19,33 +16,40 @@ namespace Core
     std::vector<uint8_t> out;
     out.reserve(STATE_SIZE);
 
-    Common::putU64(out, nonce);
-    Common::putU64(out, balance);
-    Common::putU64(out, staked);
-    Common::putU64(out, pending_rewards);
-    Common::putU64(out, last_reward_epoch);
-    Common::putU64(out, staker_since_height);
-    Common::putU64(out, created_at_height);
-    out.push_back(staking_opted_out ? 1 : 0);
+    Common::Writer w(out);
+    w.writeU64(nonce);
+    w.writeU64(balance);
+    w.writeU64(staked);
+    w.writeU64(pending_rewards);
+    w.writeU64(last_reward_epoch);
+    w.writeU64(staker_since_height);
+    w.writeU64(created_at_height);
+    w.writeU8(staking_opted_out ? 1 : 0);
 
     return out;
   }
 
   bool Account::deserializeState(const uint8_t *data, size_t len, Account &out)
   {
-    if (len < STATE_SIZE)
+    //  Exact-length check. A serialized Account is exactly STATE_SIZE
+    //  bytes; anything longer means the caller passed a buffer with
+    //  trailing bytes, which is a bug on their side, not a valid
+    //  encoding we should silently accept.
+    if (len != STATE_SIZE)
       return false;
 
-    out.nonce = Common::readU64(data + 0);
-    out.balance = Common::readU64(data + 8);
-    out.staked = Common::readU64(data + 16);
-    out.pending_rewards = Common::readU64(data + 24);
-    out.last_reward_epoch = Common::readU64(data + 32);
-    out.staker_since_height = Common::readU64(data + 40);
-    out.created_at_height = Common::readU64(data + 48);
-    out.staking_opted_out = (data[56] != 0);
+    Common::Reader r(data, len);
 
-    return true;
+    out.nonce = r.readU64();
+    out.balance = r.readU64();
+    out.staked = r.readU64();
+    out.pending_rewards = r.readU64();
+    out.last_reward_epoch = r.readU64();
+    out.staker_since_height = r.readU64();
+    out.created_at_height = r.readU64();
+    out.staking_opted_out = (r.readU8() != 0);
+
+    return r.ok();
   }
 
   //  Framework serialization (for API / JSON output)

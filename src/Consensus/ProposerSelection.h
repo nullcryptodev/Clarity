@@ -16,13 +16,19 @@ namespace Consensus
 {
   // Index into active_set for the proposer of (height, round).
   // Formula: (height + round) % active_size
-  size_t proposerIndex(Height height, Round round, size_t active_size) noexcept;
+  size_t proposerIndex(Height height, Round round, size_t active_size) noexcept
+  {
+    if (active_size == 0)
+      return 0;
+    return static_cast<size_t>((height + round) % active_size);
+  }
 
   // Validator ID of the proposer for (height, round).
   // Returns INVALID_ID if the active set is empty.
-  Id proposerFor(
-      Height height,
-      Round round,
-      const std::vector<Id> &active_set) noexcept;
-
+  Id proposerFor(Height height, Round round, const std::vector<Id> &active_set) noexcept
+  {
+    if (active_set.empty())
+      return INVALID_ID;
+    return active_set[proposerIndex(height, round, active_set.size())];
+  }
 } // namespace Consensus
