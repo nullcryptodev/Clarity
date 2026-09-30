@@ -32,6 +32,7 @@ namespace Core
   //    [8]  epoch
   //    [8]  rotation_index
   //    [8]  commit_round          // transmitted, NOT part of the hash
+  //    [8]  emergency_rotation    // transmitted, IS part of the hash
   //    [32] state_root
   //    [32] tx_root
   //    [32] receipts_root
@@ -40,7 +41,7 @@ namespace Core
   //    [4]  tx_count
   //    [4]  active_validator_count
   //
-  //  Total: 258 bytes.
+  //  Total: 266 bytes.
   //
   //  commit_round is the round in which the precommit quorum formed. It
   //  may differ from the round the block was proposed in when the round
@@ -77,6 +78,23 @@ namespace Core
     uint64_t epoch{0};
     uint64_t rotation_index{0};
     uint64_t commit_round{0};
+
+    //  Emergency rotation round.
+    //
+    //  Zero on a normal block. Nonzero means the block was proposed
+    //  on the emergency active set, and the value is the round at
+    //  which the emergency decision was made.
+    //
+    //  Verifiers recompute the emergency set from (committed_set,
+    //  registry, current_height) and use it for quorum and set-root
+    //  checks. When the block commits, the emergency set is written
+    //  to state as the new committed set.
+    //
+    //  Unlike commit_round, this field IS part of the block hash: it
+    //  changes what set the block was validated against, so two blocks
+    //  with identical header-except-emergency_rotation are different
+    //  blocks.
+    uint64_t emergency_rotation{0};
 
     // ---- Commitments ----
     Crypto::Hash state_root{};

@@ -4,6 +4,7 @@
 
 #include "Crypto/Blake2b.h"
 
+#include "TransactionBuilder.h"
 #include "Utils.h"
 
 namespace Tests
@@ -255,6 +256,36 @@ namespace Tests
           s.putGlobal("next_validator_id", bytes); });
     }
 
+    //  Set a validator's last_seen_height directly. Used by the
+    //  emergency-rotation tests to make a validator "offline" without
+    //  having to mine 20 blocks.
+    void setValidatorLastSeen(Id id, uint64_t last_seen)
+    {
+      withState([&](State::StateAccess &s)
+                {
+        Core::ValidatorInfo v;
+        if (s.getValidator(id, v))
+        {
+          v.last_seen_height = last_seen;
+          s.putValidator(v);
+        } });
+    }
+
+    //  Set a validator's is_active flag directly. Used when a test
+    //  needs a pool candidate (is_active = false) that the emergency
+    //  derivation can promote.
+    void setValidatorActive(Id id, bool active)
+    {
+      withState([&](State::StateAccess &s)
+                {
+        Core::ValidatorInfo v;
+        if (s.getValidator(id, v))
+        {
+          v.is_active = active;
+          s.putValidator(v);
+        } });
+    }
+
     // ---- Context ----
 
     Core::BlockContext makeContext(uint64_t height, bool dry_run = false)
@@ -344,6 +375,7 @@ namespace Tests
       h.epoch = height / Core::ROTATION_INTERVAL;
       h.rotation_index = height / Core::ROTATION_INTERVAL;
       h.commit_round = 0;
+      h.emergency_rotation = 0;
       h.state_root = Crypto::Hash{};
       h.tx_root = Crypto::Hash{};
       h.receipts_root = Crypto::Hash{};
@@ -378,8 +410,9 @@ namespace Tests
 
     // Produces a set of quorum signatures over the block's hash,
     // signed by the given keypairs. `block` must already have its
-    // final `commit_round` and `state_root` set — the signature covers
-    // the block hash, which covers both.
+    // final `commit_round`, `emergency_rotation`, and `state_root`
+    // set — the signature covers the block hash, which covers all
+    // three.
     //
     // Signature i is produced by keys[i], and is tagged with
     // signer_index i. The caller is responsible for passing a key list
@@ -421,17 +454,50 @@ namespace Tests
         vs.signature = Crypto::sign(signing_hash, keys[i].secretKey);
         sigs.push_back(vs);
       }
+      std::cerr << "makeQuorum: block.h=" << block.header.height
+                << " block.em=" << block.header.emergency_rotation
+                << " block.hash=" << block.hash().toString().substr(0, 16)
+                << " signing_hash=" << signing_hash.toString().substr(0, 16)
+                << " keys=" << keys.size()
+                << "\n";
       return sigs;
     }
 
+    //  Resolve the signing key for each active-set entry. Every
+    //  validator in the set must have a key registered; a missing key
+    //  produces a default-constructed KeyPair whose signature will
+    //  fail verification. That's a loud failure at checkQuorum, which
+    //  is where test bugs should surface.
+    std::vector<Crypto::KeyPair> quorumKeysFor(
+        const std::vector<Id> &active_set)
+    {
+      std::vector<Crypto::KeyPair> quorum_keys;
+      quorum_keys.reserve(active_set.size());
+      for (Id vid : active_set)
+      {
+        auto it = validator_keys_.find(vid);
+        quorum_keys.push_back(it != validator_keys_.end()
+                                  ? it->second
+                                  : Crypto::KeyPair{});
+      }
+      return quorum_keys;
+    }
+
     // ---- Block builder ----
+    //
+    //  `emergency_rotation` is set before simulation so that the
+    //  dry-run applyBlock derives the same emergency active set the
+    //  real application will. The field is part of the block hash, so
+    //  it must be present before signing.
     Core::Block makeProcessableBlock(uint64_t height,
                                      const Crypto::Hash &parent,
                                      const std::vector<Core::Transaction> &txs,
-                                     const std::vector<Id> &active_set)
+                                     const std::vector<Id> &active_set,
+                                     uint64_t emergency_rotation = 0)
     {
       Core::Block b;
       b.header = makeHeaderSkeleton(height, parent, active_set);
+      b.header.emergency_rotation = emergency_rotation;
       b.transactions = txs;
       b.header.tx_count = static_cast<uint32_t>(txs.size());
       b.header.active_validator_count =
@@ -497,22 +563,7 @@ namespace Tests
         b.header.receipts_root = Crypto::Hash{};
       }
 
-      //  Resolve the signing key for each active-set entry. Every
-      //  validator in the active set must have a key registered here;
-      //  a missing key produces a default-constructed KeyPair whose
-      //  signature will fail verification. That's a loud failure at
-      //  checkQuorum, which is where test bugs should surface.
-      std::vector<Crypto::KeyPair> quorum_keys;
-      quorum_keys.reserve(active_set.size());
-      for (Id vid : active_set)
-      {
-        auto it = validator_keys_.find(vid);
-        quorum_keys.push_back(it != validator_keys_.end()
-                                  ? it->second
-                                  : Crypto::KeyPair{});
-      }
-
-      b.quorum_signatures = makeQuorumForBlock(b, quorum_keys);
+      b.quorum_signatures = makeQuorumForBlock(b, quorumKeysFor(active_set));
 
       return b;
     }
@@ -530,22 +581,7 @@ namespace Tests
                                  bool dry_run = false)
     {
       Core::Block b = makeProcessableBlock(height, parent, txs, activeSet());
-      Core::BlockContext ctx = makeContext(height, dry_run);
-
-      auto t = db_->beginWrite();
-      State::StateAccess s(*db_, t, 0);
-      Core::BlockResult r = Core::BlockProcessor::applyBlock(s, b, ctx);
-      if (r.valid)
-      {
-        s.commit(/*version=*/0);
-        t.commit();
-      }
-      else
-      {
-        t.abort();
-      }
-
-      return r;
+      return applyPrebuiltBlock(b, dry_run);
     }
 
     Core::BlockResult applyBlock(uint64_t height,
@@ -555,7 +591,16 @@ namespace Tests
                                  const std::vector<Id> &active_set)
     {
       Core::Block b = makeProcessableBlock(height, parent, txs, active_set);
-      Core::BlockContext ctx = makeContext(height, dry_run);
+      return applyPrebuiltBlock(b, dry_run);
+    }
+
+    //  Apply a pre-built block. Used by the emergency-rotation tests,
+    //  which need to control the header's emergency_rotation field
+    //  before application.
+    Core::BlockResult applyPrebuiltBlock(const Core::Block &b,
+                                         bool dry_run = false)
+    {
+      Core::BlockContext ctx = makeContext(b.header.height, dry_run);
 
       auto t = db_->beginWrite();
       State::StateAccess s(*db_, t, 0);
@@ -580,7 +625,8 @@ namespace Tests
     void registerValidatorWithKey(Id id,
                                   const Crypto::KeyPair &kp,
                                   uint64_t stake = 1'000'000'000ULL,
-                                  bool is_seed = false)
+                                  bool is_seed = false,
+                                  bool is_active = true)
     {
       Crypto::Address addr = addressOf(kp);
 
@@ -591,8 +637,10 @@ namespace Tests
       v.stake = stake;
       v.reward_multiplier = Core::REWARD_MULTIPLIER_START;
       v.uptime_score = 10'000;
+      v.registered_at_height = 1;
+      v.last_seen_height = 1;
       v.is_seed = is_seed;
-      v.is_active = true;
+      v.is_active = is_active;
 
       withState([&](State::StateAccess &s)
                 {
@@ -601,6 +649,19 @@ namespace Tests
 
       validator_keys_[id] = kp;
     }
+
+    //  Register a pool candidate. Not active, but eligible to be
+    //  promoted by the emergency rotation. The last_seen_height is
+    //  set recent so the candidate passes isOffline() — a fresh
+    //  registration is by definition online.
+    void registerPoolValidator(Id id,
+                               const Crypto::KeyPair &kp,
+                               uint64_t stake = 1'000'000'000ULL)
+    {
+      registerValidatorWithKey(id, kp, stake,
+                               /*is_seed=*/false, /*is_active=*/false);
+    }
+
     // ---- Members ----
 
     std::filesystem::path test_dir_;

@@ -347,7 +347,7 @@ namespace Tests
         return NodeTestAccess::chain(node_ref).height();
       };
 
-      deps.active_set = [this]() -> std::vector<Id>
+      deps.active_set = [this](bool /*force_rotation*/) -> std::vector<Id>
       {
         std::vector<Id> ids;
         for (size_t i = 0; i < validators_.size(); ++i)

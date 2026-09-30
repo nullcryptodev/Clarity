@@ -661,3 +661,156 @@ TEST(Core_Integration, RotationCyclePreservesSetSize)
   EXPECT_EQ(b.reg.active_set.size(),
             before - plan.to_remove.size() + plan.to_add.size());
 }
+
+// computeEmergencyActiveSet
+
+TEST(Core_EmergencyRotation, NormalSet_ReturnsCommitted)
+{
+  //  No rotation requested. Committed set is returned unchanged.
+  RotationBuilder b(30, 21);
+
+  for (Id id = 1; id <= 30; ++id)
+    b.setLastSeen(id, 1000);
+
+  auto result = computeEmergencyActiveSet(
+      b.reg, b.reg.active_set, /*current_height=*/1000,
+      /*force_rotation=*/false);
+
+  EXPECT_EQ(result, b.reg.active_set);
+}
+
+TEST(Core_EmergencyRotation, ForceWithAllLive_ReturnsCommitted)
+{
+  //  Rotation forced, but every validator is live. Nothing to rotate —
+  //  the emergency path returns the committed set, since a stall with
+  //  no offline validators has a different cause.
+  RotationBuilder b(30, 21);
+
+  for (Id id = 1; id <= 30; ++id)
+    b.setLastSeen(id, 1000);
+
+  auto result = computeEmergencyActiveSet(
+      b.reg, b.reg.active_set, /*current_height=*/1000,
+      /*force_rotation=*/true);
+
+  EXPECT_EQ(result, b.reg.active_set);
+}
+
+TEST(Core_EmergencyRotation, LostQuorum_DerivesEmergencySet)
+{
+  //  21 active, 10 offline, 10 pool candidates.
+  RotationBuilder b(40, 21);
+
+  for (Id id = 1; id <= 40; ++id)
+    b.setLastSeen(id, 1000);
+
+  std::vector<Id> offline;
+  for (Id id = 1; id <= 10; ++id)
+  {
+    b.setLastSeen(id, 1000 - OFFLINE_KICK_BLOCKS - 1);
+    offline.push_back(id);
+  }
+
+  auto result = computeEmergencyActiveSet(
+      b.reg, b.reg.active_set, /*current_height=*/1000,
+      /*force_rotation=*/true);
+
+  for (Id vid : offline)
+  {
+    EXPECT_EQ(std::find(result.begin(), result.end(), vid), result.end())
+        << "offline validator " << vid << " still in emergency set";
+  }
+
+  EXPECT_EQ(result.size(), 21u);
+
+  auto sorted = result;
+  std::sort(sorted.begin(), sorted.end());
+  EXPECT_EQ(result, sorted);
+}
+
+TEST(Core_EmergencyRotation, PoolEmpty_ShrinksSet)
+{
+  RotationBuilder b(21, 21);
+
+  for (Id id = 1; id <= 21; ++id)
+    b.setLastSeen(id, 1000);
+
+  for (Id id = 1; id <= 10; ++id)
+    b.setLastSeen(id, 1000 - OFFLINE_KICK_BLOCKS - 1);
+
+  auto result = computeEmergencyActiveSet(
+      b.reg, b.reg.active_set, /*current_height=*/1000,
+      /*force_rotation=*/true);
+
+  EXPECT_EQ(result.size(), 11u);
+}
+
+TEST(Core_EmergencyRotation, SingleValidator_Unchanged)
+{
+  RotationBuilder b(3, 1);
+  b.setLastSeen(1, 1000 - OFFLINE_KICK_BLOCKS - 1);
+
+  auto result = computeEmergencyActiveSet(
+      b.reg, b.reg.active_set, /*current_height=*/1000,
+      /*force_rotation=*/true);
+
+  EXPECT_EQ(result, b.reg.active_set);
+  EXPECT_EQ(result.size(), 1u);
+}
+
+TEST(Core_EmergencyRotation, DeterministicAcrossCalls)
+{
+  RotationBuilder b(40, 21);
+
+  for (Id id = 1; id <= 40; ++id)
+    b.setLastSeen(id, 1000);
+
+  for (Id id = 1; id <= 10; ++id)
+    b.setLastSeen(id, 1000 - OFFLINE_KICK_BLOCKS - 1);
+
+  auto first = computeEmergencyActiveSet(
+      b.reg, b.reg.active_set, 1000, true);
+  auto second = computeEmergencyActiveSet(
+      b.reg, b.reg.active_set, 1000, true);
+
+  EXPECT_EQ(first, second);
+}
+
+TEST(Core_EmergencyRotation, EmergencyMayDropOfflineSeeds)
+{
+  RotationBuilder b(30, 21);
+
+  for (Id id = 1; id <= 30; ++id)
+    b.setLastSeen(id, 1000);
+
+  // Seed 1 is offline and must be droppable — this is the whole
+  // point of the emergency path: a stalled chain whose seed has
+  // failed cannot recover if the seed is protected.
+  //
+  // Seed 2 is also a seed, but is live, so it survives.
+  b.setSeed(1);
+  b.setSeed(2);
+  b.setLastSeen(1, 500);
+  b.setLastSeen(2, 1000);
+
+  // A non-seed is also offline.
+  b.setLastSeen(7, 500);
+
+  auto result = computeEmergencyActiveSet(
+      b.reg, b.reg.active_set, 1000, true);
+
+  // Offline seed 1 is dropped.
+  EXPECT_EQ(std::find(result.begin(), result.end(), 1), result.end())
+      << "offline seed should be droppable in emergency rotation";
+
+  // Live seed 2 survives.
+  EXPECT_NE(std::find(result.begin(), result.end(), 2), result.end())
+      << "live seed should survive emergency rotation";
+
+  // Offline non-seed 7 is dropped.
+  EXPECT_EQ(std::find(result.begin(), result.end(), 7), result.end());
+
+  // Two offline validators dropped, two pool candidates promoted,
+  // so the set size is unchanged.
+  EXPECT_EQ(result.size(), 21u);
+}

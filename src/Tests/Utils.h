@@ -6,7 +6,6 @@
 #include <string>
 
 #include "Logger.h"
-#include "TransactionBuilder.h"
 
 #include "Consensus/BftConsensus.h"
 

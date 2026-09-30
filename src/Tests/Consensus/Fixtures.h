@@ -52,8 +52,12 @@ namespace Tests
       };
       deps.current_height = [this]() -> Height
       { return current_height_; };
-      deps.active_set = [this]()
-      { return activeIds(); };
+      deps.active_set = [this](bool force_rotation) -> std::vector<Id>
+      {
+        if (force_rotation && !emergency_ids_.empty())
+          return emergency_ids_;
+        return activeIds();
+      };
       deps.signer_public_key =
           [this](Index idx) -> std::optional<Crypto::PublicKey>
       {
@@ -78,6 +82,25 @@ namespace Tests
       };
       deps.now_ms = []() -> uint64_t
       { return 1'700'000'000'000ULL; };
+      deps.state_lookup_validator =
+          [this](Id id, Core::ValidatorInfo &out) -> bool
+      {
+        for (const auto &v : validators_)
+        {
+          if (v.id == id)
+          {
+            out.id = id;
+            std::memcpy(out.reward_address.data.data(),
+                        v.pubkey().data.data(), 32);
+            out.owner = out.reward_address;
+            out.stake = Core::VALIDATOR_MIN_STAKE;
+            out.uptime_score = 10'000;
+            out.is_active = true;
+            return true;
+          }
+        }
+        return false;
+      };
       return deps;
     }
 
@@ -192,6 +215,11 @@ namespace Tests
           makeSignedVote(signer_index, height, round, is_nil, block_hash));
     }
 
+    void setEmergencyIds(std::vector<Id> ids)
+    {
+      emergency_ids_ = std::move(ids);
+    }
+
     NoopLogger logger_;
     std::unique_ptr<Logging::LoggerRef> log_ref_;
     std::vector<TestValidator> validators_;
@@ -203,6 +231,14 @@ namespace Tests
     std::vector<Consensus::Vote> broadcast_precommits;
     std::vector<Core::Block> committed_blocks;
     std::vector<Height> height_advances;
+
+    //  Optional distinct emergency set. When empty (default), the
+    //  fixture returns activeIds() regardless of force_rotation, which
+    //  preserves the behavior every existing test relies on. When
+    //  populated, force_rotation=true returns emergency_ids_ — that
+    //  lets a test exercise the case where the emergency set differs
+    //  from the committed set.
+    std::vector<Id> emergency_ids_;
   };
 
   class Consensus_NetworkFixture : public testing::Test

@@ -11,6 +11,11 @@
 #include "RewardTypes.h"
 #include "ValidatorTypes.h"
 
+namespace State
+{
+  class StateAccess;
+}
+
 namespace Core
 {
   //  Validator rotation
@@ -81,4 +86,60 @@ namespace Core
   bool applyInfractionPenalty(ValidatorInfo &validator,
                               uint64_t current_height) noexcept;
 
+  //  Emergency active set
+  //
+  //  Derives a replacement active set when the committed set can no
+  //  longer form quorum. Uses block-height-based liveness (via
+  //  ValidatorInfo::isOffline against the current height) rather
+  //  than wall clock, because the derivation must be deterministic
+  //  across nodes: two honest nodes with the same registry and the
+  //  same current_height must compute the same emergency set.
+  //
+  //  Returns `committed` unchanged unless `force_rotation` is true.
+  //  The caller (consensus) sets `force_rotation` when it has observed
+  //  enough consecutive round timeouts to conclude the committed set
+  //  is not producing blocks. The threshold and the observation live
+  //  in the consensus layer; this function is a pure derivation.
+  //
+  //  When `force_rotation` is true:
+  //    - Validators whose last_seen_height is older than
+  //      OFFLINE_KICK_BLOCKS relative to `current_height` are dropped.
+  //    - Pool candidates are promoted one-for-one, using the same
+  //      ordering as planRotation.
+  //    - If the pool is empty, the set shrinks rather than the chain
+  //      halting outright.
+  //
+  //  Seeds are never dropped, matching planOfflineRemoval.
+  std::vector<Id> computeEmergencyActiveSet(
+      const ValidatorRegistry &registry,
+      const std::vector<Id> &committed,
+      uint64_t current_height,
+      bool force_rotation);
+
+  //  Resolve the active set for a block, taking emergency rotation
+  //  into account.
+  //
+  //  Under normal conditions this returns `committed` unchanged. If
+  //  `emergency` is true, the set is derived from the same inputs both
+  //  the proposer and every verifier use:
+  //
+  //      committed - offline_validators + pool_promotions
+  //
+  //  `committed` is the committed active set read from state (the
+  //  "active_set" global). It's passed in rather than read here so
+  //  callers that already have it don't pay for a second read.
+  //
+  //  Every honest node with the same committed set, the same registry,
+  //  and the same current height computes the same result. That's what
+  //  makes an emergency block verifiable by nodes that didn't propose
+  //  it.
+  //
+  //  This is the single call site for the derivation. Both Node (for
+  //  the consensus proposer's view) and BlockProcessor (for
+  //  verification) call this function, so the two can't drift.
+  std::vector<Id> resolveActiveSet(
+      State::StateAccess &state,
+      const std::vector<Id> &committed,
+      uint64_t current_height,
+      bool emergency);
 } // namespace Core

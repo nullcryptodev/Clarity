@@ -219,19 +219,24 @@ TEST_F(Consensus_BftFixture, RejectsProposalWithBadSignature)
 }
 
 // Vote handling
-
 TEST_F(Consensus_BftFixture, RecordsValidPrevote)
 {
   makeValidators(4);
   makeConsensus(3);
   consensus_->start(0);
 
+  //  Deliver a proposal so the round has a known block. The vote
+  //  must reference a real block — a vote for an unknown block is
+  //  buffered, not counted.
+  Core::Block block = makeBlock(0);
+  Proposal p = proposeFromProposer(0, 0, 0, block);
+  consensus_->onProposal(p);
+
   consensus_->forceTimerExpiryForTest();
   consensus_->pollTimers();
   ASSERT_EQ(consensus_->state().step, Step::Prevote);
 
-  Crypto::Hash block_hash;
-  block_hash.data[0] = 0xAA;
+  Crypto::Hash block_hash = block.hash();
   deliverPrevote(0, 0, 0, /*is_nil=*/false, block_hash);
 
   EXPECT_EQ(consensus_->state().prevote_count, 2u);
@@ -242,12 +247,16 @@ TEST_F(Consensus_BftFixture, IgnoresDuplicatePrevote)
   makeValidators(4);
   makeConsensus(3);
   consensus_->start(0);
+
+  Core::Block block = makeBlock(0);
+  Proposal p = proposeFromProposer(0, 0, 0, block);
+  consensus_->onProposal(p);
+
   consensus_->forceTimerExpiryForTest();
   consensus_->pollTimers();
   ASSERT_EQ(consensus_->state().step, Step::Prevote);
 
-  Crypto::Hash block_hash;
-  block_hash.data[0] = 0xAA;
+  Crypto::Hash block_hash = block.hash();
 
   deliverPrevote(0, 0, 0, false, block_hash);
   ASSERT_EQ(consensus_->state().prevote_count, 2u);
@@ -308,12 +317,15 @@ TEST_F(Consensus_BftFixture, QuorumThresholdIsBftQuorum)
   makeConsensus(3);
   consensus_->start(0);
 
+  Core::Block block = makeBlock(0);
+  Proposal p = proposeFromProposer(0, 0, 0, block);
+  consensus_->onProposal(p);
+
   consensus_->forceTimerExpiryForTest();
   consensus_->pollTimers();
   ASSERT_EQ(consensus_->state().step, Step::Prevote);
 
-  Crypto::Hash block_hash;
-  block_hash.data[0] = 0xAA;
+  Crypto::Hash block_hash = block.hash();
 
   deliverPrevote(0, 0, 0, false, block_hash);
   EXPECT_EQ(consensus_->state().step, Step::Prevote);
@@ -545,12 +557,16 @@ TEST_F(Consensus_BftFixture, MixedVotesDoNotFormFalseQuorum)
   makeValidators(4);
   makeConsensus(3);
   consensus_->start(0);
+
+  Core::Block block = makeBlock(0);
+  Proposal p = proposeFromProposer(0, 0, 0, block);
+  consensus_->onProposal(p);
+
   consensus_->forceTimerExpiryForTest();
   consensus_->pollTimers();
   ASSERT_EQ(consensus_->state().step, Step::Prevote);
 
-  Crypto::Hash block_hash;
-  block_hash.data[0] = 0xAA;
+  Crypto::Hash block_hash = block.hash();
 
   deliverPrevote(0, 0, 0, false, block_hash);
   deliverPrecommit(1, 0, 0, false, block_hash);
@@ -759,4 +775,276 @@ TEST_F(Consensus_BftFixture, PrecommitQuorumDoesNotBroadcastPrevote)
   EXPECT_EQ(broadcast_prevotes.size(), prevotes_at_prevote)
       << "a prevote was broadcast after entering Precommit";
   EXPECT_GE(broadcast_precommits.size(), 1u);
+}
+
+// ============================================================================
+//  Emergency rotation trigger
+// ============================================================================
+
+TEST_F(Consensus_BftFixture, ConsecutiveTimeoutsIncrementOnFailedRound)
+{
+  //  Non-proposer. Every round it enters ends in a timeout — no
+  //  proposal arrives, no votes form a quorum. Each round advance
+  //  increments consecutive_timeouts_ by one. This is what drives
+  //  the emergency rotation trigger.
+  //
+  //  Regression guard: the counter is only reset on a successful
+  //  commit. A failed round — timeout at any step, no quorum — must
+  //  leave the counter climbing, or the emergency path can never
+  //  fire on a genuinely stalled chain.
+  makeValidators(4);
+  makeConsensus(SIZE_MAX); // not a validator: never proposes
+  consensus_->start(0);
+
+  ASSERT_EQ(consensus_->consecutiveTimeouts(), 0u);
+
+  //  Round 0: Propose -> Prevote -> Precommit -> next round.
+  //  Each timer expiry advances one step; the last one rolls the
+  //  round forward.
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers(); // Propose -> Prevote
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers(); // Prevote -> Precommit
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers(); // Precommit -> next round
+
+  EXPECT_EQ(consensus_->state().round, 1u);
+  EXPECT_EQ(consensus_->consecutiveTimeouts(), 1u)
+      << "counter did not increment on the first failed round";
+
+  //  Round 1: same again.
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers();
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers();
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers();
+
+  EXPECT_EQ(consensus_->state().round, 2u);
+  EXPECT_EQ(consensus_->consecutiveTimeouts(), 2u)
+      << "counter did not increment on the second failed round";
+}
+
+TEST_F(Consensus_BftFixture, ConsecutiveTimeoutsResetOnSuccessfulCommit)
+{
+  //  Single validator. One force-poll drives propose -> prevote ->
+  //  precommit -> commit, because the lone validator's own votes
+  //  form quorum at each step. The counter must be 0 afterwards.
+  makeValidators(1);
+  makeConsensus(0);
+  consensus_->start(0);
+
+  ASSERT_EQ(consensus_->consecutiveTimeouts(), 0u);
+
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers();
+
+  ASSERT_EQ(committed_blocks.size(), 1u);
+  EXPECT_EQ(consensus_->consecutiveTimeouts(), 0u)
+      << "counter not reset after a successful commit";
+}
+
+TEST_F(Consensus_BftFixture, EmergencyRotationActiveOnlyAfterThreshold)
+{
+  //  Non-proposer. Drive through EMERGENCY_ROTATION_ROUNDS - 1
+  //  failed rounds and assert the flag is still off, then one more
+  //  and assert it turns on.
+  makeValidators(4);
+  makeConsensus(SIZE_MAX);
+  consensus_->start(0);
+
+  const uint64_t threshold = Core::EMERGENCY_ROTATION_ROUNDS;
+
+  for (uint64_t r = 0; r < threshold - 1; ++r)
+  {
+    //  Advance one round by timing out all three steps.
+    consensus_->forceTimerExpiryForTest();
+    consensus_->pollTimers();
+    consensus_->forceTimerExpiryForTest();
+    consensus_->pollTimers();
+    consensus_->forceTimerExpiryForTest();
+    consensus_->pollTimers();
+  }
+
+  EXPECT_EQ(consensus_->consecutiveTimeouts(), threshold - 1);
+  EXPECT_FALSE(consensus_->emergencyRotationActive())
+      << "emergency flag turned on before the threshold";
+
+  //  One more failed round crosses the threshold.
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers();
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers();
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers();
+
+  EXPECT_EQ(consensus_->consecutiveTimeouts(), threshold);
+  EXPECT_TRUE(consensus_->emergencyRotationActive())
+      << "emergency flag did not turn on at the threshold";
+}
+
+// ============================================================================
+//  Vote verification against the block's emergency flag
+// ============================================================================
+
+TEST_F(Consensus_BftFixture, VoteBufferedUntilBlockKnown)
+{
+  //  Non-proposer. Enter prevote step, then deliver a prevote for a
+  //  block we haven't seen. The vote is unverifiable — without the
+  //  block we don't know which active set the round ran on, so we
+  //  can't look up the signer's public key. It must be buffered, not
+  //  counted.
+  //
+  //  When the proposal arrives, the block becomes known, the buffer
+  //  drains, and the vote is verified against the block's flag.
+  makeValidators(4);
+  makeConsensus(SIZE_MAX);
+  consensus_->start(0);
+
+  //  Advance to Prevote.
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers();
+  ASSERT_EQ(consensus_->state().step, Step::Prevote);
+
+  const size_t initial = consensus_->state().prevote_count;
+
+  //  Build the block first so we know its hash, but don't deliver
+  //  the proposal yet.
+  Core::Block block = makeBlock(0);
+  Crypto::Hash block_hash = block.hash();
+
+  //  Validator 0 (the actual proposer of round 0 with 4 validators)
+  //  prevotes the block. We don't have the block, so the vote is
+  //  buffered.
+  deliverPrevote(0, 0, 0, /*is_nil=*/false, block_hash);
+
+  EXPECT_EQ(consensus_->state().prevote_count, initial)
+      << "vote for an unknown block was counted before its block arrived";
+
+  //  Deliver the proposal from validator 0. The block becomes known,
+  //  the buffer drains, and the vote is verified.
+  Proposal p = proposeFromProposer(0, 0, 0, block);
+  consensus_->onProposal(p);
+
+  EXPECT_GT(consensus_->state().prevote_count, initial)
+      << "buffered vote was not delivered after its block arrived";
+}
+
+TEST_F(Consensus_BftFixture, VoteVerifiedAgainstBlockEmergencyFlag)
+{
+  //  Four validators. The committed set is {1, 2, 3, 4}. The
+  //  emergency set is {1, 3} — a subset, chosen so that a vote from
+  //  validator 2 is valid against the committed set but out of range
+  //  (or pointing at a different validator) against the emergency set.
+  //
+  //  A proposal whose block header carries emergency_rotation > 0 is
+  //  the signal that the round ran on the emergency set. Votes must
+  //  be verified against the emergency set, not the committed set,
+  //  even though the local counter may be below the threshold.
+  makeValidators(4);
+
+  //  Committed set is all four. Emergency set is {1, 3}.
+  std::vector<Id> emergency = {1, 3};
+  setEmergencyIds(emergency);
+
+  makeConsensus(SIZE_MAX);
+  consensus_->start(0);
+
+  //  Advance to Prevote.
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers();
+  ASSERT_EQ(consensus_->state().step, Step::Prevote);
+
+  const size_t initial = consensus_->state().prevote_count;
+
+  //  Build a block whose header carries the emergency flag. The
+  //  block must be signed-into a proposal by the round's real
+  //  proposer — index 0 in the committed set (proposerFor returns
+  //  active[0] for round 0 with 4 validators).
+  Core::Block block = makeBlock(0);
+  block.header.emergency_rotation = 1; // round at which the decision was made
+  //  The block's validator_set_root was computed by makeBlock against
+  //  the full set. That's fine for the consensus-layer test — the
+  //  fixture's simulate_block returns the header's own state root, so
+  //  validateProposal never checks the set root. BlockProcessor does,
+  //  and that path is already covered by Core_BlockProcessorFixture.
+  Crypto::Hash block_hash = block.hash();
+
+  Proposal p = proposeFromProposer(0, 0, 0, block);
+  consensus_->onProposal(p);
+
+  //  A vote from validator 1 (index 0 in emergency set = {1, 3}, so
+  //  index 0 → id 1, matches validators_[0]) should verify.
+  deliverPrevote(0, 0, 0, /*is_nil=*/false, block_hash);
+  EXPECT_GT(consensus_->state().prevote_count, initial)
+      << "vote from a member of the emergency set was not counted";
+
+  //  A vote from validator 2 (index 1 in committed set, but index 1
+  //  in emergency set {1, 3} resolves to id 3, whose key is
+  //  validators_[2]'s — not validators_[1]'s). The vote is signed by
+  //  validator 2's key, but the emergency set's index 1 expects
+  //  validator 3's key. Verification fails.
+  const size_t after_first = consensus_->state().prevote_count;
+  deliverPrevote(1, 0, 0, /*is_nil=*/false, block_hash);
+  EXPECT_EQ(consensus_->state().prevote_count, after_first)
+      << "vote signed by a non-member of the emergency set was counted";
+}
+
+TEST_F(Consensus_BftFixture, EvidenceSurvivesFailedRound)
+{
+  //  A conflict is observed. The round then fails to commit — no
+  //  quorum forms on any block. The evidence must still be present
+  //  for the next proposer.
+  //
+  //  Regression guard: an earlier draft erased evidence at propose
+  //  time, which meant a failed round silently discarded the
+  //  evidence and no slash could ever be applied.
+  makeValidators(4);
+  makeConsensus(SIZE_MAX);
+  consensus_->start(0);
+
+  //  Deliver a proposal so the round has a known block. The first
+  //  injected vote must reference it — an unverifiable vote is
+  //  buffered, not recorded, and the conflict check needs a
+  //  previously recorded vote to fire.
+  Core::Block block = makeBlock(0);
+  Proposal p = proposeFromProposer(0, 0, 0, block);
+  consensus_->onProposal(p);
+
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers();
+  ASSERT_EQ(consensus_->state().step, Step::Prevote);
+
+  ASSERT_EQ(consensus_->equivocationCount(), 0u);
+
+  //  First vote: for the real block. Verifies, is recorded.
+  const Crypto::Hash block_hash = block.hash();
+  deliverPrevote(0, 0, 0, /*is_nil=*/false, block_hash);
+
+  //  Second vote: same signer, same (height, round), different block
+  //  hash. The block doesn't need to be known — once we hold a vote
+  //  from this signer, a second one reaches recordVote, and the
+  //  conflict fires.
+  Crypto::Hash conflicting_hash;
+  conflicting_hash.data[0] = 0xCC;
+  conflicting_hash.data[1] = 0xDD;
+  ASSERT_NE(conflicting_hash, block_hash);
+
+  deliverPrevote(0, 0, 0, /*is_nil=*/false, conflicting_hash);
+
+  ASSERT_EQ(consensus_->equivocationCount(), 1u)
+      << "conflict was not recorded";
+
+  //  Advance the round without committing. No value quorum forms
+  //  because only one honest validator prevoted for the proposal;
+  //  the local node is not a validator and doesn't vote.
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers(); // prevote -> precommit
+  consensus_->forceTimerExpiryForTest();
+  consensus_->pollTimers(); // precommit -> next round
+
+  ASSERT_GT(consensus_->state().round, 0u);
+
+  EXPECT_EQ(consensus_->equivocationCount(), 1u)
+      << "evidence was lost when the round failed to commit";
 }

@@ -169,7 +169,7 @@ namespace Tests
       { return validators_[index].sign(h); };
       deps.current_height = []() -> Height
       { return 0; };
-      deps.active_set = [this]() -> std::vector<Id>
+      deps.active_set = [this](bool /*force_rotation*/) -> std::vector<Id>
       {
         std::vector<Id> ids;
         ids.reserve(validators_.size());
@@ -200,19 +200,13 @@ namespace Tests
       deps.state_lookup_validator =
           [this](Id id, Core::ValidatorInfo &out) -> bool
       {
-        //  The harness doesn't hold a real state DB. Synthesize a
-        //  ValidatorInfo whose reward_address matches the validator's
-        //  pubkey, so the equivocation proof verifier can check the
-        //  signature. Everything else can be default.
         for (const auto &v : validators_)
         {
           if (v.id == id)
           {
             std::memcpy(out.reward_address.data.data(),
-                        v.kp.publicKey.data.data(), 32);
+                        v.pubkey().data.data(), 32);
             out.id = id;
-            out.stake = Core::VALIDATOR_MIN_STAKE;
-            out.reward_multiplier = Core::REWARD_MULTIPLIER_START;
             return true;
           }
         }

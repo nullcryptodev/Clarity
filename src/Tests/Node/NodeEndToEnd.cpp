@@ -525,3 +525,29 @@ TEST_F(Node_EndToEndFixture, ConsensusOverRealP2P)
   t0.join();
   t1.join();
 }
+
+TEST_F(Node_EndToEndFixture, ChainRecoversFromLostQuorum)
+{
+  //  Six validators: four active, two in the pool.
+  //  Bring all six online, then take two of the four active offline.
+  //  bftQuorum(4) = 3, so with only two live the committed set can't
+  //  form quorum. The emergency path should promote the two pool
+  //  candidates and the chain should resume committing.
+  makeValidators(6);
+  startNodes();
+
+  setOffline(2, true);
+  setOffline(3, true);
+
+  startAllConsensus(1);
+
+  for (int i = 0; i < 20; ++i)
+    advanceTimers();
+
+  //  At least the two remaining live validators should have advanced.
+  //  (The offline ones can't have, by definition.)
+  EXPECT_GE(NodeTestAccess::chain(*nodes_[0]).height(), 1u);
+  EXPECT_GE(NodeTestAccess::chain(*nodes_[1]).height(), 1u);
+
+  stopNodes();
+}

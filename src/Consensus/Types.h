@@ -94,5 +94,27 @@ namespace Consensus
         return false;
       return true;
     }
+
+    //  Identity comparison. Two evidence entries are the same if both
+    //  votes match on the fields that determine what the proof is
+    //  about — height, round, signer, is_nil, and block hash — for
+    //  both votes. Signatures are not compared: two valid signatures
+    //  over identical content from the same key are byte-identical,
+    //  and if only one is valid the on-chain verifier rejects the
+    //  pair regardless. Content equality is sufficient to identify
+    //  the evidence.
+    bool operator==(const EquivocationEvidence &other) const noexcept
+    {
+      return vote_a.height == other.vote_a.height &&
+             vote_a.round == other.vote_a.round &&
+             vote_a.signer_index == other.vote_a.signer_index &&
+             vote_a.is_nil == other.vote_a.is_nil &&
+             vote_a.block_hash == other.vote_a.block_hash &&
+             vote_b.height == other.vote_b.height &&
+             vote_b.round == other.vote_b.round &&
+             vote_b.signer_index == other.vote_b.signer_index &&
+             vote_b.is_nil == other.vote_b.is_nil &&
+             vote_b.block_hash == other.vote_b.block_hash;
+    }
   };
 } // namespace Consensus

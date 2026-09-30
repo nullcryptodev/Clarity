@@ -29,10 +29,10 @@ namespace Consensus
       : deps_(std::move(deps)), callbacks_(std::move(callbacks)), config_(config), log_(log)
   {
     round_timer_ = std::make_unique<Common::RoundTimer>([this]()
-    {
-      // Timeout is handled by pollTimers().
-      // The callback is a no-op.
-    });
+                                                        {
+                                                          // Timeout is handled by pollTimers().
+                                                          // The callback is a no-op.
+                                                        });
   }
 
   BftConsensus::~BftConsensus()
@@ -76,7 +76,46 @@ namespace Consensus
     return running_;
   }
 
-  //  State transitions
+  //  Active set resolution
+  //
+  //  The set a round runs on is determined by the proposal for that
+  //  round, not by the local timeout counter. The proposal's block
+  //  header carries `emergency_rotation`; every node reads the flag
+  //  from there and derives the same set. The local counter is only
+  //  consulted by the proposer, to decide whether to set the flag on
+  //  the block it is about to build.
+  //
+  //  There is exactly one case where the local counter drives the set
+  //  choice: `propose()`, before the block exists. Every verifier
+  //  reads the flag from the block.
+
+  bool BftConsensus::roundUsesEmergencySet(Height height, Round round) const
+  {
+    auto it = proposal_for_round_.find({height, round});
+    if (it == proposal_for_round_.end())
+      return false;
+
+    auto block_it = proposals_by_hash_.find(it->second);
+    if (block_it == proposals_by_hash_.end())
+      return false;
+
+    return block_it->second.header.emergency_rotation > 0;
+  }
+
+  bool BftConsensus::roundUsesEmergencySetForVote(const Vote &v) const
+  {
+    if (!v.is_nil)
+    {
+      auto it = proposals_by_hash_.find(v.block_hash);
+      if (it == proposals_by_hash_.end())
+        return false;
+      return it->second.header.emergency_rotation > 0;
+    }
+
+    return roundUsesEmergencySet(v.height, v.round);
+  }
+
+  //  Lifecycle (continued)
 
   void BftConsensus::enterNewHeight(Height height)
   {
@@ -89,7 +128,10 @@ namespace Consensus
     resetForNewRound(round);
     step_ = Step::Propose;
 
-    auto active = deps_.active_set();
+    if (round > 0)
+      consecutive_timeouts_++;
+
+    auto active = deps_.active_set(useEmergencySet());
     proposer_ = proposerFor(height, round, active);
 
     auto my_id = deps_.my_validator_id();
@@ -110,7 +152,7 @@ namespace Consensus
   void BftConsensus::enterPrevote(Height height, Round round)
   {
     if (step_ == Step::Prevote && round_ == round)
-      return; // already in prevote for this round
+      return;
 
     step_ = Step::Prevote;
     prevotes_.clear();
@@ -141,24 +183,13 @@ namespace Consensus
     if (round_timer_)
       round_timer_->start(round);
 
-    //  Deliver any prevotes that arrived while we were still in
-    //  propose. Their signature and height/round have already been
-    //  validated by handlePrevote before buffering — wait, no, they
-    //  weren't. recordVote does the signature check. Deliver through
-    //  recordVote so the check still runs.
-    auto pending = std::move(pending_prevotes_);
-    pending_prevotes_.clear();
-    for (const auto &v : pending)
-    {
-      if (v.height == height_ && v.round == round_ && step_ == Step::Prevote)
-        recordVote(v, /*is_precommit=*/false);
-    }
+    drainPendingVotes(/*is_precommit=*/false);
   }
 
   void BftConsensus::enterPrecommit(Height height, Round round)
   {
     if (step_ == Step::Precommit && round_ == round)
-      return; // already in precommit for this round
+      return;
 
     step_ = Step::Precommit;
     precommits_.clear();
@@ -191,17 +222,7 @@ namespace Consensus
     if (round_timer_)
       round_timer_->start(round);
 
-    //  Deliver any precommits that arrived early. Note that the
-    //  precommit filter (block must be locked or valid) is applied
-    //  inside handlePrecommit, not recordVote, so we go through
-    //  handlePrecommit here rather than recordVote.
-    auto pending = std::move(pending_precommits_);
-    pending_precommits_.clear();
-    for (const auto &v : pending)
-    {
-      if (v.height == height_ && v.round == round_)
-        handlePrecommit(v);
-    }
+    drainPendingVotes(/*is_precommit=*/true);
   }
 
   void BftConsensus::enterCommit(Height height, Round round)
@@ -284,6 +305,58 @@ namespace Consensus
       return;
     }
 
+    //  The commit is real. Reset the timeout counter now — not at
+    //  the top of the function, because a failed enterCommit (no
+    //  quorum, unknown block, short signature set) is exactly the
+    //  stall case the counter is meant to detect. Resetting there
+    //  would keep the counter at 0 or 1 forever on a stalled chain,
+    //  and the emergency path would never fire.
+    consecutive_timeouts_ = 0;
+
+    //  Erase evidence that this block includes. Every node runs this,
+    //  not just the proposer. The block's Slash txs are the source of
+    //  truth: if a Slash tx is in the committed block, the evidence it
+    //  carries is on-chain and permanent, and no node should
+    //  re-include it.
+    //
+    //  A node that wasn't the proposer has no idea what the proposer
+    //  intended to include. It only sees the block. Scanning the
+    //  block's transactions is the only way for it to know what
+    //  evidence was committed.
+    //
+    //  The block's Slash txs were already verified on-chain when the
+    //  block was applied by every node's BlockProcessor. Re-verifying
+    //  here would be redundant, so we use the decode-only helper.
+    for (const auto &tx : block.transactions)
+    {
+      if (tx.tx_type != Core::TxType::Slash)
+        continue;
+
+      auto decoded = Core::decodeSlashEvidence(tx.payload);
+      if (!decoded.has_value())
+        continue;
+
+      //  Erase every evidence entry against the same signer at the same
+      //  (height, round). The block's Slash tx proves one offense at
+      //  that (H, R); any other conflicting pair a validator produced
+      //  at the same (H, R) describes the same offense. Including them
+      //  in a second Slash tx would double-slash for one infraction,
+      //  which is neither correct nor intended.
+      const Id target_signer = decoded->vote_a.signer_index;
+      const uint64_t target_height = decoded->vote_a.height;
+      const uint64_t target_round = decoded->vote_a.round;
+
+      equivocations_.erase(
+          std::remove_if(equivocations_.begin(), equivocations_.end(),
+                         [&](const EquivocationEvidence &e)
+                         {
+                           return e.vote_a.signer_index == target_signer &&
+                                  e.vote_a.height == target_height &&
+                                  e.vote_a.round == target_round;
+                         }),
+          equivocations_.end());
+    }
+
     log_(Logging::INFO)
         << "Committing block: h=" << height
         << " hash=" << block.hash().toString().substr(0, 16)
@@ -327,18 +400,8 @@ namespace Consensus
       return;
     }
 
-    // A proposal for a future round is not invalid — it's early. The
-    // proposer for round N+1 can legitimately send its proposal while
-    // some validators are still finishing round N. Queue it and
-    // deliver it when we reach round N+1. Dropping it (as the code
-    // did previously) stalls the round until the proposer times out
-    // and re-proposes, which for a 2-validator network is a liveness
-    // failure: the proposer cannot re-propose within the same round.
     if (p.round > round_)
     {
-      // Reject absurdly-far-ahead rounds. The BFT safety argument
-      // doesn't cover an unbounded queue, and a peer that sends a
-      // proposal for round 10'000 is not being helpful.
       constexpr Round MAX_FUTURE_ROUNDS = 64;
       if (p.round - round_ > MAX_FUTURE_ROUNDS)
       {
@@ -364,15 +427,30 @@ namespace Consensus
       return;
     }
 
-    // p.round == round_. Continue as before.
-
     if (proposal_.has_value())
     {
       log_(Logging::WARNING) << "handleProposal REJECT already-have";
       return;
     }
 
-    auto active = deps_.active_set();
+    //  Deserialize first. The block header carries the
+    //  emergency_rotation flag, which determines which active set
+    //  this round ran on. Every check below must use that set, not
+    //  the local counter — otherwise two honest nodes whose counters
+    //  disagree by one will compute different proposers and reject
+    //  each other's proposals.
+    Core::Block block;
+    if (!Core::Block::deserialize(p.block_bytes.data(),
+                                  p.block_bytes.size(),
+                                  block))
+    {
+      log_(Logging::WARNING) << "handleProposal: deserialize failed";
+      return;
+    }
+
+    const bool emergency = (block.header.emergency_rotation > 0);
+    auto active = deps_.active_set(emergency);
+
     Id expected_proposer = proposerFor(height_, round_, active);
     if (p.signer_index >= active.size())
       return;
@@ -382,7 +460,6 @@ namespace Consensus
       return;
     }
 
-    Core::Block block;
     if (!validateProposal(p, block))
     {
       log_(Logging::WARNING) << "Invalid proposal";
@@ -396,6 +473,15 @@ namespace Consensus
                            << " hash=" << p.block_hash.toString().substr(0, 16);
 
     proposals_by_hash_[p.block_hash] = block;
+
+    //  Record the block for this (height, round). Later votes at the
+    //  same round will look up the flag through this map.
+    proposal_for_round_[{p.height, p.round}] = p.block_hash;
+
+    //  A proposal just arrived for the current round. Votes that were
+    //  buffered because their block was unknown can now be verified.
+    drainPendingVotes(/*is_precommit=*/false);
+    drainPendingVotes(/*is_precommit=*/true);
 
     log_(Logging::DEBUGGING) << "Accepted proposal for h=" << height_
                              << " r=" << round_
@@ -415,9 +501,61 @@ namespace Consensus
         << "Draining queued proposal for round " << round_
         << " hash=" << p.block_hash.toString().substr(0, 16);
 
-    // Re-enter handleProposal. It will now see p.round == round_
-    // and process normally.
     handleProposal(p);
+  }
+
+  void BftConsensus::drainPendingVotes(bool is_precommit)
+  {
+    auto &buffer = is_precommit ? pending_precommits_ : pending_prevotes_;
+    if (buffer.empty())
+      return;
+
+    std::vector<Vote> still_pending;
+    still_pending.reserve(buffer.size());
+
+    for (const auto &v : buffer)
+    {
+      if (v.height != height_ || v.round != round_)
+        continue;
+
+      if (is_precommit && step_ != Step::Precommit)
+      {
+        still_pending.push_back(v);
+        continue;
+      }
+      if (!is_precommit && step_ != Step::Prevote)
+      {
+        still_pending.push_back(v);
+        continue;
+      }
+
+      //  A vote from a signer we already have a vote from is a
+      //  potential equivocation — deliver it to recordVote so the
+      //  conflict check can run, even if the block is unknown.
+      auto &container = is_precommit ? precommits_ : prevotes_;
+      const bool have_vote = container.count(v.signer_index) > 0;
+
+      if (!have_vote && !voteIsVerifiable(v))
+      {
+        still_pending.push_back(v);
+        continue;
+      }
+
+      if (is_precommit)
+        handlePrecommit(v);
+      else
+        recordVote(v, /*is_precommit=*/false);
+    }
+
+    buffer = std::move(still_pending);
+  }
+
+  bool BftConsensus::voteIsVerifiable(const Vote &v) const
+  {
+    if (!v.is_nil)
+      return proposals_by_hash_.count(v.block_hash) > 0;
+
+    return proposal_for_round_.count({v.height, v.round}) > 0;
   }
 
   void BftConsensus::handlePrevote(const Vote &v)
@@ -427,8 +565,6 @@ namespace Consensus
     if (v.round != round_)
       return;
 
-    //  A prevote can arrive before our own propose timer fires. We're
-    //  still in Propose. Buffer it and deliver on enterPrevote().
     if (step_ == Step::Propose || step_ == Step::NewHeight)
     {
       pending_prevotes_.push_back(v);
@@ -436,6 +572,20 @@ namespace Consensus
     }
     if (step_ != Step::Prevote)
       return;
+
+    //  If we already hold a vote from this signer at this round, the
+    //  incoming vote is either a duplicate or an equivocation. Route
+    //  it to recordVote so the conflict check runs — it doesn't need
+    //  the block to detect the conflict, only to verify the signature,
+    //  and a conflicting vote is evidence regardless.
+    const bool have_vote = prevotes_.count(v.signer_index) > 0;
+
+    if (!have_vote && !voteIsVerifiable(v))
+    {
+      pending_prevotes_.push_back(v);
+      return;
+    }
+
     recordVote(v, false);
   }
 
@@ -447,9 +597,6 @@ namespace Consensus
     if (v.round != round_)
       return;
 
-    //  A precommit can arrive before our own prevote timer fires, or
-    //  even before our propose timer fires. Buffer it and deliver on
-    //  enterPrecommit().
     if (step_ == Step::Propose || step_ == Step::Prevote ||
         step_ == Step::NewHeight)
     {
@@ -459,6 +606,14 @@ namespace Consensus
 
     if (step_ != Step::Precommit)
       return;
+
+    const bool have_vote = precommits_.count(v.signer_index) > 0;
+
+    if (!have_vote && !voteIsVerifiable(v))
+    {
+      pending_precommits_.push_back(v);
+      return;
+    }
 
     // A precommit is only meaningful if it references a block the
     // network has a reason to precommit at this round:
@@ -492,7 +647,6 @@ namespace Consensus
     if (!running_ || !round_timer_)
       return;
 
-    // Log every poll so we can see whether the poll loop is alive.
     log_(Logging::WARNING) << "pollTimers: h=" << height_
                            << " r=" << round_
                            << " step=" << static_cast<int>(step_)
@@ -568,16 +722,19 @@ namespace Consensus
 
     propose();
   }
+
   bool BftConsensus::propose()
   {
     Core::Block block;
 
-    //  Resolve the active set once, up front. Both the Slash-inclusion
-    //  filter below and the validator_set_root computation later need
-    //  it, and they must use the same value.
-    auto active = deps_.active_set();
+    //  The proposer's decision: is the local counter high enough to
+    //  warrant the emergency set? This is the only place the local
+    //  counter drives the set choice. Once the block is built, the
+    //  flag is authoritative for every verifier.
+    const bool emergency = useEmergencySet();
 
-    // Header setup using deps.
+    auto active = deps_.active_set(emergency);
+
     block.header.version = GlobalConfig::CURRENT_BLOCK_VERSION;
     block.header.chain_id = deps_.chain_id ? deps_.chain_id() : 0;
     block.header.height = height_;
@@ -589,7 +746,6 @@ namespace Consensus
                                               .count());
     block.header.parent_hash = deps_.parent_hash ? deps_.parent_hash() : Crypto::Hash{};
 
-    // Select transactions from the mempool.
     if (callbacks_.select_transactions)
     {
       block.transactions = callbacks_.select_transactions(
@@ -604,26 +760,17 @@ namespace Consensus
     //       signatures, same height/round/signer, different value).
     //    2. signer_index must be in range for the current active set.
     //
-    //  We do NOT check whether the target validator is still registered
-    //  here. That check is performed by every node during block
-    //  application (Core::verifyEquivocationProof), and duplicating it
-    //  at propose time would require plumbing a validator lookup through
-    //  BftConsensus's Dependencies. The cost of including a stale proof
-    //  is a rejected block: the proposer loses the round, the network
-    //  retries with the next proposer, and the stale evidence is
-    //  consumed and never re-included. This is a liveness cost, not a
-    //  safety one. In practice evidence does not survive long enough
-    //  for its target to be unregistered.
+    //  Evidence that fails a filter is left in equivocations_ for a
+    //  future proposer — a validator not yet in the active set may
+    //  join next epoch, and a proof that's stale now may become valid
+    //  later. Erasing on skip would lose it permanently.
     //
-    //  Evidence that passes both filters is included and then removed
-    //  from equivocations_, so it is not re-included in the next block
-    //  (which would be a duplicate and rejected).
-    //
-    //  Evidence that fails a filter is dropped without inclusion: it
-    //  is stale, and will not become valid later.
+    //  Erasure of included evidence happens at commit time, not
+    //  propose time, and is driven by scanning the committed block's
+    //  Slash txs. That way every node erases evidence that a block
+    //  contains, not just the node that proposed it.
     if (!equivocations_.empty() && !active.empty())
     {
-      std::vector<size_t> consumed;
       std::set<Index> already_slashed;
 
       for (size_t i = 0; i < equivocations_.size(); ++i)
@@ -631,26 +778,14 @@ namespace Consensus
         const auto &ev = equivocations_[i];
 
         if (!ev.isValid())
-        {
-          consumed.push_back(i);
           continue;
-        }
 
         if (ev.vote_a.signer_index >= active.size())
-        {
-          consumed.push_back(i);
           continue;
-        }
 
         if (already_slashed.count(ev.vote_a.signer_index) > 0)
-        {
-          consumed.push_back(i);
           continue;
-        }
 
-        //  Guard against exceeding the per-block tx budget. If the
-        //  block is already full, stop including; the remaining
-        //  evidence stays in equivocations_ for the next proposer.
         if (block.transactions.size() >= config_.max_block_txs)
           break;
 
@@ -664,32 +799,25 @@ namespace Consensus
 
         block.transactions.push_back(std::move(slash_tx));
         already_slashed.insert(ev.vote_a.signer_index);
-        consumed.push_back(i);
       }
-
-      //  Remove consumed entries in reverse order so indices stay
-      //  valid.
-      for (auto it = consumed.rbegin(); it != consumed.rend(); ++it)
-        equivocations_.erase(equivocations_.begin() + *it);
     }
 
     block.header.tx_root = Core::computeTxRoot(block.transactions);
     block.header.tx_count = static_cast<uint32_t>(block.transactions.size());
 
-    // Validator set root.
     block.header.validator_set_root = Core::computeValidatorSetRoot(active);
     block.header.active_validator_count = static_cast<uint32_t>(active.size());
 
-    // Record the round this block is being proposed in. ...
     block.header.commit_round = round_;
 
-    // Populate participants with the full active set. ...
     block.participants = active;
 
-    // Proposer.
     block.header.proposer = deps_.my_address ? deps_.my_address() : Crypto::Address{};
 
-    // Simulate the block to get the resulting state root and receipts root.
+    //  Stamp the flag. This is what every verifier reads.
+    if (emergency)
+      block.header.emergency_rotation = round_;
+
     auto sim_root = simulateBlock(block);
     if (!sim_root.has_value())
     {
@@ -698,7 +826,6 @@ namespace Consensus
     }
     block.header.state_root = *sim_root;
 
-    // Sign the proposal.
     Crypto::Hash block_hash = block.hash();
     Proposal p;
     p.height = height_;
@@ -715,9 +842,11 @@ namespace Consensus
 
     proposal_ = p;
     proposals_by_hash_[block_hash] = block;
+    proposal_for_round_[{height_, round_}] = block_hash;
 
     log_(Logging::INFO) << "Proposed block for h=" << height_
                         << " r=" << round_
+                        << " em=" << (emergency ? "yes" : "no")
                         << " txs=" << block.transactions.size()
                         << " hash=" << block_hash.toString().substr(0, 16);
 
@@ -725,18 +854,13 @@ namespace Consensus
   }
 
   //  Validation
+  //
+  //  Takes the already-deserialized block. handleProposal deserializes
+  //  first so it can read the emergency flag before choosing the set.
 
-  bool BftConsensus::validateProposal(const Proposal &p, Core::Block &out_block)
+  bool BftConsensus::validateProposal(const Proposal &p, const Core::Block &block)
   {
-    if (!Core::Block::deserialize(p.block_bytes.data(),
-                                  p.block_bytes.size(),
-                                  out_block))
-    {
-      log_(Logging::WARNING) << "validateProposal: deserialize failed";
-      return false;
-    }
-
-    Crypto::Hash block_hash = out_block.hash();
+    Crypto::Hash block_hash = block.hash();
     if (block_hash != p.block_hash)
     {
       log_(Logging::WARNING) << "validateProposal: block hash mismatch: "
@@ -745,10 +869,10 @@ namespace Consensus
       return false;
     }
 
-    if (out_block.header.height != p.height)
+    if (block.header.height != p.height)
     {
       log_(Logging::WARNING) << "validateProposal: height mismatch: "
-                             << "header=" << out_block.header.height
+                             << "header=" << block.header.height
                              << " proposal=" << p.height;
       return false;
     }
@@ -768,14 +892,14 @@ namespace Consensus
       return false;
     }
 
-    auto computed_root = simulateBlock(out_block);
+    auto computed_root = simulateBlock(block);
     if (!computed_root.has_value())
     {
       log_(Logging::WARNING) << "validateProposal: simulateBlock returned nullopt";
       return false;
     }
 
-    if (*computed_root != out_block.header.state_root)
+    if (*computed_root != block.header.state_root)
     {
       log_(Logging::WARNING) << "validateProposal: state root mismatch";
       return false;
@@ -795,23 +919,26 @@ namespace Consensus
 
   bool BftConsensus::recordVote(const Vote &v, bool is_precommit)
   {
-    auto active = deps_.active_set();
-    if (v.signer_index >= active.size())
-      return false;
-
     auto &container = is_precommit ? precommits_ : prevotes_;
+
+    //  Conflict check runs first, before signature verification and
+    //  before any dependency on the active set. Two votes from the
+    //  same signer at the same (height, round) with different
+    //  (block_hash, is_nil) is an equivocation regardless of which
+    //  set the round ran on — the conflict is a property of the two
+    //  votes, not of any particular chain state. Detecting it here
+    //  means evidence is recorded even when the block is unknown,
+    //  which is the case an adversary can exploit by equivocating
+    //  against a block no honest node has seen.
+    //
+    //  The votes' signatures are NOT verified here. On-chain
+    //  verification (Core::verifyEquivocationProof, called from
+    //  BlockProcessor::applySlash) re-verifies both signatures before
+    //  any slash is applied, so a forged conflict cannot cause a
+    //  slash — it can only produce a block that gets rejected, which
+    //  is a liveness cost, not a safety one.
     if (container.count(v.signer_index) > 0)
     {
-      //  A second vote from this signer at this (height, round). If
-      //  it conflicts with the first — different block_hash or
-      //  different is_nil — record the evidence for a future proposer
-      //  to embed in a Slash transaction. Then reject it, as before:
-      //  the first vote remains the one counted toward quorum.
-      //
-      //  The conflicting vote is NOT counted. Quorum computation must
-      //  see at most one vote per signer; counting both would let a
-      //  single equivocating validator contribute two votes toward a
-      //  quorum it should only contribute one to.
       const Vote &first = container.at(v.signer_index);
       if (first.block_hash != v.block_hash || first.is_nil != v.is_nil)
       {
@@ -822,10 +949,6 @@ namespace Consensus
         {
           equivocations_.push_back(ev);
 
-          //  Enforce the bound. Dropping the oldest is correct: older
-          //  evidence is less likely to reference a validator still in
-          //  the current active set, so it is the least valuable to
-          //  keep. In practice the buffer never approaches this size.
           if (equivocations_.size() > MAX_EQUIVOCATION_EVIDENCE)
           {
             equivocations_.erase(equivocations_.begin());
@@ -844,13 +967,32 @@ namespace Consensus
       return false;
     }
 
-    Crypto::Hash signing_hash = voteSigningHash(v.height, v.round,
-                                                v.is_nil, v.block_hash);
-    auto pk = deps_.signer_public_key(v.signer_index);
-    if (!pk.has_value())
+    //  No conflict — this is the first vote from this signer at this
+    //  (height, round). Verify and record.
+    const bool emergency = roundUsesEmergencySetForVote(v);
+    auto active = deps_.active_set(emergency);
+
+    if (v.signer_index >= active.size())
       return false;
 
-    if (!Crypto::verify(signing_hash, *pk, v.signature))
+    Crypto::Hash signing_hash = voteSigningHash(v.height, v.round,
+                                                v.is_nil, v.block_hash);
+
+    //  Resolve the signer through the active set: index -> validator ID
+    //  -> validator record. This is the same path BlockProcessor::checkQuorum
+    //  uses. Using the raw signer index against a flat key table would
+    //  make the same vote resolve to different validators depending on
+    //  which set the round ran on.
+    const Id vid = active[v.signer_index];
+    Core::ValidatorInfo vinfo;
+    if (!deps_.state_lookup_validator ||
+        !deps_.state_lookup_validator(vid, vinfo))
+    {
+      return false;
+    }
+    const Crypto::PublicKey pk = vinfo.reward_address;
+
+    if (!Crypto::verify(signing_hash, pk, v.signature))
       return false;
 
     container[v.signer_index] = v;
@@ -859,15 +1001,13 @@ namespace Consensus
                              << " received: h=" << v.height
                              << " r=" << v.round
                              << " signer=" << v.signer_index
-                             << " nil=" << v.is_nil;
+                             << " nil=" << v.is_nil
+                             << " em=" << (emergency ? "yes" : "no");
 
     // Fire the state transition only when a *value quorum* has formed
     // — that is, `threshold` votes for the same non-nil block hash.
     // A round where everyone votes nil has no value quorum and is
-    // advanced by the round timer instead. Firing on container size
-    // (as the code did previously) would let a set of votes that
-    // doesn't actually agree on a value advance the round, missing
-    // the moment the value quorum would have formed.
+    // advanced by the round timer instead.
     if (quorumValue(is_precommit).has_value())
     {
       if (is_precommit && step_ == Step::Precommit)
@@ -942,7 +1082,12 @@ namespace Consensus
 
   size_t BftConsensus::quorumThreshold() const
   {
-    auto active = deps_.active_set();
+    //  Threshold depends on which set the current round runs on. If
+    //  a proposal for this round is known, use its flag. Otherwise,
+    //  no quorum can have formed yet (we haven't even proposed), so
+    //  return the committed-set threshold as a safe default.
+    const bool emergency = roundUsesEmergencySet(height_, round_);
+    auto active = deps_.active_set(emergency);
     return Core::bftQuorum(active.size());
   }
 
@@ -952,7 +1097,15 @@ namespace Consensus
     if (my_id == INVALID_ID)
       return INVALID_INDEX;
 
-    auto active = deps_.active_set();
+    //  If we're the proposer of this round and haven't proposed yet,
+    //  use the local counter — we're about to make the decision
+    //  ourselves. Otherwise, read the flag from the block.
+    const bool emergency =
+        proposal_for_round_.count({height_, round_}) > 0
+            ? roundUsesEmergencySet(height_, round_)
+            : useEmergencySet();
+
+    auto active = deps_.active_set(emergency);
     for (size_t i = 0; i < active.size(); ++i)
     {
       if (active[i] == my_id)
@@ -1021,6 +1174,8 @@ namespace Consensus
     round_ = 0;
     step_ = Step::NewHeight;
 
+    consecutive_timeouts_ = 0;
+
     locked_ = false;
     locked_hash_ = Crypto::Hash{};
     locked_round_ = 0;
@@ -1037,11 +1192,13 @@ namespace Consensus
     pending_prevotes_.clear();
     pending_precommits_.clear();
 
-    // Queued proposals are for rounds at the previous height. Even if
-    // the round number happens to match a new round at the new height,
-    // the proposal's height field is stale and it must not be
-    // delivered. Clear unconditionally.
     future_proposals_.clear();
+    proposal_for_round_.clear();
+
+    //  equivocations_ is deliberately NOT cleared here. Evidence
+    //  observed at height H must remain available to the proposer at
+    //  height H+1, H+2, ... until a block containing it commits.
+    //  Erasure happens in enterCommit, driven by the committed block.
   }
 
   void BftConsensus::resetForNewRound(Round round)
@@ -1103,5 +1260,22 @@ namespace Consensus
   {
     std::lock_guard<std::mutex> lock(mutex_);
     return equivocations_.size();
+  }
+
+  Round BftConsensus::consecutiveTimeouts() const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return consecutive_timeouts_;
+  }
+
+  bool BftConsensus::emergencyRotationActive() const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return useEmergencySet();
+  }
+
+  bool BftConsensus::useEmergencySet() const noexcept
+  {
+    return consecutive_timeouts_ >= Core::EMERGENCY_ROTATION_ROUNDS;
   }
 } // namespace Consensus

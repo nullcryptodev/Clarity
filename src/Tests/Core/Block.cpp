@@ -17,55 +17,46 @@ using namespace Tests;
 //  BlockHeader
 // ============================================================================
 
-TEST(Core_BlockHeader, WellFormedBaseline)
+TEST(Core_Core_BlockHeader, WellFormedBaseline)
 {
   EXPECT_TRUE(makeHeader().isWellFormed());
 }
 
-TEST(Core_BlockHeader, RejectsWrongVersion)
+TEST(Core_Core_BlockHeader, RejectsWrongVersion)
 {
   BlockHeader h = makeHeader();
   h.version = 999;
   EXPECT_FALSE(h.isWellFormed());
 }
 
-TEST(Core_BlockHeader, RejectsZeroChainId)
+TEST(Core_Core_BlockHeader, RejectsZeroChainId)
 {
   BlockHeader h = makeHeader();
   h.chain_id = 0;
   EXPECT_FALSE(h.isWellFormed());
 }
 
-TEST(Core_BlockHeader, RejectsNullProposer)
+TEST(Core_Core_BlockHeader, RejectsNullProposer)
 {
   BlockHeader h = makeHeader();
   h.proposer = Crypto::Address{};
   EXPECT_FALSE(h.isWellFormed());
 }
 
-TEST(Core_BlockHeader, RejectsZeroActiveValidators)
+TEST(Core_Core_BlockHeader, RejectsZeroActiveValidators)
 {
   BlockHeader h = makeHeader();
   h.active_validator_count = 0;
   EXPECT_FALSE(h.isWellFormed());
 }
 
-TEST(Core_BlockHeader, HashIsDeterministic)
+TEST(Core_Core_BlockHeader, HashIsDeterministic)
 {
   BlockHeader h = makeHeader();
   EXPECT_EQ(h.hash().toString(), h.hash().toString());
 }
 
-TEST(Core_BlockHeader, HashCaches)
-{
-  BlockHeader h = makeHeader();
-  auto first = h.hash();
-  // Second call should hit the cache.
-  auto second = h.hash();
-  EXPECT_EQ(first.toString(), second.toString());
-}
-
-TEST(Core_BlockHeader, HashChangesWithContent)
+TEST(Core_Core_BlockHeader, HashChangesWithContent)
 {
   BlockHeader h1 = makeHeader();
   BlockHeader h2 = makeHeader();
@@ -74,7 +65,43 @@ TEST(Core_BlockHeader, HashChangesWithContent)
   EXPECT_NE(h1.hash().toString(), h2.hash().toString());
 }
 
-TEST(Core_BlockHeader, SerializeRoundTrip)
+//  commit_round and emergency_rotation have opposite semantics:
+//
+//    commit_round is EXCLUDED from the hash. It can change between
+//    proposal and commit (the round-crossing case) without changing
+//    the block's identity. Validators sign over the block hash, and
+//    the round they signed in becomes commit_round — but the hash
+//    stays stable.
+
+//    emergency_rotation is INCLUDED in the hash. It changes which
+//    validator set the block was validated against, so two blocks
+//    that differ only in this field are different blocks.
+
+TEST(Core_Core_BlockHeader, CommitRoundNotInHash)
+{
+  BlockHeader h1 = makeHeader();
+  h1.commit_round = 5;
+
+  BlockHeader h2 = makeHeader();
+  h2.commit_round = 99;
+
+  EXPECT_EQ(h1.hash().toString(), h2.hash().toString())
+      << "changing commit_round must not change the block hash";
+}
+
+TEST(Core_Core_BlockHeader, EmergencyRotationInHash)
+{
+  BlockHeader h1 = makeHeader();
+  h1.emergency_rotation = 0;
+
+  BlockHeader h2 = makeHeader();
+  h2.emergency_rotation = 1;
+
+  EXPECT_NE(h1.hash().toString(), h2.hash().toString())
+      << "changing emergency_rotation must change the block hash";
+}
+
+TEST(Core_Core_BlockHeader, SerializeRoundTrip)
 {
   BlockHeader original = makeHeader();
 
@@ -90,6 +117,8 @@ TEST(Core_BlockHeader, SerializeRoundTrip)
   EXPECT_EQ(restored.proposer.toString(), original.proposer.toString());
   EXPECT_EQ(restored.epoch, original.epoch);
   EXPECT_EQ(restored.rotation_index, original.rotation_index);
+  EXPECT_EQ(restored.commit_round, original.commit_round);
+  EXPECT_EQ(restored.emergency_rotation, original.emergency_rotation);
   EXPECT_EQ(restored.state_root.toString(), original.state_root.toString());
   EXPECT_EQ(restored.tx_root.toString(), original.tx_root.toString());
   EXPECT_EQ(restored.receipts_root.toString(), original.receipts_root.toString());
@@ -99,7 +128,7 @@ TEST(Core_BlockHeader, SerializeRoundTrip)
   EXPECT_EQ(restored.active_validator_count, original.active_validator_count);
 }
 
-TEST(Core_BlockHeader, SerializeDeterministic)
+TEST(Core_Core_BlockHeader, SerializeDeterministic)
 {
   BlockHeader h = makeHeader();
   EXPECT_EQ(h.serialize(), h.serialize());
@@ -109,7 +138,7 @@ TEST(Core_BlockHeader, SerializeDeterministic)
 //  Block
 // ============================================================================
 
-TEST(Block, WellFormedEmpty)
+TEST(Core_Block, WellFormedEmpty)
 {
   Block b;
   b.header = makeHeader();
@@ -122,7 +151,7 @@ TEST(Block, WellFormedEmpty)
   EXPECT_FALSE(b.isWellFormed());
 }
 
-TEST(Block, WellFormedWithQuorum)
+TEST(Core_Block, WellFormedWithQuorum)
 {
   Block b;
   b.header = makeHeader();
@@ -144,7 +173,30 @@ TEST(Block, WellFormedWithQuorum)
   EXPECT_TRUE(b.isWellFormed());
 }
 
-TEST(Block, RejectsTxCountMismatch)
+TEST(Core_Block, WellFormedWithEmergencyRotation)
+{
+  //  A block carrying a nonzero emergency_rotation is still
+  //  well-formed. The field changes what set the block was validated
+  //  against, not whether the header is structurally valid.
+  Block b;
+  b.header = makeHeader();
+  b.header.tx_count = 0;
+  b.header.active_validator_count = 21;
+  b.header.emergency_rotation = 42;
+
+  for (int i = 0; i < 15; ++i)
+  {
+    Crypto::ValidatorSignature vs;
+    vs.signer_index = static_cast<Index>(i);
+    for (size_t j = 0; j < 64; ++j)
+      vs.signature.data[j] = static_cast<uint8_t>(i + j);
+    b.quorum_signatures.push_back(vs);
+  }
+
+  EXPECT_TRUE(b.isWellFormed());
+}
+
+TEST(Core_Block, RejectsTxCountMismatch)
 {
   Block b;
   b.header = makeHeader();
@@ -163,7 +215,7 @@ TEST(Block, RejectsTxCountMismatch)
   EXPECT_FALSE(b.isWellFormed());
 }
 
-TEST(Block, SerializeRoundTripEmpty)
+TEST(Core_Block, SerializeRoundTripEmpty)
 {
   Block original;
   original.header = makeHeader();
@@ -184,11 +236,12 @@ TEST(Block, SerializeRoundTripEmpty)
 
   EXPECT_EQ(restored.header.height, original.header.height);
   EXPECT_EQ(restored.header.chain_id, original.header.chain_id);
+  EXPECT_EQ(restored.header.emergency_rotation, original.header.emergency_rotation);
   EXPECT_EQ(restored.transactions.size(), original.transactions.size());
   EXPECT_EQ(restored.quorum_signatures.size(), original.quorum_signatures.size());
 }
 
-TEST(Block, SerializeRoundTripWithTransactions)
+TEST(Core_Block, SerializeRoundTripWithTransactions)
 {
   Block original;
   original.header = makeHeader();
@@ -217,7 +270,7 @@ TEST(Block, SerializeRoundTripWithTransactions)
   EXPECT_EQ(restored.transactions[2].nonce, original.transactions[2].nonce);
 }
 
-TEST(Block, SerializeRoundTripWithParticipants)
+TEST(Core_Block, SerializeRoundTripWithParticipants)
 {
   Block original;
   original.header = makeHeader();
@@ -249,7 +302,7 @@ TEST(Block, SerializeRoundTripWithParticipants)
   }
 }
 
-TEST(Block, SerializeDeterministic)
+TEST(Core_Block, SerializeDeterministic)
 {
   Block b;
   b.header = makeHeader();
@@ -266,7 +319,7 @@ TEST(Block, SerializeDeterministic)
   EXPECT_EQ(b.serialize(), b.serialize());
 }
 
-TEST(Block, SerializedSizeMatchesActual)
+TEST(Core_Block, SerializedSizeMatchesActual)
 {
   Block b;
   b.header = makeHeader();
@@ -288,7 +341,7 @@ TEST(Block, SerializedSizeMatchesActual)
   EXPECT_EQ(b.serialize().size(), b.serializedSize());
 }
 
-TEST(Block, HashEqualsHeaderHash)
+TEST(Core_Block, HashEqualsHeaderHash)
 {
   Block b;
   b.header = makeHeader();
@@ -299,14 +352,14 @@ TEST(Block, HashEqualsHeaderHash)
 //  Merkle roots
 // ============================================================================
 
-TEST(MerkleRoot, EmptyReturnsNullHash)
+TEST(Core_MerkleRoot, EmptyReturnsNullHash)
 {
   std::vector<Crypto::Hash> empty;
   Crypto::Hash root = computeMerkleRoot(empty);
   EXPECT_TRUE(root.isNull());
 }
 
-TEST(MerkleRoot, SingleLeaf)
+TEST(Core_MerkleRoot, SingleLeaf)
 {
   Crypto::Hash leaf;
   for (size_t i = 0; i < 32; ++i)
@@ -320,7 +373,7 @@ TEST(MerkleRoot, SingleLeaf)
   EXPECT_FALSE(root.isNull());
 }
 
-TEST(MerkleRoot, Deterministic)
+TEST(Core_MerkleRoot, Deterministic)
 {
   std::vector<Crypto::Hash> leaves;
   for (int i = 0; i < 4; ++i)
@@ -335,7 +388,7 @@ TEST(MerkleRoot, Deterministic)
             computeMerkleRoot(leaves).toString());
 }
 
-TEST(MerkleRoot, ChangesWithLeaves)
+TEST(Core_MerkleRoot, ChangesWithLeaves)
 {
   std::vector<Crypto::Hash> leaves1;
   std::vector<Crypto::Hash> leaves2;
@@ -356,7 +409,7 @@ TEST(MerkleRoot, ChangesWithLeaves)
             computeMerkleRoot(leaves2).toString());
 }
 
-TEST(TxRoot, Deterministic)
+TEST(Core_TxRoot, Deterministic)
 {
   std::vector<Transaction> txs;
   txs.push_back(makeSimpleTx(1));
@@ -366,7 +419,7 @@ TEST(TxRoot, Deterministic)
             computeTxRoot(txs).toString());
 }
 
-TEST(TxRoot, ChangesWithTransactions)
+TEST(Core_TxRoot, ChangesWithTransactions)
 {
   std::vector<Transaction> txs1;
   txs1.push_back(makeSimpleTx(1));
@@ -378,14 +431,14 @@ TEST(TxRoot, ChangesWithTransactions)
             computeTxRoot(txs2).toString());
 }
 
-TEST(ValidatorSetRoot, Deterministic)
+TEST(Core_ValidatorSetRoot, Deterministic)
 {
   std::vector<Id> set = {1, 2, 3, 4, 5};
   EXPECT_EQ(computeValidatorSetRoot(set).toString(),
             computeValidatorSetRoot(set).toString());
 }
 
-TEST(ValidatorSetRoot, OrderIndependent)
+TEST(Core_ValidatorSetRoot, OrderIndependent)
 {
   std::vector<Id> set1 = {1, 2, 3, 4, 5};
   std::vector<Id> set2 = {5, 3, 1, 4, 2};
@@ -395,7 +448,7 @@ TEST(ValidatorSetRoot, OrderIndependent)
             computeValidatorSetRoot(set2).toString());
 }
 
-TEST(ValidatorSetRoot, ChangesWithMembers)
+TEST(Core_ValidatorSetRoot, ChangesWithMembers)
 {
   std::vector<Id> set1 = {1, 2, 3, 4, 5};
   std::vector<Id> set2 = {1, 2, 3, 4, 6};
@@ -404,14 +457,14 @@ TEST(ValidatorSetRoot, ChangesWithMembers)
             computeValidatorSetRoot(set2).toString());
 }
 
-TEST(ValidatorSetRoot, EmptyReturnsNullHash)
+TEST(Core_ValidatorSetRoot, EmptyReturnsNullHash)
 {
   std::vector<Id> empty;
   Crypto::Hash root = computeValidatorSetRoot(empty);
   EXPECT_TRUE(root.isNull());
 }
 
-TEST(BlockRoundTrip, HashSurvivesSerializeDeserialize)
+TEST(Core_BlockRoundTrip, HashSurvivesSerializeDeserialize)
 {
   Core::Block original;
   original.header.version = GlobalConfig::CURRENT_BLOCK_VERSION;
@@ -428,6 +481,7 @@ TEST(BlockRoundTrip, HashSurvivesSerializeDeserialize)
   original.header.active_validator_count = 2;
   original.header.tx_count = 0;
   original.header.total_fees = 0;
+  original.header.emergency_rotation = 0;
 
   // Hash before round-trip.
   Crypto::Hash hash_before = original.hash();
@@ -441,4 +495,36 @@ TEST(BlockRoundTrip, HashSurvivesSerializeDeserialize)
   Crypto::Hash hash_after = restored.hash();
 
   EXPECT_EQ(hash_before, hash_after);
+}
+
+TEST(Core_BlockRoundTrip, HashSurvivesWithEmergencyRotation)
+{
+  //  A block with a nonzero emergency_rotation hashes the same on both
+  //  sides of the wire. This pins the fact that the field is included
+  //  in serializeForHash and survives deserialization unchanged.
+  Core::Block original;
+  original.header.version = GlobalConfig::CURRENT_BLOCK_VERSION;
+  original.header.chain_id = 0x434C5247;
+  original.header.height = 1;
+  original.header.parent_hash.data[0] = 0x01;
+  original.header.timestamp_ms = 1'700'000'000'000ULL;
+  for (size_t i = 0; i < 32; ++i)
+    original.header.proposer.data[i] = uint8_t(0x80 + i);
+  original.header.tx_root = Core::computeTxRoot({});
+  original.header.state_root.data[0] = 0x02;
+  original.header.receipts_root = Crypto::Hash{};
+  original.header.validator_set_root = Core::computeValidatorSetRoot({1, 2});
+  original.header.active_validator_count = 2;
+  original.header.tx_count = 0;
+  original.header.total_fees = 0;
+  original.header.emergency_rotation = 42;
+
+  Crypto::Hash hash_before = original.hash();
+
+  auto bytes = original.serialize();
+  Core::Block restored;
+  ASSERT_TRUE(Core::Block::deserialize(bytes.data(), bytes.size(), restored));
+
+  EXPECT_EQ(restored.header.emergency_rotation, 42u);
+  EXPECT_EQ(hash_before, restored.hash());
 }

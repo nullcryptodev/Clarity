@@ -1068,3 +1068,241 @@ TEST_F(Core_BlockProcessorFixture, RejectsBlockWithInvalidQuorumSignature)
   EXPECT_FALSE(r.valid);
   EXPECT_EQ(r.error, "invalid quorum signature");
 }
+
+// ============================================================================
+//  Seed-only reward distribution
+// ============================================================================
+
+TEST_F(Core_BlockProcessorFixture, SeedOnlySingleSeed_EarnsProducerBonus)
+{
+  //  Fixture genesis has two seeds. Reduce the active set to just
+  //  seed 1 and apply a block.
+  const std::vector<Id> seed_set = {1};
+  withState([&](State::StateAccess &s)
+            { s.putGlobal("active_set", encodeActiveSet(seed_set)); });
+
+  Crypto::Address seed1 = validatorAddress(1);
+  uint64_t before = balanceOf(seed1);
+  uint64_t pot_before = currentPot();
+
+  BlockResult r = applyBlock(1, genesis_hash_, {}, false, seed_set);
+  ASSERT_TRUE(r.valid) << r.error;
+
+  //  Expected: seed 1 earns the full producer bonus; pot gains the
+  //  set share plus the staker pool.
+  const uint64_t validator_pool =
+      applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::VALIDATOR_SHARE_BPS);
+  const uint64_t producer_amount =
+      applyBps(validator_pool, GlobalConfig::PRODUCER_BONUS_BPS);
+  const uint64_t set_amount = validator_pool - producer_amount;
+  const uint64_t staker_pool =
+      applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::STAKER_SHARE_BPS);
+
+  EXPECT_EQ(balanceOf(seed1) - before, producer_amount);
+  EXPECT_EQ(currentPot() - pot_before, set_amount + staker_pool);
+}
+
+TEST_F(Core_BlockProcessorFixture, SeedOnlyTwoSeeds_SplitProducerBonus)
+{
+  //  Fixture default active set is {1, 2}, both seeds.
+  Crypto::Address seed1 = validatorAddress(1);
+  Crypto::Address seed2 = validatorAddress(2);
+  uint64_t s1_before = balanceOf(seed1);
+  uint64_t s2_before = balanceOf(seed2);
+  uint64_t pot_before = currentPot();
+
+  BlockResult r = applyBlock(1, genesis_hash_, {});
+  ASSERT_TRUE(r.valid) << r.error;
+
+  const uint64_t validator_pool =
+      applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::VALIDATOR_SHARE_BPS);
+  const uint64_t producer_amount =
+      applyBps(validator_pool, GlobalConfig::PRODUCER_BONUS_BPS);
+  const uint64_t set_amount = validator_pool - producer_amount;
+  const uint64_t staker_pool =
+      applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::STAKER_SHARE_BPS);
+
+  const uint64_t per_seed = producer_amount / 2;
+
+  EXPECT_EQ(balanceOf(seed1) - s1_before, per_seed);
+  EXPECT_EQ(balanceOf(seed2) - s2_before, per_seed);
+  EXPECT_EQ(currentPot() - pot_before, set_amount + staker_pool);
+}
+
+TEST_F(Core_BlockProcessorFixture, MixedActiveSet_PaysNormalSplit)
+{
+  //  Add a non-seed validator to the active set. The seed-only branch
+  //  must not fire; both seeds and the new validator participate in
+  //  the normal distribution.
+  auto target_key = Crypto::generateKeyPair();
+  constexpr Id NON_SEED_ID = 100;
+  registerValidatorWithKey(NON_SEED_ID, target_key);
+
+  const std::vector<Id> mixed_set = {1, 2, NON_SEED_ID};
+  withState([&](State::StateAccess &s)
+            { s.putGlobal("active_set", encodeActiveSet(mixed_set)); });
+
+  uint64_t pot_before = currentPot();
+
+  BlockResult r = applyBlock(1, genesis_hash_, {}, false, mixed_set);
+  ASSERT_TRUE(r.valid) << r.error;
+
+  const uint64_t staker_pool =
+      applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::STAKER_SHARE_BPS);
+
+  //  Under normal distribution, the pot only receives the staker pool
+  //  plus any multiplier-penalty differences (zero here, all multipliers
+  //  are START). The set share is paid to validators, not to the pot.
+  EXPECT_EQ(currentPot() - pot_before, staker_pool);
+
+  //  And the non-seed validator earned its share of the set amount.
+  ValidatorInfo non_seed;
+  ASSERT_TRUE(readValidator(NON_SEED_ID, non_seed));
+  EXPECT_GT(non_seed.total_rewards_earned, 0u);
+}
+
+// ============================================================================
+//  Emergency rotation
+// ============================================================================
+
+TEST_F(Core_BlockProcessorFixture, EmergencyBlock_CommitsNewActiveSet)
+{
+  //  Setup: seed 1 is offline by height criteria, seed 2 is live,
+  //  validator 3 is a pool candidate.
+  //
+  //  At the emergency block's height (100), the height-based offline
+  //  predicate is:
+  //
+  //      current_height - last_seen_height >= OFFLINE_KICK_BLOCKS (20)
+  //
+  //  So seed 1 with last_seen_height = 0 is offline at height >= 20.
+  //  Seed 2 and validator 3 must have recent last_seen_height.
+
+  auto pool_kp = Crypto::generateKeyPair();
+  registerPoolValidator(3, pool_kp);
+
+  setValidatorLastSeen(1, 0);
+  setValidatorLastSeen(2, 100);
+  setValidatorLastSeen(3, 100);
+
+  //  The emergency derivation drops seed 1 and promotes validator 3,
+  //  producing {2, 3}.
+  const std::vector<Id> emergency_set = {2, 3};
+
+  //  Build the parent chain: state must reflect a chain that has
+  //  advanced to height 100 for the height-based offline predicate to
+  //  fire. We can't just apply 100 blocks — too slow and each block
+  //  would re-rotate. Instead, the fixture's state already has
+  //  last_seen_height values set directly, and we pass height = 100
+  //  to the block.
+  //
+  //  But applyBlock checks block.header.height against the parent.
+  //  We need the block to be at the height the fixture's state
+  //  already represents. Since the fixture's state has no
+  //  chain-height variable, we just pass the height we want and let
+  //  the block's parent be genesis_hash_.
+
+  const uint64_t emergency_height = 100;
+
+  Block b = makeProcessableBlock(
+      emergency_height, genesis_hash_, {}, emergency_set,
+      /*emergency_rotation=*/emergency_height);
+
+  BlockResult r = applyPrebuiltBlock(b);
+  ASSERT_TRUE(r.valid) << r.error;
+
+  //  State reflects the emergency set.
+  auto active = readActiveSet();
+  EXPECT_EQ(active, emergency_set);
+
+  //  Flags updated to match.
+  ValidatorInfo v1, v3;
+  ASSERT_TRUE(readValidator(1, v1));
+  ASSERT_TRUE(readValidator(3, v3));
+  EXPECT_FALSE(v1.is_active)
+      << "offline validator should have been demoted";
+  EXPECT_TRUE(v3.is_active)
+      << "promoted pool validator should be active";
+
+  //  The emergency block committed at the emergency height.
+  EXPECT_EQ(b.header.height, emergency_height);
+}
+
+TEST_F(Core_BlockProcessorFixture, EmergencyBlock_QuorumVerifiedAgainstDerivedSet)
+{
+  auto pool_kp = Crypto::generateKeyPair();
+  registerPoolValidator(3, pool_kp);
+
+  setValidatorLastSeen(1, 0);
+  setValidatorLastSeen(2, 100);
+  setValidatorLastSeen(3, 100);
+
+  const std::vector<Id> emergency_set = {2, 3};
+  const uint64_t emergency_height = 100;
+
+  //  Build a valid emergency block first.
+  Block good = makeProcessableBlock(
+      emergency_height, genesis_hash_, {}, emergency_set,
+      /*emergency_rotation=*/emergency_height);
+
+  //  Corrupt one quorum signature. checkQuorum resolves signer_index 0
+  //  against active_set[0]. For an emergency block, active_set is the
+  //  derived emergency set, so active_set[0] = 2, not 1. The signature
+  //  was produced by seed2_'s key (index 0 of emergency_set's keys).
+  //  Corrupting it fails verification.
+  Block bad = good;
+  bad.quorum_signatures[0].signature.data[0] ^= 0xFF;
+
+  //  Apply the corrupted block first, from a throwaway txn, so the
+  //  real state stays at the pre-block root for the second apply.
+  {
+    BlockContext ctx = makeContext(emergency_height);
+    auto t = db_->beginWrite();
+    State::StateAccess s(*db_, t, 0);
+    BlockResult r = BlockProcessor::applyBlock(s, bad, ctx);
+    t.abort();
+
+    EXPECT_FALSE(r.valid);
+    EXPECT_EQ(r.error, "invalid quorum signature");
+  }
+
+  //  Now apply the good one for real.
+  BlockResult r = applyPrebuiltBlock(good);
+  EXPECT_TRUE(r.valid) << r.error;
+}
+
+TEST_F(Core_BlockProcessorFixture, EmergencyBlock_StateRootMatchesDerivedSet)
+{
+  //  The state root the block commits to must be the root produced by
+  //  applying it against the emergency set. If the block's simulation
+  //  and its real application disagreed about the set, the state-root
+  //  check inside applyBlock would fire and the block would be
+  //  rejected.
+  //
+  //  This test exists to catch a specific class of bug: if
+  //  makeProcessableBlock sets emergency_rotation *after* simulation,
+  //  the dry run uses the committed set and the real application uses
+  //  the emergency set. Their roots differ, and the block is rejected
+  //  even though everything else is correct.
+
+  auto pool_kp = Crypto::generateKeyPair();
+  registerPoolValidator(3, pool_kp);
+
+  setValidatorLastSeen(1, 0);
+  setValidatorLastSeen(2, 100);
+  setValidatorLastSeen(3, 100);
+
+  const std::vector<Id> emergency_set = {2, 3};
+  const uint64_t emergency_height = 100;
+
+  Block b = makeProcessableBlock(
+      emergency_height, genesis_hash_, {}, emergency_set,
+      /*emergency_rotation=*/emergency_height);
+
+  //  The block's header state_root was produced by the fixture's
+  //  dry-run simulation. Applying the block for real must produce
+  //  the same root.
+  BlockResult r = applyPrebuiltBlock(b);
+  ASSERT_TRUE(r.valid) << r.error;
+  EXPECT_EQ(r.new_state_root, b.header.state_root);
+}

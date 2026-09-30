@@ -35,6 +35,26 @@ namespace Consensus
   //  practice this is never reached.
   inline constexpr size_t MAX_EQUIVOCATION_EVIDENCE = 256;
 
+  struct RoundKey
+  {
+    Height height{0};
+    Round round{0};
+
+    bool operator==(const RoundKey &other) const noexcept
+    {
+      return height == other.height && round == other.round;
+    }
+  };
+
+  struct RoundKeyHash
+  {
+    size_t operator()(const RoundKey &k) const noexcept
+    {
+      return std::hash<uint64_t>()(k.height) ^
+             (std::hash<uint64_t>()(k.round) << 1);
+    }
+  };
+
   struct Callbacks
   {
     std::function<void(const Proposal &)> broadcast_proposal;
@@ -62,7 +82,13 @@ namespace Consensus
     std::function<Id()> my_validator_id;
     std::function<Crypto::Signature(const Crypto::Hash &)> sign;
     std::function<Height()> current_height;
-    std::function<std::vector<Id>()> active_set;
+
+    //  Returns the active set. When `force_rotation` is true, the
+    //  caller has observed enough consecutive round timeouts to
+    //  conclude the committed set can no longer form quorum, and the
+    //  derived emergency set is returned instead.
+    std::function<std::vector<Id>(bool force_rotation)> active_set;
+
     std::function<bool(Id, Core::ValidatorInfo &)> state_lookup_validator;
 
     std::function<std::optional<Crypto::PublicKey>(Index)> signer_public_key;
@@ -134,6 +160,16 @@ namespace Consensus
 
     size_t equivocationCount() const;
 
+    //  Number of consecutive rounds at the current height that ended
+    //  without a commit. Reset on successful commit and on entering a
+    //  new height. Drives the emergency rotation trigger.
+    Round consecutiveTimeouts() const;
+
+    //  True when consecutiveTimeouts() has reached
+    //  Core::EMERGENCY_ROTATION_ROUNDS. The proposer sets
+    //  block.header.emergency_rotation when this is true.
+    bool emergencyRotationActive() const;
+
   private:
     void enterNewHeight(Height height);
     void enterPropose(Height height, Round round);
@@ -150,7 +186,7 @@ namespace Consensus
     void onPrecommitTimeout();
 
     bool propose();
-    bool validateProposal(const Proposal &p, Core::Block &out_block);
+    bool validateProposal(const Proposal &p, const Core::Block &block);
     std::optional<Crypto::Hash> simulateBlock(const Core::Block &block);
 
     bool recordVote(const Vote &v, bool is_precommit);
@@ -171,6 +207,24 @@ namespace Consensus
     // Deliver any stashed proposal for the current round. Called from
     // resetForNewRound after the round counter is updated.
     void drainFutureProposal();
+
+    //  Deliver any buffered votes whose step is now current. A vote
+    //  whose block isn't known yet stays buffered unless we already
+    //  hold a vote from the same signer — in that case it's a
+    //  potential equivocation and must reach recordVote.
+    void drainPendingVotes(bool is_precommit);
+
+    //  True if we can verify the signature of a vote — that is, if we
+    //  know which active set the round ran on, and thus which key to
+    //  check the signature against.
+    bool voteIsVerifiable(const Vote &v) const;
+
+    //  Active-set resolution helpers. See the comment block in the
+    //  .cpp for the design.
+    bool roundUsesEmergencySet(Height height, Round round) const;
+    bool roundUsesEmergencySetForVote(const Vote &v) const;
+
+    bool useEmergencySet() const noexcept;
 
     Dependencies deps_;
     Callbacks callbacks_;
@@ -232,11 +286,31 @@ namespace Consensus
     std::vector<Vote> pending_prevotes_;
     std::vector<Vote> pending_precommits_;
 
-    // Evidence of equivocation seen at the current height. Cleared in
-    // resetForNewHeight. Appended to (never overwritten) in
-    // recordVote when a second vote from a signer conflicts with the
-    // first. Drained by the proposer when it builds a block.
+    //  For each (height, round) we've accepted a proposal for, the
+    //  block hash of that proposal. Lets vote verification look up the
+    //  emergency flag from the block that the round ran on, rather
+    //  than consulting the local timeout counter.
+    std::unordered_map<RoundKey, Crypto::Hash, RoundKeyHash> proposal_for_round_;
+
+    //  Evidence of equivocation seen at the current height. Appended
+    //  to (never overwritten) in recordVote when a second vote from a
+    //  signer conflicts with the first. Drained by the proposer when
+    //  it builds a block, and erased from every node when a block
+    //  containing the evidence commits.
+    //
+    //  Not cleared on height transition — evidence observed at height
+    //  H may not be included in a block until H+1 or later. Bounded by
+    //  MAX_EQUIVOCATION_EVIDENCE to prevent unbounded growth from a
+    //  peer that feeds conflicting votes.
     std::vector<EquivocationEvidence> equivocations_;
+
+    //  Consecutive rounds that ended without a commit, counted at the
+    //  current height. Reset to zero when a block commits. When this
+    //  reaches EMERGENCY_ROTATION_ROUNDS, the proposer for the next
+    //  round sets block.header.emergency_rotation, and every node
+    //  derives the emergency active set for that round's votes and
+    //  block verification.
+    Round consecutive_timeouts_{0};
   };
 
 } // namespace Consensus

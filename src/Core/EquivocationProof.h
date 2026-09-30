@@ -18,6 +18,11 @@ namespace State
   class StateAccess;
 }
 
+namespace Consensus
+{
+  struct EquivocationEvidence;
+}
+
 namespace Core
 {
   //  Equivocation proof verification.
@@ -86,4 +91,22 @@ namespace Core
                                       uint64_t round,
                                       bool is_nil,
                                       const Crypto::Hash &block_hash);
+
+  //  Decode the payload of a Slash transaction into the two votes it
+  //  carries, without verifying anything.
+  //
+  //  The payload is two votes back-to-back in the wire format produced
+  //  by Consensus::encodeVote. Both are fixed-size; no length prefix.
+  //
+  //  Returns std::nullopt if the payload length isn't exactly two
+  //  votes, or if either vote fails to decode structurally.
+  //
+  //  Callers that need cryptographic verification must use
+  //  verifyEquivocationProof instead. This function is used by
+  //  BftConsensus to identify which evidence a committed block
+  //  contains, so it can erase that evidence from its local pending
+  //  list. The block was already verified on-chain; re-verifying here
+  //  would be redundant.
+  std::optional<Consensus::EquivocationEvidence> decodeSlashEvidence(
+      const std::vector<uint8_t> &payload);
 } // namespace Core

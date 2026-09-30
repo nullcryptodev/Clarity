@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "ValidatorRotation.h"
+#include "State/StateAccess.h"
 
 #include <algorithm>
 #include <unordered_set>
@@ -422,5 +423,121 @@ namespace Core
 
     return true;
   }
+  //  Emergency active set
 
+  std::vector<Id> computeEmergencyActiveSet(
+      const ValidatorRegistry &registry,
+      const std::vector<Id> &committed,
+      uint64_t current_height,
+      bool force_rotation)
+  {
+    //  A single-validator set is returned unchanged. There is no
+    //  quorum to lose at size 1, and the emergency path can't help.
+    if (committed.size() <= 1)
+      return committed;
+
+    //  Fast path: no rotation requested. Return the committed set.
+    if (!force_rotation)
+      return committed;
+
+    //  Partition the committed set by height-based liveness, the same
+    //  predicate planOfflineRemoval uses.
+    std::vector<Id> live;
+    std::vector<Id> offline;
+    live.reserve(committed.size());
+
+    for (Id vid : committed)
+    {
+      const ValidatorInfo *v = registry.find(vid);
+      if (!v)
+      {
+        offline.push_back(vid);
+        continue;
+      }
+
+      //  NOTE: no seed special-case. Emergency rotation is the one path
+      //  where seeds are droppable, because the chain is already stalled
+      //  and can't reach quorum — a failed seed is exactly what needs to
+      //  be replaced. Normal rotation (planRotation), periodic offline
+      //  removal (planOfflineRemoval), and unhealthy culling
+      //  (findUnhealthy) all still protect seeds.
+
+      if (v->isOffline(current_height))
+        offline.push_back(vid);
+      else
+        live.push_back(vid);
+    }
+
+    //  If nothing is actually offline, there's nothing to rotate.
+    //  The chain's stall must have a different cause (network
+    //  partition, clock skew, etc.) — the emergency path can't help.
+    if (offline.empty())
+      return committed;
+
+    //  Gather pool candidates. Same predicate as planRotation's
+    //  addable set: registered, not currently active, can be active.
+    std::unordered_set<Id> committed_set(committed.begin(), committed.end());
+
+    struct Candidate
+    {
+      Id id;
+      uint16_t uptime;
+      uint64_t last_active;
+    };
+    std::vector<Candidate> pool;
+
+    for (const auto &v : registry.validators)
+    {
+      if (v.id == INVALID_ID)
+        continue;
+      if (committed_set.count(v.id) > 0)
+        continue;
+      if (v.is_active)
+        continue;
+      if (!v.canBeActive())
+        continue;
+      pool.push_back({v.id, v.uptime_score, v.last_active_at});
+    }
+
+    std::sort(pool.begin(), pool.end(),
+              [](const Candidate &a, const Candidate &b)
+              {
+                if (a.uptime != b.uptime)
+                  return a.uptime > b.uptime;
+                return a.last_active < b.last_active;
+              });
+
+    const size_t promote_count = std::min(offline.size(), pool.size());
+    for (size_t i = 0; i < promote_count; ++i)
+      live.push_back(pool[i].id);
+
+    std::sort(live.begin(), live.end());
+    return live;
+  }
+  //  Emergency active set resolution
+
+  std::vector<Id> resolveActiveSet(
+      State::StateAccess &state,
+      const std::vector<Id> &committed,
+      uint64_t current_height,
+      bool emergency)
+  {
+    if (!emergency)
+      return committed;
+
+    //  Build the validator registry. Every registered validator is
+    //  needed, not just the active set — pool candidates are the
+    //  source of replacements, and the emergency derivation needs to
+    //  see them.
+    ValidatorRegistry registry;
+    registry.active_set = committed;
+    state.forEachValidator([&registry](const ValidatorInfo &v)
+                           { registry.validators.push_back(v); });
+
+    return computeEmergencyActiveSet(
+        registry,
+        committed,
+        current_height,
+        /*force_rotation=*/true);
+  }
 } // namespace Core

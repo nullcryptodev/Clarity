@@ -89,6 +89,15 @@ namespace Core
   inline constexpr uint64_t SECONDS_PER_EPOCH =
       ROTATION_INTERVAL * NOMINAL_BLOCK_SECONDS;
 
+  //  Consecutive round timeouts that trigger the emergency rotation
+  //  path. A single round timing out is normal (network jitter, a slow
+  //  proposer). Thirty consecutive timeouts is evidence the committed
+  //  active set has lost quorum.
+  //
+  //  At ~5 seconds per round, this is roughly 2.5 minutes of stall
+  //  before the emergency path fires.
+  inline constexpr uint64_t EMERGENCY_ROTATION_ROUNDS = 30;
+
   // ---- Pot mechanics ----
   //
   // The pot holds staker rewards that couldn't be distributed because
@@ -149,12 +158,6 @@ namespace Core
   // Number of consecutive blocks offline before a validator is removed.
   // Provides a grace period for transient network blips.
   inline constexpr uint64_t OFFLINE_KICK_BLOCKS = 20;
-
-  // ---- Chain halt ----
-
-  // If the live (non-offline) active set drops below this, consensus
-  // cannot proceed. The chain halts and logs a critical error.
-  inline constexpr size_t MIN_LIVE_VALIDATORS = 4;
 
   // ---- Slashing (reward multiplier) ----
 

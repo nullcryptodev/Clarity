@@ -5,6 +5,8 @@
 
 #include "EquivocationProof.h"
 
+#include "Consensus/Message.h"
+#include "Consensus/Types.h"
 #include "Crypto/Blake2b.h"
 #include "Crypto/Ed25519.h"
 #include "State/StateAccess.h"
@@ -15,17 +17,15 @@ namespace Core
 {
   namespace
   {
-    //  Wire-format sizes, matching Consensus::encodeVote.
-    //
-    //    [8]  height
-    //    [8]  round
-    //    [2]  signer_index
-    //    [1]  is_nil
-    //    [32] block_hash
-    //    [64] signature
-    //
-    //  Total: 115 bytes.
-    constexpr size_t VOTE_WIRE_SIZE = 8 + 8 + 2 + 1 + 32 + 64;
+    //  Wire size of one Consensus::Vote, computed once from a
+    //  default-constructed vote. Using encodeVote itself means this
+    //  constant tracks the encoder: if the wire format changes, this
+    //  changes with it.
+    const size_t VOTE_WIRE_SIZE = []
+    {
+      Consensus::Vote v;
+      return Consensus::encodeVote(v).size();
+    }();
     constexpr size_t VOTE_PREFIX_SIZE = 8 + 8 + 2 + 1 + 32; // no signature
 
     //  Core-local mirror of Consensus::Vote. Only the fields needed
@@ -119,18 +119,13 @@ namespace Core
       const std::vector<uint8_t> &vote_a_bytes,
       const std::vector<uint8_t> &vote_b_bytes)
   {
+    //  Wire format: the two votes back-to-back, no framing. Both are
+    //  fixed-size (VOTE_WIRE_SIZE bytes each), so no length prefix is
+    //  needed. The total is 2 * VOTE_WIRE_SIZE.
     std::vector<uint8_t> out;
-    out.reserve(4 + vote_a_bytes.size() + vote_b_bytes.size());
-
-    uint32_t len_a = static_cast<uint32_t>(vote_a_bytes.size());
-    out.push_back(uint8_t(len_a));
-    out.push_back(uint8_t(len_a >> 8));
-    out.push_back(uint8_t(len_a >> 16));
-    out.push_back(uint8_t(len_a >> 24));
-
+    out.reserve(vote_a_bytes.size() + vote_b_bytes.size());
     out.insert(out.end(), vote_a_bytes.begin(), vote_a_bytes.end());
     out.insert(out.end(), vote_b_bytes.begin(), vote_b_bytes.end());
-
     return out;
   }
 
@@ -149,27 +144,14 @@ namespace Core
   {
     //  ---- 1. Decode framing ----
 
-    if (payload.size() < 4)
-      return std::nullopt;
-
-    uint32_t len_a = uint32_t(payload[0]) |
-                     (uint32_t(payload[1]) << 8) |
-                     (uint32_t(payload[2]) << 16) |
-                     (uint32_t(payload[3]) << 24);
-
-    if (len_a != VOTE_WIRE_SIZE)
-      return std::nullopt;
-
-    const size_t vote_a_off = 4;
-    const size_t vote_b_off = vote_a_off + len_a;
-
-    if (payload.size() != vote_b_off + VOTE_WIRE_SIZE)
+    //  Wire format: two fixed-size votes, back to back, no framing.
+    if (payload.size() != 2 * VOTE_WIRE_SIZE)
       return std::nullopt;
 
     DecodedVote va, vb;
-    if (!decodeVoteBytes(payload.data() + vote_a_off, len_a, va))
+    if (!decodeVoteBytes(payload.data(), VOTE_WIRE_SIZE, va))
       return std::nullopt;
-    if (!decodeVoteBytes(payload.data() + vote_b_off, VOTE_WIRE_SIZE, vb))
+    if (!decodeVoteBytes(payload.data() + VOTE_WIRE_SIZE, VOTE_WIRE_SIZE, vb))
       return std::nullopt;
 
     //  ---- 2. Same (height, round, signer_index) ----
@@ -224,5 +206,26 @@ namespace Core
       return std::nullopt;
 
     return validator_id;
+  }
+
+  std::optional<Consensus::EquivocationEvidence> decodeSlashEvidence(
+      const std::vector<uint8_t> &payload)
+  {
+    if (payload.size() != 2 * VOTE_WIRE_SIZE)
+      return std::nullopt;
+
+    Consensus::Vote vote_a;
+    if (!Consensus::decodeVote(payload.data(), VOTE_WIRE_SIZE, vote_a))
+      return std::nullopt;
+
+    Consensus::Vote vote_b;
+    if (!Consensus::decodeVote(payload.data() + VOTE_WIRE_SIZE,
+                               VOTE_WIRE_SIZE, vote_b))
+      return std::nullopt;
+
+    Consensus::EquivocationEvidence ev;
+    ev.vote_a = vote_a;
+    ev.vote_b = vote_b;
+    return ev;
   }
 } // namespace Core

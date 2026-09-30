@@ -92,6 +92,7 @@ namespace Core
     Common::putU64(out, epoch);
     Common::putU64(out, rotation_index);
     Common::putU64(out, commit_round);
+    Common::putU64(out, emergency_rotation);
     Common::putBytes(out, state_root.data.data(), state_root.data.size());
     Common::putBytes(out, tx_root.data.data(), tx_root.data.size());
     Common::putBytes(out, receipts_root.data.data(), receipts_root.data.size());
@@ -120,6 +121,7 @@ namespace Core
     Common::putU64(out, epoch);
     Common::putU64(out, rotation_index);
     // commit_round omitted from the hash.
+    Common::putU64(out, emergency_rotation);
     Common::putBytes(out, state_root.data.data(), state_root.data.size());
     Common::putBytes(out, tx_root.data.data(), tx_root.data.size());
     Common::putBytes(out, receipts_root.data.data(), receipts_root.data.size());
@@ -148,6 +150,7 @@ namespace Core
     out.epoch = r.readU64();
     out.rotation_index = r.readU64();
     out.commit_round = r.readU64();
+    out.emergency_rotation = r.readU64();
 
     r.readBytes(out.state_root.data.data(), out.state_root.data.size());
     r.readBytes(out.tx_root.data.data(), out.tx_root.data.size());

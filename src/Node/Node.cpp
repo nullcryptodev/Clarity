@@ -7,6 +7,7 @@
 
 #include "Core/Genesis.h"
 #include "Core/TransactionExecutor.h"
+#include "Core/ValidatorRotation.h"
 #include "Consensus/Message.h"
 #include "P2P/MessageTypes.h"
 #include "P2P/VersionMessage.h"
@@ -577,8 +578,15 @@ namespace Node
     { return signHash(h); };
     deps.current_height = [this]()
     { return getCurrentHeight(); };
-    deps.active_set = [this]()
-    { return getActiveSet(); };
+
+    deps.active_set = [this](bool force_rotation) -> std::vector<Id>
+    {
+      State::StateAccess state(*state_db_, /*version=*/0);
+      std::vector<Id> committed = getActiveSet();
+      return Core::resolveActiveSet(
+          state, committed, chain_->height(), force_rotation);
+    };
+
     deps.signer_public_key = [this](Index idx)
     { return getSignerPublicKey(idx); };
 
@@ -586,6 +594,11 @@ namespace Node
         [this](Id id, Core::ValidatorInfo &out) -> bool
     {
       auto state = makeStateView();
+
+      (*log_)(Logging::ERROR) << "state_lookup_validator: id=" << id
+                              << " -> addr=" << out.reward_address.toString().substr(0, 16)
+                              << "\n";
+
       return state->getValidator(id, out);
     };
 

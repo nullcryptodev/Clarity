@@ -1,4 +1,4 @@
-![Known Tests](https://img.shields.io/badge/Passing_Tests-1%2C540%20%28100%25%29-blue)
+![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C564%20%28100%25%29-blue)
 
 ## Build
 
@@ -61,13 +61,17 @@ Wallet           keystores, HD derivation (BIP39/SLIP10), signing, addresses
 
 **Validator set:** Bounded between 11 and 100. Rotates at epoch boundaries (every 60 blocks, `ROTATION_INTERVAL`). The rotation is sized to `min(ceil(n / 21), n - bftQuorum(n))` — a small enough fraction that rotation can never break quorum.
 
-**Seed validators:** Two seed validators are defined in the regtest genesis and presumably in mainnet genesis. They are never removed from the active set regardless of uptime, stake, or liveness. This is the trust anchor for bootstrap — the seeds are expected to be operated by the project itself.
+**Seed validators:** Two seed validators are defined in the regtest genesis and presumably in mainnet genesis. They are never removed from the active set by normal rotation, offline removal, or unhealthy-culling. This is the trust anchor for bootstrap — the seeds are expected to be operated by the project itself.
+
+**Emergency rotation:** If the committed set can no longer form quorum, `BftConsensus` counts consecutive round timeouts. At `EMERGENCY_ROTATION_ROUNDS` (30) the proposer stamps `block.header.emergency_rotation` and builds against a derived set — committed minus offline validators, plus pool promotions. Every verifier reads the flag from the block and derives the same set. Seeds are droppable here, unlike the normal paths. When the emergency block commits, the derived set becomes the committed set. The field is part of the block hash.
+
+**The active set is a function of the block, not the local counter.** `handleProposal`, `recordVote`, `quorumThreshold`, and `mySignerIndex` all read the emergency flag from the proposal's block header. The local counter is only consulted by the proposer to decide whether to stamp the flag. This prevents two nodes whose counters differ by one from computing different proposers. A vote's `signer_index` resolves through `active_set[signer_index]` → validator record → signing key, matching `checkQuorum`. Votes for unknown blocks buffer until the block arrives; a second vote from a known signer is routed to `recordVote` regardless, so a conflict is detectable without the block.
 
 **Dry-run vs. finalized validation:** The block processor distinguishes between *simulating* a block (the proposer needs to know what state root a candidate block would produce, but the block's state root and quorum signatures aren't populated yet) and *applying* a finalized block. `BlockContext::dry_run` skips structural header checks, quorum verification, and the state-root comparison; the non-dry path runs them all. This split is load-bearing — the consensus proposer relies on it, and the test suite exercises both paths.
 
 ## State: how the chain is stored
 
-**Storage:** MDBX, a memory-mapped key-value store. Fifteen tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, three index tables (stakers, validators, order expiry), receipts, tx index, blocks by hash, blocks by height.
+**Storage:** MDBX, a memory-mapped key-value store. Sixteen tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, three index tables (stakers, validators, order expiry), receipts, tx index, blocks by hash, blocks by height, and the persistent mempool.
 
 **State commitment:** A **sparse Merkle tree** of depth 256. Each key is a 32-byte hash (derived from an account address, token balance key, validator ID, or global state name). Each leaf commits to a value. The tree root is the state root, which is written into every block header. Any two nodes with the same state produce the same root.
 
@@ -99,15 +103,23 @@ Every transaction is signed with Ed25519 by the sender, has a nonce for replay p
 
 ## Economics: how value flows
 
-**Block reward:** Each block issues a fixed reward in CLRTY. The reward splits into a validator pool (60%), a staker pool (the remaining 40%), and a producer bonus (20% of the validator pool, paid to the block's proposer).
+**Block reward:** Each block issues a fixed reward in CLRTY. The reward splits into a validator pool (60%) and a staker pool (40%).
 
-**Validator rewards:** The validator pool is split across active validators, weighted by their `reward_multiplier`. A validator that has been penalized for infractions has a reduced multiplier. Any validator ID in the active set with no corresponding validator record has its share routed to the pot.
+**Validator pool:** The validator pool splits into a producer bonus (20% of the pool, paid to the block's proposer) and a set share (80% of the pool, split across the active set).
+
+**Validator rewards:** Under the normal path, the producer bonus goes to the proposer and the set share is split evenly across active validators, weighted by their `reward_multiplier`. A validator that has been penalized for infractions has a reduced multiplier, and the difference is routed to the pot. Any validator ID in the active set with no corresponding validator record has its share routed to the pot.
+
+**Seed-only reward policy:** When every validator in the active set is a seed, the normal split is replaced. The producer bonus is distributed evenly across all seeds — the producing seed earns no more than any other seed, because seeds are operated as a single entity and the distinction between producing and signing is bookkeeping noise. The entire set share (80% of the validator pool) is routed to the pot, along with the staker pool.
+
+This is deliberate: paying seeds the full validator pool on a chain with no other validators would concentrate wealth and provide no incentive for new validators to register. The policy fires only when *every* active validator is a seed — a single non-seed in the set resumes normal distribution, so a validator that joins a seed-heavy chain starts earning its share immediately.
+
+The degenerate case is one seed: the seed earns the full producer bonus, and the set share plus staker pool go to the pot. The invariant `validator_earnings + pot_earnings == block_reward` holds in every case.
 
 **Staker rewards:** The staker pool accumulates in a "pot" on a per-block basis. At each epoch boundary (every 60 blocks), the pot is drained to pay stakers a target APY. Stakers are weighted by their staked balance, with a bonus for large balances (`BALANCE_BONUS_THRESHOLD`, `BALANCE_BONUS_BPS`), and time-weighted by how long they've been staked during the epoch.
 
 **APY mechanism:** The target APY is `base + activity + pot_bonus`. Base is a fixed 5% (`APY_BASE_BPS = 500`). Activity scales with transaction throughput, up to a cap. Pot bonus scales with how full the pot is, up to a cap. The effective APY is capped at some maximum (`APY_ACTIVITY_MAX_BPS + APY_POT_BONUS_MAX_BPS + base`, all uint16).
 
-**Pot mechanics:** The pot accumulates 40% of each block reward as it's issued. At the epoch boundary, the protocol tries to pay stakers the target APY. If the pot doesn't have enough, it pays what it has and drains. If the pool (this epoch's 40% contribution) doesn't cover the target, the pot fills in the gap. If the pot exceeds a maximum, the excess is burned.
+**Pot mechanics:** The pot accumulates 40% of each block reward as it's issued, plus the set share during seed-only blocks, plus the difference from any validator's reward multiplier penalty, plus any slash proceeds. At the epoch boundary, the protocol tries to pay stakers the target APY. If the pot doesn't have enough, it pays what it has and drains. If the pool (this epoch's 40% contribution) doesn't cover the target, the pot fills in the gap. If the pot exceeds a maximum, the excess is burned.
 
 **Total supply:** Increases by the block reward each block. Genesis has an initial supply of 100M CLRTY on mainnet (10M on testnet, 1M on regtest). Genesis distributes to a community fund (60M), development (20M), treasury (10M), and two seed validators (5M each). Total supply grows without a cap, but the growth rate is bounded by the block reward.
 
@@ -117,7 +129,7 @@ Every transaction is signed with Ed25519 by the sender, has a nonce for replay p
 
 A validator whose post-slash stake falls below `VALIDATOR_MIN_STAKE` becomes ineligible for the active set via the existing `canBeActive` check, and rotation removes it on the next epoch boundary.
 
-**How equivocation is detected and slashed:** Nodes detect conflicting votes during the prevote phase, retain the evidence across height transitions, and the proposer includes a `TxType::Slash` transaction carrying the proof in the next block it builds. Every node independently verifies the proof during block application — same proof, same result, same state on every honest node. Verification checks framing, `(height, round, signer)` agreement, value disagreement, signer range, validator registration, and both Ed25519 signatures over the domain-separated vote hash. A block containing an invalid Slash proof is rejected.
+**How equivocation is detected and slashed:** Nodes detect conflicting votes during the prevote phase. The conflict check runs before signature verification and before any dependency on the active set, so a conflict is recorded even when the block being voted on is unknown. Evidence survives round and height transitions, bounded by `MAX_EQUIVOCATION_EVIDENCE` (256 entries), and the proposer includes a `TxType::Slash` transaction carrying the proof in the next block it builds. Every node independently verifies the proof during block application — same proof, same result, same state on every honest node. Verification checks framing, `(height, round, signer)` agreement, value disagreement, signer range, validator registration, and both Ed25519 signatures over the domain-separated vote hash. A block containing an invalid Slash proof is rejected. Once a Slash tx commits, every node erases matching evidence by scanning the committed block — not just the proposer. Evidence against the same `(signer, height, round)` is erased together: multiple conflicting pairs from one validator at one `(H, R)` describe one offense, and including them separately would double-slash.
 
 ## Network: how nodes talk
 
@@ -179,8 +191,6 @@ A validator whose post-slash stake falls below `VALIDATOR_MIN_STAKE` becomes ine
 
 ## What's notably absent
 
-**No persistent mempool.** Pending transactions are lost on restart. Peers re-broadcast their pending transactions on reconnect, so the network recovers the important ones — but a transaction submitted immediately before a restart may be gone until someone re-submits it.
-
 **No versioned state *queries*.** `rootAtVersion(n)` retrieves a historical root, but you cannot retrieve a *key's value* at version `n`. This makes it impossible to answer "what was this account's balance at block 1000?" against the SMT alone. A block-explorer-style service would need to maintain its own historical index.
 
 **No historical pruning.** Every state is retained. The DB grows unboundedly. Fine for a small network, not for a long-running one. The SMT has a `prune` hook that isn't wired up.
@@ -207,6 +217,8 @@ A validator whose post-slash stake falls below `VALIDATOR_MIN_STAKE` becomes ine
 
 **Slashing does not survive rotation.** A proof's `signer_index` resolves against the active set at the block being applied. If rotation runs between detection and inclusion, the proof fails and the proposer's `state_lookup_validator` filter drops it before inclusion. A versioned active-set store would let a proof resolve against the set at the height it names.
 
+**Emergency rotation is untested end to end.** Every component is tested in isolation — the derivation, the block path, the timeout counter, vote verification, evidence lifetime — but there is no test that drives a stalled network through the counter threshold and asserts recovery. The `ConsensusNetwork` fixture doesn't model offline validators or pool candidates.
+
 **No wallet CLI.** The wallet layer is a library. There's no `clarity-wallet` binary, no interactive key management, no transaction signing UI, no address book management. Integrators drive the library directly.
 
 ## Design choices worth noting
@@ -219,9 +231,11 @@ A validator whose post-slash stake falls below `VALIDATOR_MIN_STAKE` becomes ine
 
 **Reward distribution is epoch-based for stakers, block-based for validators.** Validators get paid every block. Stakers get paid every epoch (60 blocks). Keeps the per-block state transition cheap and defers the expensive iteration to the epoch boundary.
 
-**Pot mechanism as a smoothing buffer.** The pot accumulates staker rewards when activity is low and releases them when activity is high. Decouples the staker payout from the current block's activity, giving a more stable APY.
+**Pot mechanism as a smoothing buffer.** The pot accumulates staker rewards when activity is low and releases them when activity is high. Decouples the staker payout from the current block's activity, giving a more stable APY. The pot is the destination for every unallocated reward: validator pool remainders when the active set contains unknown validator IDs, reward multiplier penalty differences, seed-only set shares, and slash proceeds.
 
 **Validator rotation is bounded by BFT safety.** `computeRotationCount` never removes more validators than would keep the remaining set above quorum. A validator set of 4 can rotate at most 1 per epoch; a set of 100 can rotate up to 33. Rotation is gradual by design.
+
+**State transitions are pure functions of the block and the state they run against.** Nothing inside `applyBlock` reads wall-clock time, local peer state, or hardware entropy. This is why the emergency rotation decision lives in the block header rather than a per-node timer: a node can look at its own clock to decide *whether* to stamp the flag, but only the *value* it stamped goes into the block, and only the block feeds the state. An earlier draft wrote a wall-clock timestamp into validator records inside `applyBlock`; two nodes applying the same block at slightly different times produced different state roots, and every block-processor test failed at once.
 
 **Wire codec is a codec, not a validator.** `BlockHeader::deserialize` round-trips bytes without applying consensus rules. `isWellFormed` is a separate, explicit step the acceptance path runs. This matters for three reasons: historical blocks remain readable if rules change, diagnostic tools can inspect malformed blocks without satisfying consensus rules, and test fixtures can construct blocks whose fields aren't all populated yet.
 
@@ -236,3 +250,9 @@ A validator whose post-slash stake falls below `VALIDATOR_MIN_STAKE` becomes ine
 **Messages are weighted for rate limiting.** The per-peer token bucket charges by message type: cheap control messages cost 1, `Tx` costs 5, `GetHeaders` and `GetBlocks` cost 20. This reflects the asymmetry of work — a `GetHeaders` is 12 bytes on the wire but causes the server to do up to 2000 lookups. Consensus messages use a separate, stricter bucket.
 
 **Slashing is automatic, not voted.** A proof of equivocation is a mathematical fact — two valid signatures over conflicting values at the same `(height, round)`. It isn't subject to a vote, because a Byzantine majority could vote to slash an honest validator but cannot forge a signature. Automatic application means the safety argument of BFT is economically enforced: a validator that equivocates loses stake and earnings, regardless of what the other validators think about it.
+
+**Evidence is erased on commit, by every node.** When a block containing a Slash tx commits, every node scans the block's transactions, decodes each Slash tx, and erases matching evidence from its own pending list. Not just the proposer — every node. Only the proposer knows what it *tried* to include; a non-proposer only sees the block. Reading the block as the source of truth is what keeps all nodes in sync.
+
+**Seed rewards are stipend-based, not fee-based.** When the active set contains only seeds, the producer bonus is split evenly across seeds and the set share is routed to the pot. The producing seed earns no more than any other seed — seeds are a single operational entity, and the distinction between producing and signing is bookkeeping noise. This keeps a young chain's rewards flowing into the pot (where they eventually pay stakers) rather than concentrating in the seed operators' balances, and it preserves the incentive for new validators to register: the moment a non-seed joins the active set, normal distribution resumes.
+
+**Persistent mempool.** The mempool writes through to a dedicated MDBX table (`TBL_MEMPOOL`) on every mutation — add, remove, removeIncluded, purgeExpired, clear. On startup, `Node::initMempool` rebuilds the pool by re-adding each persisted entry through the normal validation path; entries that fail (nonce too low, insufficient funds, expired, already on chain) are dropped and their rows deleted. This means a transaction submitted before a restart is still in the pool after the node comes back — important for the case where a user submits a tx and the operator restarts their validator before the next block commits it. The persisted entry carries the full `Entry` (tx, tier, fee rate, sequence, add time), not just the transaction, so priority status and eviction ordering survive a restart.

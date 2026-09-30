@@ -97,6 +97,8 @@ namespace Core
                                      const Block &block,
                                      const BlockContext &ctx);
 
+    static ValidatorRegistry loadValidatorRegistry(State::StateAccess &state);
+
   private:
     // ---- Pre-checks (before any state mutation) ----
 
@@ -170,7 +172,10 @@ namespace Core
 
     // ---- Helpers ----
 
-    // Load the current active validator set from state.
+    // Load the active set used by consensus and block application.
+    // Under normal conditions this is the committed set. When the
+    // committed set can no longer form quorum by wall clock, this
+    // returns the derived emergency set instead. See
     static std::vector<Id> loadActiveSet(State::StateAccess &state);
 
     // Compute the epoch number for a given block height.

@@ -22,11 +22,21 @@
 
 #include <algorithm>
 #include <cstring>
+#include <unordered_set>
+#include <iostream>
 
 namespace Core
 {
   namespace
   {
+    uint64_t nowMs() noexcept
+    {
+      using namespace std::chrono;
+      return duration_cast<milliseconds>(
+                 system_clock::now().time_since_epoch())
+          .count();
+    }
+
     uint64_t readU64Global(State::StateAccess &state, const char *name)
     {
       std::vector<uint8_t> bytes;
@@ -92,7 +102,23 @@ namespace Core
       return result;
     }
 
-    std::vector<Id> active_set = loadActiveSet(state);
+    //  Resolve the active set for this block. Under normal conditions
+    //  this is the committed set from state. When the block carries
+    //  the emergency_rotation flag, the emergency set is derived from
+    //  the same inputs the proposer used — committed_set, the
+    //  validator registry, and the current height — so quorum and
+    //  set-root verification see the same set every honest node
+    //  computes.
+    //
+    //  The derivation must be a pure function of state and height.
+    //  Both the proposer (via Node::buildConsensusDeps::active_set)
+    //  and every verifier (here) call resolveActiveSet, so they can't
+    //  drift.
+    std::vector<Id> committed_set = loadActiveSet(state);
+    const bool is_emergency = (block.header.emergency_rotation > 0);
+    std::vector<Id> active_set = is_emergency
+                                     ? resolveActiveSet(state, committed_set, ctx.current_height, true)
+                                     : committed_set;
 
     if (active_set.size() != block.header.active_validator_count)
     {
@@ -125,6 +151,58 @@ namespace Core
     {
       result.error = error;
       return result;
+    }
+
+    //  Emergency rotation commit. If this block was proposed on the
+    //  emergency set, that set becomes the new committed set. The
+    //  is_active flags are flipped to match — the same bookkeeping
+    //  applyOfflineRemoval performs, but driven by the emergency
+    //  derivation instead of the height-based one.
+    //
+    //  Writing the emergency set back to state is what makes the
+    //  rotation durable. The next block reads the new committed set
+    //  from state and no longer needs the emergency flag.
+    if (is_emergency && active_set != committed_set)
+    {
+      std::unordered_set<Id> was_active(
+          committed_set.begin(), committed_set.end());
+      std::unordered_set<Id> now_active(
+          active_set.begin(), active_set.end());
+
+      for (Id vid : committed_set)
+      {
+        if (now_active.count(vid) > 0)
+          continue;
+
+        ValidatorInfo v;
+        if (!state.getValidator(vid, v))
+          continue;
+        v.is_active = false;
+        v.last_active_at = ctx.current_height;
+        state.putValidator(v);
+      }
+
+      for (Id vid : active_set)
+      {
+        if (was_active.count(vid) > 0)
+          continue;
+
+        ValidatorInfo v;
+        if (!state.getValidator(vid, v))
+          continue;
+        v.is_active = true;
+        v.became_active_at = ctx.current_height;
+        state.putValidator(v);
+      }
+
+      std::vector<uint8_t> set_bytes;
+      set_bytes.reserve(active_set.size() * 8);
+      for (auto vid : active_set)
+      {
+        for (int i = 0; i < 8; ++i)
+          set_bytes.push_back(uint8_t(vid >> (i * 8)));
+      }
+      state.putGlobal("active_set", set_bytes);
     }
 
     for (auto vid : block.participants)
@@ -230,10 +308,7 @@ namespace Core
       return false;
     }
 
-    uint64_t now_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
+    uint64_t now_ms = nowMs();
     if (block.header.timestamp_ms > now_ms + 2000)
     {
       error = "timestamp is too far in the future";
@@ -454,6 +529,10 @@ namespace Core
 
     reward_ctx.total_staked = readU64Global(state, "total_staked");
 
+    //  Rewards are paid to the set that actually produced this block.
+    //  For an emergency block, that's the derived set written to state
+    //  above. Re-reading here gives us the same value, since the write
+    //  happened earlier in applyBlock.
     std::vector<Id> active_set = loadActiveSet(state);
 
     ValidatorRegistry registry;
@@ -477,6 +556,102 @@ namespace Core
     BlockRewardResult rewards = computeBlockReward(reward_ctx, registry);
 
     uint64_t total_redistributed = 0;
+
+    //  ---- Seed-only special case ----
+    //
+    //  When every validator in the active set is a seed, the normal
+    //  reward split is replaced by a "seed stipend" model:
+    //
+    //    - The producer bonus (20% of the validator pool) is split
+    //      evenly across all seeds, regardless of which seed proposed
+    //      the block. Seeds are operated as a single entity, so the
+    //      distinction between producing and signing is bookkeeping
+    //      noise.
+    //
+    //    - The set share (80% of the validator pool) is routed to the
+    //      pot rather than paid to the seeds. Paying a seed the full
+    //      validator pool on a chain with no other validators would
+    //      concentrate wealth and provide no incentive for new
+    //      validators to register.
+    //
+    //  When the active set contains even one non-seed, the normal
+    //  distribution resumes. This preserves the incentive to register:
+    //  a validator that joins a seed-heavy chain starts earning
+    //  immediately.
+    //
+    //  Degenerate case: with one seed, the seed earns the full
+    //  producer bonus and the set share goes to the pot.
+    const bool seed_only = !active_set.empty() &&
+                           std::all_of(active_set.begin(), active_set.end(),
+                                       [&](Id vid)
+                                       {
+                                         ValidatorInfo v;
+                                         return state.getValidator(vid, v) && v.is_seed;
+                                       });
+
+    if (seed_only)
+    {
+      const uint64_t seed_pool = rewards.producer_amount;
+      const uint64_t seed_count = active_set.size();
+      const uint64_t per_seed = seed_pool / seed_count;
+      uint64_t remainder = seed_pool % seed_count;
+
+      for (Id vid : active_set)
+      {
+        uint64_t amount = per_seed;
+        if (remainder > 0)
+        {
+          amount += 1;
+          --remainder;
+        }
+
+        ValidatorInfo v;
+        if (!state.getValidator(vid, v))
+        {
+          //  Should not happen — the caller loaded the set from state.
+          //  If it does, the amount is routed to the pot.
+          total_redistributed += amount;
+          continue;
+        }
+
+        //  Apply the reward multiplier, matching the normal path.
+        //  In practice a seed's multiplier is always START, so this
+        //  is a no-op, but keeping it makes the code consistent and
+        //  handles any future policy that penalizes a seed.
+        const uint64_t adjusted = amount * v.reward_multiplier / 10'000;
+        const uint64_t difference = amount - adjusted;
+
+        if (adjusted > 0)
+        {
+          Account acct = state.getAccount(v.reward_address);
+          acct.balance += adjusted;
+          state.putAccount(v.reward_address, acct);
+        }
+
+        v.total_rewards_earned += adjusted;
+        state.putValidator(v);
+
+        total_redistributed += difference;
+      }
+
+      //  Route the entire set share to the pot.
+      total_redistributed += rewards.set_amount;
+
+      //  Credit the pot and return. The normal producer loop and
+      //  per-validator set-share loop are skipped — the seed stipend
+      //  above replaces both.
+      uint64_t pot = readU64Global(state, "pot");
+      pot += total_redistributed;
+
+      const uint64_t staker_pool =
+          applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::STAKER_SHARE_BPS);
+      pot += staker_pool;
+
+      writeU64Global(state, "pot", pot);
+      return;
+    }
+
+    //  ---- Normal (non-seed-only) distribution ----
 
     if (rewards.producer_amount > 0 && !active_set.empty())
     {

@@ -328,3 +328,123 @@ TEST_F(Consensus_NetworkFixture, EquivocationProducesSlashTxInCommittedBlock)
       << "no committed block contained a Slash tx after an "
          "equivocation was recorded";
 }
+
+TEST_F(Consensus_NetworkFixture, EquivocationEvidenceIncludedExactlyOnce)
+{
+  //  After an equivocation is recorded and a block commits with a
+  //  Slash tx, the evidence is erased. No subsequent block should
+  //  contain another Slash tx for the same signer.
+  //
+  //  Regression guard for the evidence-drain fix: if the proposer
+  //  erased evidence at propose time (as an earlier draft did), the
+  //  first Slash tx could be lost if its block failed to commit —
+  //  and if the proposer did NOT erase on commit (a naive fix), the
+  //  evidence would be re-included in every subsequent block.
+  //
+  //  This test pins the middle ground: erased once, on commit,
+  //  nowhere else.
+  constexpr size_t N = 4;
+  constexpr size_t EQUIVOCATOR_IDX = 2;
+
+  ConsensusNetwork net(N, logger_);
+  net.startAll(/*height=*/1);
+
+  //  Advance past Propose so every node is in Prevote, then inject
+  //  the two conflicting votes. This is the same setup as
+  //  EquivocationProducesSlashTxInCommittedBlock.
+  net.advanceAllTimers();
+
+  auto probe = net.instance(0).state();
+  const Height H = probe.height;
+  const Round R = probe.round;
+
+  const auto &eq = net.validator(EQUIVOCATOR_IDX);
+  const Index signer_index = static_cast<Index>(EQUIVOCATOR_IDX);
+
+  Consensus::Vote vote_a;
+  vote_a.height = H;
+  vote_a.round = R;
+  vote_a.signer_index = signer_index;
+  vote_a.is_nil = false;
+  vote_a.block_hash = makeHash(0xAAAA);
+  vote_a.signature = eq.sign(
+      Consensus::voteSigningHash(H, R, false, vote_a.block_hash));
+
+  Consensus::Vote vote_b;
+  vote_b.height = H;
+  vote_b.round = R;
+  vote_b.signer_index = signer_index;
+  vote_b.is_nil = false;
+  vote_b.block_hash = makeHash(0xBBBB);
+  vote_b.signature = eq.sign(
+      Consensus::voteSigningHash(H, R, false, vote_b.block_hash));
+
+  for (size_t i = 0; i < N; ++i)
+    net.instance(i).onPrevote(vote_a);
+  for (size_t i = 0; i < N; ++i)
+    net.instance(i).onPrevote(vote_b);
+
+  //  Advance until the first Slash tx appears in any committed block.
+  bool first_slash_found = false;
+  uint64_t first_slash_height = 0;
+  for (int pass = 0; pass < 8 && !first_slash_found; ++pass)
+  {
+    net.advanceAllTimers();
+
+    for (size_t i = 0; i < N && !first_slash_found; ++i)
+    {
+      for (const auto &block : net.committed(i))
+      {
+        for (const auto &tx : block.transactions)
+        {
+          if (tx.tx_type == Core::TxType::Slash)
+          {
+            first_slash_found = true;
+            first_slash_height = block.header.height;
+            break;
+          }
+        }
+        if (first_slash_found)
+          break;
+      }
+    }
+  }
+
+  ASSERT_TRUE(first_slash_found)
+      << "no committed block contained a Slash tx after an equivocation";
+
+  //  Now advance several more heights. No further Slash tx for this
+  //  signer should appear — the evidence was consumed by the first
+  //  inclusion and erased on commit.
+  //
+  //  A Slash tx for a *different* signer would be legitimate (a new
+  //  equivocation), but no new equivocation is injected, so any
+  //  Slash tx at all in later blocks is a duplicate.
+  uint32_t extra_slash_count = 0;
+
+  for (int pass = 0; pass < 6; ++pass)
+  {
+    net.advanceAllTimers();
+
+    for (size_t i = 0; i < N; ++i)
+    {
+      for (const auto &block : net.committed(i))
+      {
+        //  Skip blocks at or below the one that first carried the
+        //  Slash tx. Those are the block we already counted.
+        if (block.header.height <= first_slash_height)
+          continue;
+
+        for (const auto &tx : block.transactions)
+        {
+          if (tx.tx_type == Core::TxType::Slash)
+            ++extra_slash_count;
+        }
+      }
+    }
+  }
+
+  EXPECT_EQ(extra_slash_count, 0u)
+      << "Slash tx re-included after the first commit — the evidence "
+         "was not erased on commit";
+}

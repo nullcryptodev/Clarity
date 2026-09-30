@@ -20,7 +20,6 @@ add_subdirectory(Wallet)
 # Top-level test files: main, shared utils, the transaction builder.
 add_executable(${TEST_TARGET}
   main.cpp
-  TransactionBuilder.cpp
   Utils.cpp
 )
 
