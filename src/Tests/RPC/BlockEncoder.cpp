@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "Core/Block.h"
-#include "RPC/Encoders/BlockEncoder.h"
+#include "RPC/Encoders.h"
 #include "Tests/Utils.h"
 
 using Common::Json;

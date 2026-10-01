@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "Core/Order.h"
-#include "RPC/Encoders/OrderEncoder.h"
+#include "RPC/Encoders.h"
 
 using Common::Json;
 using Rpc::encodeOrder;

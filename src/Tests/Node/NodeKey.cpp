@@ -186,7 +186,7 @@ TEST_F(Node_Fixture, NonP2PNodeDoesNotCreateNodeKey)
 
 TEST_F(Node_Fixture, ValidatorUsesValidatorKeyAsNodeKey)
 {
-  // The key precedence rule: node_secret_key (config) > validator_secret_key
+  // The key precedence rule: node_secret_key (config) > consensus_secret_key
   // > load-or-create from disk. On a validator, using the validator key
   // as the node key is what makes verifyPeerAuth() able to bind the peer
   // to a validator ID: the pubkey advertised in Auth derives to the
@@ -205,7 +205,7 @@ TEST_F(Node_Fixture, ValidatorUsesValidatorKeyAsNodeKey)
   node.start();
 
   EXPECT_FALSE(fileExists(path))
-      << "validator node must use its validator_secret_key as the node "
+      << "validator node must use its consensus_secret_key as the node "
          "key; writing a separate node_key file would make the peer "
          "authenticate as a non-validator";
 
@@ -241,7 +241,7 @@ TEST_F(Node_Fixture, ValidatorKeyPrecedenceOverridesDisk)
   for (auto b : bytes)
     EXPECT_EQ(b, 0xEE)
         << "validator node must not overwrite an existing node_key file; "
-           "it uses its validator_secret_key instead";
+           "it uses its consensus_secret_key instead";
 
   node.stop();
 }

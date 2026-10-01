@@ -185,7 +185,7 @@ namespace Node
     Height next_height = chain_->height() + 1;
     consensus_->start(next_height);
 
-    (*log_)(Logging::INFO)
+    (*log_)(Logging::DEBUGGING)
         << "Consensus started at height " << next_height
         << " (quorum=" << quorum
         << " reachable=" << reachable
@@ -248,7 +248,7 @@ namespace Node
     mempool_->load(*view);
 
     (*log_)(Logging::INFO)
-        << "Mempool loaded: " << mempool_->size() << " pending txs";
+        << "Mempool loaded: " << Logging::BRIGHT_GREEN << mempool_->size() << " pending txs";
   }
 
   void Node::initGenesis()
@@ -478,7 +478,7 @@ namespace Node
         continue;
       // v1 convention: the validator's signing key IS its reward
       // address. See getSignerPublicKey().
-      if (v.reward_address == pk)
+      if (v.effectiveConsensusKey() == pk)
         return vid;
     }
     return 0;
@@ -594,12 +594,15 @@ namespace Node
         [this](Id id, Core::ValidatorInfo &out) -> bool
     {
       auto state = makeStateView();
+      const bool found = state->getValidator(id, out);
 
-      (*log_)(Logging::ERROR) << "state_lookup_validator: id=" << id
-                              << " -> addr=" << out.reward_address.toString().substr(0, 16)
-                              << "\n";
+      (*log_)(Logging::DEBUGGING)
+          << "state_lookup_validator: id=" << id
+          << " found=" << (found ? "yes" : "no")
+          << (found ? " addr=" + out.reward_address.toString().substr(0, 16) : "")
+          << " consensus=" << (found ? out.effectiveConsensusKey().toString().substr(0, 16) : "");
 
-      return state->getValidator(id, out);
+      return found;
     };
 
     // ---- chain_id ----
@@ -627,7 +630,7 @@ namespace Node
       Core::ValidatorInfo v;
       if (!state.getValidator(config_.validator_id, v))
         return Crypto::Address{};
-      return v.reward_address;
+      return v.effectiveConsensusKey();
     };
 
     // ---- simulate_block ----
@@ -705,11 +708,11 @@ namespace Node
 
   Crypto::Signature Node::signHash(const Crypto::Hash &hash)
   {
-    if (config_.validator_secret_key.isNull())
+    if (config_.consensus_secret_key.isNull())
     {
       return Crypto::Signature{};
     }
-    return Crypto::sign(hash, config_.validator_secret_key);
+    return Crypto::sign(hash, config_.consensus_secret_key);
   }
 
   Height Node::getCurrentHeight() const
@@ -765,10 +768,7 @@ namespace Node
     if (!state.getValidator(vid, v))
       return std::nullopt;
 
-    // For v1, the signer's public key IS the reward address.
-    // In a fuller implementation, validators would register a
-    // dedicated signing key separate from their reward address.
-    return v.reward_address;
+    return v.effectiveConsensusKey();
   }
 
   //  ConsensusCallbacks implementations
@@ -843,7 +843,7 @@ namespace Node
       return;
     }
 
-    (*log_)(Logging::INFO)
+    (*log_)(Logging::DEBUGGING)
         << "Applied committed block: height=" << block.header.height
         << " hash=" << block.hash().toString().substr(0, 16)
         << " txs=" << block.transactions.size();
@@ -857,8 +857,8 @@ namespace Node
 
   void Node::onHeightAdvanced(Height height)
   {
-    (*log_)(Logging::DEBUGGING)
-        << "Chain advanced to height " << height;
+    (*log_)(Logging::INFO)
+        << "Chain advanced to height " << Logging::BRIGHT_GREEN << height;
   }
 
   void Node::onConsensusPoll()
@@ -943,7 +943,7 @@ namespace Node
 
   void Node::onP2PPeerDisconnected(P2P::PeerId id, const std::string &reason)
   {
-    (*log_)(Logging::INFO) << "Peer disconnected: " << id << " (" << reason << ")";
+    (*log_)(Logging::DEBUGGING) << "Peer disconnected: " << id << " (" << reason << ")";
     // Drop the sync manager, if any. Any in-flight request dies with
     // it; the next peer with a higher best_height will take over.
     sync_managers_.erase(id);
@@ -1129,7 +1129,7 @@ namespace Node
     P2P::GetHeadersMessage req;
     if (!P2P::deserializeGetHeaders(msg.payload.data(), msg.payload.size(), req))
     {
-      (*log_)(Logging::DEBUGGING)
+      (*log_)(Logging::WARNING)
           << "Malformed GetHeaders from peer " << from;
       return;
     }
@@ -1176,7 +1176,7 @@ namespace Node
     P2P::GetBlocksMessage req;
     if (!P2P::deserializeGetBlocks(msg.payload.data(), msg.payload.size(), req))
     {
-      (*log_)(Logging::DEBUGGING)
+      (*log_)(Logging::WARNING)
           << "Malformed GetBlocks from peer " << from;
       return;
     }
@@ -1345,11 +1345,11 @@ namespace Node
     //
     // Non-validator nodes fall through and get a fresh key, which
     // authenticates them as "not a validator" (validator_id = 0).
-    if (!config_.validator_secret_key.isNull())
+    if (!config_.consensus_secret_key.isNull())
     {
-      node_key_ = config_.validator_secret_key;
+      node_key_ = config_.consensus_secret_key;
       (*log_)(Logging::DEBUGGING)
-          << "Using validator_secret_key as node key";
+          << "Using consensus_secret_key as node key";
       return;
     }
 
@@ -1421,7 +1421,7 @@ namespace Node
   void Node::onP2PPeerEstablished(
       const P2P::P2PManager::PeerEstablishedInfo &info)
   {
-    (*log_)(Logging::INFO)
+    (*log_)(Logging::DEBUGGING)
         << "Peer established: " << info.id
         << " best_height=" << info.best_height
         << " validator_id=" << info.validator_id

@@ -13,7 +13,7 @@ using namespace Tests;
 
 TEST_F(RPC_MethodTestFixture, GetPool_MissingParam)
 {
-  Common::Json resp = callRaw("clrty_getPool", Common::Json::object());
+  Common::Json resp = callRaw("getPool", Common::Json::object());
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
@@ -21,14 +21,14 @@ TEST_F(RPC_MethodTestFixture, GetPool_MissingParam)
 TEST_F(RPC_MethodTestFixture, GetPool_UnknownId)
 {
   // Shared fixture has no AMM pools.
-  Common::Json resp = callRaw("clrty_getPool", {{"pool_id", "0x1"}});
+  Common::Json resp = callRaw("getPool", {{"pool_id", "0x1"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::PoolNotFound);
 }
 
 TEST_F(RPC_MethodTestFixture, GetPool_MalformedId)
 {
-  Common::Json resp = callRaw("clrty_getPool", {{"pool_id", "not-a-number"}});
+  Common::Json resp = callRaw("getPool", {{"pool_id", "not-a-number"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
@@ -37,14 +37,14 @@ TEST_F(RPC_MethodTestFixture, GetPool_MalformedId)
 
 TEST_F(RPC_MethodTestFixture, GetPosition_MissingParam)
 {
-  Common::Json resp = callRaw("clrty_getPosition", Common::Json::object());
+  Common::Json resp = callRaw("getPosition", Common::Json::object());
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
 
 TEST_F(RPC_MethodTestFixture, GetPosition_UnknownId)
 {
-  Common::Json resp = callRaw("clrty_getPosition", {{"position_id", "0x1"}});
+  Common::Json resp = callRaw("getPosition", {{"position_id", "0x1"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::PoolNotFound);
 }
@@ -53,7 +53,7 @@ TEST_F(RPC_MethodTestFixture, GetPosition_UnknownId)
 
 TEST_F(RPC_MethodTestFixture, GetPositionByOwner_MissingAddress)
 {
-  Common::Json resp = callRaw("clrty_getPositionByOwner", {{"pool_id", "0x1"}});
+  Common::Json resp = callRaw("getPositionByOwner", {{"pool_id", "0x1"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
@@ -61,7 +61,7 @@ TEST_F(RPC_MethodTestFixture, GetPositionByOwner_MissingAddress)
 TEST_F(RPC_MethodTestFixture, GetPositionByOwner_MissingPoolId)
 {
   std::string addr = encodeAddr(addrFromU64(100));
-  Common::Json resp = callRaw("clrty_getPositionByOwner", {{"address", addr}});
+  Common::Json resp = callRaw("getPositionByOwner", {{"address", addr}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
@@ -69,7 +69,7 @@ TEST_F(RPC_MethodTestFixture, GetPositionByOwner_MissingPoolId)
 TEST_F(RPC_MethodTestFixture, GetPositionByOwner_NoPosition)
 {
   std::string addr = encodeAddr(addrFromU64(101));
-  Common::Json resp = callRaw("clrty_getPositionByOwner",
+  Common::Json resp = callRaw("getPositionByOwner",
                               {{"address", addr}, {"pool_id", "0x1"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::PoolNotFound);
@@ -77,7 +77,7 @@ TEST_F(RPC_MethodTestFixture, GetPositionByOwner_NoPosition)
 
 TEST_F(RPC_MethodTestFixture, GetPositionByOwner_MalformedAddress)
 {
-  Common::Json resp = callRaw("clrty_getPositionByOwner",
+  Common::Json resp = callRaw("getPositionByOwner",
                               {{"address", "not-an-address"}, {"pool_id", "0x1"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);

@@ -7,6 +7,43 @@
 
 namespace Tests
 {
+  struct TestValidator
+  {
+    Id id{0};
+    Crypto::KeyPair kp{};
+    Crypto::Address address{};
+
+    static TestValidator make(Id id)
+    {
+      TestValidator v;
+      v.id = id;
+
+      // Deterministic seed derived from the validator ID. This makes
+      // the network reproducible: two runs with the same validator
+      // count produce the same blocks.
+      Crypto::SecretKey seed;
+      for (int i = 0; i < 8; ++i)
+        seed.data[i] = uint8_t(id >> (i * 8));
+      for (size_t i = 8; i < 32; ++i)
+        seed.data[i] = uint8_t(0xA5 + i); // arbitrary fill
+
+      v.kp = Crypto::generateKeyPairFromSeed(seed);
+      std::memcpy(v.address.data.data(),
+                  v.kp.publicKey.data.data(), 32);
+      return v;
+    }
+
+    Crypto::Signature sign(const Crypto::Hash &h) const
+    {
+      return Crypto::sign(h, kp.secretKey);
+    }
+
+    Crypto::PublicKey pubkey() const
+    {
+      return kp.publicKey;
+    }
+  };
+
   //  ConsensusNetwork
   //
   //  Owns N BftConsensus instances and a shared message queue. Each
@@ -551,6 +588,5 @@ namespace Tests
     // Randomized delivery. random_seed_ == 0 means deterministic.
     uint64_t random_seed_{0};
     std::mt19937_64 random_engine_;
-
   };
 }

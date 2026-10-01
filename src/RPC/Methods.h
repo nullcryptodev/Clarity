@@ -9,13 +9,14 @@ namespace Rpc
 {
   class JsonRpcDispatcher;
 
+  void registerAdminMethods(JsonRpcDispatcher &d);
+  void registerAmmMethods(JsonRpcDispatcher &d);
+
   void registerChainMethods(JsonRpcDispatcher &d);
   void registerTxMethods(JsonRpcDispatcher &d);
   void registerStateMethods(JsonRpcDispatcher &d);
   void registerMempoolMethods(JsonRpcDispatcher &d);
   void registerConsensusMethods(JsonRpcDispatcher &d);
-  void registerAmmMethods(JsonRpcDispatcher &d);
   void registerOrderMethods(JsonRpcDispatcher &d);
   void registerNodeMethods(JsonRpcDispatcher &d);
-  void registerAdminMethods(JsonRpcDispatcher &d);
 }

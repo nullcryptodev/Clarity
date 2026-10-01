@@ -7,7 +7,7 @@
 
 #include "Core/AmmPool.h"
 #include "Core/AmmPosition.h"
-#include "RPC/Encoders/AmmEncoder.h"
+#include "RPC/Encoders.h"
 #include "Tests/Utils.h"
 
 using Common::Json;

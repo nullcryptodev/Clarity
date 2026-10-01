@@ -9,7 +9,7 @@
 
 #include "Common/Wire.h"
 
-#include "RPC/Methods/Methods.h"
+#include "RPC/Methods.h"
 
 namespace Tests
 {

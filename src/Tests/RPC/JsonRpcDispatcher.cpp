@@ -363,7 +363,7 @@ TEST_F(RPC_DispatcherFixture, MethodNamesIncludesRegisteredAndBuiltins)
   EXPECT_NE(std::find(names.begin(), names.end(), "test_echo"), names.end());
 
   // built-in clrty_methods is registered by the dispatcher itself
-  EXPECT_NE(std::find(names.begin(), names.end(), "clrty_methods"), names.end());
+  EXPECT_NE(std::find(names.begin(), names.end(), "methods"), names.end());
 
   // sorted
   EXPECT_TRUE(std::is_sorted(names.begin(), names.end()));
@@ -372,7 +372,7 @@ TEST_F(RPC_DispatcherFixture, MethodNamesIncludesRegisteredAndBuiltins)
 TEST_F(RPC_DispatcherFixture, HasMethod)
 {
   EXPECT_TRUE(dispatcher_->hasMethod("test_constant"));
-  EXPECT_TRUE(dispatcher_->hasMethod("clrty_methods"));
+  EXPECT_TRUE(dispatcher_->hasMethod("methods"));
   EXPECT_FALSE(dispatcher_->hasMethod("no_such_method"));
 }
 
@@ -380,7 +380,7 @@ TEST_F(RPC_DispatcherFixture, ClrtyMethodsListsItself)
 {
   Json req = {
       {"jsonrpc", "2.0"},
-      {"method", "clrty_methods"},
+      {"method", "methods"},
       {"id", 1}};
 
   auto parsed = Rpc::parseRequest(req);

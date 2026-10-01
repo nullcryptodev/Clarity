@@ -23,7 +23,7 @@ namespace Rpc
   //
   //  Fields:
   //
-  //    method  — the method name, e.g. "clrty_getBalance". Non-empty.
+  //    method  — the method name, e.g. "getBalance". Non-empty.
   //    params  — the params object. Always an object (may be empty).
   //              Array params are rejected by the parser.
   //    id      — the request id, echoed back in the response.

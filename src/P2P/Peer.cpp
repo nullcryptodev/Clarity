@@ -368,10 +368,10 @@ namespace P2P
     stats_.peerBestHeight = v.bestHeight;
     stats_.peerNonce = v.networkNonce;
 
-    log_(Logging::INFO) << "peer " << endpointString()
-                        << " version=" << v.protocolVersion
-                        << " agent=\"" << v.agentString << "\""
-                        << " height=" << v.bestHeight;
+    log_(Logging::DEBUGGING) << "peer " << endpointString()
+                             << " version=" << v.protocolVersion
+                             << " agent=\"" << v.agentString << "\""
+                             << " height=" << v.bestHeight;
 
     send(Message::verack());
     transitionTo(PeerState::VerackPending);
@@ -457,17 +457,17 @@ namespace P2P
     peerPubkey_ = a.pubkey;
     peerValidatorId_ = validatorId;
 
-    log_(Logging::INFO) << "peer " << endpointString()
-                        << " authenticated"
-                        << " validator_id=" << validatorId
-                        << " pubkey=" << a.pubkey.toString().substr(0, 16);
+    log_(Logging::DEBUGGING) << "peer " << endpointString()
+                             << " authenticated"
+                             << " validator_id=" << validatorId
+                             << " pubkey=" << a.pubkey.toString().substr(0, 16);
 
     // Both sides have now sent and verified Auth. Transition to
     // Established and start the ping timer.
     handshakeTimer_.cancel();
     transitionTo(PeerState::Established);
 
-    log_(Logging::INFO) << "handshake complete with " << endpointString();
+    log_(Logging::DEBUGGING) << "handshake complete with " << endpointString();
 
     armPingTimer();
 

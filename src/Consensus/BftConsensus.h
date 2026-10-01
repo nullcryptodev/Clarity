@@ -208,7 +208,7 @@ namespace Consensus
     size_t countVotesFor(bool is_precommit, const Crypto::Hash &block_hash) const;
     size_t countNilVotes(bool is_precommit) const;
 
-    size_t quorumThreshold() const;
+    size_t quorumThreshold(bool emergency) const;
     Index mySignerIndex() const;
 
     void broadcastProposal(const Proposal &p);

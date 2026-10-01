@@ -57,12 +57,18 @@ namespace Daemon
     }
 
     // Parse a hex-encoded 32-byte secret key.
+    //
+    // This is used for the validator's *consensus* secret key — the
+    // key the daemon uses to sign proposals, prevotes, precommits,
+    // and timeout attestations. It is not the reward address, and
+    // it is not the P2P node identity key (those are separate
+    // concepts post-split; see NodeConfig.h).
     Crypto::SecretKey parseSecretKey(const std::string &hex)
     {
       if (hex.size() != 64)
       {
         throw std::runtime_error(
-            "secret key must be 64 hex characters (32 bytes)");
+            "consensus key must be 64 hex characters (32 bytes)");
       }
       Crypto::SecretKey sk;
       for (size_t i = 0; i < 32; ++i)
@@ -81,7 +87,7 @@ namespace Daemon
         int lo = nib(hex[i * 2 + 1]);
         if (hi < 0 || lo < 0)
         {
-          throw std::runtime_error("secret key contains non-hex characters");
+          throw std::runtime_error("consensus key contains non-hex characters");
         }
         sk.data[i] = static_cast<uint8_t>((hi << 4) | lo);
       }
@@ -178,14 +184,33 @@ namespace Daemon
       }
 
       // ---- Validator ----
+      //
+      //  --validator-id    the validator's persistent ID in the
+      //                    registry. Non-zero means "this node is a
+      //                    validator" and enables the consensus
+      //                    subsystem.
+      //
+      //  --consensus-key   the Ed25519 secret key that signs this
+      //                    validator's consensus messages. Raw hex,
+      //                    64 characters. The public half is what
+      //                    goes into genesis (for seed validators)
+      //                    or a RegisterValidator transaction (for
+      //                    user registrations).
+      //
+      //  This flag takes the secret on the command line, which is a
+      //  development convenience: the value appears in `ps`, shell
+      //  history, and any process listing. For a production
+      //  validator, prefer a future --consensus-key-file flag or an
+      //  environment variable. The flag exists today so the regtest
+      //  devnet can be started without a config file.
       if (arg == "--validator-id")
       {
         args.node.validator_id = parseU64(next());
         continue;
       }
-      if (arg == "--validator-key")
+      if (arg == "--consensus-key")
       {
-        args.node.validator_secret_key = parseSecretKey(next());
+        args.node.consensus_secret_key = parseSecretKey(next());
         continue;
       }
 
@@ -314,7 +339,10 @@ namespace Daemon
         << "\n"
         << "Validator:\n"
         << "  --validator-id <N>         Validator ID (0 = not a validator)\n"
-        << "  --validator-key <hex>      Ed25519 secret key (64 hex chars)\n"
+        << "  --consensus-key <hex>      Ed25519 consensus secret key\n"
+        << "                             (64 hex chars). Signs votes and\n"
+        << "                             proposals. Use ValidatorKeyGen\n"
+        << "                             to produce one.\n"
         << "\n"
         << "Consensus:\n"
         << "  --max-block-bytes <bytes>  Max block size (default: 262144)\n"
@@ -370,8 +398,8 @@ namespace Daemon
     }
     std::cout << "\n";
     std::cout << "  validator_id:         " << n.validator_id << "\n";
-    std::cout << "  validator_key:        "
-              << (n.validator_secret_key.isNull() ? "(none)" : "(set)") << "\n";
+    std::cout << "  consensus_key:        "
+              << (n.consensus_secret_key.isNull() ? "(none)" : "(set)") << "\n";
     std::cout << "  max_block_bytes:      " << n.max_block_bytes << "\n";
     std::cout << "  max_block_txs:        " << n.max_block_txs << "\n";
     std::cout << "  consensus_poll_ms:    " << n.consensus_poll_ms << "\n";

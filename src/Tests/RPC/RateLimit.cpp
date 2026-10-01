@@ -66,7 +66,7 @@ namespace
   std::string pingRequest()
   {
     const std::string body =
-        R"({"jsonrpc":"2.0","id":1,"method":"clrty_ping"})";
+        R"({"jsonrpc":"2.0","id":1,"method":"ping"})";
     return "POST / HTTP/1.1\r\n"
            "Host: 127.0.0.1\r\n"
            "Content-Type: application/json\r\n"

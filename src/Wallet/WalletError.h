@@ -41,6 +41,7 @@ namespace Wallet
     InvalidHex,
     InvalidPubkey,
     InvalidSignature,
+    InvalidParameter,
 
     // Keystore
     KeyStoreNotFound,

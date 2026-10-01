@@ -21,6 +21,10 @@ namespace Core
     // ---- Identity ----
     Id id{INVALID_ID};
     Crypto::Address reward_address{};
+
+    //  The key that signs consensus votes for this validator.
+    Crypto::PublicKey consensus_key{};
+
     Crypto::PublicKey node_key{};
     Crypto::Address owner{};
 
@@ -114,6 +118,20 @@ namespace Core
       return (current_height - last_seen_height) >= OFFLINE_KICK_BLOCKS;
     }
 
+    //  Returns `consensus_key` if it has been set. Falls back to
+    //  `reward_address` for records that predate the split, or for
+    //  genesis validators where no consensus key was declared. This
+    //  fallback is what makes the migration backward-compatible: an
+    //  old record decodes with `consensus_key` null, and every
+    //  verification site uses the reward address, exactly as before.
+    //
+    //  Callers that resolve keys for signature verification must use
+    //  this, not `consensus_key` directly.
+    const Crypto::PublicKey &effectiveConsensusKey() const noexcept
+    {
+      return consensus_key.isNull() ? reward_address : consensus_key;
+    }
+
     // ------------------------------------------------------------------
     //  State serialization (compact, deterministic)
     // ------------------------------------------------------------------
@@ -121,6 +139,7 @@ namespace Core
     // Layout (little-endian, in field order):
     //    [8]   id
     //    [32]  reward_address
+    //    [32]  consensus_key
     //    [32]  node_key
     //    [32]  owner
     //    [8]   registered_at_height
@@ -140,7 +159,7 @@ namespace Core
     //    [8]   became_active_at
     //    [8]   last_active_at
     //
-    // Total: 237 bytes.
+    // Total: 269 bytes.
 
     std::vector<uint8_t> serializeState() const;
 
@@ -148,7 +167,7 @@ namespace Core
                                  ValidatorInfo &out);
 
     static constexpr size_t STATE_SIZE =
-        8 + 32 + 32 + 32 + 8 + 8 + 2 + 8 + 4 + 4 + 8 + 2 + 2 + 8 + 8 + 8 + 8 + 1 + 8 + 8;
+        8 + 32 + 32 + 32 + 32 + 8 + 8 + 2 + 8 + 4 + 4 + 8 + 2 + 2 + 8 + 8 + 8 + 8 + 1 + 8 + 8;
 
     // ------------------------------------------------------------------
     //  Framework serialization

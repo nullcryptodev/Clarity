@@ -7,26 +7,29 @@
 
 #include "Crypto/Bech32.h"
 
+#include <algorithm>
 #include <array>
 #include <vector>
 
 namespace Wallet
 {
+
+  //  ---- HRP <-> Network ----
+
+  std::optional<Network> networkForHrp(std::string_view hrp) noexcept
+  {
+    if (hrp == hrpForNetwork(Network::Mainnet))
+      return Network::Mainnet;
+    if (hrp == hrpForNetwork(Network::Testnet))
+      return Network::Testnet;
+    if (hrp == hrpForNetwork(Network::Regtest))
+      return Network::Regtest;
+    return std::nullopt;
+  }
+
   namespace
   {
-    // Map an HRP back to a network, or nullopt if unknown.
-    std::optional<Network> networkForHrp(std::string_view hrp) noexcept
-    {
-      if (hrp == hrpForNetwork(Network::Mainnet))
-        return Network::Mainnet;
-      if (hrp == hrpForNetwork(Network::Testnet))
-        return Network::Testnet;
-      if (hrp == hrpForNetwork(Network::Regtest))
-        return Network::Regtest;
-      return std::nullopt;
-    }
-
-    // Build the 33-byte payload: [witness_version, pubkey[32]].
+    //  Build the 33-byte payload: [witness_version, pubkey[32]].
     std::vector<uint8_t> buildPayload(const Crypto::Address &addr)
     {
       std::vector<uint8_t> payload;
@@ -36,9 +39,9 @@ namespace Wallet
       return payload;
     }
 
-    // Extract the address from a decoded payload. Returns nullopt if the
-    // payload is the wrong length, has the wrong witness version, or
-    // decodes to the all-zero pubkey.
+    //  Extract the address from a decoded payload. Returns nullopt if
+    //  the payload is the wrong length, has the wrong witness version,
+    //  or decodes to the all-zero pubkey.
     std::optional<Crypto::Address> addressFromPayload(
         const std::vector<uint8_t> &payload)
     {
@@ -50,10 +53,10 @@ namespace Wallet
       Crypto::Address addr;
       std::copy(payload.begin() + 1, payload.end(), addr.data.begin());
 
-      // Reject the null address explicitly. Nothing on chain ever uses
-      // the all-zero pubkey; a bech32m string that decodes to it is
-      // almost certainly a copy-paste artifact or a malformed genesis
-      // placeholder.
+      //  Reject the null address explicitly. Nothing on chain ever
+      //  uses the all-zero pubkey; a bech32m string that decodes to
+      //  it is almost certainly a copy-paste artifact or a malformed
+      //  genesis placeholder.
       if (addr.isNull())
         return std::nullopt;
 
@@ -61,18 +64,27 @@ namespace Wallet
     }
   } // namespace
 
+  //  ---- Encoding ----
+
   std::string encodeAddress(const Crypto::Address &addr, Network network)
+  {
+    return encodeAddress(addr, hrpForNetwork(network));
+  }
+
+  std::string encodeAddress(const Crypto::Address &addr,
+                            std::string_view hrp)
   {
     if (addr.isNull())
       return {};
 
-    const std::string_view hrp = hrpForNetwork(network);
     if (hrp.empty())
       return {};
 
     const std::vector<uint8_t> payload = buildPayload(addr);
     return Crypto::bech32Encode(hrp, payload, Crypto::Bech32Encoding::Bech32m);
   }
+
+  //  ---- Decoding ----
 
   std::optional<Crypto::Address> decodeAddress(std::string_view s,
                                                Network expected_network)
@@ -89,12 +101,12 @@ namespace Wallet
     if (err != Crypto::Bech32Error::Ok)
       return std::nullopt;
 
-    // Reject legacy Bech32 (segwit v0) addresses for CLRTY. We only
-    // ever emit Bech32m.
+    //  Reject legacy Bech32 (segwit v0) addresses for CLRTY. We only
+    //  ever emit Bech32m.
     if (encoding != Crypto::Bech32Encoding::Bech32m)
       return std::nullopt;
 
-    // The HRP must match the expected network.
+    //  The HRP must match the expected network.
     const std::string_view expected_hrp = hrpForNetwork(expected_network);
     if (hrp != expected_hrp)
       return std::nullopt;

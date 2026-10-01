@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "Core/Account.h"
-#include "RPC/Encoders/AccountEncoder.h"
+#include "RPC/Encoders.h"
 
 using Common::Json;
 using Rpc::encodeAccount;

@@ -45,18 +45,6 @@ using namespace Tests;
 
 namespace
 {
-  //  Write the length-prefixed `active_set` global. Not read by
-  //  resolveActiveSet, but kept for tests that want it present.
-  void putActiveSet(StateAccess &s, const std::vector<Id> &ids)
-  {
-    std::vector<uint8_t> bytes;
-    bytes.reserve(ids.size() * 8);
-    for (auto id : ids)
-      for (int i = 0; i < 8; ++i)
-        bytes.push_back(uint8_t(id >> (i * 8)));
-    s.putGlobal("active_set", bytes);
-  }
-
   //  Seed a validator. is_active defaults to false, which is what
   //  the pool filter wants for pool candidates. Committed-set
   //  validators are excluded from the pool by the committed_set
@@ -76,15 +64,6 @@ namespace
     v.is_seed = is_seed;
     v.is_active = false;
     s.putValidator(v);
-  }
-
-  //  Convenience: are all elements of `set` present in `vec`?
-  bool containsAll(const std::vector<Id> &vec, const std::vector<Id> &set)
-  {
-    for (Id id : set)
-      if (std::find(vec.begin(), vec.end(), id) == vec.end())
-        return false;
-    return true;
   }
 } // anonymous namespace
 
@@ -260,9 +239,13 @@ TEST(Consensus_ActiveSetResolution, EmergencyPromotesOnePerOfflineValidator)
 
   //  9 survivors are all present.
   for (Id id : committed)
+  {
     if (id != 103 && id != 107 && id != 110)
+    {
       EXPECT_NE(std::find(result.begin(), result.end(), id), result.end())
           << "survivor " << id << " missing";
+    }
+  }
 
   //  3 of the pool were promoted. Which three depends on tie-break
   //  order; all have equal uptime and last_active, so std::sort

@@ -142,8 +142,6 @@ namespace Tests
   Rpc::RpcConfig makeTestRpcConfig();
   void registerAllNonAdminMethods(Rpc::JsonRpcDispatcher &d);
 
-  // Templates
-
   template <typename Pred>
   bool waitFor(Pred &&pred, std::chrono::milliseconds timeout)
   {
@@ -156,8 +154,6 @@ namespace Tests
     }
     return false;
   }
-
-  // Structs
 
   struct Envelope
   {
@@ -180,126 +176,6 @@ namespace Tests
     //  proposer's broadcast_proposal callback so deliverAll can honor
     //  proposal suppression without decoding the block itself.
     bool is_emergency{false};
-  };
-
-  //  Registry builder for rotation tests.
-  //  Validators are numbered 1..N. Active set starts as the first M
-  //  validators. Uptime scores default to 10'000 (perfect). Callers can
-  //  override per-validator state via the helpers below.
-
-  struct RotationBuilder
-  {
-    Core::ValidatorRegistry reg;
-
-    explicit RotationBuilder(size_t total_validators = 0,
-                             size_t active_count = 0)
-    {
-      // Index 0 sentinel.
-      reg.validators.push_back(Core::ValidatorInfo{});
-      reg.next_id = 1;
-
-      for (size_t i = 0; i < total_validators; ++i)
-      {
-        Core::ValidatorInfo v;
-        v.id = static_cast<Id>(i + 1);
-        v.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
-        v.uptime_score = 10'000;
-        v.reward_multiplier = Core::REWARD_MULTIPLIER_START;
-        v.is_active = false;
-        v.registered_at_height = 1;
-        v.last_active_at = 1;
-        v.became_active_at = 0;
-        reg.validators.push_back(v);
-        reg.next_id = v.id + 1;
-      }
-
-      for (size_t i = 0; i < active_count && i < total_validators; ++i)
-      {
-        Id vid = static_cast<Id>(i + 1);
-        auto *v = reg.find(vid);
-        if (v)
-        {
-          v->is_active = true;
-          v->became_active_at = 1;
-          reg.active_set.push_back(vid);
-        }
-      }
-    }
-
-    // Set an arbitrary uptime for a validator.
-    void setUptime(Id id, uint16_t uptime)
-    {
-      if (auto *v = reg.find(id))
-        v->uptime_score = uptime;
-    }
-
-    // Set last_active_at (for rotation fairness tie-breaking).
-    void setLastActive(Id id, uint64_t h)
-    {
-      if (auto *v = reg.find(id))
-        v->last_active_at = h;
-    }
-
-    // Set became_active_at (for removal priority tie-breaking).
-    void setBecameActive(Id id, uint64_t h)
-    {
-      if (auto *v = reg.find(id))
-        v->became_active_at = h;
-    }
-
-    // Mark a validator as a seed.
-    void setSeed(Id id, bool seed = true)
-    {
-      if (auto *v = reg.find(id))
-        v->is_seed = seed;
-    }
-
-    // Set last_seen_height for offline detection.
-    void setLastSeen(Id id, uint64_t h)
-    {
-      if (auto *v = reg.find(id))
-        v->last_seen_height = h;
-    }
-
-    // Set current target_size in the registry.
-    void setTargetSize(uint64_t t) { reg.target_size = t; }
-  };
-
-  struct TestValidator
-  {
-    Id id{0};
-    Crypto::KeyPair kp{};
-    Crypto::Address address{};
-
-    static TestValidator make(Id id)
-    {
-      TestValidator v;
-      v.id = id;
-
-      // Deterministic seed derived from the validator ID. This makes
-      // the network reproducible: two runs with the same validator
-      // count produce the same blocks.
-      Crypto::SecretKey seed;
-      for (int i = 0; i < 8; ++i)
-        seed.data[i] = uint8_t(id >> (i * 8));
-      for (size_t i = 8; i < 32; ++i)
-        seed.data[i] = uint8_t(0xA5 + i); // arbitrary fill
-
-      v.kp = Crypto::generateKeyPairFromSeed(seed);
-      std::memcpy(v.address.data.data(),
-                  v.kp.publicKey.data.data(), 32);
-      return v;
-    }
-
-    Crypto::Signature sign(const Crypto::Hash &h) const
-    {
-      return Crypto::sign(h, kp.secretKey);
-    }
-
-    Crypto::PublicKey pubkey() const
-    {
-      return kp.publicKey;
-    }
   };
 
   // TempFile creates a unique temp file path, removes it on destruction.

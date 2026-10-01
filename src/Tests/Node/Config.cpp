@@ -100,7 +100,7 @@ TEST(Node_Config, ValidateRejectsValidatorWithoutKey)
   Node::NodeConfig cfg;
   cfg.data_dir = "/tmp/x";
   cfg.validator_id = 1;
-  // validator_secret_key is null
+  // consensus_secret_key is null
   EXPECT_THROW(Node::validateConfig(cfg), std::runtime_error);
 }
 
@@ -116,7 +116,7 @@ TEST(Node_Config, ValidateAcceptsValidatorWithKey)
   Node::NodeConfig cfg;
   cfg.data_dir = "/tmp/x";
   cfg.validator_id = 1;
-  for (auto &b : cfg.validator_secret_key.data)
+  for (auto &b : cfg.consensus_secret_key.data)
     b = 0xAB;
   EXPECT_NO_THROW(Node::validateConfig(cfg));
 }

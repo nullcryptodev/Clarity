@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "Crypto/Types.h"
-#include "RPC/Encoders/Encoding.h"
+#include "RPC/Encoding.h"
 #include "RPC/JsonRpcDispatcher.h"
 
 using Common::Json;

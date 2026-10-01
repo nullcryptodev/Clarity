@@ -164,7 +164,7 @@ namespace Rpc
       }
     }
 
-    (*log_)(Logging::INFO)
+    (*log_)(Logging::DEBUGGING)
         << "RPC listening on " << config_.bind_address << ":"
         << listening_port_ << " (" << pool_.threadCount() << " workers)";
 

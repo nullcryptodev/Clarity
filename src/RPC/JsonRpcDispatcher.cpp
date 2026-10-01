@@ -3,11 +3,10 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include "JsonRpcDispatcher.h"
-
-#include "Methods/Methods.h"
-
 #include <algorithm>
+
+#include "JsonRpcDispatcher.h"
+#include "Methods.h"
 
 namespace Rpc
 {
@@ -33,14 +32,14 @@ namespace Rpc
     registerNodeMethods(*this);
     registerAdminMethods(*this);
 
-    // clrty_methods is registered last so its handler can capture
+    // methods is registered last so its handler can capture
     // `this` and read the dispatcher's full method list, including
     // every method registered above. The placeholder registered by
     // registerChainMethods is shadowed by this one — registerMethod
     // replaces on duplicate names, and that's intentional: the
     // chain group owns the *documentation* of the method, while the
     // dispatcher owns its *implementation*.
-    registerMethod("clrty_methods",
+    registerMethod("methods",
                    [this](Node::Node &, const RpcConfig &,
                           const JsonRpcRequest &) -> Common::Json
                    {

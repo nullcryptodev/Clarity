@@ -17,8 +17,13 @@
 #include "State/StateAccess.h"
 #include "State/StateDB.h"
 
+#include "Wallet/AddressCodec.h"
+#include "Wallet/WalletTypes.h"
+
 #include <chrono>
+#include <cstring>
 #include <filesystem>
+#include <stdexcept>
 
 namespace
 {
@@ -36,7 +41,68 @@ namespace
     std::memcpy(h.data.data(), bytes.data(), 32);
     return h;
   }
-}
+
+  //  Resolve an address from a GlobalConfig constant.
+  //
+  //  The config may hold either a bech32m address (the normal case,
+  //  e.g. "rclrty1qpmfjm75...") or a 64-character hex string (the
+  //  legacy form, used for the community and treasury fund
+  //  placeholders). This helper accepts both and throws on anything
+  //  else, so a misconfigured constant fails loudly at genesis
+  //  construction rather than silently producing a garbage address.
+  //
+  //  Detection:
+  //    - exactly 64 characters, all hex digits → parse as hex
+  //    - decodes as a bech32m address for the expected network → use it
+  //    - anything else → throw
+  //
+  //  The expected network is passed explicitly because the three
+  //  genesis configs share this code path but use different HRPs.
+  //  A mainnet address in a regtest config is a hard error rather
+  //  than a silent misparse.
+  Crypto::Address addressFromConfig(const char *value,
+                                    Wallet::Network expected_network,
+                                    const char *label)
+  {
+    const std::string s(value);
+
+    auto isHex64 = [](const std::string &str) -> bool
+    {
+      if (str.size() != 64)
+        return false;
+      for (char c : str)
+      {
+        const bool hex =
+            (c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F');
+        if (!hex)
+          return false;
+      }
+      return true;
+    };
+
+    //  Hex form. Preserves the existing behaviour for the fund
+    //  addresses, which are still placeholder hex constants.
+    if (isHex64(s))
+      return Crypto::addrFromHex(value);
+
+    //  Bech32m form. The decoder validates the HRP against
+    //  `expected_network`, so a mainnet HRP in a regtest config is
+    //  rejected rather than silently accepted.
+    const auto decoded = Wallet::decodeAddress(s, expected_network);
+    if (!decoded.has_value())
+    {
+      throw std::runtime_error(
+          std::string("genesis: ") + label +
+          ": failed to decode address '" + s +
+          "' (expected bech32m for the configured network, "
+          "or 64-character hex)");
+    }
+
+    return *decoded;
+  }
+} // anonymous namespace
 
 namespace Core
 {
@@ -46,46 +112,46 @@ namespace Core
     cfg.chain_id = GlobalConfig::CHAIN_ID;
     cfg.timestamp_ms = GlobalConfig::GENESIS_TIMESTAMP_MS;
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::COMMUNITY_FUND_ADDRESS),
+    constexpr Wallet::Network net = Wallet::Network::Mainnet;
+
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::COMMUNITY_FUND_ADDRESS, net, "community fund"),
                             GlobalConfig::COMMUNITY_FUND_AMOUNT,
                             "community fund"});
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::TREASURY_FUND_ADDRESS),
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::TREASURY_FUND_ADDRESS, net, "treasury"),
                             GlobalConfig::TREASURY_FUND_AMOUNT,
                             "treasury"});
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS),
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::SEED_ADDRESS_MAINNET, net, "seed validator 1"),
                             GlobalConfig::SEED_FUND_AMOUNT,
                             "seed validator 1"});
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::SEED_ADDRESS_TWO_MAINNET, net, "seed validator 2"),
                             GlobalConfig::SEED_FUND_AMOUNT_TWO,
                             "seed validator 2"});
 
-    // Add more if needed
-    //cfg.accounts.push_back({
-    // GlobalConfig::SEED_ADDRESS_TWO
-    // GlobalConfig::SEED_FUND_AMOUNT_TWO,
-    // "seed validator 2"
-    //});
-
+    //  Seed validators.
+    //
+    //  The consensus key is set explicitly to SEED_NODE. If it were
+    //  left null, applyGenesis would fall back to the reward address,
+    //  and the daemon's signing key would not match the validator
+    //  record — every vote would fail verification.
+    //
+    //  Brace-init order is {id, reward_address, node_key, is_seed,
+    //  consensus_key}. The consensus_key field is at the END of
+    //  GenesisValidator so that earlier configs which do not set it
+    //  continue to compile and get the fallback behaviour.
     cfg.validators.push_back({1,
-                              Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS),
+                              addressFromConfig(GlobalConfig::SEED_ADDRESS_MAINNET, net, "seed validator 1 reward"),
                               Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE),
-                              true});
+                              true,
+                              Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE)});
 
     cfg.validators.push_back({2,
-                              Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+                              addressFromConfig(GlobalConfig::SEED_ADDRESS_TWO_MAINNET, net, "seed validator 2 reward"),
                               Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE_TWO),
-                              true});
-
-    // Add more if needed
-    //cfg.validators.push_back({
-    //  2,
-    //  GlobalConfig::SEED_ADDRESS_TWO,
-    //  GlobalConfig::SEED_NODE_TWO,
-    //  true
-    //});
+                              true,
+                              Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE_TWO)});
 
     cfg.initial_total_supply = GlobalConfig::GENESIS_SUPPLY;
     cfg.initial_active_set_size = GlobalConfig::INITIAL_SET_SIZE;
@@ -99,46 +165,35 @@ namespace Core
     cfg.chain_id = GlobalConfig::TESTNET_CHAIN_ID; // 'CLTT'
     cfg.timestamp_ms = GlobalConfig::GENESIS_TIMESTAMP_MS;
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::COMMUNITY_FUND_ADDRESS),
+    constexpr Wallet::Network net = Wallet::Network::Testnet;
+
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::COMMUNITY_FUND_ADDRESS, net, "community fund"),
                             GlobalConfig::COMMUNITY_FUND_AMOUNT,
                             "community fund"});
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::TREASURY_FUND_ADDRESS),
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::TREASURY_FUND_ADDRESS, net, "treasury"),
                             GlobalConfig::TREASURY_FUND_AMOUNT,
                             "treasury"});
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS),
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::SEED_ADDRESS_TESTNET, net, "seed validator 1"),
                             GlobalConfig::SEED_FUND_AMOUNT,
                             "seed validator 1"});
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::SEED_ADDRESS_TWO_TESTNET, net, "seed validator 2"),
                             GlobalConfig::SEED_FUND_AMOUNT_TWO,
                             "seed validator 2"});
 
-    // Add more if needed
-    // cfg.accounts.push_back({
-    // GlobalConfig::SEED_ADDRESS_TWO
-    // GlobalConfig::SEED_FUND_AMOUNT_TWO,
-    // "seed validator 2"
-    //});
-
     cfg.validators.push_back({1,
-                              Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS),
+                              addressFromConfig(GlobalConfig::SEED_ADDRESS_TESTNET, net, "seed validator 1 reward"),
                               Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE),
-                              true});
+                              true,
+                              Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE)});
 
     cfg.validators.push_back({2,
-                              Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+                              addressFromConfig(GlobalConfig::SEED_ADDRESS_TWO_TESTNET, net, "seed validator 2 reward"),
                               Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE_TWO),
-                              true});
-
-    // Add more if needed
-    // cfg.validators.push_back({
-    //  2,
-    //  GlobalConfig::SEED_ADDRESS_TWO,
-    //  GlobalConfig::SEED_NODE_TWO,
-    //  true
-    //});
+                              true,
+                              Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE_TWO)});
 
     cfg.initial_total_supply = GlobalConfig::GENESIS_SUPPLY;
     cfg.initial_active_set_size = GlobalConfig::INITIAL_SET_SIZE;
@@ -152,46 +207,35 @@ namespace Core
     cfg.chain_id = GlobalConfig::REGNET_CHAIN_ID;
     cfg.timestamp_ms = GlobalConfig::GENESIS_TIMESTAMP_MS;
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::COMMUNITY_FUND_ADDRESS),
+    constexpr Wallet::Network net = Wallet::Network::Regtest;
+
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::COMMUNITY_FUND_ADDRESS, net, "community fund"),
                             GlobalConfig::COMMUNITY_FUND_AMOUNT,
                             "community fund"});
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::TREASURY_FUND_ADDRESS),
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::TREASURY_FUND_ADDRESS, net, "treasury"),
                             GlobalConfig::TREASURY_FUND_AMOUNT,
                             "treasury"});
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS),
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::SEED_ADDRESS_REGTEST, net, "seed validator 1"),
                             GlobalConfig::SEED_FUND_AMOUNT,
                             "seed validator 1"});
 
-    cfg.accounts.push_back({Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+    cfg.accounts.push_back({addressFromConfig(GlobalConfig::SEED_ADDRESS_TWO_REGTEST, net, "seed validator 2"),
                             GlobalConfig::SEED_FUND_AMOUNT_TWO,
                             "seed validator 2"});
 
-    // Add more if needed
-    // cfg.accounts.push_back({
-    // GlobalConfig::SEED_ADDRESS_TWO
-    // GlobalConfig::SEED_FUND_AMOUNT_TWO,
-    // "seed validator 2"
-    //});
-
     cfg.validators.push_back({1,
-                              Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS),
+                              addressFromConfig(GlobalConfig::SEED_ADDRESS_REGTEST, net, "seed validator 1 reward"),
                               Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE),
-                              true});
+                              true,
+                              Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE)});
 
     cfg.validators.push_back({2,
-                              Crypto::addrFromHex(GlobalConfig::SEED_ADDRESS_TWO),
+                              addressFromConfig(GlobalConfig::SEED_ADDRESS_TWO_REGTEST, net, "seed validator 2 reward"),
                               Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE_TWO),
-                              true});
-
-    // Add more if needed
-    // cfg.validators.push_back({
-    //  2,
-    //  GlobalConfig::SEED_ADDRESS_TWO,
-    //  GlobalConfig::SEED_NODE_TWO,
-    //  true
-    //});
+                              true,
+                              Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE_TWO)});
 
     cfg.initial_total_supply = GlobalConfig::GENESIS_SUPPLY;
     cfg.initial_active_set_size = GlobalConfig::INITIAL_SET_SIZE;
@@ -239,6 +283,14 @@ namespace Core
       ValidatorInfo vi;
       vi.id = v.id;
       vi.reward_address = v.reward_address;
+
+      //  Consensus key: use whatever the genesis config declares.
+      //  The genesis builders above always set it explicitly, so the
+      //  fallback is only reachable from a custom GenesisConfig that
+      //  doesn't populate the field.
+      vi.consensus_key = v.consensus_key.isNull() ? v.reward_address
+                                                  : v.consensus_key;
+
       vi.node_key = v.node_key;
       vi.owner = v.reward_address;
       vi.registered_at_height = 0;
@@ -262,7 +314,6 @@ namespace Core
 
       state.putValidator(vi);
 
-      // NEW: validator-by-address index.
       state.putValidatorByAddress(v.reward_address, v.id);
     }
 
@@ -279,10 +330,6 @@ namespace Core
       state.putGlobal("active_set", set_bytes);
     }
 
-    // Derive next_validator_id from the highest seed id rather
-    // than assuming exactly two seeds with ids {1, 2}. The previous
-    // hardcoded value would collide with a third seed if a network
-    // ever added one.
     uint64_t max_seed_id = 0;
     for (const auto &v : config.validators)
     {
@@ -298,7 +345,7 @@ namespace Core
     state.putGlobal("epoch_number", u64Bytes(0));
     state.putGlobal("staker_count", u64Bytes(0));
     state.putGlobal("next_validator_id", u64Bytes(max_seed_id + 1));
-    state.putGlobal("next_token_id", u64Bytes(1)); // 0 is native CLRTY
+    state.putGlobal("next_token_id", u64Bytes(1));
     state.putGlobal("next_order_id", u64Bytes(1));
     state.putGlobal("next_pool_id", u64Bytes(1));
     state.putGlobal("next_position_id", u64Bytes(1));
@@ -306,9 +353,6 @@ namespace Core
     state.putGlobal("apy_activity_bps", u64Bytes(0));
     state.putGlobal("apy_pot_bps", u64Bytes(0));
 
-    // Initial active set size. Written explicitly so a fresh node
-    // reads it from state rather than falling back to a compile-time
-    // default in the rotation logic.
     state.putGlobal("active_set_size",
                     u64Bytes(config.initial_active_set_size));
 
@@ -319,7 +363,7 @@ namespace Core
       native.name = GlobalConfig::PROJECT_NAME;
       native.symbol = GlobalConfig::PROJECT_SYMBOL;
       native.decimals = GlobalConfig::DECIMALS;
-      native.creator = Crypto::Address{}; // zero = native token
+      native.creator = Crypto::Address{};
       native.backing = BackingModel::Unbacked;
       native.maxSupply = 0;
       native.royaltyBps = 0;
@@ -334,7 +378,7 @@ namespace Core
   BlockHeader makeGenesisHeader(const GenesisConfig &config)
   {
     BlockHeader hdr;
-    hdr.version = 1; // Genesis will always be version 1
+    hdr.version = 1;
     hdr.chain_id = config.chain_id;
     hdr.height = 0;
     hdr.parent_hash = Crypto::NULL_HASH;
@@ -357,7 +401,6 @@ namespace Core
     Block b;
     b.header = makeGenesisHeader(config);
 
-    // Collect seed validator IDs.
     std::vector<Id> active_ids;
     for (const auto &v : config.validators)
     {
@@ -365,13 +408,9 @@ namespace Core
         active_ids.push_back(v.id);
     }
 
-    // Root of the seed validator set.
     b.header.validator_set_root = computeValidatorSetRoot(active_ids);
-
-    // The state root after applying genesis.
     b.header.state_root = state.stateRoot();
 
-    // No transactions, no quorum signatures, no participants.
     b.transactions.clear();
     b.quorum_signatures.clear();
     b.participants.clear();
@@ -413,7 +452,7 @@ namespace Core
     return state.stateRoot() == expected;
   }
 
-    Crypto::Hash expectedGenesisHash(const GenesisConfig &config) noexcept
+  Crypto::Hash expectedGenesisHash(const GenesisConfig &config) noexcept
   {
     try
     {
@@ -429,8 +468,6 @@ namespace Core
     }
     catch (...)
     {
-      // A malformed pinned hash disables the check. The caller logs
-      // the computed hash on startup, so drift is still detectable.
       return Crypto::Hash{};
     }
     return Crypto::Hash{};

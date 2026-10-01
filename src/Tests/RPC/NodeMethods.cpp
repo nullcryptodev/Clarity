@@ -17,13 +17,13 @@ using namespace Tests;
 
 TEST_F(RPC_MethodTestFixture, Ping_ReturnsPong)
 {
-  Common::Json result = call("clrty_ping");
+  Common::Json result = call("ping");
   EXPECT_EQ(result, "pong");
 }
 
 TEST_F(RPC_MethodTestFixture, Ping_IgnoresExtraParams)
 {
-  Common::Json result = call("clrty_ping", {{"bogus", 42}});
+  Common::Json result = call("ping", {{"bogus", 42}});
   EXPECT_EQ(result, "pong");
 }
 
@@ -33,7 +33,7 @@ TEST_F(RPC_MethodTestFixture, Ping_IgnoresExtraParams)
 
 TEST_F(RPC_MethodTestFixture, Status_HasExpectedFields)
 {
-  Common::Json s = call("clrty_status");
+  Common::Json s = call("status");
 
   // Fields the spec promises.
   ASSERT_TRUE(s.is_object());
@@ -55,7 +55,7 @@ TEST_F(RPC_MethodTestFixture, Status_HasExpectedFields)
 
 TEST_F(RPC_MethodTestFixture, Status_HeightIsHexString)
 {
-  Common::Json s = call("clrty_status");
+  Common::Json s = call("status");
   ASSERT_TRUE(s["height"].is_string());
   const std::string h = s["height"].get<std::string>();
   ASSERT_GE(h.size(), 2u);
@@ -64,14 +64,14 @@ TEST_F(RPC_MethodTestFixture, Status_HeightIsHexString)
 
 TEST_F(RPC_MethodTestFixture, Status_RunningIsTrue)
 {
-  Common::Json s = call("clrty_status");
+  Common::Json s = call("status");
   ASSERT_TRUE(s["running"].is_boolean());
   EXPECT_TRUE(s["running"].get<bool>());
 }
 
 TEST_F(RPC_MethodTestFixture, Status_NetworkIsRegtest)
 {
-  Common::Json s = call("clrty_status");
+  Common::Json s = call("status");
   ASSERT_TRUE(s["network"].is_string());
   EXPECT_EQ(s["network"].get<std::string>(), "regtest");
 }
@@ -82,7 +82,7 @@ TEST_F(RPC_MethodTestFixture, Status_NetworkIsRegtest)
 
 TEST_F(RPC_MethodTestFixture, Health_OkWhenRunning)
 {
-  Common::Json h = call("clrty_health");
+  Common::Json h = call("health");
   ASSERT_TRUE(h.is_object());
   ASSERT_TRUE(h["ok"].is_boolean());
   EXPECT_TRUE(h["ok"].get<bool>());
@@ -97,7 +97,7 @@ TEST_F(RPC_MethodTestFixture, Health_OkWhenRunning)
 
 TEST_F(RPC_MethodTestFixture, GetPeers_EmptyWhenNoP2P)
 {
-  Common::Json p = call("clrty_getPeers");
+  Common::Json p = call("getPeers");
   ASSERT_TRUE(p.is_object());
   EXPECT_TRUE(p.contains("count"));
   EXPECT_TRUE(p.contains("peers"));
@@ -115,7 +115,7 @@ TEST_F(RPC_MethodTestFixture, GetPeers_EmptyWhenNoP2P)
 
 TEST_F(RPC_MethodTestFixture, GetConfig_DoesNotLeakAdminToken)
 {
-  Common::Json c = call("clrty_getConfig");
+  Common::Json c = call("getConfig");
   ASSERT_TRUE(c.is_object());
 
   // The wire format must never contain the admin token itself.
@@ -127,7 +127,7 @@ TEST_F(RPC_MethodTestFixture, GetConfig_DoesNotLeakAdminToken)
 
 TEST_F(RPC_MethodTestFixture, GetConfig_HasOperationalFields)
 {
-  Common::Json c = call("clrty_getConfig");
+  Common::Json c = call("getConfig");
   EXPECT_TRUE(c.contains("enabled"));
   EXPECT_TRUE(c.contains("bind_address"));
   EXPECT_TRUE(c.contains("port"));
@@ -207,7 +207,7 @@ TEST_F(RPC_MethodTestFixture, NetListening_FalseWithNoPeers)
 
 TEST_F(RPC_MethodTestFixture, UnknownMethodReturnsError)
 {
-  Common::Json resp = callRaw("clrty_thisMethodDoesNotExist",
+  Common::Json resp = callRaw("thisMethodDoesNotExist",
                               Common::Json::object());
   ASSERT_TRUE(resp.contains("error"));
   ASSERT_TRUE(resp["error"].is_object());

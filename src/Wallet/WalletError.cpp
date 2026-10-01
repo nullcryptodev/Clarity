@@ -38,6 +38,8 @@ namespace Wallet
       return "InvalidPubkey";
     case WalletError::InvalidSignature:
       return "InvalidSignature";
+    case WalletError::InvalidParameter:
+      return "InvalidParameter";
 
     case WalletError::KeyStoreNotFound:
       return "KeyStoreNotFound";

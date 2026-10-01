@@ -41,10 +41,10 @@ namespace
 
 TEST(RPC_JsonRpcRequest, MinimalValidRequest)
 {
-  Json j = {{"jsonrpc", "2.0"}, {"method", "clrty_ping"}};
+  Json j = {{"jsonrpc", "2.0"}, {"method", "ping"}};
 
   auto req = mustParse(j);
-  EXPECT_EQ(req.method, "clrty_ping");
+  EXPECT_EQ(req.method, "ping");
   EXPECT_TRUE(req.params.is_object());
   EXPECT_TRUE(req.params.empty());
   EXPECT_TRUE(req.is_notification);
@@ -55,12 +55,12 @@ TEST(RPC_JsonRpcRequest, FullRequestWithObjectParams)
 {
   Json j = {
       {"jsonrpc", "2.0"},
-      {"method", "clrty_getBalance"},
+      {"method", "getBalance"},
       {"params", {{"address", "abc"}}},
       {"id", 42}};
 
   auto req = mustParse(j);
-  EXPECT_EQ(req.method, "clrty_getBalance");
+  EXPECT_EQ(req.method, "getBalance");
   EXPECT_FALSE(req.is_notification);
   EXPECT_EQ(req.id, 42);
   ASSERT_TRUE(req.params.contains("address"));
@@ -71,7 +71,7 @@ TEST(RPC_JsonRpcRequest, StringId)
 {
   Json j = {
       {"jsonrpc", "2.0"},
-      {"method", "clrty_ping"},
+      {"method", "ping"},
       {"id", "req-1"}};
 
   auto req = mustParse(j);
@@ -83,7 +83,7 @@ TEST(RPC_JsonRpcRequest, NullIdIsNotification)
 {
   Json j = {
       {"jsonrpc", "2.0"},
-      {"method", "clrty_ping"},
+      {"method", "ping"},
       {"id", nullptr}};
 
   auto req = mustParse(j);
@@ -95,7 +95,7 @@ TEST(RPC_JsonRpcRequest, NullParamsTreatedAsEmpty)
 {
   Json j = {
       {"jsonrpc", "2.0"},
-      {"method", "clrty_ping"},
+      {"method", "ping"},
       {"params", nullptr},
       {"id", 1}};
 
@@ -109,7 +109,7 @@ TEST(RPC_JsonRpcRequest, LargeIntegerIdAccepted)
   // 64-bit ids are legal. Only fractional numbers are rejected.
   Json j = {
       {"jsonrpc", "2.0"},
-      {"method", "clrty_ping"},
+      {"method", "ping"},
       {"id", uint64_t(0xFFFFFFFFFFFFFFFFULL)}};
 
   auto req = mustParse(j);
@@ -133,7 +133,7 @@ TEST(RPC_JsonRpcRequest, RejectsUnknownTopLevelField)
 {
   Json j = {
       {"jsonrpc", "2.0"},
-      {"method", "clrty_ping"},
+      {"method", "ping"},
       {"extra", "nope"}};
 
   auto r = mustFail(j);
@@ -147,14 +147,14 @@ TEST(RPC_JsonRpcRequest, RejectsUnknownTopLevelField)
 
 TEST(RPC_JsonRpcRequest, RejectsMissingJsonrpc)
 {
-  Json j = {{"method", "clrty_ping"}};
+  Json j = {{"method", "ping"}};
   auto r = mustFail(j);
   EXPECT_EQ(r.error_code, ErrorCode::InvalidRequest);
 }
 
 TEST(RPC_JsonRpcRequest, RejectsNonStringJsonrpc)
 {
-  Json j = {{"jsonrpc", 2.0}, {"method", "clrty_ping"}};
+  Json j = {{"jsonrpc", 2.0}, {"method", "ping"}};
   auto r = mustFail(j);
   EXPECT_EQ(r.error_code, ErrorCode::InvalidRequest);
 }
@@ -163,7 +163,7 @@ TEST(RPC_JsonRpcRequest, RejectsWrongJsonrpcVersion)
 {
   for (const char *v : {"2", "2.1", "1.0", ""})
   {
-    Json j = {{"jsonrpc", v}, {"method", "clrty_ping"}};
+    Json j = {{"jsonrpc", v}, {"method", "ping"}};
     auto r = mustFail(j);
     EXPECT_EQ(r.error_code, ErrorCode::InvalidRequest) << "version=" << v;
   }
@@ -202,7 +202,7 @@ TEST(RPC_JsonRpcRequest, RejectsArrayParams)
 {
   Json j = {
       {"jsonrpc", "2.0"},
-      {"method", "clrty_ping"},
+      {"method", "ping"},
       {"params", Json::array({1, 2, 3})}};
 
   auto r = mustFail(j);
@@ -216,7 +216,7 @@ TEST(RPC_JsonRpcRequest, RejectsScalarParams)
   {
     Json j = {
         {"jsonrpc", "2.0"},
-        {"method", "clrty_ping"},
+        {"method", "ping"},
         {"params", p}};
 
     auto r = mustFail(j);
@@ -232,7 +232,7 @@ TEST(RPC_JsonRpcRequest, RejectsFloatId)
 {
   Json j = {
       {"jsonrpc", "2.0"},
-      {"method", "clrty_ping"},
+      {"method", "ping"},
       {"id", 1.5}};
 
   auto r = mustFail(j);
@@ -243,7 +243,7 @@ TEST(RPC_JsonRpcRequest, RejectsArrayId)
 {
   Json j = {
       {"jsonrpc", "2.0"},
-      {"method", "clrty_ping"},
+      {"method", "ping"},
       {"id", Json::array({1, 2})}};
 
   auto r = mustFail(j);
@@ -254,7 +254,7 @@ TEST(RPC_JsonRpcRequest, RejectsObjectId)
 {
   Json j = {
       {"jsonrpc", "2.0"},
-      {"method", "clrty_ping"},
+      {"method", "ping"},
       {"id", {{"nested", 1}}}};
 
   auto r = mustFail(j);

@@ -43,6 +43,21 @@ namespace Core
     Crypto::Address reward_address;
     Crypto::PublicKey node_key;
     bool is_seed;
+
+    //  The validator's consensus signing key.
+    //
+    //  Placed at the END of the struct so existing brace-initializers
+    //  of the form {id, reward_address, node_key, is_seed} continue to
+    //  compile unchanged. Adding it before `node_key` would silently
+    //  reassign the fields of every brace-init in Genesis.cpp and every
+    //  test fixture.
+    //
+    //  Defaults to the zero key. When zero, applyGenesis writes the
+    //  reward_address into ValidatorInfo::consensus_key — matching the
+    //  pre-split convention where a validator's signing key was its
+    //  reward address. Networks that want a distinct consensus key set
+    //  this explicitly.
+    Crypto::PublicKey consensus_key{};
   };
 
   struct GenesisConfig
@@ -67,12 +82,17 @@ namespace Core
 
   // Write genesis state to a fresh StateAccess.
   //
-  // Idempotency: if the state already contains genesis (state_root matches
-  // the expected value), this is a no-op. Otherwise, it writes the genesis
-  // state on top of whatever is there.
+  // Overwrite-safe, not check-safe. The function unconditionally writes
+  // every account, validator, and global entry — it does not first check
+  // whether the state already contains genesis. Calling it twice on the
+  // same state produces the same result as calling it once, because every
+  // write is an assignment (`balance = X`, `stake = Y`) rather than an
+  // increment (`balance += X`). This is idempotency by construction, not
+  // by a guard.
   //
-  // Callers should only call this on an empty DB, or after verifying that
-  // the DB is at genesis.
+  // If you change any write in this function from `=` to `+=`, calling it
+  // twice stops being safe. Callers should still only call this on an
+  // empty DB or after verifying the DB is at genesis.
   void applyGenesis(State::StateAccess &state, const GenesisConfig &config);
 
   // Construct the genesis block header for the given config, without
@@ -129,10 +149,6 @@ namespace Core
   //   Crypto::Hash genesis_hash = genesis.hash();
   //
   //   storeBlock(genesis, genesis_hash);
-  //
-  // The genesis hash can optionally be hard-coded in a later version to
-  // detect accidental changes to the genesis config before they cause
-  // a chain fork.
   Block makeGenesisBlock(State::StateAccess &state, const GenesisConfig &config);
 
   // The expected genesis block hash for this network. Used at startup

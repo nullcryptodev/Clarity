@@ -529,6 +529,11 @@ namespace Core
         return failure;
     }
 
+    // Capture the current effective signing key before the reward
+    // address changes, so future updates don't implicitly rotate it.
+    if (validator.consensus_key.isNull())
+      validator.consensus_key = validator.effectiveConsensusKey();
+
     // Update the index: remove the old, add the new.
     state.deleteValidatorByAddress(validator.reward_address);
     state.putValidatorByAddress(new_address, validator.id);

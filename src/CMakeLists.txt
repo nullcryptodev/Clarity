@@ -70,6 +70,7 @@ target_link_libraries(CoreLibs
     ${MDBX_LIBRARY_TARGET}
     libminiupnpc-static
     ${OPENSSL_LIBRARIES}
+    linenoise
 )
 
 # Platform-specific libraries

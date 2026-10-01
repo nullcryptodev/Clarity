@@ -48,7 +48,7 @@ namespace Node
 
     // ---- Validator identity ----
     uint64_t validator_id{0};
-    Crypto::SecretKey validator_secret_key{};
+    Crypto::SecretKey consensus_secret_key{};
 
     // ---- Node identity (P2P auth) ----
     //
@@ -63,7 +63,7 @@ namespace Node
     // first run. Set it explicitly only for tests that need a fixed
     // identity.
     //
-    // On a validator, this may be the same key as validator_secret_key
+    // On a validator, this may be the same key as consensus_secret_key
     // or different — either works. The auth protocol doesn't require
     // the node key to match the validator key; the validator binding
     // is a separate lookup by reward address in verifyPeerAuth().

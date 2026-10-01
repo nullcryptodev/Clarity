@@ -43,10 +43,10 @@ namespace Rpc
   {
   public:
     // Construct with `thread_count` workers. 0 means "auto", which uses
-    // max(1, hardware_concurrency() - 1), capped at 8. `max_queue_size`
-    // is the maximum number of pending jobs; submit() returns false when
-    // the queue is full.
-    explicit WorkerPool(size_t thread_count = 0,
+    // max(1, hardware_concurrency() - 1), capped at 8. Default 1 thread.
+    //`max_queue_size` is the maximum number of pending jobs; submit()
+    // returns false when the queue is full.
+    explicit WorkerPool(size_t thread_count = 1,
                         size_t max_queue_size = 1024);
 
     ~WorkerPool();

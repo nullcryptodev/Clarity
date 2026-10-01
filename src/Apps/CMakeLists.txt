@@ -2,4 +2,5 @@
 # module under src/. Apps are leaf targets, nothing links against them.
 
 add_subdirectory(Daemon)
+add_subdirectory(Wallet)
 add_subdirectory(Tools)

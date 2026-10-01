@@ -12,6 +12,7 @@
 #include <string_view>
 
 #include "WalletError.h"
+#include "WalletTypes.h"
 
 namespace Wallet
 {
@@ -121,6 +122,20 @@ namespace Wallet
   inline HdPath changePath(uint32_t account, uint32_t index)
   {
     return clrtyPath(account, 1, index);
+  }
+
+  //  The validator consensus key path.
+  //
+  //  Derives a distinct Ed25519 keypair used for signing consensus
+  //  messages. Same mnemonic as the receive address, different
+  //  branch. One validator key per account.
+  //
+  //  By convention, the validator key lives at index 0 of the
+  //  validator chain. Multiple validator keys per account would be
+  //  unusual; if you ever need them, use increasing indices.
+  inline HdPath validatorPath(uint32_t account, uint32_t index = 0)
+  {
+    return clrtyPath(account, HD_VALIDATOR_CHAIN, index);
   }
 
 } // namespace Wallet

@@ -74,10 +74,10 @@ namespace Node
     // Validator sanity.
     if (config.validator_id != 0)
     {
-      if (config.validator_secret_key.isNull())
+      if (config.consensus_secret_key.isNull())
       {
         throw std::runtime_error(
-            "node: validator_id set but validator_secret_key is null");
+            "node: validator_id set but consensus_secret_key is null");
       }
     }
   }

@@ -19,6 +19,7 @@ namespace Core
     Common::Writer w(out);
     w.writeU64(id);
     w.writeBytes(reward_address.data.data(), reward_address.data.size());
+    w.writeBytes(consensus_key.data.data(), consensus_key.data.size());
     w.writeBytes(node_key.data.data(), node_key.data.size());
     w.writeBytes(owner.data.data(), owner.data.size());
     w.writeU64(registered_at_height);
@@ -60,6 +61,7 @@ namespace Core
 
     out.id = r.readU64();
     r.readBytes(out.reward_address.data.data(), out.reward_address.data.size());
+    r.readBytes(out.consensus_key.data.data(), out.consensus_key.data.size());
     r.readBytes(out.node_key.data.data(), out.node_key.data.size());
     r.readBytes(out.owner.data.data(), out.owner.data.size());
 

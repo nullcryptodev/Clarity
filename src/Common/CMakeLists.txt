@@ -24,6 +24,7 @@ set_property(TARGET Common PROPERTY OUTPUT_NAME "Common")
 target_link_libraries(Common
   PUBLIC
     Crypto
+    linenoise
 )
 
 # Include directories

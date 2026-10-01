@@ -59,28 +59,6 @@ namespace
     //    - If we have the higher nonce, that connection is our inbound.
     return we_have_lower_nonce ? we_dialed : !we_dialed;
   }
-
-  const char *peerStateName(P2P::PeerState s) noexcept
-  {
-    switch (s)
-    {
-    case P2P::PeerState::Connecting:
-      return "connecting";
-    case P2P::PeerState::Handshaking:
-      return "handshaking";
-    case P2P::PeerState::VerackPending:
-      return "verack-pending";
-    case P2P::PeerState::AuthPending:
-      return "auth-pending";
-    case P2P::PeerState::Established:
-      return "established";
-    case P2P::PeerState::Disconnecting:
-      return "disconnecting";
-    case P2P::PeerState::Closed:
-      return "closed";
-    }
-    return "unknown";
-  }
 }
 
 namespace P2P
@@ -153,7 +131,7 @@ namespace P2P
                          config_.listenPort);
         acceptor_ = std::make_unique<tcp::acceptor>(io_, ep);
         startAccept();
-        (*log_)(Logging::INFO) << "listening on port " << config_.listenPort;
+        (*log_)(Logging::INFO) << "P2P listening on port " << Logging::BRIGHT_GREEN << config_.listenPort;
       }
       catch (const std::exception &e)
       {
@@ -440,9 +418,9 @@ namespace P2P
     const auto score = peer.stats().misbehaviors;
     const auto reason = peer.isClosed() ? "closed" : "disconnected";
 
-    (*log_)(Logging::INFO) << "peer " << id << " (" << ip << ":" << port
-                           << ") disconnected: " << reason
-                           << " (misbehaviors=" << score << ")";
+    (*log_)(Logging::DEBUGGING) << "peer " << id << " (" << ip << ":" << port
+                                << ") disconnected: " << reason
+                                << " (misbehaviors=" << score << ")";
 
     //  Peer deduplication cleanup. Only erase the map entry if it
     //  still points at *this* peer. If it points at a different peer

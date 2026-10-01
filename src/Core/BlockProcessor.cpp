@@ -423,9 +423,7 @@ namespace Core
         return false;
       }
 
-      // The codebase convention: a validator's signing key is its
-      // reward_address. Same convention as Node::getSignerPublicKey.
-      Crypto::PublicKey pk = v.reward_address;
+      Crypto::PublicKey pk = v.effectiveConsensusKey();
 
       if (!Crypto::verify(signing_hash, pk, vs.signature))
       {

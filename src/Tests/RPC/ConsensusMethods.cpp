@@ -16,7 +16,7 @@ using namespace Tests;
 TEST_F(RPC_MethodTestFixture, GetValidators_ReturnsArray)
 {
   // encodeValidatorList returns a bare JSON array, sorted by id.
-  Common::Json v = call("clrty_getValidators");
+  Common::Json v = call("getValidators");
   ASSERT_TRUE(v.is_array());
 
   // The shared fixture has one seed validator at genesis.
@@ -34,7 +34,7 @@ TEST_F(RPC_MethodTestFixture, GetValidators_ReturnsArray)
 
 TEST_F(RPC_MethodTestFixture, GetValidators_ActiveOnlyAccepted)
 {
-  Common::Json v = call("clrty_getValidators", {{"active_only", true}});
+  Common::Json v = call("getValidators", {{"active_only", true}});
   ASSERT_TRUE(v.is_array());
 
   // Every returned validator should have is_active == true.
@@ -49,7 +49,7 @@ TEST_F(RPC_MethodTestFixture, GetValidators_ActiveOnlyAccepted)
 TEST_F(RPC_MethodTestFixture, GetValidators_WrongTypeFlag)
 {
   // active_only is a bool; a string should be rejected.
-  Common::Json resp = callRaw("clrty_getValidators", {{"active_only", "yes"}});
+  Common::Json resp = callRaw("getValidators", {{"active_only", "yes"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
@@ -60,7 +60,7 @@ TEST_F(RPC_MethodTestFixture, GetValidators_WrongTypeFlag)
 
 TEST_F(RPC_MethodTestFixture, GetValidator_MissingParam)
 {
-  Common::Json resp = callRaw("clrty_getValidator", Common::Json::object());
+  Common::Json resp = callRaw("getValidator", Common::Json::object());
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
@@ -68,7 +68,7 @@ TEST_F(RPC_MethodTestFixture, GetValidator_MissingParam)
 TEST_F(RPC_MethodTestFixture, GetValidator_UnknownId)
 {
   // A high id that certainly doesn't exist.
-  Common::Json resp = callRaw("clrty_getValidator", {{"id", "0xFFFF"}});
+  Common::Json resp = callRaw("getValidator", {{"id", "0xFFFF"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::ValidatorNotFound);
 }
@@ -79,7 +79,7 @@ TEST_F(RPC_MethodTestFixture, GetValidator_UnknownId)
 
 TEST_F(RPC_MethodTestFixture, GetActiveSet_WellFormed)
 {
-  Common::Json v = call("clrty_getActiveSet");
+  Common::Json v = call("getActiveSet");
   ASSERT_TRUE(v.is_object());
   EXPECT_TRUE(v.contains("ids"));
   EXPECT_TRUE(v.contains("size"));
@@ -91,7 +91,7 @@ TEST_F(RPC_MethodTestFixture, GetActiveSet_WellFormed)
 
 TEST_F(RPC_MethodTestFixture, GetActiveSet_SizeMatchesArray)
 {
-  Common::Json v = call("clrty_getActiveSet");
+  Common::Json v = call("getActiveSet");
   const std::string size_hex = v["size"].get<std::string>();
   // Parse the hex size back to a number and compare with the array length.
   uint64_t reported = std::stoull(size_hex.substr(2), nullptr, 16);
@@ -104,7 +104,7 @@ TEST_F(RPC_MethodTestFixture, GetActiveSet_SizeMatchesArray)
 
 TEST_F(RPC_MethodTestFixture, GetConsensusState_Fields)
 {
-  Common::Json v = call("clrty_getConsensusState");
+  Common::Json v = call("getConsensusState");
   ASSERT_TRUE(v.is_object());
   EXPECT_TRUE(v.contains("height"));
   EXPECT_TRUE(v.contains("round"));
@@ -117,13 +117,13 @@ TEST_F(RPC_MethodTestFixture, GetConsensusState_Fields)
 
 TEST_F(RPC_MethodTestFixture, GetConsensusState_HeightIsHex)
 {
-  Common::Json v = call("clrty_getConsensusState");
+  Common::Json v = call("getConsensusState");
   ASSERT_TRUE(v["height"].is_string());
   EXPECT_EQ(v["height"].get<std::string>().substr(0, 2), "0x");
 }
 
 TEST_F(RPC_MethodTestFixture, GetConsensusState_IsValidatorBool)
 {
-  Common::Json v = call("clrty_getConsensusState");
+  Common::Json v = call("getConsensusState");
   ASSERT_TRUE(v["is_validator"].is_boolean());
 }

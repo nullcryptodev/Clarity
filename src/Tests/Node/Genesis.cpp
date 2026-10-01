@@ -15,6 +15,7 @@
 #include "Core/Genesis.h"
 #include "GlobalConfig.h"
 #include "Node/Node.h"
+#include "Wallet/AddressCodec.h"
 
 using namespace Tests;
 
@@ -108,6 +109,26 @@ TEST(Node_Genesis, PinnedHashMatchesRegtest)
          "Computed="
       << computed.toString()
       << " pinned=" << pinned.toString();
+}
+
+// Tests regtest values
+TEST(Node_Genesis, ConfigSeedAddressesDecode)
+{
+  auto a1 = Wallet::decodeAddress(GlobalConfig::SEED_ADDRESS_REGTEST,
+                                  Wallet::Network::Regtest);
+  ASSERT_TRUE(a1.has_value())
+      << "SEED_ADDRESS does not decode: " << GlobalConfig::SEED_ADDRESS_REGTEST;
+
+  auto a2 = Wallet::decodeAddress(GlobalConfig::SEED_ADDRESS_TWO_REGTEST,
+                                  Wallet::Network::Regtest);
+  ASSERT_TRUE(a2.has_value())
+      << "SEED_ADDRESS_TWO does not decode: " << GlobalConfig::SEED_ADDRESS_TWO_REGTEST;
+
+  EXPECT_EQ(a1->toString(), std::string(GlobalConfig::SEED_NODE))
+      << "SEED_ADDRESS does not decode to SEED_NODE";
+
+  EXPECT_EQ(a2->toString(), std::string(GlobalConfig::SEED_NODE_TWO))
+      << "SEED_ADDRESS_TWO does not decode to SEED_NODE_TWO";
 }
 
 //  Verify the pin is actually enforced at startup. This is the

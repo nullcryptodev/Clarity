@@ -412,16 +412,169 @@ namespace Rpc
     return out;
   }
 
-  Crypto::Address requireAddress(const Common::Json &obj, const char *key,
-                                 const std::string &expected_hrp)
-  {
-    if (!obj.contains(key) || !obj.at(key).is_string())
-      missingOrBad(key, "an address (Bech32m or hex)");
+  // ===========================================================================
+  //  requireAddress
+  // ===========================================================================
+  //
+  //  Resolve a "address" parameter to a Crypto::Address. Accepts two
+  //  forms:
+  //
+  //    1. bech32m — decoded with the network matching `hrp`. A mismatch
+  //       between the address's HRP and `hrp` is rejected with a
+  //       message that names both, so the user knows they sent a
+  //       mainnet address to a regtest node (or vice versa).
+  //
+  //    2. raw hex — a 64-character hex string is decoded as a bare
+  //       32-byte Ed25519 public key. This is the format that appears
+  //       in ValidatorInfo::consensus_key, in some RPC responses, and
+  //       in genesis configs. Accepting it here means a client that
+  //       has a raw key from one query can use it directly in another
+  //       without round-tripping through bech32m.
+  //
+  //  Throws RpcMethodError with ErrorCode::InvalidParams on any
+  //  failure. The error data carries both the field name and the
+  //  rejected value so the client can diagnose.
+  //
+  //  The order of attempts matters. bech32m is tried first because it
+  //  is what every user-facing address is, and what the RPC emits in
+  //  its own responses. Hex is the fallback for tooling.
+  //
+  //  A note on the HRP-detection in the error path: bech32m addresses
+  //  have an HRP separated from the rest of the string by the
+  //  character '1'. Splitting on the first '1' gives us the HRP that
+  //  the address claims to have. If it differs from `hrp`, that's the
+  //  most useful thing we can tell the user.
+  //
+  //  The '1' separator is unique to bech32m; a raw hex string
+  //  contains only [0-9a-fA-F], none of which is '1'... actually '1'
+  //  IS a valid hex character. So we have to be careful: the HRP
+  //  detection should only run when the input is clearly not hex.
+  //  See the guard below.
 
-    Crypto::Address out;
-    if (!parseAddress(obj.at(key).get<std::string>(), expected_hrp, out))
-      missingOrBad(key, "an address (Bech32m or hex) on this network");
-    return out;
+  Crypto::Address requireAddress(const Common::Json &params,
+                                 const char *name,
+                                 const std::string &hrp)
+  {
+    //  Fetch the parameter as a string. requireString throws
+    //  RpcMethodError(InvalidParams) if the field is missing or not a
+    //  string.
+    const std::string value = requireString(params, name);
+
+    //  Empty input is never valid.
+    if (value.empty())
+    {
+      throw RpcMethodError(
+          ErrorCode::InvalidParams,
+          ("field '" + std::string(name) + "' is empty").c_str(),
+          makeErrorData(ErrorCode::InvalidParams,
+                        {{"field", name}, {"value", value}}));
+    }
+
+    //  ---- Attempt 1: bech32m ----
+    //
+    //  Look up the network for the expected HRP. If the HRP is
+    //  unknown (a config error on the server side, not a client
+    //  error), fall through to the hex attempt rather than throwing
+    //  — the raw-hex path doesn't need to know about networks.
+    {
+      auto network_opt = Wallet::networkForHrp(hrp);
+      if (network_opt.has_value())
+      {
+        auto decoded = Wallet::decodeAddress(value, *network_opt);
+        if (decoded.has_value())
+          return *decoded;
+      }
+    }
+
+    //  ---- Attempt 2: raw hex ----
+    //
+    //  A 64-character hex string. Decode byte by byte. Rejects
+    //  anything that isn't exactly 32 bytes or contains a non-hex
+    //  character.
+    if (value.size() == 64)
+    {
+      auto hexNibble = [](char c) -> int
+      {
+        if (c >= '0' && c <= '9')
+          return c - '0';
+        if (c >= 'a' && c <= 'f')
+          return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+          return c - 'A' + 10;
+        return -1;
+      };
+
+      Crypto::Address addr;
+      bool all_hex = true;
+
+      for (size_t i = 0; i < 32; ++i)
+      {
+        const int hi = hexNibble(value[i * 2]);
+        const int lo = hexNibble(value[i * 2 + 1]);
+        if (hi < 0 || lo < 0)
+        {
+          all_hex = false;
+          break;
+        }
+        addr.data[i] = static_cast<uint8_t>((hi << 4) | lo);
+      }
+
+      if (all_hex)
+        return addr;
+    }
+
+    //  ---- Neither form worked. Build a helpful error. ----
+
+    std::string message = "field '" + std::string(name) +
+                          "' is not a valid address";
+
+    //  If the input looks like a bech32m address with the wrong HRP,
+    //  say so explicitly. This is the single most common cause of
+    //  this error in practice: a user pastes a mainnet address into
+    //  a regtest session (or vice versa).
+    //
+    //  Detection: the input contains a '1' that isn't part of a
+    //  hex-only string. A 64-char input containing any non-hex
+    //  character is not a raw key, so it might be a bech32m address
+    //  with the wrong HRP.
+    {
+      const size_t sep = value.find('1');
+      if (sep != std::string::npos && sep > 0 && sep < value.size() - 1)
+      {
+        const std::string value_hrp = value.substr(0, sep);
+
+        //  Only report an HRP mismatch if the prefix actually looks
+        //  like an HRP (all lowercase letters). This avoids a false
+        //  positive on something like "0x1234...1abc..." where the
+        //  '1' is a hex digit.
+        bool hrp_looks_valid = !value_hrp.empty();
+        for (char c : value_hrp)
+        {
+          if (c < 'a' || c > 'z')
+          {
+            hrp_looks_valid = false;
+            break;
+          }
+        }
+
+        if (hrp_looks_valid && value_hrp != hrp)
+        {
+          message += ": address is for '";
+          message += value_hrp;
+          message += "' but this node is '";
+          message += hrp;
+          message += "'";
+        }
+      }
+    }
+
+    throw RpcMethodError(
+        ErrorCode::InvalidParams,
+        message.c_str(),
+        makeErrorData(ErrorCode::InvalidParams,
+                      {{"field", name},
+                       {"value", value},
+                       {"expected_hrp", hrp}}));
   }
 
   std::string requireString(const Common::Json &obj, const char *key)

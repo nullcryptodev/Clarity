@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "Core/ValidatorTypes.h"
-#include "RPC/Encoders/ValidatorEncoder.h"
+#include "RPC/Encoders.h"
 
 using Common::Json;
 using Rpc::encodeValidator;

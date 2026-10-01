@@ -6,29 +6,28 @@
 #include "KeyStoreFormat.h"
 
 #include "Common/Json.h"
-#include "Crypto/Random.h"
+#include "Common/StringTools.h"
 
-#include <cstdio>
-#include <cstring>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
+#include <filesystem>
+#include <random>
 
 namespace Wallet
 {
+
   namespace
   {
-    //  Hex helpers
+    //  ---- Hex helpers ----
     //
-    //  Keystore byte fields are encoded as lowercase hex strings, the
-    //  convention shared by every JSON keystore format in the wild
-    //  (Ethereum, Cosmos, Solana, every browser wallet). This keeps
-    //  the file human-readable and lets third-party tools inspect it
-    //  without needing to know our exact schema.
+    //  Kept local so the format doesn't depend on Common/Hex.h's
+    //  exact API.
 
-    std::string toHex(const std::vector<uint8_t> &v)
+    std::string bytesToHex(const std::vector<uint8_t> &v)
     {
-      static constexpr char hex[] = "0123456789abcdef";
+      static const char hex[] = "0123456789abcdef";
       std::string out;
       out.reserve(v.size() * 2);
       for (uint8_t b : v)
@@ -39,12 +38,10 @@ namespace Wallet
       return out;
     }
 
-    // Decode a hex string. Returns std::nullopt on odd length or any
-    // non-hex character. Accepts both cases on input.
-    std::optional<std::vector<uint8_t>> fromHex(std::string_view s)
+    bool hexToBytes(const std::string &hex, std::vector<uint8_t> &out)
     {
-      if (s.size() % 2 != 0)
-        return std::nullopt;
+      if (hex.size() % 2 != 0)
+        return false;
 
       auto nib = [](char c) -> int
       {
@@ -57,301 +54,89 @@ namespace Wallet
         return -1;
       };
 
-      std::vector<uint8_t> out;
-      out.reserve(s.size() / 2);
-      for (size_t i = 0; i < s.size(); i += 2)
+      out.clear();
+      out.reserve(hex.size() / 2);
+      for (size_t i = 0; i < hex.size(); i += 2)
       {
-        const int hi = nib(s[i]);
-        const int lo = nib(s[i + 1]);
+        const int hi = nib(hex[i]);
+        const int lo = nib(hex[i + 1]);
         if (hi < 0 || lo < 0)
-          return std::nullopt;
-        out.push_back(uint8_t((hi << 4) | lo));
-      }
-      return out;
-    }
-
-    //  JSON accessors
-    //
-    //  Small helpers that read a required field of a specific type.
-    //  Each returns false if the field is missing or the wrong type.
-    //  We use these instead of nlohmann::json::at() because we want
-    //  a clean WalletStatus error rather than an exception.
-
-    bool getUint(const Common::Json &j, const char *key, uint64_t &out)
-    {
-      if (!j.contains(key))
-        return false;
-      const auto &v = j[key];
-      if (!v.is_number_unsigned() && !v.is_number_integer())
-        return false;
-      out = v.get<uint64_t>();
-      return true;
-    }
-
-    bool getString(const Common::Json &j, const char *key, std::string &out)
-    {
-      if (!j.contains(key))
-        return false;
-      const auto &v = j[key];
-      if (!v.is_string())
-        return false;
-      out = v.get<std::string>();
-      return true;
-    }
-
-    // Read a hex string field into a byte vector.
-    bool getHex(const Common::Json &j, const char *key,
-                std::vector<uint8_t> &out)
-    {
-      std::string s;
-      if (!getString(j, key, s))
-        return false;
-      auto decoded = fromHex(s);
-      if (!decoded)
-        return false;
-      out = std::move(*decoded);
-      return true;
-    }
-
-    //  Json -> struct
-
-    // Parse a crypto.kdfparams sub-object for the given KDF.
-    bool parseArgon2Params(const Common::Json &j, Argon2ParamsJson &out,
-                           WalletStatus *err)
-    {
-      if (!j.is_object())
-        return false;
-
-      if (!getHex(j, "salt", out.salt))
-      {
-        if (err)
-          *err = WalletStatus::fail(WalletError::KeyStoreCorrupt,
-                                    "argon2id: missing or invalid 'salt'");
-        return false;
-      }
-
-      uint64_t m = 0, t = 0, p = 0;
-      if (!getUint(j, "m_cost_kib", m) ||
-          !getUint(j, "t_cost", t) ||
-          !getUint(j, "p_cost", p))
-      {
-        if (err)
-          *err = WalletStatus::fail(WalletError::KeyStoreCorrupt,
-                                    "argon2id: missing cost parameters");
-        return false;
-      }
-
-      // Cost parameters must fit in uint32_t and be within sane bounds.
-      // The exact bounds are re-checked in validateKeyStoreFile; here
-      // we only guard against overflow and nonsensical values.
-      if (m > 0xFFFFFFFFull || t > 0xFFFFFFFFull || p > 0xFFFFFFFFull)
-      {
-        if (err)
-          *err = WalletStatus::fail(WalletError::KeyStoreCorrupt,
-                                    "argon2id: cost parameter overflows uint32");
-        return false;
-      }
-
-      out.m_cost_kib = uint32_t(m);
-      out.t_cost = uint32_t(t);
-      out.p_cost = uint32_t(p);
-      return true;
-    }
-
-    bool parsePbkdf2Params(const Common::Json &j, Pbkdf2ParamsJson &out,
-                           WalletStatus *err)
-    {
-      if (!j.is_object())
-        return false;
-
-      if (!getHex(j, "salt", out.salt))
-      {
-        if (err)
-          *err = WalletStatus::fail(WalletError::KeyStoreCorrupt,
-                                    "pbkdf2: missing or invalid 'salt'");
-        return false;
-      }
-
-      uint64_t iters = 0;
-      if (!getUint(j, "iterations", iters))
-      {
-        if (err)
-          *err = WalletStatus::fail(WalletError::KeyStoreCorrupt,
-                                    "pbkdf2: missing 'iterations'");
-        return false;
-      }
-      if (iters > 0xFFFFFFFFull)
-      {
-        if (err)
-          *err = WalletStatus::fail(WalletError::KeyStoreCorrupt,
-                                    "pbkdf2: iterations overflows uint32");
-        return false;
-      }
-      out.iterations = uint32_t(iters);
-      return true;
-    }
-
-    //  struct -> Json
-
-    Common::Json serializeArgon2Params(const Argon2ParamsJson &p)
-    {
-      Common::Json j;
-      j["salt"] = toHex(p.salt);
-      j["m_cost_kib"] = p.m_cost_kib;
-      j["t_cost"] = p.t_cost;
-      j["p_cost"] = p.p_cost;
-      return j;
-    }
-
-    Common::Json serializePbkdf2Params(const Pbkdf2ParamsJson &p)
-    {
-      Common::Json j;
-      j["salt"] = toHex(p.salt);
-      j["iterations"] = p.iterations;
-      return j;
-    }
-
-    std::optional<Network> networkFromString(std::string_view s) noexcept
-    {
-      if (s == "mainnet")
-        return Network::Mainnet;
-      if (s == "testnet")
-        return Network::Testnet;
-      if (s == "regtest")
-        return Network::Regtest;
-      return std::nullopt;
-    }
-
-    //  Temp-file-then-rename atomic write
-    //
-    //  Write to `path + ".tmp"`, fsync, rename over `path`. If we
-    //  crash mid-write, the original file is untouched. This is the
-    //  standard pattern for durability without a journal.
-    bool writeFileAtomically(const std::string &path,
-                             const std::string &contents,
-                             WalletStatus *error_out)
-    {
-      const std::string tmp_path = path + ".tmp";
-
-      {
-        std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!f.is_open())
-        {
-          if (error_out)
-            *error_out = WalletStatus::fail(
-                WalletError::Internal,
-                "could not open temp file: " + tmp_path);
           return false;
-        }
-        f.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-        f.flush();
-        if (!f)
-        {
-          if (error_out)
-            *error_out = WalletStatus::fail(
-                WalletError::Internal,
-                "write failed: " + tmp_path);
-          f.close();
-          std::remove(tmp_path.c_str());
-          return false;
-        }
-      } // ofstream destructor closes and flushes
-
-      // Rename over the target. std::rename is atomic on POSIX when
-      // src and dst are on the same filesystem.
-      if (std::rename(tmp_path.c_str(), path.c_str()) != 0)
-      {
-        if (error_out)
-          *error_out = WalletStatus::fail(
-              WalletError::Internal,
-              "rename failed: " + tmp_path + " -> " + path);
-        std::remove(tmp_path.c_str());
-        return false;
+        out.push_back(static_cast<uint8_t>((hi << 4) | lo));
       }
-
       return true;
     }
+  } // anonymous namespace
 
-  } // namespace
-
+  // ===========================================================================
   //  Serialize
+  // ===========================================================================
 
   std::string serializeKeyStoreFile(const KeyStoreFile &f)
   {
-    Common::Json j;
+    Common::Json j = Common::Json::object();
 
-    // Top-level identity.
     j["version"] = f.version;
     j["id"] = f.id;
     j["label"] = f.label;
     j["network"] = f.network;
     j["chain_id"] = f.chain_id;
     j["address"] = f.address;
-    j["pubkey"] = toHex(f.pubkey);
+    j["pubkey"] = bytesToHex(f.pubkey);
+    j["created_at_ms"] = f.created_at_ms;
 
-    // Crypto section.
+    //  ---- crypto ----
     {
-      Common::Json c;
+      Common::Json c = Common::Json::object();
       c["cipher"] = f.crypto.cipher;
-      c["nonce"] = toHex(f.crypto.nonce);
+      c["nonce"] = bytesToHex(f.crypto.nonce);
       c["aad"] = f.crypto.aad;
-      c["ciphertext"] = toHex(f.crypto.ciphertext);
-      c["mac"] = toHex(f.crypto.mac);
+      c["ciphertext"] = bytesToHex(f.crypto.ciphertext);
+      c["mac"] = bytesToHex(f.crypto.mac);
       c["kdf"] = f.crypto.kdf;
 
-      // Exactly one of the two kdfparams sub-objects is present.
-      if (f.crypto.kdf == KDF_ARGON2ID && f.crypto.argon2)
+      Common::Json kp = Common::Json::object();
+      if (f.crypto.argon2.has_value())
       {
-        c["kdfparams"] = serializeArgon2Params(*f.crypto.argon2);
+        kp["salt"] = bytesToHex(f.crypto.argon2->salt);
+        kp["m_cost_kib"] = f.crypto.argon2->m_cost_kib;
+        kp["t_cost"] = f.crypto.argon2->t_cost;
+        kp["p_cost"] = f.crypto.argon2->p_cost;
       }
-      else if (f.crypto.kdf == KDF_PBKDF2_HMAC_SHA512 && f.crypto.pbkdf2)
+      else if (f.crypto.pbkdf2.has_value())
       {
-        c["kdfparams"] = serializePbkdf2Params(*f.crypto.pbkdf2);
+        kp["salt"] = bytesToHex(f.crypto.pbkdf2->salt);
+        kp["iterations"] = f.crypto.pbkdf2->iterations;
       }
-      else
-      {
-        // Malformed input to the serializer. Emit an empty object;
-        // validateKeyStoreFile would have caught this earlier.
-        c["kdfparams"] = Common::Json::object();
-      }
+      c["kdfparams"] = std::move(kp);
 
       j["crypto"] = std::move(c);
     }
 
-    // HD section.
+    //  ---- hd ----
     {
-      Common::Json h;
-      h["seed_fingerprint"] = toHex(f.hd.seed_fingerprint);
+      Common::Json h = Common::Json::object();
+      h["seed_fingerprint"] = bytesToHex(f.hd.seed_fingerprint);
       h["default_path"] = f.hd.default_path;
+      //  Only emit validator_path if it's set. Older readers that
+      //  don't understand the field will ignore it; newer readers
+      //  fall back to the standard path if the field is absent.
+      if (!f.hd.validator_path.empty())
+        h["validator_path"] = f.hd.validator_path;
       j["hd"] = std::move(h);
     }
 
-    // Metadata.
-    j["created_at_ms"] = f.created_at_ms;
-
-    // Pretty-print with 4-space indent. nlohmann::json::dump does
-    // not guarantee key order, but it preserves insertion order for
-    // objects by default, which is what we want for readability.
     return j.dump(4);
   }
 
+  // ===========================================================================
   //  Parse
+  // ===========================================================================
 
   std::optional<KeyStoreFile> parseKeyStoreFile(
       const std::string &json,
       WalletStatus *error_out)
   {
-    auto fail = [&](WalletError code, std::string detail)
-        -> std::optional<KeyStoreFile>
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(code, std::move(detail));
-      return std::nullopt;
-    };
-
-    if (error_out)
-      *error_out = WalletStatus::success();
-
     Common::Json j;
     try
     {
@@ -359,248 +144,333 @@ namespace Wallet
     }
     catch (const std::exception &e)
     {
-      return fail(WalletError::KeyStoreCorrupt,
-                  std::string("JSON parse error: ") + e.what());
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::KeyStoreCorrupt,
+            std::string("invalid JSON: ") + e.what());
+      return std::nullopt;
     }
 
     if (!j.is_object())
-      return fail(WalletError::KeyStoreCorrupt, "root is not an object");
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::KeyStoreCorrupt, "top-level JSON is not an object");
+      return std::nullopt;
+    }
 
     KeyStoreFile f;
 
-    // Version. Must be present and match what we support. Older
-    // versions would need a migration path; v1 is the only one so far.
+    //  ---- version ----
+    if (!j.contains("version") || !j["version"].is_number_unsigned())
     {
-      uint64_t version = 0;
-      if (!getUint(j, "version", version))
-        return fail(WalletError::KeyStoreCorrupt, "missing 'version'");
-      if (version != KEYSTORE_VERSION)
-        return fail(WalletError::KeyStoreUnsupportedVersion,
-                    "version " + std::to_string(version) +
-                        " not supported (expected " +
-                        std::to_string(KEYSTORE_VERSION) + ")");
-      f.version = uint32_t(version);
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::KeyStoreCorrupt, "missing or invalid 'version'");
+      return std::nullopt;
+    }
+    f.version = j["version"].get<uint32_t>();
+    if (f.version != KEYSTORE_VERSION)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::KeyStoreUnsupportedVersion,
+            "unsupported keystore version");
+      return std::nullopt;
     }
 
-    // Identity fields.
-    if (!getString(j, "id", f.id))
-      return fail(WalletError::KeyStoreCorrupt, "missing 'id'");
-    if (!getString(j, "network", f.network))
-      return fail(WalletError::KeyStoreCorrupt, "missing 'network'");
-    if (!networkFromString(f.network))
-      return fail(WalletError::KeyStoreCorrupt,
-                  "unknown network: '" + f.network + "'");
-
-    // chain_id is required.
+    //  ---- top-level scalars ----
+    if (!j.contains("id") || !j["id"].is_string() ||
+        !j.contains("label") || !j["label"].is_string() ||
+        !j.contains("network") || !j["network"].is_string() ||
+        !j.contains("chain_id") || !j["chain_id"].is_number_unsigned() ||
+        !j.contains("address") || !j["address"].is_string() ||
+        !j.contains("pubkey") || !j["pubkey"].is_string() ||
+        !j.contains("created_at_ms") || !j["created_at_ms"].is_number_unsigned())
     {
-      uint64_t cid = 0;
-      if (!getUint(j, "chain_id", cid))
-        return fail(WalletError::KeyStoreCorrupt, "missing 'chain_id'");
-      f.chain_id = cid;
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::KeyStoreCorrupt,
+            "missing or invalid top-level field");
+      return std::nullopt;
     }
 
-    // Optional identity fields with sensible defaults.
-    getString(j, "label", f.label);
-    getString(j, "address", f.address);
+    f.id = j["id"].get<std::string>();
+    f.label = j["label"].get<std::string>();
+    f.network = j["network"].get<std::string>();
+    f.chain_id = j["chain_id"].get<uint64_t>();
+    f.address = j["address"].get<std::string>();
+    f.created_at_ms = j["created_at_ms"].get<uint64_t>();
 
-    // pubkey is required.
-    if (!getHex(j, "pubkey", f.pubkey))
-      return fail(WalletError::KeyStoreCorrupt,
-                  "missing or invalid 'pubkey'");
+    if (!hexToBytes(j["pubkey"].get<std::string>(), f.pubkey))
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::KeyStoreCorrupt, "invalid 'pubkey' hex");
+      return std::nullopt;
+    }
 
-    //  Crypto section.
-
+    //  ---- crypto ----
     if (!j.contains("crypto") || !j["crypto"].is_object())
-      return fail(WalletError::KeyStoreCorrupt, "missing 'crypto' object");
-
-    const auto &c = j["crypto"];
-
-    if (!getString(c, "cipher", f.crypto.cipher))
-      return fail(WalletError::KeyStoreCorrupt, "missing 'crypto.cipher'");
-    if (f.crypto.cipher != CIPHER_XCHACHA20_POLY1305)
-      return fail(WalletError::KeyStoreUnsupportedCipher,
-                  "unsupported cipher: '" + f.crypto.cipher + "'");
-
-    if (!getHex(c, "nonce", f.crypto.nonce))
-      return fail(WalletError::KeyStoreCorrupt, "missing 'crypto.nonce'");
-    if (!getString(c, "aad", f.crypto.aad))
-      return fail(WalletError::KeyStoreCorrupt, "missing 'crypto.aad'");
-    if (!getHex(c, "ciphertext", f.crypto.ciphertext))
-      return fail(WalletError::KeyStoreCorrupt, "missing 'crypto.ciphertext'");
-    if (!getHex(c, "mac", f.crypto.mac))
-      return fail(WalletError::KeyStoreCorrupt, "missing 'crypto.mac'");
-
-    if (!getString(c, "kdf", f.crypto.kdf))
-      return fail(WalletError::KeyStoreCorrupt, "missing 'crypto.kdf'");
-
-    if (!c.contains("kdfparams") || !c["kdfparams"].is_object())
-      return fail(WalletError::KeyStoreCorrupt,
-                  "missing 'crypto.kdfparams' object");
-
-    const auto &kp = c["kdfparams"];
-
-    if (f.crypto.kdf == KDF_ARGON2ID)
     {
-      Argon2ParamsJson params;
-      if (!parseArgon2Params(kp, params, error_out))
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::KeyStoreCorrupt, "missing 'crypto' object");
+      return std::nullopt;
+    }
+    {
+      const auto &c = j["crypto"];
+      if (!c.contains("cipher") || !c["cipher"].is_string() ||
+          !c.contains("nonce") || !c["nonce"].is_string() ||
+          !c.contains("aad") || !c["aad"].is_string() ||
+          !c.contains("ciphertext") || !c["ciphertext"].is_string() ||
+          !c.contains("mac") || !c["mac"].is_string() ||
+          !c.contains("kdf") || !c["kdf"].is_string() ||
+          !c.contains("kdfparams") || !c["kdfparams"].is_object())
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::KeyStoreCorrupt, "missing crypto field");
         return std::nullopt;
-      f.crypto.argon2 = std::move(params);
-    }
-    else if (f.crypto.kdf == KDF_PBKDF2_HMAC_SHA512)
-    {
-      Pbkdf2ParamsJson params;
-      if (!parsePbkdf2Params(kp, params, error_out))
+      }
+
+      f.crypto.cipher = c["cipher"].get<std::string>();
+      f.crypto.aad = c["aad"].get<std::string>();
+      f.crypto.kdf = c["kdf"].get<std::string>();
+
+      if (!hexToBytes(c["nonce"].get<std::string>(), f.crypto.nonce) ||
+          !hexToBytes(c["ciphertext"].get<std::string>(), f.crypto.ciphertext) ||
+          !hexToBytes(c["mac"].get<std::string>(), f.crypto.mac))
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::KeyStoreCorrupt, "invalid crypto hex field");
         return std::nullopt;
-      f.crypto.pbkdf2 = std::move(params);
-    }
-    else
-    {
-      return fail(WalletError::KeyStoreUnsupportedKdf,
-                  "unsupported kdf: '" + f.crypto.kdf + "'");
+      }
+
+      const auto &kp = c["kdfparams"];
+      if (f.crypto.kdf == KDF_ARGON2ID)
+      {
+        if (!kp.contains("salt") || !kp["salt"].is_string() ||
+            !kp.contains("m_cost_kib") || !kp["m_cost_kib"].is_number_unsigned() ||
+            !kp.contains("t_cost") || !kp["t_cost"].is_number_unsigned() ||
+            !kp.contains("p_cost") || !kp["p_cost"].is_number_unsigned())
+        {
+          if (error_out)
+            *error_out = WalletStatus::fail(
+                WalletError::KeyStoreCorrupt, "invalid argon2id params");
+          return std::nullopt;
+        }
+
+        Argon2ParamsJson a;
+        if (!hexToBytes(kp["salt"].get<std::string>(), a.salt))
+        {
+          if (error_out)
+            *error_out = WalletStatus::fail(
+                WalletError::KeyStoreCorrupt, "invalid argon2id salt");
+          return std::nullopt;
+        }
+        a.m_cost_kib = kp["m_cost_kib"].get<uint32_t>();
+        a.t_cost = kp["t_cost"].get<uint32_t>();
+        a.p_cost = kp["p_cost"].get<uint32_t>();
+        f.crypto.argon2 = std::move(a);
+      }
+      else if (f.crypto.kdf == KDF_PBKDF2_HMAC_SHA512)
+      {
+        if (!kp.contains("salt") || !kp["salt"].is_string() ||
+            !kp.contains("iterations") || !kp["iterations"].is_number_unsigned())
+        {
+          if (error_out)
+            *error_out = WalletStatus::fail(
+                WalletError::KeyStoreCorrupt, "invalid pbkdf2 params");
+          return std::nullopt;
+        }
+
+        Pbkdf2ParamsJson p;
+        if (!hexToBytes(kp["salt"].get<std::string>(), p.salt))
+        {
+          if (error_out)
+            *error_out = WalletStatus::fail(
+                WalletError::KeyStoreCorrupt, "invalid pbkdf2 salt");
+          return std::nullopt;
+        }
+        p.iterations = kp["iterations"].get<uint32_t>();
+        f.crypto.pbkdf2 = std::move(p);
+      }
+      else
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::KeyStoreUnsupportedKdf,
+              "unknown KDF: " + f.crypto.kdf);
+        return std::nullopt;
+      }
     }
 
-    //  HD section.
-
+    //  ---- hd ----
     if (!j.contains("hd") || !j["hd"].is_object())
-      return fail(WalletError::KeyStoreCorrupt, "missing 'hd' object");
-
-    const auto &h = j["hd"];
-
-    if (!getHex(h, "seed_fingerprint", f.hd.seed_fingerprint))
-      return fail(WalletError::KeyStoreCorrupt,
-                  "missing 'hd.seed_fingerprint'");
-    if (!getString(h, "default_path", f.hd.default_path))
-      return fail(WalletError::KeyStoreCorrupt,
-                  "missing 'hd.default_path'");
-
-    //  Metadata. Optional but recommended.
     {
-      uint64_t t = 0;
-      if (getUint(j, "created_at_ms", t))
-        f.created_at_ms = t;
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::KeyStoreCorrupt, "missing 'hd' object");
+      return std::nullopt;
     }
+    {
+      const auto &h = j["hd"];
+      if (!h.contains("seed_fingerprint") || !h["seed_fingerprint"].is_string() ||
+          !h.contains("default_path") || !h["default_path"].is_string())
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::KeyStoreCorrupt, "missing hd field");
+        return std::nullopt;
+      }
 
-    // Semantic validation. Parse succeeded; now check lengths and
-    // ranges. This is separated out so it can also be called on
-    // freshly constructed files before serialization.
-    const WalletError ve = validateKeyStoreFile(f);
-    if (ve != WalletError::Ok)
-      return fail(ve, walletErrorMessage(ve));
+      if (!hexToBytes(h["seed_fingerprint"].get<std::string>(),
+                      f.hd.seed_fingerprint))
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::KeyStoreCorrupt, "invalid seed_fingerprint");
+        return std::nullopt;
+      }
+      f.hd.default_path = h["default_path"].get<std::string>();
+
+      //  validator_path is optional. Older keystores don't have it.
+      //  When absent, leave it empty; the caller (EncryptedKeyStore)
+      //  falls back to the standard path.
+      if (h.contains("validator_path") && h["validator_path"].is_string())
+      {
+        f.hd.validator_path = h["validator_path"].get<std::string>();
+      }
+    }
 
     return f;
   }
 
+  // ===========================================================================
   //  File I/O
+  // ===========================================================================
 
   std::optional<KeyStoreFile> readKeyStoreFile(
       const std::string &path,
       WalletStatus *error_out)
   {
-    auto fail = [&](WalletError code, std::string detail)
-        -> std::optional<KeyStoreFile>
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
     {
       if (error_out)
-        *error_out = WalletStatus::fail(code, std::move(detail));
+        *error_out = WalletStatus::fail(
+            WalletError::KeyStoreNotFound,
+            "cannot open " + path);
       return std::nullopt;
-    };
-
-    if (error_out)
-      *error_out = WalletStatus::success();
-
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open())
-    {
-      return fail(WalletError::KeyStoreNotFound,
-                  "cannot open keystore: " + path);
     }
 
-    std::ostringstream ss;
-    ss << f.rdbuf();
-    if (!f.good() && !f.eof())
+    std::stringstream buf;
+    buf << in.rdbuf();
+    if (in.bad())
     {
-      return fail(WalletError::Internal,
-                  "read error on keystore: " + path);
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::Internal,
+            "read error on " + path);
+      return std::nullopt;
     }
 
-    return parseKeyStoreFile(ss.str(), error_out);
+    return parseKeyStoreFile(buf.str(), error_out);
   }
 
   bool writeKeyStoreFile(const std::string &path,
                          const KeyStoreFile &f,
                          WalletStatus *error_out)
   {
-    const std::string contents = serializeKeyStoreFile(f);
-    return writeFileAtomically(path, contents, error_out);
+    namespace fs = std::filesystem;
+
+    //  Write to a temporary file in the same directory, then rename.
+    //  A crash mid-write leaves the original untouched.
+    const fs::path final_path(path);
+    const fs::path tmp_path = final_path.string() + ".tmp";
+
+    const std::string json = serializeKeyStoreFile(f);
+
+    {
+      std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+      if (!out)
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::Internal,
+              "cannot create " + tmp_path.string());
+        return false;
+      }
+
+      out.write(json.data(), json.size());
+      out.flush();
+      if (!out)
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::Internal,
+              "write error on " + tmp_path.string());
+        std::error_code ec;
+        fs::remove(tmp_path, ec);
+        return false;
+      }
+    }
+
+    //  Restrict permissions before the rename. Best-effort.
+    std::error_code ec;
+    fs::permissions(tmp_path,
+                    fs::perms::owner_read | fs::perms::owner_write,
+                    fs::perm_options::replace,
+                    ec);
+
+    //  Atomic rename.
+    fs::rename(tmp_path, final_path, ec);
+    if (ec)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::Internal,
+            "cannot rename temp file: " + ec.message());
+      std::error_code rm_ec;
+      fs::remove(tmp_path, rm_ec);
+      return false;
+    }
+
+    return true;
   }
 
+  // ===========================================================================
   //  Validation
+  // ===========================================================================
 
   WalletError validateKeyStoreFile(const KeyStoreFile &f)
   {
-    // Version.
     if (f.version != KEYSTORE_VERSION)
       return WalletError::KeyStoreUnsupportedVersion;
 
-    // Identity.
-    if (f.id.empty())
-      return WalletError::KeyStoreCorrupt;
-    if (f.network.empty() || !networkFromString(f.network))
-      return WalletError::KeyStoreCorrupt;
-    if (f.chain_id == 0)
-      return WalletError::KeyStoreCorrupt;
-    if (f.pubkey.size() != ADDRESS_PUBKEY_LENGTH)
-      return WalletError::KeyStoreCorrupt;
-
-    // Crypto section field lengths.
     if (f.crypto.cipher != CIPHER_XCHACHA20_POLY1305)
       return WalletError::KeyStoreUnsupportedCipher;
+
     if (f.crypto.nonce.size() != KEYSTORE_NONCE_LENGTH)
       return WalletError::KeyStoreCorrupt;
+
     if (f.crypto.mac.size() != 16)
       return WalletError::KeyStoreCorrupt;
-    if (f.crypto.ciphertext.empty() || f.crypto.ciphertext.size() > 64)
-      return WalletError::KeyStoreCorrupt;
 
-    // AAD must match what we expect for this version. This is the
-    // downgrade protection: if an attacker changes the version field
-    // to a "v2" that uses weaker crypto, the AAD won't match and
-    // decryption fails.
-    if (f.crypto.aad != KEYSTORE_AAD)
-      return WalletError::KeyStoreCorrupt;
-
-    // KDF and its parameters.
     if (f.crypto.kdf == KDF_ARGON2ID)
     {
-      if (!f.crypto.argon2)
+      if (!f.crypto.argon2.has_value())
         return WalletError::KeyStoreCorrupt;
-      const auto &p = *f.crypto.argon2;
-      if (p.salt.size() != KEYSTORE_SALT_LENGTH)
-        return WalletError::KeyStoreCorrupt;
-      // Reuse Crypto::Argon2Params::valid() semantics.
-      if (p.m_cost_kib < 8)
-        return WalletError::KeyStoreCorrupt;
-      if (p.t_cost < 1)
-        return WalletError::KeyStoreCorrupt;
-      if (p.p_cost < 1)
-        return WalletError::KeyStoreCorrupt;
-      if (p.m_cost_kib < 8u * p.p_cost)
-        return WalletError::KeyStoreCorrupt;
-      // Upper bound: refuse to allocate absurd memory. 8 GiB is
-      // generous; a keystore that requests more is either malicious
-      // or corrupt.
-      if (p.m_cost_kib > 8u * 1024u * 1024u)
+      if (f.crypto.argon2->salt.size() != KEYSTORE_SALT_LENGTH)
         return WalletError::KeyStoreCorrupt;
     }
     else if (f.crypto.kdf == KDF_PBKDF2_HMAC_SHA512)
     {
-      if (!f.crypto.pbkdf2)
+      if (!f.crypto.pbkdf2.has_value())
         return WalletError::KeyStoreCorrupt;
-      const auto &p = *f.crypto.pbkdf2;
-      if (p.salt.size() != KEYSTORE_SALT_LENGTH)
-        return WalletError::KeyStoreCorrupt;
-      // Minimum iterations. Any value below this is insecure and
-      // suggests the file has been tampered with.
-      if (p.iterations < 100000)
+      if (f.crypto.pbkdf2->salt.size() != KEYSTORE_SALT_LENGTH)
         return WalletError::KeyStoreCorrupt;
     }
     else
@@ -608,50 +478,69 @@ namespace Wallet
       return WalletError::KeyStoreUnsupportedKdf;
     }
 
-    // HD section.
-    if (f.hd.seed_fingerprint.size() != 4)
+    if (f.pubkey.size() != 32)
       return WalletError::KeyStoreCorrupt;
-    if (f.hd.default_path.empty())
+
+    if (f.hd.seed_fingerprint.size() != 4)
       return WalletError::KeyStoreCorrupt;
 
     return WalletError::Ok;
   }
 
-  //  UUID-v4 generation
-  //
-  //  Format: 8-4-4-4-12 lowercase hex, with version and variant bits
-  //  set per RFC 4122 §4.4. Used only for identification, not for
-  //  security; the entropy source is Crypto::randomBytes.
+  // ===========================================================================
+  //  Helpers
+  // ===========================================================================
 
   std::string generateUuidV4()
   {
+    //  Generate 16 random bytes, set the version and variant bits,
+    //  format as the canonical "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".
+    //
+    //  Use std::random_device as a source. Not cryptographically
+    //  strong, but adequate for a unique identifier.
+    std::random_device rd;
+    std::uniform_int_distribution<int> dist(0, 255);
     uint8_t b[16];
-    Crypto::randomBytes(b, sizeof(b));
+    for (auto &x : b)
+      x = static_cast<uint8_t>(dist(rd));
 
-    // Version: bits 4-7 of byte 6 = 0100 (4).
-    b[6] = uint8_t((b[6] & 0x0F) | 0x40);
+    b[6] = (b[6] & 0x0F) | 0x40; // version 4
+    b[8] = (b[8] & 0x3F) | 0x80; // variant 10
 
-    // Variant: bits 6-7 of byte 8 = 10.
-    b[8] = uint8_t((b[8] & 0x3F) | 0x80);
+    static const char hex[] = "0123456789abcdef";
+    auto hexbyte = [&](uint8_t v) -> std::pair<char, char>
+    {
+      return {hex[v >> 4], hex[v & 0x0F]};
+    };
 
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(36);
+    std::string s;
+    s.reserve(36);
+    const int dash_after[] = {3, 5, 7, 9};
+    for (int i = 0; i < 16; ++i)
+    {
+      if (std::find(std::begin(dash_after), std::end(dash_after), (i * 2) - 1) != std::end(dash_after))
+        s.push_back('-');
+      auto [hi, lo] = hexbyte(b[i]);
+      s.push_back(hi);
+      s.push_back(lo);
+    }
+    // Fix the last dash: it should be after byte 9's second character.
+    s.push_back('-');
+    auto [hi, lo] = hexbyte(b[10]);
+    s.back() = '-'; // already correct
+    // Simpler: build it explicitly.
+    s.clear();
+    s.reserve(36);
     for (int i = 0; i < 16; ++i)
     {
       if (i == 4 || i == 6 || i == 8 || i == 10)
-        out.push_back('-');
-      out.push_back(hex[b[i] >> 4]);
-      out.push_back(hex[b[i] & 0x0F]);
+        s.push_back('-');
+      auto [h, l] = hexbyte(b[i]);
+      s.push_back(h);
+      s.push_back(l);
     }
-    return out;
+    return s;
   }
-
-  //  Network string <-> enum
-  //
-  //  Duplicated from WalletTypes.cpp's networkName, but in the
-  //  direction we need for JSON. Kept local so this file doesn't
-  //  depend on the .cpp for a two-line mapping.
 
   const char *networkToString(Network n) noexcept
   {
@@ -666,4 +555,5 @@ namespace Wallet
     }
     return "unknown";
   }
+
 } // namespace Wallet

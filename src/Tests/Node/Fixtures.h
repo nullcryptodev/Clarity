@@ -44,8 +44,8 @@ namespace Tests
       cfg.validator_id = validator_id;
       // Fill the secret key with a deterministic non-zero value
       // (the tests don't need a real signature chain here).
-      for (size_t i = 0; i < cfg.validator_secret_key.data.size(); ++i)
-        cfg.validator_secret_key.data[i] = uint8_t(0x80 + validator_id + i);
+      for (size_t i = 0; i < cfg.consensus_secret_key.data.size(); ++i)
+        cfg.consensus_secret_key.data[i] = uint8_t(0x80 + validator_id + i);
       return cfg;
     }
 
@@ -230,7 +230,7 @@ namespace Tests
       cfg.chain_map_size = 64ULL * 1024 * 1024;
       cfg.enable_p2p = false;
       cfg.validator_id = static_cast<uint64_t>(index + 1);
-      cfg.validator_secret_key = validators_[index].secretKey;
+      cfg.consensus_secret_key = validators_[index].secretKey;
       cfg.apply_genesis_on_start = true;
       cfg.test_genesis_override = genesis_;
       return cfg;

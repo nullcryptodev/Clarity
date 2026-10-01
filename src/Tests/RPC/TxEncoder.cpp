@@ -8,7 +8,7 @@
 #include "Core/Receipt.h"
 #include "Core/Transaction.h"
 #include "Core/TransactionTypes.h"
-#include "RPC/Encoders/TxEncoder.h"
+#include "RPC/Encoders.h"
 
 using Common::Json;
 using Rpc::encodeReceipt;

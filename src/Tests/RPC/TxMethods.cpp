@@ -15,14 +15,14 @@ using namespace Tests;
 
 TEST_F(RPC_MethodTestFixture, GetTransactionByHash_MissingParam)
 {
-  Common::Json resp = callRaw("clrty_getTransactionByHash", Common::Json::object());
+  Common::Json resp = callRaw("getTransactionByHash", Common::Json::object());
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
 
 TEST_F(RPC_MethodTestFixture, GetTransactionByHash_MalformedHash)
 {
-  Common::Json resp = callRaw("clrty_getTransactionByHash", {{"hash", "0xnotahash"}});
+  Common::Json resp = callRaw("getTransactionByHash", {{"hash", "0xnotahash"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
@@ -30,7 +30,7 @@ TEST_F(RPC_MethodTestFixture, GetTransactionByHash_MalformedHash)
 TEST_F(RPC_MethodTestFixture, GetTransactionByHash_Unknown)
 {
   const std::string fake = "0x" + std::string(64, 'a');
-  Common::Json resp = callRaw("clrty_getTransactionByHash", {{"hash", fake}});
+  Common::Json resp = callRaw("getTransactionByHash", {{"hash", fake}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::TransactionNotFound);
 }
@@ -41,14 +41,14 @@ TEST_F(RPC_MethodTestFixture, GetTransactionByHash_Unknown)
 
 TEST_F(RPC_MethodTestFixture, GetTransactionReceipt_MissingParam)
 {
-  Common::Json resp = callRaw("clrty_getTransactionReceipt", Common::Json::object());
+  Common::Json resp = callRaw("getTransactionReceipt", Common::Json::object());
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
 
 TEST_F(RPC_MethodTestFixture, GetTransactionReceipt_MalformedHash)
 {
-  Common::Json resp = callRaw("clrty_getTransactionReceipt", {{"hash", "0x1234"}});
+  Common::Json resp = callRaw("getTransactionReceipt", {{"hash", "0x1234"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
@@ -56,7 +56,7 @@ TEST_F(RPC_MethodTestFixture, GetTransactionReceipt_MalformedHash)
 TEST_F(RPC_MethodTestFixture, GetTransactionReceipt_Unknown)
 {
   const std::string fake = "0x" + std::string(64, 'b');
-  Common::Json resp = callRaw("clrty_getTransactionReceipt", {{"hash", fake}});
+  Common::Json resp = callRaw("getTransactionReceipt", {{"hash", fake}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::ReceiptNotFound);
 }
@@ -67,14 +67,14 @@ TEST_F(RPC_MethodTestFixture, GetTransactionReceipt_Unknown)
 
 TEST_F(RPC_MethodTestFixture, SimulateTransaction_MissingParam)
 {
-  Common::Json resp = callRaw("clrty_simulateTransaction", Common::Json::object());
+  Common::Json resp = callRaw("simulateTransaction", Common::Json::object());
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
 
 TEST_F(RPC_MethodTestFixture, SimulateTransaction_NotHex)
 {
-  Common::Json resp = callRaw("clrty_simulateTransaction",
+  Common::Json resp = callRaw("simulateTransaction",
                               {{"tx", "this is not hex"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
@@ -82,7 +82,7 @@ TEST_F(RPC_MethodTestFixture, SimulateTransaction_NotHex)
 
 TEST_F(RPC_MethodTestFixture, SimulateTransaction_EmptyHex)
 {
-  Common::Json resp = callRaw("clrty_simulateTransaction", {{"tx", "0x"}});
+  Common::Json resp = callRaw("simulateTransaction", {{"tx", "0x"}});
   ASSERT_TRUE(resp.contains("error"));
   // Empty bytes for a tx is "malformed", not "invalid params".
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::TxMalformed);
@@ -92,7 +92,7 @@ TEST_F(RPC_MethodTestFixture, SimulateTransaction_GarbageBytes)
 {
   // Valid hex, but not a valid serialized Transaction.
   std::string junk = "0x" + std::string(100, 'f');
-  Common::Json resp = callRaw("clrty_simulateTransaction", {{"tx", junk}});
+  Common::Json resp = callRaw("simulateTransaction", {{"tx", junk}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::TxMalformed);
 }
@@ -103,14 +103,14 @@ TEST_F(RPC_MethodTestFixture, SimulateTransaction_GarbageBytes)
 
 TEST_F(RPC_MethodTestFixture, SendRawTransaction_MissingParam)
 {
-  Common::Json resp = callRaw("clrty_sendRawTransaction", Common::Json::object());
+  Common::Json resp = callRaw("sendRawTransaction", Common::Json::object());
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
 }
 
 TEST_F(RPC_MethodTestFixture, SendRawTransaction_NotHex)
 {
-  Common::Json resp = callRaw("clrty_sendRawTransaction",
+  Common::Json resp = callRaw("sendRawTransaction",
                               {{"tx", "zzz not hex"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::InvalidParams);
@@ -118,7 +118,7 @@ TEST_F(RPC_MethodTestFixture, SendRawTransaction_NotHex)
 
 TEST_F(RPC_MethodTestFixture, SendRawTransaction_EmptyHex)
 {
-  Common::Json resp = callRaw("clrty_sendRawTransaction", {{"tx", "0x"}});
+  Common::Json resp = callRaw("sendRawTransaction", {{"tx", "0x"}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::TxMalformed);
 }
@@ -126,7 +126,7 @@ TEST_F(RPC_MethodTestFixture, SendRawTransaction_EmptyHex)
 TEST_F(RPC_MethodTestFixture, SendRawTransaction_GarbageBytes)
 {
   std::string junk = "0x" + std::string(200, 'a');
-  Common::Json resp = callRaw("clrty_sendRawTransaction", {{"tx", junk}});
+  Common::Json resp = callRaw("sendRawTransaction", {{"tx", junk}});
   ASSERT_TRUE(resp.contains("error"));
   EXPECT_EQ(resp["error"]["code"], Rpc::ErrorCode::TxMalformed);
 }

@@ -16,8 +16,8 @@
 #include "Node/Node.h"
 #include "Node/NodeConfig.h"
 #include "RPC/JsonRpcDispatcher.h"
-#include "RPC/Methods/Methods.h"
-#include "RPC/Encoders/Encoding.h"
+#include "RPC/Methods.h"
+#include "RPC/Encoding.h"
 
 namespace Tests
 {
@@ -35,7 +35,7 @@ namespace Tests
     {
       static std::atomic<uint64_t> counter{0};
       s_data_dir = std::filesystem::temp_directory_path() /
-                   ("clrty_rpc_shared_" + std::to_string(counter.fetch_add(1)));
+                   ("rpc_shared_" + std::to_string(counter.fetch_add(1)));
       std::filesystem::remove_all(s_data_dir);
 
       s_node = std::make_unique<Node::Node>(
@@ -182,7 +182,7 @@ namespace Tests
     {
       static std::atomic<uint64_t> counter{0};
       data_dir_ = std::filesystem::temp_directory_path() /
-                  ("clrty_rpc_iso_" + std::to_string(counter.fetch_add(1)));
+                  ("rpc_iso_" + std::to_string(counter.fetch_add(1)));
       std::filesystem::remove_all(data_dir_);
 
       node_ = std::make_unique<Node::Node>(
@@ -274,7 +274,7 @@ namespace Tests
       // Unique temp dir per test. Node's constructor validates the
       // config and creates the data dir; we just need a valid path.
       tmp_dir_ = std::filesystem::temp_directory_path() /
-                 ("clrty_rpc_dispatch_test_" +
+                 ("rpc_dispatch_test_" +
                   std::to_string(::getpid()) + "_" +
                   std::to_string(reinterpret_cast<uintptr_t>(this)));
 

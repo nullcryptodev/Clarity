@@ -18,17 +18,15 @@
 //  after an intentional change.
 //
 //  Usage:
-//    GenesisHash                 # all three networks, human-readable
-//    GenesisHash --paste         # only the paste-ready block
-//    GenesisHash --network mainnet
-//    GenesisHash --network=regtest
+//    genesis_hash                   # all three networks, human-readable
+//    genesis_hash --paste           # only the paste-ready block
+//    genesis_hash --network mainnet
+//    genesis_hash --network=regtest
 //
 //  Output discipline:
 //    stdout  — the data (hashes, paste-ready block). Redirectable.
 //    stderr  — progress and summary narration. Not redirectable by
 //              accident; kept out of any file a user pipes stdout to.
-//
-//  Exit code is 0 on success, 1 on any network's failure.
 
 #include "Core/Genesis.h"
 #include "GlobalConfig.h"

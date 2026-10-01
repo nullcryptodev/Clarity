@@ -185,6 +185,14 @@ namespace Consensus
 
     broadcastPrevote(prevote_nil, prevote_hash);
 
+    //  broadcastPrevote -> recordVote can synchronously advance the
+    //  state machine (a prevote quorum can trigger enterPrecommit, and
+    //  a precommit quorum can trigger enterCommit -> enterNewHeight).
+    //  If the height or round moved, the timer and drain below are
+    //  for a step that no longer exists. Return without touching them.
+    if (height_ != height || round_ != round)
+      return;
+
     if (round_timer_)
       round_timer_->start(round);
 
@@ -234,6 +242,11 @@ namespace Consensus
 
     broadcastPrecommit(precommit_nil, precommit_hash);
 
+    //  Same reentrancy hazard as enterPrevote: broadcastPrecommit ->
+    //  recordVote can trigger enterCommit -> enterNewHeight.
+    if (height_ != height || round_ != round)
+      return;
+
     if (round_timer_)
       round_timer_->start(round);
 
@@ -244,7 +257,7 @@ namespace Consensus
   {
     step_ = Step::Commit;
 
-    log_(Logging::INFO) << "Entering commit: h=" << height << " r=" << round;
+    log_(Logging::DEBUGGING) << "Entering commit: h=" << height << " r=" << round;
 
     auto quorum_block = quorumValue(/*is_precommit=*/true);
 
@@ -267,6 +280,11 @@ namespace Consensus
     }
 
     Core::Block block = it->second;
+
+    //  The quorum was formed over this block, so the active set the
+    //  round ran on is the set the block's header names. Use that same
+    //  flag for the final threshold check.
+    const bool emergency = (block.header.emergency_rotation > 0);
 
     block.header.commit_round = round;
 
@@ -294,12 +312,12 @@ namespace Consensus
                 return a.signer_index < b.signer_index;
               });
 
-    if (block.quorum_signatures.size() < quorumThreshold())
+    if (block.quorum_signatures.size() < quorumThreshold(emergency))
     {
       log_(Logging::WARNING)
           << "Precommit quorum reported but signature set is short ("
           << block.quorum_signatures.size() << " < "
-          << quorumThreshold() << "), advancing round";
+          << quorumThreshold(emergency) << "), advancing round";
       enterPropose(height, round + 1);
       return;
     }
@@ -330,7 +348,7 @@ namespace Consensus
           equivocations_.end());
     }
 
-    log_(Logging::INFO)
+    log_(Logging::DEBUGGING)
         << "Committing block: h=" << height
         << " hash=" << block.hash().toString().substr(0, 16)
         << " quorum_sigs=" << block.quorum_signatures.size()
@@ -386,6 +404,10 @@ namespace Consensus
       else
         log_(Logging::WARNING) << "handleProposal REJECT height: p=" << p.height
                                << " local=" << height_;
+
+      //  Return unconditionally: this proposal is not for the current
+      //  height and must not be processed as if it were.
+      return;
     }
 
     if (p.round > round_)
@@ -450,9 +472,9 @@ namespace Consensus
 
     proposal_ = p;
 
-    log_(Logging::WARNING) << "handleProposal SET: h=" << height_
-                           << " r=" << round_
-                           << " hash=" << p.block_hash.toString().substr(0, 16);
+    log_(Logging::DEBUGGING) << "handleProposal SET: h=" << height_
+                             << " r=" << round_
+                             << " hash=" << p.block_hash.toString().substr(0, 16);
 
     proposals_by_hash_[p.block_hash] = block;
 
@@ -555,7 +577,7 @@ namespace Consensus
 
     const Crypto::Hash signing_hash =
         timeoutVoteSigningHash(tv.height, tv.round);
-    if (!Crypto::verify(signing_hash, vinfo.reward_address, tv.signature))
+    if (!Crypto::verify(signing_hash, vinfo.effectiveConsensusKey(), tv.signature))
       return;
 
     for (const auto &existing : timeout_votes_)
@@ -960,11 +982,11 @@ namespace Consensus
     proposals_by_hash_[block_hash] = block;
     proposal_for_round_[{height_, round_}] = block_hash;
 
-    log_(Logging::INFO) << "Proposed block for h=" << height_
-                        << " r=" << round_
-                        << " em=" << (emergency ? "yes" : "no")
-                        << " txs=" << block.transactions.size()
-                        << " hash=" << block_hash.toString().substr(0, 16);
+    log_(Logging::DEBUGGING) << "Proposed block for h=" << height_
+                             << " r=" << round_
+                             << " em=" << (emergency ? "yes" : "no")
+                             << " txs=" << block.transactions.size()
+                             << " hash=" << block_hash.toString().substr(0, 16);
 
     return true;
   }
@@ -1247,7 +1269,7 @@ namespace Consensus
         {
           return false;
         }
-        const Crypto::PublicKey pk = vinfo.reward_address;
+        const Crypto::PublicKey pk = vinfo.effectiveConsensusKey();
 
         const Crypto::Hash first_hash = voteSigningHash(
             first.height, first.round, first.is_nil, first.block_hash);
@@ -1308,7 +1330,7 @@ namespace Consensus
     {
       return false;
     }
-    const Crypto::PublicKey pk = vinfo.reward_address;
+    const Crypto::PublicKey pk = vinfo.effectiveConsensusKey();
 
     if (!Crypto::verify(signing_hash, pk, v.signature))
       return false;
@@ -1351,7 +1373,41 @@ namespace Consensus
   std::optional<Crypto::Hash> BftConsensus::quorumValue(bool is_precommit) const
   {
     auto &container = is_precommit ? precommits_ : prevotes_;
-    size_t threshold = quorumThreshold();
+
+    //  Resolve the emergency flag from the votes themselves. If any
+    //  non-nil vote references a block we know, use that block's header
+    //  flag. This is the set the round actually ran on. If all votes are
+    //  nil, fall back to the current round's proposal, then to the local
+    //  counter — same fallbacks the old code used, but only for nil-only
+    //  rounds, which don't carry a block reference to resolve against.
+    //
+    //  This matters for round-crossing: a validator locked on an
+    //  emergency block in round R re-precommits it in round R+1. If the
+    //  local node has no proposal for round R+1 yet, the old code used
+    //  the non-emergency set and computed a different quorum threshold
+    //  than the one the round actually ran on. That could let the node
+    //  commit with a sub-threshold set, or refuse to commit at threshold.
+    bool emergency = false;
+    bool resolved = false;
+
+    for (const auto &[idx, v] : container)
+    {
+      if (v.is_nil)
+        continue;
+
+      auto it = proposals_by_hash_.find(v.block_hash);
+      if (it == proposals_by_hash_.end())
+        continue;
+
+      emergency = (it->second.header.emergency_rotation > 0);
+      resolved = true;
+      break;
+    }
+
+    if (!resolved)
+      emergency = roundUsesEmergencySet(height_, round_);
+
+    const size_t threshold = quorumThreshold(emergency);
 
     if (container.size() < threshold)
       return std::nullopt;
@@ -1405,9 +1461,8 @@ namespace Consensus
 
   //  Helpers
 
-  size_t BftConsensus::quorumThreshold() const
+  size_t BftConsensus::quorumThreshold(bool emergency) const
   {
-    const bool emergency = roundUsesEmergencySet(height_, round_);
     auto active = deps_.active_set(emergency);
     return Core::bftQuorum(active.size());
   }
@@ -1418,10 +1473,14 @@ namespace Consensus
     if (my_id == INVALID_ID)
       return INVALID_INDEX;
 
-    const bool emergency =
-        proposal_for_round_.count({height_, round_}) > 0
-            ? roundUsesEmergencySet(height_, round_)
-            : useEmergencySet();
+    //  Prefer the round's proposal's flag. Fall back to the local
+    //  counter only if no proposal has arrived yet — in that window a
+    //  nil vote is the only thing we can cast, and it references no
+    //  block, so the local counter is the best information available.
+    const bool have_proposal = proposal_for_round_.count({height_, round_}) > 0;
+    const bool emergency = have_proposal
+                               ? roundUsesEmergencySet(height_, round_)
+                               : useEmergencySet();
 
     auto active = deps_.active_set(emergency);
     for (size_t i = 0; i < active.size(); ++i)

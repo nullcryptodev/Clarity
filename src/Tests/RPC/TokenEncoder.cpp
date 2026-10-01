@@ -6,7 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "Core/TokenTypes.h"
-#include "RPC/Encoders/TokenEncoder.h"
+#include "RPC/Encoders.h"
 
 using Common::Json;
 using Rpc::encodeToken;

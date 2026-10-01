@@ -115,13 +115,16 @@ int main(int argc, char **argv)
 
   // Banner
   Logging::LoggerRef log(*logger, "Daemon");
+  log(Logging::INFO) << "▄█████ ▄▄     ▄▄▄  ▄▄▄▄  ▄▄ ▄▄▄▄▄▄ ▄▄ ▄▄ ";
+  log(Logging::INFO) << "██     ██    ██▀██ ██▄█▄ ██   ██   ▀███▀ ";
+  log(Logging::INFO) << "▀█████ ██▄▄▄ ██▀██ ██ ██ ██   ██     █   ";
+
   log(Logging::INFO) << "=================================================";
   log(Logging::INFO) << "  Clarity daemon starting";
-  log(Logging::INFO) << "  network:  " << Node::networkName(args.node.network);
-  log(Logging::INFO) << "  data dir: " << args.node.data_dir;
+  log(Logging::INFO) << "  network:  " << Logging::BRIGHT_GREEN << Node::networkName(args.node.network);
+  log(Logging::INFO) << "  data dir: " << Logging::BRIGHT_GREEN << args.node.data_dir;
   log(Logging::INFO) << "  rpc:      "
-                     << (args.rpc.enabled ? "enabled" : "disabled");
-  log(Logging::INFO) << "=================================================";
+                     << Logging::BRIGHT_GREEN << (args.rpc.enabled ? "enabled" : "disabled");
 
   // Disable nonvital logs from mdbx.
   setenv("MDBX_LOG", "ERROR", 1);
@@ -168,7 +171,7 @@ int main(int argc, char **argv)
       rpc->start();
       g_rpc = rpc.get();
 
-      log(Logging::INFO) << "RPC listening on "
+      log(Logging::INFO) << "RPC listening on " << Logging::BRIGHT_GREEN
                          << args.rpc.bind_address << ":"
                          << rpc->listeningPort();
     }

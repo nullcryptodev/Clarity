@@ -281,7 +281,7 @@ namespace Consensus
         return false;
       }
 
-      if (!Crypto::verify(signing_hash, v.reward_address, tv.signature))
+      if (!Crypto::verify(signing_hash, v.effectiveConsensusKey(), tv.signature))
       {
         error = "invalid timeout vote signature";
         return false;

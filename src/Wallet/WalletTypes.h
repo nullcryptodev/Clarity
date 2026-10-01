@@ -19,10 +19,6 @@ namespace Wallet
   //  compile without pulling in Node, so it carries its own copy of the
   //  enum. The two values must stay in lockstep; the conversion helpers
   //  in NetworkBridge.h are the only place they meet.
-  //
-  //  If you ever decide to unify them, move Network to Common/ and make
-  //  both Node::Network and Wallet::Network aliases. Until then, this
-  //  duplication is intentional and documented.
 
   enum class Network : uint8_t
   {
@@ -53,9 +49,6 @@ namespace Wallet
   //  Addresses are encoded as bech32m(HRP, witness_version=0x00, pubkey32).
   //  The HRP comes from GlobalConfig, one per network. See
   //  AddressCodec.h for the encode/decode entry points.
-  //
-  //  Witness version 0 is used for all CLRTY addresses. Future address
-  //  types (script hashes, threshold commitments) would bump this.
 
   inline constexpr uint8_t ADDRESS_WITNESS_VERSION = 0x00;
   inline constexpr size_t ADDRESS_PUBKEY_LENGTH = 32;
@@ -89,8 +82,25 @@ namespace Wallet
 
   inline constexpr uint32_t BIP44_PURPOSE = 44;
   inline constexpr uint32_t COIN_TYPE_CLRTY = 9000;
-  inline constexpr uint32_t HD_EXTERNAL_CHAIN = 0; // receive addresses
-  inline constexpr uint32_t HD_INTERNAL_CHAIN = 1; // change addresses
+
+  //  Chain indices. Each chain is a distinct branch of the account's
+  //  derivation tree:
+  //
+  //    external (0)    receive addresses. What the user thinks of as
+  //                    "their address".
+  //    internal (1)    change addresses. Reserved; unused today, but
+  //                    the constant exists so the numbering is stable.
+  //    validator (2)   the validator's consensus signing key. One
+  //                    per account. Absent for non-validators.
+  //
+  //  Using dedicated chain numbers means a user who adds a validator
+  //  key later doesn't collide with any existing derivation. And a
+  //  keystore that only knows about chain 0 continues to work
+  //  unchanged — the validator key is derived on demand.
+
+  inline constexpr uint32_t HD_EXTERNAL_CHAIN = 0;  // receive addresses
+  inline constexpr uint32_t HD_INTERNAL_CHAIN = 1;  // change addresses (reserved)
+  inline constexpr uint32_t HD_VALIDATOR_CHAIN = 2; // validator consensus key
 
   //  Currency
   //
