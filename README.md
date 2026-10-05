@@ -2,7 +2,7 @@
 
 # Clarity
 
-![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C753-blue) ![Stage](https://img.shields.io/badge/Stage-Developmen-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue)
+![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C753-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue)
 
 #### Table of Contents
 
@@ -39,7 +39,7 @@
   - [Consensus Key](#consensus-key)
   - [Reward Address](#reward-address)
   - [Tooling](#tooling)
-  - [Economics: how value flows](#economics-how-value-flows)
+- [**Economics**: how value flows](#economics-how-value-flows)
   - [Block Reward](#block-reward)
   - [Validator Pool](#validator-pool)
   - [Validator Rewards](#validator-rewards)
