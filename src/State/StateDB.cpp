@@ -50,6 +50,8 @@ namespace State
       return "blocks_by_height";
     case TBL_MEMPOOL:
       return "mempool";
+    case TBL_CONSENSUS_WAL:
+      return "consensus_wal";
     default:
       return "<unknown>";
     }

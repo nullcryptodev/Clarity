@@ -16,6 +16,39 @@
 using namespace Core;
 using namespace Tests;
 
+namespace
+{
+  //  Compute the avg_tx_per_block that makes
+  //  computeTargetActiveSetSize() return exactly `target`.
+  //
+  //  The formula is:
+  //      target = MIN + (traffic * (MAX - MIN)) / SATURATION
+  //  So:
+  //      traffic = (target - MIN) * SATURATION / (MAX - MIN)
+  //
+  //  Integer division means the result is a lower bound: passing it
+  //  to computeTargetActiveSetSize() yields a value <= `target`, and
+  //  may be one less due to truncation. The tests below verify the
+  //  round-trip and adjust if needed.
+  //
+  //  Hardcoding this value in a test is what broke
+  //  SameSizeLowestUptimeRemoved when ACTIVE_SET_MIN changed from 11
+  //  to 2: the comment claimed traffic ≈ 113 with the old constants,
+  //  but the actual formula with the new constants produced 13, and
+  //  the assertion on new_target_size == 21 failed. Deriving from the
+  //  constants makes the test immune to that class of change.
+  uint64_t trafficForTarget(uint64_t target)
+  {
+    if (target <= GlobalConfig::ACTIVE_SET_MIN)
+      return 0;
+    if (target >= GlobalConfig::ACTIVE_SET_MAX)
+      return TRAFFIC_SATURATION_TX;
+
+    const uint64_t range = GlobalConfig::ACTIVE_SET_MAX - GlobalConfig::ACTIVE_SET_MIN;
+    return ((target - GlobalConfig::ACTIVE_SET_MIN) * TRAFFIC_SATURATION_TX + range - 1) / range;
+  }
+}
+
 TEST(Core_BftQuorum, KnownValues)
 {
   EXPECT_EQ(bftQuorum(4), 3u);
@@ -92,10 +125,23 @@ TEST(Core_PlanRotation, SameSizeLowestUptimeRemoved)
   // i.e. same as our current active set size. This forces the plan
   // down the same-size rotation path.
   //
-  // target = 11 + (traffic * 89) / 1000
-  // 21     = 11 + (traffic * 89) / 1000
-  // traffic ≈ 113
-  auto plan = planRotation(b.reg, /*avg_tx_per_block=*/113);
+  // The traffic value is computed from the current constants rather
+  // than hardcoded. If a constant changes such that no traffic value
+  // produces exactly 21, the assertion below catches it and the test
+  // needs to pick a target size that IS reachable.
+  const uint64_t traffic = trafficForTarget(21);
+
+  // Sanity-check the round trip before trusting the plan output.
+  // Without this, an unreachable target would show up as a confusing
+  // "shrink branch ran instead of same-size" failure.
+  ASSERT_EQ(computeTargetActiveSetSize(traffic), 21u)
+      << "traffic value " << traffic
+      << " does not produce target size 21 with the current constants; "
+      << "ACTIVE_SET_MIN=" << GlobalConfig::ACTIVE_SET_MIN
+      << " ACTIVE_SET_MAX=" << GlobalConfig::ACTIVE_SET_MAX
+      << " TRAFFIC_SATURATION_TX=" << TRAFFIC_SATURATION_TX;
+
+  auto plan = planRotation(b.reg, traffic);
 
   // Confirm we're actually in the same-size branch.
   ASSERT_EQ(plan.new_target_size, 21u);
@@ -117,8 +163,7 @@ TEST(Core_PlanRotation, HighestUptimeCandidatesAdded)
 
   auto plan = planRotation(b.reg, /*avg_tx_per_block=*/500);
 
-  // Grow path: target 55, current 21, so we want to add 9 candidates
-  // (all that exist in the pool).
+  // Grow path: target > 21, so we want to add candidates.
   ASSERT_GT(plan.new_target_size, 21u);
   ASSERT_FALSE(plan.to_add.empty());
   ASSERT_LE(plan.to_add.size(), 9u);
@@ -163,7 +208,7 @@ TEST(Core_PlanRotation, ShrinkSet)
 
   auto plan = planRotation(b.reg, /*avg_tx_per_block=*/0);
 
-  // Target = ACTIVE_SET_MIN = 11, so shrink.
+  // Target = ACTIVE_SET_MIN, so shrink.
   EXPECT_LT(plan.new_target_size, 50u);
   EXPECT_GT(plan.to_remove.size(), 0u);
   EXPECT_EQ(plan.to_add.size(), 0u);

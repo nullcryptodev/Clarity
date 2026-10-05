@@ -4,13 +4,15 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <gtest/gtest.h>
+#include <cstring>
 
 #include "Fixtures.h"
+#include "Tests/Temp.h"
+
 #include "Core/BlockProcessor.h"
 #include "Core/ValidatorTypes.h"
-#include "State/StateAccess.h"
 
-#include <cstring>
+#include "State/StateAccess.h"
 
 using namespace State;
 using namespace Core;
@@ -117,6 +119,8 @@ TEST(Consensus_ActiveSetResolution, EmergencyEmptyOfflineReturnsCommitted)
 
   //  A pool candidate exists but must not be touched.
   seedValidator(s, 1, 1000);
+
+  s.commit(0);
 
   auto result = BlockProcessor::resolveActiveSet(
       s, committed, /*current_height=*/1000, /*force_rotation=*/true);

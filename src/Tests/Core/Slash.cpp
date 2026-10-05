@@ -24,7 +24,15 @@ using namespace Tests;
 
 namespace
 {
+  //  signer_id is mandatory. Consensus::Vote carries both signer_id
+  //  and signer_index; verifyEquivocationProof resolves the signer
+  //  from signer_id, not from signer_index, because the index means
+  //  different things in the committed set and an emergency set. A
+  //  vote with signer_id == INVALID_ID is rejected before any
+  //  signature check runs, so tests that want a slash to succeed must
+  //  populate both fields.
   Consensus::Vote makeSignedVote(const Crypto::KeyPair &kp,
+                                 Id signer_id,
                                  uint64_t height,
                                  uint64_t round,
                                  uint16_t signer_index,
@@ -35,6 +43,7 @@ namespace
     v.height = height;
     v.round = round;
     v.signer_index = signer_index;
+    v.signer_id = signer_id;
     v.is_nil = is_nil;
     v.block_hash = block_hash;
     v.signature = Crypto::sign(
@@ -85,8 +94,8 @@ TEST_F(Core_BlockProcessorFixture, SlashTxInBlock_ReducesStakeAndCreditsPot)
             { s.putGlobal("active_set", encodeActiveSet(slash_set)); });
 
   //  Equivocation at height 1, round 0, signer_index 0 (the target).
-  Consensus::Vote vote_a = makeSignedVote(target_key, 1, 0, 0, false, makeHash(1001));
-  Consensus::Vote vote_b = makeSignedVote(target_key, 1, 0, 0, false, makeHash(1002));
+  Consensus::Vote vote_a = makeSignedVote(target_key, TARGET_ID, 1, 0, 0, false, makeHash(1001));
+  Consensus::Vote vote_b = makeSignedVote(target_key, TARGET_ID, 1, 0, 0, false, makeHash(1002));
 
   Transaction slash_tx = makeSlashTx(genesis_config_.chain_id, vote_a, vote_b);
 
@@ -143,9 +152,10 @@ TEST_F(Core_BlockProcessorFixture, SlashTxAgainstSeedIsRejected)
   //  internally valid, but executeSystemSlash refuses to act on
   //  seeds, so the block is rejected.
   const std::vector<Id> slash_set = {1, 2};
+  constexpr Id SEED_ID = 1;
 
-  Consensus::Vote vote_a = makeSignedVote(seed1_, 1, 0, 0, false, makeHash(2001));
-  Consensus::Vote vote_b = makeSignedVote(seed1_, 1, 0, 0, false, makeHash(2002));
+  Consensus::Vote vote_a = makeSignedVote(seed1_, SEED_ID, 1, 0, 0, false, makeHash(2001));
+  Consensus::Vote vote_b = makeSignedVote(seed1_, SEED_ID, 1, 0, 0, false, makeHash(2002));
 
   Transaction slash_tx = makeSlashTx(genesis_config_.chain_id, vote_a, vote_b);
 
@@ -166,8 +176,8 @@ TEST_F(Core_BlockProcessorFixture, SlashTxWithSameValueVotesIsRejected)
             { s.putGlobal("active_set", encodeActiveSet(slash_set)); });
 
   //  Identical value: not a conflict.
-  Consensus::Vote vote_a = makeSignedVote(target_key, 1, 0, 0, false, makeHash(3001));
-  Consensus::Vote vote_b = makeSignedVote(target_key, 1, 0, 0, false, makeHash(3001));
+  Consensus::Vote vote_a = makeSignedVote(target_key, TARGET_ID, 1, 0, 0, false, makeHash(3001));
+  Consensus::Vote vote_b = makeSignedVote(target_key, TARGET_ID, 1, 0, 0, false, makeHash(3001));
 
   Transaction slash_tx = makeSlashTx(genesis_config_.chain_id, vote_a, vote_b);
 
@@ -187,8 +197,8 @@ TEST_F(Core_BlockProcessorFixture, SlashTxWithBadSignatureIsRejected)
   withState([&](State::StateAccess &s)
             { s.putGlobal("active_set", encodeActiveSet(slash_set)); });
 
-  Consensus::Vote vote_a = makeSignedVote(target_key, 1, 0, 0, false, makeHash(4001));
-  Consensus::Vote vote_b = makeSignedVote(target_key, 1, 0, 0, false, makeHash(4002));
+  Consensus::Vote vote_a = makeSignedVote(target_key, TARGET_ID, 1, 0, 0, false, makeHash(4001));
+  Consensus::Vote vote_b = makeSignedVote(target_key, TARGET_ID, 1, 0, 0, false, makeHash(4002));
   vote_b.signature.data[0] ^= 0x01;
 
   Transaction slash_tx = makeSlashTx(genesis_config_.chain_id, vote_a, vote_b);
@@ -213,8 +223,8 @@ TEST_F(Core_BlockProcessorFixture, SlashTxAgainstUnregisteredValidatorIsRejected
   withState([&](State::StateAccess &s)
             { s.putGlobal("active_set", encodeActiveSet(slash_set)); });
 
-  Consensus::Vote vote_a = makeSignedVote(target_key, 1, 0, 0, false, makeHash(5001));
-  Consensus::Vote vote_b = makeSignedVote(target_key, 1, 0, 0, false, makeHash(5002));
+  Consensus::Vote vote_a = makeSignedVote(target_key, TARGET_ID, 1, 0, 0, false, makeHash(5001));
+  Consensus::Vote vote_b = makeSignedVote(target_key, TARGET_ID, 1, 0, 0, false, makeHash(5002));
 
   Transaction slash_tx = makeSlashTx(genesis_config_.chain_id, vote_a, vote_b);
 
@@ -233,8 +243,8 @@ TEST_F(Core_BlockProcessorFixture, SlashTxForDifferentHeightIsRejected)
             { s.putGlobal("active_set", encodeActiveSet(slash_set)); });
 
   //  Different heights — not an equivocation.
-  Consensus::Vote vote_a = makeSignedVote(target_key, 1, 0, 0, false, makeHash(6001));
-  Consensus::Vote vote_b = makeSignedVote(target_key, 2, 0, 0, false, makeHash(6002));
+  Consensus::Vote vote_a = makeSignedVote(target_key, TARGET_ID, 1, 0, 0, false, makeHash(6001));
+  Consensus::Vote vote_b = makeSignedVote(target_key, TARGET_ID, 2, 0, 0, false, makeHash(6002));
 
   Transaction slash_tx = makeSlashTx(genesis_config_.chain_id, vote_a, vote_b);
 
@@ -254,8 +264,8 @@ TEST_F(Core_BlockProcessorFixture, SlashTxChangesStateRoot)
   withState([&](State::StateAccess &s)
             { s.putGlobal("active_set", encodeActiveSet(slash_set)); });
 
-  Consensus::Vote vote_a = makeSignedVote(target_key, 1, 0, 0, false, makeHash(7001));
-  Consensus::Vote vote_b = makeSignedVote(target_key, 1, 0, 0, false, makeHash(7002));
+  Consensus::Vote vote_a = makeSignedVote(target_key, TARGET_ID, 1, 0, 0, false, makeHash(7001));
+  Consensus::Vote vote_b = makeSignedVote(target_key, TARGET_ID, 1, 0, 0, false, makeHash(7002));
 
   Transaction slash_tx = makeSlashTx(genesis_config_.chain_id, vote_a, vote_b);
 

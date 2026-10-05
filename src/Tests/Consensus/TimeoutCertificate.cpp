@@ -4,14 +4,17 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <gtest/gtest.h>
-
-#include "Fixtures.h"
-#include "Consensus/Types.h"
-#include "Core/ValidatorTypes.h"
-#include "State/StateAccess.h"
-
 #include <cstring>
 #include <functional>
+
+#include "Fixtures.h"
+#include "Tests/Temp.h"
+
+#include "Consensus/Types.h"
+
+#include "Core/ValidatorTypes.h"
+
+#include "State/StateAccess.h"
 
 using namespace State;
 using namespace Consensus;

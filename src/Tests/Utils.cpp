@@ -67,37 +67,6 @@ namespace Tests
     return v;
   }
 
-  Core::ValidatorInfo makeValidator()
-  {
-    Core::ValidatorInfo v;
-    v.id = 7;
-    v.reward_address = Crypto::Address{};
-    for (int i = 0; i < 32; ++i)
-      v.reward_address.data[i] = static_cast<uint8_t>(i);
-    v.node_key = Crypto::PublicKey{};
-    for (int i = 0; i < 32; ++i)
-      v.node_key.data[i] = static_cast<uint8_t>(0x80 + i);
-    v.owner = v.reward_address;
-    v.registered_at_height = 100;
-    v.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
-    v.uptime_score = 9'800;
-    v.last_ping_height = 150;
-    v.pings_responded_this_epoch = 55;
-    v.pings_sent_this_epoch = 60;
-    v.last_seen_height = 200;
-    v.reward_multiplier = Core::REWARD_MULTIPLIER_START;
-    v.infraction_count = 0;
-    v.last_infraction_height = 0;
-    v.total_blocks_produced = 42;
-    v.total_rewards_earned = 5000;
-    v.epochs_active = 7;
-    v.is_seed = false;
-    v.is_active = true;
-    v.became_active_at = 100;
-    v.last_active_at = 200;
-    return v;
-  }
-
   // Read a uint64 global from a StateAccess. Returns 0 if the entry is
   // missing or the wrong size.
   uint64_t readU64Global(State::StateAccess &s, const std::string &name)
@@ -178,73 +147,6 @@ namespace Tests
     boost::system::error_code ec;
     acc.close(ec);
     return port;
-  }
-
-  Crypto::KeyPair deterministicValidatorKey(uint64_t id)
-  {
-    Crypto::SecretKey seed;
-    for (int i = 0; i < 8; ++i)
-      seed.data[i] = uint8_t(id >> (i * 8));
-    for (size_t i = 8; i < 32; ++i)
-      seed.data[i] = uint8_t(0xC0 + i);
-    return Crypto::generateKeyPairFromSeed(seed);
-  }
-
-  Crypto::KeyPair aliceKey()
-  {
-    Crypto::SecretKey seed;
-    for (int i = 0; i < 8; ++i)
-      seed.data[i] = uint8_t(0xA1 + i);
-    for (size_t i = 8; i < 32; ++i)
-      seed.data[i] = uint8_t(0xDD);
-    return Crypto::generateKeyPairFromSeed(seed);
-  }
-
-  Crypto::KeyPair bobKey()
-  {
-    Crypto::SecretKey seed;
-    for (int i = 0; i < 8; ++i)
-      seed.data[i] = uint8_t(0xB2 + i);
-    for (size_t i = 8; i < 32; ++i)
-      seed.data[i] = uint8_t(0xEE);
-    return Crypto::generateKeyPairFromSeed(seed);
-  }
-
-  Crypto::Address addressOf(const Crypto::KeyPair &kp)
-  {
-    Crypto::Address a;
-    std::memcpy(a.data.data(), kp.publicKey.data.data(), 32);
-    return a;
-  }
-
-  Core::GenesisConfig makeTestGenesis(
-      const std::vector<Crypto::KeyPair> &validators)
-  {
-    Core::GenesisConfig cfg;
-    cfg.chain_id = 0x434C5247; // 'CLRG'
-    cfg.timestamp_ms = 1'700'000'000'000ULL;
-
-    constexpr uint64_t INITIAL =
-        GlobalConfig::GENESIS_SUPPLY * GlobalConfig::ATOMIC_UNITS_PER_COIN;
-
-    Crypto::Address fund_addr;
-    std::fill(fund_addr.data.begin(), fund_addr.data.end(), 0x01);
-    cfg.accounts.push_back({fund_addr, INITIAL, "test fund"});
-
-    cfg.accounts.push_back({addressOf(aliceKey()), INITIAL, "alice"});
-    cfg.accounts.push_back({addressOf(bobKey()), 0, "bob"});
-
-    for (size_t i = 0; i < validators.size(); ++i)
-    {
-      cfg.validators.push_back({static_cast<Id>(i + 1),
-                                addressOf(validators[i]),
-                                validators[i].publicKey,
-                                true});
-    }
-
-    cfg.initial_total_supply = INITIAL;
-    cfg.initial_active_set_size = static_cast<uint64_t>(validators.size());
-    return cfg;
   }
 
   const char *stepNameLocal(Consensus::Step s)
@@ -516,7 +418,7 @@ namespace Tests
 
   //  Block builder helpers
 
-  Core::BlockHeader makeTestHeader(uint64_t height, const Crypto::Hash &parent, uint64_t chain_id)
+  Core::BlockHeader makeBlockHeader(uint64_t height, const Crypto::Hash &parent, uint64_t chain_id)
   {
     Core::BlockHeader h;
     h.version = GlobalConfig::CURRENT_BLOCK_VERSION;
@@ -572,7 +474,7 @@ namespace Tests
     return sigs;
   }
 
-  Core::Block makeTestBlock(Core::BlockHeader header,
+  Core::Block makeBlock(Core::BlockHeader header,
                             std::vector<Core::Transaction> txs,
                             std::vector<Id> participants)
   {
@@ -589,12 +491,12 @@ namespace Tests
     return b;
   }
 
-  Crypto::KeyPair makeTestKeyPair()
+  Crypto::KeyPair makeKeyPair()
   {
     return Crypto::generateKeyPair();
   }
 
-  Core::Transaction makeTestTx(const Crypto::KeyPair &kp,
+  Core::Transaction makeTransaction(const Crypto::KeyPair &kp,
                                uint64_t nonce,
                                uint64_t amount,
                                uint64_t fee,
@@ -622,7 +524,7 @@ namespace Tests
   }
 
   // Bbuild a minimal well-formed transaction.
-  Core::Transaction makeTx()
+  Core::Transaction makeTransaction()
   {
     Core::Transaction tx;
     tx.version = GlobalConfig::CURRENT_TRANSACTION_VERSION;
@@ -663,45 +565,7 @@ namespace Tests
     return t;
   }
 
-  Core::BlockHeader makeHeader()
-  {
-    Core::BlockHeader h;
-    h.version = GlobalConfig::CURRENT_BLOCK_VERSION;
-    h.chain_id = 0x434C5247;
-    h.height = 100;
-
-    // Non-null parent (already set).
-    h.parent_hash = Crypto::Hash{};
-    for (size_t i = 0; i < 32; ++i)
-      h.parent_hash.data[i] = static_cast<uint8_t>(i);
-
-    h.timestamp_ms = 1700000000000ULL;
-    h.proposer = Crypto::Address{};
-    for (size_t i = 0; i < 32; ++i)
-      h.proposer.data[i] = static_cast<uint8_t>(0x80 + i);
-
-    h.epoch = 1;
-    h.rotation_index = 1;
-
-    // isWellFormed requires non-null state_root for height > 0.
-    // Use a deterministic value so tests are reproducible.
-    h.state_root = Crypto::Hash{};
-    h.state_root.data[0] = 0x11;
-
-    h.tx_root = Crypto::Hash{};
-    h.tx_root.data[0] = 0x22;
-    h.receipts_root = Crypto::Hash{};
-    h.receipts_root.data[0] = 0x33;
-    h.validator_set_root = Crypto::Hash{};
-    h.validator_set_root.data[0] = 0x44;
-
-    h.total_fees = 1500;
-    h.tx_count = 0;
-    h.active_validator_count = 21;
-    return h;
-  }
-
-  Core::Transaction makeSimpleTx(uint64_t nonce)
+  Core::Transaction makeTransaction(uint64_t nonce)
   {
     Core::Transaction tx;
     tx.version = GlobalConfig::CURRENT_TRANSACTION_VERSION;
@@ -814,7 +678,7 @@ namespace Tests
     return toHex(out.data(), out.size());
   }
 
-  Node::NodeConfig makeTestNodeConfig(const std::string &data_dir)
+  Node::NodeConfig makeNodeConfig(const std::string &data_dir)
   {
     Node::NodeConfig cfg;
     cfg.network = Node::Network::Regtest;
@@ -829,7 +693,7 @@ namespace Tests
     return cfg;
   }
 
-  Rpc::RpcConfig makeTestRpcConfig()
+  Rpc::RpcConfig makeRpcConfig()
   {
     Rpc::RpcConfig cfg;
     cfg.enabled = true;

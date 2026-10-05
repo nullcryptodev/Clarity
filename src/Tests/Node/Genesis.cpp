@@ -5,8 +5,12 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "Fixtures.h"
 #include "Tests/Utils.h"
@@ -65,6 +69,22 @@ namespace
     if (bytes.size() == 32)
       std::memcpy(h.data.data(), bytes.data(), 32);
     return h;
+  }
+
+  //  Node::start() is asynchronous: it posts initialization to the
+  //  node's io_context and returns immediately. Genesis is written on
+  //  that background thread. Any test that stops the node, or reads
+  //  chain state, must wait for genesis to land first or it races a
+  //  partially-initialized node.
+  void waitForGenesis(Node::Node &n)
+  {
+    for (int i = 0; i < 200; ++i)
+    {
+      if (!NodeTestAccess::chainDb(n).getHead().hash.isNull())
+        return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    FAIL() << "genesis never applied after start()";
   }
 } // anonymous namespace
 
@@ -154,6 +174,7 @@ TEST_F(Node_Fixture, StartupRejectsWrongGenesisHash)
   // path is exercised by the fact that if the pins were wrong, the
   // three tests above would fail first.
   EXPECT_NO_THROW(node.start());
+  waitForGenesis(node);
   node.stop();
 }
 
@@ -162,5 +183,6 @@ TEST_F(Node_BlockFixture, StartupSkipsCheckWithOverride)
   Node::NodeConfig cfg = makeFixtureConfig(); // has custom genesis
   Node::Node node(cfg, logger_);
   EXPECT_NO_THROW(node.start());
+  waitForGenesis(node);
   node.stop();
 }

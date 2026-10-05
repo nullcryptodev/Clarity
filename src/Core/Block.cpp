@@ -25,6 +25,7 @@ namespace Core
     constexpr const char *TX_LEAF_DOMAIN = "CLRTY_TXLEAF_V1";
     constexpr const char *VALIDATOR_LEAF_DOMAIN = "CLRTY_VALSETLEAF_V1";
     constexpr const char *MERKLE_INTERNAL_DOMAIN = "CLRTY_MERKLE_V1";
+    constexpr const char *TIMEOUT_CERT_DOMAIN = "CLRTY_TIMEOUTCERT_V1";
 
     // Blake2b-256 of a domain-tagged byte string.
     Crypto::Hash hashWithDomain(const char *domain,
@@ -43,6 +44,20 @@ namespace Core
       return h;
     }
   } // anonymous namespace
+
+  // ===========================================================================
+  //  Certificate hash
+  // ===========================================================================
+
+  Crypto::Hash computeTimeoutCertificateHash(
+      const Consensus::TimeoutCertificate &cert)
+  {
+    if (cert.votes.empty())
+      return Crypto::Hash{};
+
+    auto bytes = cert.serialize();
+    return hashWithDomain(TIMEOUT_CERT_DOMAIN, bytes);
+  }
 
   //  BlockHeader
 
@@ -69,6 +84,25 @@ namespace Core
     // Non-genesis blocks must have a non-null state root.
     if (height > 0 && state_root.isNull())
       return false;
+
+    // The emergency flag and the certificate must agree:
+    //   - emergency_rotation > 0  → non-empty certificate AND a
+    //                               matching timeout_certificate_hash
+    //   - emergency_rotation == 0 → empty certificate AND null hash
+    if (emergency_rotation > 0)
+    {
+      if (timeout_certificate.votes.empty())
+        return false;
+      if (timeout_certificate_hash.isNull())
+        return false;
+    }
+    else
+    {
+      if (!timeout_certificate.votes.empty())
+        return false;
+      if (!timeout_certificate_hash.isNull())
+        return false;
+    }
 
     return true;
   }
@@ -103,10 +137,16 @@ namespace Core
     w.writeU32(tx_count);
     w.writeU32(active_validator_count);
 
-    // Length-prefixed certificate. Always present in the wire format,
-    // even when empty (length 0), so the header layout is fixed for
-    // all blocks and the decoder doesn't need a conditional. A
-    // length-0 certificate serializes as 4 bytes (the u32 zero).
+    //  Certificate hash. Fixed-width. Always present, zero when
+    //  there's no certificate. This is what makes the certificate
+    //  part of the block's identity without inflating the hash input
+    //  with the variable-length certificate bytes.
+    w.writeBytes(timeout_certificate_hash.data.data(),
+                 timeout_certificate_hash.data.size());
+
+    //  Length-prefixed certificate bytes. Always present in the wire
+    //  format, even when empty (length 0), so the header layout is
+    //  fixed for all blocks.
     auto cert_bytes = timeout_certificate.serialize();
     w.writeU32(static_cast<uint32_t>(cert_bytes.size()));
     w.writeBytes(cert_bytes.data(), cert_bytes.size());
@@ -116,11 +156,14 @@ namespace Core
 
   std::vector<uint8_t> BlockHeader::serializeForHash() const
   {
-    // Same field order as serialize(), but without commit_round and
-    // without the timeout certificate. The hash commits to the block
-    // identity, not to the evidence attached to it.
+    //  Same field order as serialize(), but without commit_round and
+    //  without the certificate BYTES. The certificate's HASH is
+    //  included — the block's identity commits to the certificate's
+    //  contents, but not to the exact byte encoding, which is what
+    //  lets the wire format change (e.g. adding a field to the cert
+    //  encoder) without changing block hashes.
     std::vector<uint8_t> out;
-    out.reserve(250);
+    out.reserve(250 + 32);
 
     Common::Writer w(out);
     w.writeU16(version);
@@ -140,11 +183,15 @@ namespace Core
     w.writeU64(total_fees);
     w.writeU32(tx_count);
     w.writeU32(active_validator_count);
+    // Certificate hash. Zero when there's no certificate.
+    w.writeBytes(timeout_certificate_hash.data.data(),
+                 timeout_certificate_hash.data.size());
 
     return out;
   }
 
-  bool BlockHeader::deserialize(const uint8_t *data, size_t len, BlockHeader &out)
+  bool BlockHeader::deserialize(const uint8_t *data, size_t len,
+                                BlockHeader &out)
   {
     Common::Reader r(data, len);
 
@@ -161,7 +208,8 @@ namespace Core
     r.readBytes(out.state_root.data.data(), out.state_root.data.size());
     r.readBytes(out.tx_root.data.data(), out.tx_root.data.size());
     r.readBytes(out.receipts_root.data.data(), out.receipts_root.data.size());
-    r.readBytes(out.validator_set_root.data.data(), out.validator_set_root.data.size());
+    r.readBytes(out.validator_set_root.data.data(),
+                out.validator_set_root.data.size());
     out.total_fees = r.readU64();
     out.tx_count = r.readU32();
     out.active_validator_count = r.readU32();
@@ -169,12 +217,13 @@ namespace Core
     if (!r.ok())
       return false;
 
-    //  Certificate. Length-prefixed; may be zero. Enforce a hard cap
-    //  on the encoded size so a hostile header can't make us allocate
-    //  arbitrarily before we've validated anything. The cap is generous
-    //  relative to the maximum legitimate certificate (f+1 votes at
-    //  n=100 is roughly 34 * 82 + 4 ≈ 2.8 KiB) but small enough to
-    //  bound memory.
+    //  Certificate hash. Fixed-width, always present.
+    r.readBytes(out.timeout_certificate_hash.data.data(),
+                out.timeout_certificate_hash.data.size());
+    if (!r.ok())
+      return false;
+
+    //  Certificate bytes. Length-prefixed; may be zero.
     constexpr uint32_t MAX_CERT_BYTES = 32 * 1024;
     const uint32_t cert_len = r.readU32();
     if (!r.ok() || cert_len > MAX_CERT_BYTES)
@@ -227,11 +276,11 @@ namespace Core
         return false;
     }
 
-    // Genesis has no quorum signatures — it's the chain's first block
-    // and wasn't produced by consensus.
+    // Genesis has no quorum signatures.
     if (header.height > 0)
     {
-      if (quorum_signatures.size() < bftQuorum(header.active_validator_count))
+      if (quorum_signatures.size() <
+          bftQuorum(header.active_validator_count))
       {
         return false;
       }
@@ -430,9 +479,11 @@ namespace Core
         const char *domain = MERKLE_INTERNAL_DOMAIN;
         buf.insert(buf.end(),
                    reinterpret_cast<const uint8_t *>(domain),
-                   reinterpret_cast<const uint8_t *>(domain) + std::strlen(domain));
+                   reinterpret_cast<const uint8_t *>(domain) +
+                       std::strlen(domain));
         buf.insert(buf.end(), level[i].data.begin(), level[i].data.end());
-        buf.insert(buf.end(), level[i + 1].data.begin(), level[i + 1].data.end());
+        buf.insert(buf.end(), level[i + 1].data.begin(),
+                   level[i + 1].data.end());
 
         Crypto::Hash parent;
         Crypto::blake2b(buf.data(), buf.size(), parent.data.data(), 32);
@@ -458,7 +509,8 @@ namespace Core
       const char *domain = TX_LEAF_DOMAIN;
       buf.insert(buf.end(),
                  reinterpret_cast<const uint8_t *>(domain),
-                 reinterpret_cast<const uint8_t *>(domain) + std::strlen(domain));
+                 reinterpret_cast<const uint8_t *>(domain) +
+                     std::strlen(domain));
       buf.insert(buf.end(), txid.data.begin(), txid.data.end());
 
       Crypto::Hash leaf;
@@ -483,7 +535,8 @@ namespace Core
       const char *domain = VALIDATOR_LEAF_DOMAIN;
       buf.insert(buf.end(),
                  reinterpret_cast<const uint8_t *>(domain),
-                 reinterpret_cast<const uint8_t *>(domain) + std::strlen(domain));
+                 reinterpret_cast<const uint8_t *>(domain) +
+                     std::strlen(domain));
 
       for (int i = 0; i < 8; ++i)
         buf.push_back(uint8_t(vid >> (i * 8)));

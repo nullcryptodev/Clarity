@@ -159,7 +159,7 @@ namespace Core
     //    [8]   became_active_at
     //    [8]   last_active_at
     //
-    // Total: 269 bytes.
+    // Total: 241 bytes.
 
     std::vector<uint8_t> serializeState() const;
 
@@ -167,7 +167,27 @@ namespace Core
                                  ValidatorInfo &out);
 
     static constexpr size_t STATE_SIZE =
-        8 + 32 + 32 + 32 + 32 + 8 + 8 + 2 + 8 + 4 + 4 + 8 + 2 + 2 + 8 + 8 + 8 + 8 + 1 + 8 + 8;
+        8 +  // id
+        32 + // reward_address
+        32 + // consensus_key
+        32 + // node_key
+        32 + // owner
+        8 +  // registered_at_height
+        8 +  // stake
+        2 +  // uptime_score
+        8 +  // last_ping_height
+        4 +  // pings_responded_this_epoch
+        4 +  // pings_sent_this_epoch
+        8 +  // last_seen_height
+        2 +  // reward_multiplier
+        2 +  // infraction_count
+        8 +  // last_infraction_height
+        8 +  // total_blocks_produced
+        8 +  // total_rewards_earned
+        8 +  // epochs_active
+        1 +  // flags (is_seed, is_active)
+        8 +  // became_active_at
+        8;   // last_active_at
 
     // ------------------------------------------------------------------
     //  Framework serialization

@@ -53,7 +53,7 @@ namespace
 
     // Convenience: build a HeadersMessage with contiguous entries
     // starting at `start_height`.
-    static P2P::HeadersMessage makeHeaders(uint64_t start_height, size_t n)
+    static P2P::HeadersMessage makeBlockHeaders(uint64_t start_height, size_t n)
     {
       P2P::HeadersMessage h;
       for (size_t i = 0; i < n; ++i)
@@ -170,7 +170,7 @@ TEST(Node_SyncManager, HeadersTriggersGetBlocks)
   h.our_height = 0;
   h.mgr.start();
 
-  h.mgr.onHeaders(Harness::makeHeaders(1, 10));
+  h.mgr.onHeaders(Harness::makeBlockHeaders(1, 10));
 
   EXPECT_EQ(h.mgr.state(), P2P::SyncManager::State::AwaitingBlocks);
   EXPECT_EQ(h.mgr.pendingBlockCount(), 10u);
@@ -186,7 +186,7 @@ TEST(Node_SyncManager, EmptyHeadersGoesIdle)
   h.mgr.start();
 
   // Peer responds with an empty Headers message: we're caught up.
-  h.mgr.onHeaders(Harness::makeHeaders(1, 0));
+  h.mgr.onHeaders(Harness::makeBlockHeaders(1, 0));
   EXPECT_EQ(h.mgr.state(), P2P::SyncManager::State::Idle);
 }
 
@@ -200,7 +200,7 @@ TEST(Node_SyncManager, BlocksAppliedThenGoesIdle)
   h.our_height = 0;
   h.mgr.start();
 
-  h.mgr.onHeaders(Harness::makeHeaders(1, 10));
+  h.mgr.onHeaders(Harness::makeBlockHeaders(1, 10));
 
   // Peer sends all 10 blocks.
   h.mgr.onBlocks(Harness::makeBlocks(10));
@@ -218,7 +218,7 @@ TEST(Node_SyncManager, PartialBlocksResponseContinuesSameBatch)
   h.our_height = 0;
   h.mgr.start();
 
-  h.mgr.onHeaders(Harness::makeHeaders(1, 10));
+  h.mgr.onHeaders(Harness::makeBlockHeaders(1, 10));
 
   // First request went out for 10 blocks. Peer responds with 5.
   h.mgr.onBlocks(Harness::makeBlocks(5));
@@ -261,7 +261,7 @@ TEST(Node_SyncManager, MoreBlocksThanRequestedIsMisbehavior)
   h.our_height = 0;
   h.mgr.start();
 
-  h.mgr.onHeaders(Harness::makeHeaders(1, 5));
+  h.mgr.onHeaders(Harness::makeBlockHeaders(1, 5));
 
   // Asked for 5 blocks. Peer sends 6.
   h.mgr.onBlocks(Harness::makeBlocks(6));
@@ -280,7 +280,7 @@ TEST(Node_SyncManager, FailedApplyIsMisbehavior)
   h.mgr.apply_blocks = [](const std::vector<Core::Block> &) -> size_t
   { return 0; };
 
-  h.mgr.onHeaders(Harness::makeHeaders(1, 5));
+  h.mgr.onHeaders(Harness::makeBlockHeaders(1, 5));
   h.mgr.onBlocks(Harness::makeBlocks(5));
 
   ASSERT_EQ(h.misbehaviors.size(), 1u);
@@ -325,7 +325,7 @@ TEST(Node_SyncManager, IdleRefreshSendsGetHeaders)
   EXPECT_EQ(h.countMessagesOfType(P2P::MessageType::GetHeaders), 1u);
 
   // Peer responds: empty, we're caught up.
-  h.mgr.onHeaders(Harness::makeHeaders(6, 0));
+  h.mgr.onHeaders(Harness::makeBlockHeaders(6, 0));
   EXPECT_EQ(h.mgr.state(), P2P::SyncManager::State::Idle);
 
   // First tick after the interval should send another GetHeaders.
@@ -347,7 +347,7 @@ TEST(Node_SyncManager, IdleRefreshNoOpBeforeInterval)
 
   // start() sent the first GetHeaders. Consume the response so we
   // reach Idle.
-  h.mgr.onHeaders(Harness::makeHeaders(6, 0));
+  h.mgr.onHeaders(Harness::makeBlockHeaders(6, 0));
   ASSERT_EQ(h.mgr.state(), P2P::SyncManager::State::Idle);
 
   const size_t before = h.sent.size();
@@ -371,7 +371,7 @@ TEST(Node_SyncManager, RefreshDiscoversNewBlocks)
   h.mgr.start();
 
   // Initial sync: empty response, we're caught up.
-  h.mgr.onHeaders(Harness::makeHeaders(6, 0));
+  h.mgr.onHeaders(Harness::makeBlockHeaders(6, 0));
   ASSERT_EQ(h.mgr.state(), P2P::SyncManager::State::Idle);
 
   // Peer commits block 6. Our next tick discovers it.
@@ -379,7 +379,7 @@ TEST(Node_SyncManager, RefreshDiscoversNewBlocks)
   ASSERT_EQ(h.mgr.state(), P2P::SyncManager::State::AwaitingHeaders);
 
   // Peer tells us about block 6.
-  h.mgr.onHeaders(Harness::makeHeaders(6, 1));
+  h.mgr.onHeaders(Harness::makeBlockHeaders(6, 1));
   ASSERT_EQ(h.mgr.state(), P2P::SyncManager::State::AwaitingBlocks);
 
   // Peer sends block 6. We apply it and go Idle.

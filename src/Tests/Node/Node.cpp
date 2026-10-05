@@ -5,12 +5,35 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <thread>
+
 #include "Fixtures.h"
 #include "Tests/Utils.h"
 
 #include "Node/Node.h"
 
 using namespace Tests;
+
+namespace
+{
+  //  Node::start() is asynchronous: it posts initialization to the
+  //  node's io_context and returns immediately. Genesis is written on
+  //  that background thread. Any test that reads chain state, or that
+  //  stops the node, must wait for genesis to land first or it races a
+  //  partially-initialized node. This mirrors the helper used in
+  //  SyncEndToEnd.cpp / the key-file tests.
+  void waitForGenesis(Node::Node &n)
+  {
+    for (int i = 0; i < 200; ++i)
+    {
+      if (!NodeTestAccess::chainDb(n).getHead().hash.isNull())
+        return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    FAIL() << "genesis never applied after start()";
+  }
+} // anonymous namespace
 
 // Construction
 
@@ -109,6 +132,7 @@ TEST_F(Node_Fixture, SubmitTransactionReturnsMempoolResult)
   Node::NodeConfig cfg = makeValidConfig();
   Node::Node node(cfg, logger_);
   node.start();
+  waitForGenesis(node);
 
   Core::Transaction tx; // default-constructed: not well-formed
   std::string error;
@@ -128,6 +152,7 @@ TEST_F(Node_Fixture, SubmitTransactionRejectedClearsError)
   Node::NodeConfig cfg = makeValidConfig();
   Node::Node node(cfg, logger_);
   node.start();
+  waitForGenesis(node);
 
   Core::Transaction tx; // malformed
   std::string error = "pre-existing";

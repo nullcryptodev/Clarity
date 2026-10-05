@@ -17,7 +17,7 @@ using namespace Tests;
 
 TEST_F(Core_ChainFixture, StoreAndRetrieveByHash)
 {
-  Block b = makeTestBlock(makeTestHeader(/*height=*/1));
+  Block b = makeBlock(makeBlockHeader(/*height=*/1));
 
   Crypto::Hash hash = b.hash();
   chain_db_->storeBlock(b);
@@ -33,7 +33,7 @@ TEST_F(Core_ChainFixture, StoreAndRetrieveByHash)
 
 TEST_F(Core_ChainFixture, StoreAndRetrieveByHeight)
 {
-  Block b = makeTestBlock(makeTestHeader(/*height=*/5));
+  Block b = makeBlock(makeBlockHeader(/*height=*/5));
 
   chain_db_->storeBlock(b);
 
@@ -54,7 +54,7 @@ TEST_F(Core_ChainFixture, GetBlockReturnsNullForMissing)
 
 TEST_F(Core_ChainFixture, GetHeaderByHash)
 {
-  Block b = makeTestBlock(makeTestHeader(/*height=*/10));
+  Block b = makeBlock(makeBlockHeader(/*height=*/10));
   chain_db_->storeBlock(b);
 
   auto header = chain_db_->getHeader(b.hash());
@@ -64,7 +64,7 @@ TEST_F(Core_ChainFixture, GetHeaderByHash)
 
 TEST_F(Core_ChainFixture, GetHeaderByHeight)
 {
-  Block b = makeTestBlock(makeTestHeader(/*height=*/15));
+  Block b = makeBlock(makeBlockHeader(/*height=*/15));
   chain_db_->storeBlock(b);
 
   auto header = chain_db_->getHeaderByHeight(15);
@@ -74,7 +74,7 @@ TEST_F(Core_ChainFixture, GetHeaderByHeight)
 
 TEST_F(Core_ChainFixture, GetHashByHeight)
 {
-  Block b = makeTestBlock(makeTestHeader(/*height=*/20));
+  Block b = makeBlock(makeBlockHeader(/*height=*/20));
   Crypto::Hash expected = b.hash();
   chain_db_->storeBlock(b);
 
@@ -92,7 +92,7 @@ TEST_F(Core_ChainFixture, GetHashByHeightReturnsNullForMissing)
 
 TEST_F(Core_ChainFixture, StoreIsIdempotent)
 {
-  Block b = makeTestBlock(makeTestHeader(/*height=*/1));
+  Block b = makeBlock(makeBlockHeader(/*height=*/1));
 
   chain_db_->storeBlock(b);
   chain_db_->storeBlock(b);
@@ -207,7 +207,7 @@ TEST_F(Core_ChainFixture, BlockCountGrowsWithStores)
 {
   for (uint64_t h = 1; h <= 10; ++h)
   {
-    Block b = makeTestBlock(makeTestHeader(h));
+    Block b = makeBlock(makeBlockHeader(h));
     chain_db_->storeBlock(b);
   }
   EXPECT_EQ(chain_db_->blockCount(), 10u);
@@ -219,7 +219,7 @@ TEST_F(Core_ChainFixture, DataSurvivesReopen)
 {
   const auto &path = tmp_path();
 
-  Block b = makeTestBlock(makeTestHeader(/*height=*/7));
+  Block b = makeBlock(makeBlockHeader(/*height=*/7));
   Crypto::Hash hash = b.hash();
   chain_db_->storeBlock(b);
 

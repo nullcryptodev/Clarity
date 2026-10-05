@@ -17,9 +17,9 @@ using namespace Tests;
 
 TEST(RPC_BlockEncoder, HeaderFieldsPresent)
 {
-  Json j = encodeBlockHeader(makeHeader(), "clrty");
+  Json j = encodeBlockHeader(makeBlockHeader(), "clrty");
 
-  // Values should match makeHeader
+  // Values should match makeBlockHeader
   EXPECT_EQ(j["version"], 1);
   EXPECT_EQ(j["chain_id"], 0x434C5247u);
   EXPECT_EQ(j["height"], "0x64"); 
@@ -41,7 +41,7 @@ TEST(RPC_BlockEncoder, HeaderFieldsPresent)
 TEST(RPC_BlockEncoder, EmptyBlockHashesOnly)
 {
   Core::Block b;
-  b.header = makeHeader();
+  b.header = makeBlockHeader();
 
   Json j = encodeBlock(b, /*include_transactions=*/false, "clrty");
 
@@ -51,5 +51,5 @@ TEST(RPC_BlockEncoder, EmptyBlockHashesOnly)
   EXPECT_EQ(j["participants"].size(), 0u);
   ASSERT_TRUE(j["quorum_signatures"].is_array());
   EXPECT_EQ(j["quorum_signatures"].size(), 0u);
-  EXPECT_EQ(j["height"], "0x64"); // matches makeHeader
+  EXPECT_EQ(j["height"], "0x64"); // matches makeBlockHeader
 }

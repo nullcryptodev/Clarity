@@ -15,9 +15,9 @@ using namespace Tests;
 
 TEST(Consensus_Message, ProposalRoundTrip)
 {
-  Core::BlockHeader blockHeader = makeTestHeader(42, Crypto::Hash{}, 0x434C5247);
+  Core::BlockHeader blockHeader = makeBlockHeader(42, Crypto::Hash{}, 0x434C5247);
   blockHeader.active_validator_count = 21;
-  Core::Block block = makeTestBlock(blockHeader);
+  Core::Block block = makeBlock(blockHeader);
 
   Proposal p;
   p.height = 42;

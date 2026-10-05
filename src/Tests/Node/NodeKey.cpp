@@ -43,6 +43,22 @@ namespace
     std::error_code ec;
     return std::filesystem::exists(path, ec) && !ec;
   }
+
+  //  Wait for genesis to be applied. Node::start() is asynchronous:
+  //  it posts initialization to the node's io_context and returns
+  //  immediately. Genesis is written on that background thread. Any
+  //  check that reads chain state or triggers a stop() needs genesis
+  //  to have landed, or the node is in a partially-initialized state.
+  void waitForGenesis(Node::Node &n)
+  {
+    for (int i = 0; i < 200; ++i)
+    {
+      if (!NodeTestAccess::chainDb(n).getHead().hash.isNull())
+        return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    FAIL() << "genesis never applied after start()";
+  }
 } // anonymous namespace
 
 // ============================================================================
@@ -60,6 +76,7 @@ TEST_F(Node_Fixture, NodeKeyCreatedOnFirstP2PStart)
 
   Node::Node node(cfg, logger_);
   node.start();
+  waitForGenesis(node);
 
   ASSERT_TRUE(fileExists(path))
       << "node_key file should be created on first P2P start";
@@ -95,6 +112,7 @@ TEST_F(Node_Fixture, NodeKeyStableAcrossRestart)
   {
     Node::Node node(cfg, logger_);
     node.start();
+    waitForGenesis(node);
     first = readFile(path);
     node.stop();
   }
@@ -105,6 +123,7 @@ TEST_F(Node_Fixture, NodeKeyStableAcrossRestart)
   {
     Node::Node node(cfg, logger_);
     node.start();
+    waitForGenesis(node);
     second = readFile(path);
     node.stop();
   }
@@ -128,6 +147,7 @@ TEST_F(Node_Fixture, NodeKeyConfigOverrideWins)
 
   Node::Node node(cfg, logger_);
   node.start();
+  waitForGenesis(node);
 
   // When the key comes from config, the config is the source of truth.
   // Writing it to disk would create two sources and an ambiguous
@@ -156,6 +176,7 @@ TEST_F(Node_Fixture, NodeKeyCorruptedFileRegenerates)
 
   Node::Node node(cfg, logger_);
   node.start();
+  waitForGenesis(node);
 
   auto bytes = readFile(path);
   EXPECT_EQ(bytes.size(), 32u)
@@ -173,6 +194,7 @@ TEST_F(Node_Fixture, NonP2PNodeDoesNotCreateNodeKey)
 
   Node::Node node(cfg, logger_);
   node.start();
+  waitForGenesis(node);
 
   EXPECT_FALSE(fileExists(path))
       << "P2P-disabled node must not write a node_key file";
@@ -203,6 +225,7 @@ TEST_F(Node_Fixture, ValidatorUsesValidatorKeyAsNodeKey)
 
   Node::Node node(cfg, logger_);
   node.start();
+  waitForGenesis(node);
 
   EXPECT_FALSE(fileExists(path))
       << "validator node must use its consensus_secret_key as the node "
@@ -234,6 +257,7 @@ TEST_F(Node_Fixture, ValidatorKeyPrecedenceOverridesDisk)
 
   Node::Node node(cfg, logger_);
   node.start();
+  waitForGenesis(node);
 
   // The file must be untouched — the validator key wins.
   auto bytes = readFile(path);

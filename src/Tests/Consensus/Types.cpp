@@ -33,22 +33,53 @@ TEST(Consensus_Types, DefaultVoteIsInvalid)
   Vote v;
   EXPECT_FALSE(v.isValid());
   EXPECT_EQ(v.signer_index, INVALID_INDEX);
+  EXPECT_EQ(v.signer_id, INVALID_ID);
 }
 
 TEST(Consensus_Types, VoteWithSignerAndSignatureIsValid)
 {
+  //  isValid() requires signer_id, signer_index, and a non-null
+  //  signature. signer_id is the authoritative signer; signer_index
+  //  is advisory but still required so a vote is never accepted in a
+  //  half-populated state.
   Vote v;
   v.signer_index = 3;
-  // Fill signature with non-zero bytes.
+  v.signer_id = 3;
   for (auto &b : v.signature.data)
     b = 0xAB;
   EXPECT_TRUE(v.isValid());
+}
+
+TEST(Consensus_Types, VoteWithSignatureButNoSignerIdIsInvalid)
+{
+  //  A vote with a valid-looking signature and a valid index but no
+  //  signer_id is not resolvable against a set, because the index
+  //  means different things in the committed and emergency sets.
+  //  isValid() rejects it.
+  Vote v;
+  v.signer_index = 3;
+  for (auto &b : v.signature.data)
+    b = 0xAB;
+  EXPECT_FALSE(v.isValid());
 }
 
 TEST(Consensus_Types, VoteWithSignerButNoSignatureIsInvalid)
 {
   Vote v;
   v.signer_index = 3;
+  v.signer_id = 3;
+  EXPECT_FALSE(v.isValid());
+}
+
+TEST(Consensus_Types, VoteWithSignerIdButNoIndexIsInvalid)
+{
+  //  The index is required on the wire for the compact
+  //  quorum_signatures encoding in a committed block. A vote
+  //  without it is not a well-formed vote.
+  Vote v;
+  v.signer_id = 3;
+  for (auto &b : v.signature.data)
+    b = 0xAB;
   EXPECT_FALSE(v.isValid());
 }
 
@@ -62,6 +93,7 @@ TEST(Consensus_Types, ProposalRequiresAllFields)
 {
   Proposal p;
   p.signer_index = 1;
+  p.signer_id = 1;
   p.block_hash.data[0] = 0x01;
   p.block_bytes = {1, 2, 3, 4};
   for (auto &b : p.signature.data)
@@ -73,6 +105,11 @@ TEST(Consensus_Types, ProposalRequiresAllFields)
   {
     Proposal q = p;
     q.signer_index = INVALID_INDEX;
+    EXPECT_FALSE(q.isValid());
+  }
+  {
+    Proposal q = p;
+    q.signer_id = INVALID_ID;
     EXPECT_FALSE(q.isValid());
   }
   {

@@ -112,13 +112,13 @@ namespace Core
       return result;
     }
 
-    //  Resolve the active set for this block. Under normal conditions
-    //  this is the committed set from state. When the block carries
-    //  the emergency_rotation flag, the emergency set is derived from
-    //  the same inputs the proposer used — committed_set, the
-    //  validator registry, and the current height — so quorum and
-    //  set-root verification see the same set every honest node
-    //  computes.
+    //  Resolve the active set for this block.
+    //
+    //  committed_set is the pre-emergency set: the one the
+    //  certificate's signers are drawn from. active_set is the
+    //  post-emergency set: the one the block's quorum was actually
+    //  formed against. These are the same value for a normal block
+    //  and different values for an emergency block.
     //
     //  The derivation must be a pure function of state and height.
     //  Both the proposer (via Node::buildConsensusDeps::active_set)
@@ -129,6 +129,12 @@ namespace Core
 
     if (is_emergency)
     {
+      //  The certificate hash binding (H(certificate) matches the
+      //  header's timeout_certificate_hash) was verified in
+      //  checkHeader. Here we verify the certificate's signatures
+      //  against the committed set. Two separate checks: the hash
+      //  is a wire-integrity guarantee, the signature check is a
+      //  consensus guarantee. Both must pass.
       if (!checkTimeoutCertificate(state, block, committed_set,
                                    ctx.current_height, error))
       {
@@ -287,6 +293,50 @@ namespace Core
     return result;
   }
 
+  //  Certificate checks
+  //
+  //  Two functions, one job each:
+  //
+  //    checkTimeoutCertificateHash
+  //      Wire integrity. Recomputes H(certificate) and compares it to
+  //      the value the header committed to. Catches a relaying peer
+  //      swapping or stripping the certificate, and catches a
+  //      proposer whose header claims a certificate they didn't carry.
+  //
+  //    checkTimeoutCertificate
+  //      Consensus. Verifies the certificate's signatures against the
+  //      committed set. Catches an arbitrary emergency flag.
+  //
+  //  Both must pass for an emergency block to be accepted.
+
+  bool BlockProcessor::checkTimeoutCertificateHash(const Block &block,
+                                                   std::string &error)
+  {
+    //  Recompute the certificate hash from the certificate bytes that
+    //  were transmitted alongside the block. Compare against the value
+    //  the header committed to. A mismatch means either the header's
+    //  hash is wrong (a Byzantine proposer claiming a certificate
+    //  they didn't carry) or the certificate bytes were altered in
+    //  transit (a MITM on the plaintext P2P channel). Either way, the
+    //  block is not the block the proposer signed.
+    //
+    //  This is a wire-integrity check, separate from the consensus
+    //  check that verifies the certificate's signatures. Both must
+    //  pass. See checkTimeoutCertificate.
+    const Crypto::Hash computed =
+        computeTimeoutCertificateHash(block.header.timeout_certificate);
+
+    if (computed != block.header.timeout_certificate_hash)
+    {
+      error = "timeout certificate hash mismatch: header commits to " +
+              block.header.timeout_certificate_hash.toString() +
+              ", certificate hashes to " + computed.toString();
+      return false;
+    }
+
+    return true;
+  }
+
   bool BlockProcessor::checkTimeoutCertificate(
       State::StateAccess &state,
       const Block &block,
@@ -294,6 +344,10 @@ namespace Core
       uint64_t current_height,
       std::string &error)
   {
+    //  Signature verification for the certificate. The wire-integrity
+    //  check (certificate bytes match the header's hash) is done
+    //  separately in checkTimeoutCertificateHash; that function must
+    //  have been called first (checkHeader does it).
     auto lookup = [&state](Id vid, ValidatorInfo &out) -> bool
     {
       return state.getValidator(vid, out);
@@ -321,11 +375,6 @@ namespace Core
                                    const BlockContext &ctx,
                                    std::string &error)
   {
-    // Header well-formedness is a consensus-layer check for finalized
-    // blocks. During a dry run, the block's state_root and quorum
-    // signatures may not yet be populated. Skip the check during dry
-    // runs; the caller that submitted the block for real application
-    // will hit it and reject if the block is malformed.
     if (!ctx.dry_run && !block.header.isWellFormed())
     {
       error = "block header not well-formed";
@@ -348,6 +397,19 @@ namespace Core
     {
       error = "parent hash is null";
       return false;
+    }
+
+    //  Certificate hash binding. When emergency_rotation > 0, the
+    //  header's timeout_certificate_hash must match H(certificate).
+    //  Checked here, before anything more expensive, so a bad hash
+    //  rejects the block early.
+    //
+    //  Non-emergency blocks carry an empty certificate and a null
+    //  hash; isWellFormed enforces that they agree.
+    if (!ctx.dry_run && block.header.emergency_rotation > 0)
+    {
+      if (!checkTimeoutCertificateHash(block, error))
+        return false;
     }
 
     uint64_t now_ms = nowMs();

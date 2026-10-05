@@ -35,16 +35,19 @@ namespace Consensus
       Crypto::blake2b(buf.data(), buf.size(), h.data.data(), 32);
       return h;
     }
+
+    constexpr uint32_t MAX_BLOCK_BYTES_WIRE = 8 * 1024 * 1024;
   } // anonymous namespace
 
   std::vector<uint8_t> encodeProposal(const Proposal &p)
   {
     std::vector<uint8_t> out;
-    out.reserve(8 + 8 + 2 + 4 + p.block_bytes.size() + 64);
+    out.reserve(8 + 8 + 8 + 2 + 4 + p.block_bytes.size() + 64);
 
     Common::Writer w(out);
     w.writeU64(p.height);
     w.writeU64(p.round);
+    w.writeU64(p.signer_id);
     w.writeU16(p.signer_index);
     w.writeU32(static_cast<uint32_t>(p.block_bytes.size()));
     w.writeVector(p.block_bytes);
@@ -59,13 +62,17 @@ namespace Consensus
 
     out.height = r.readU64();
     out.round = r.readU64();
+    out.signer_id = r.readU64();
     out.signer_index = r.readU16();
     uint32_t bs = r.readU32();
+
+    if (!r.ok() || bs > MAX_BLOCK_BYTES_WIRE)
+      return false;
 
     // Bounds-check the block payload before allocating. Reader::readVector
     // will catch a truncated read on its own, but checking here avoids
     // allocating a huge vector for a bogus length first.
-    if (!r.ok() || r.remaining() < bs + 64)
+    if (r.remaining() < static_cast<size_t>(bs) + 64)
       return false;
 
     out.block_bytes = r.readVector(bs);
@@ -93,11 +100,12 @@ namespace Consensus
   std::vector<uint8_t> encodeVote(const Vote &v)
   {
     std::vector<uint8_t> out;
-    out.reserve(8 + 8 + 2 + 1 + 32 + 64);
+    out.reserve(8 + 8 + 8 + 2 + 1 + 32 + 64);
 
     Common::Writer w(out);
     w.writeU64(v.height);
     w.writeU64(v.round);
+    w.writeU64(v.signer_id);
     w.writeU16(v.signer_index);
     w.writeU8(v.is_nil ? 1 : 0);
     w.writeBytes(v.block_hash.data.data(), v.block_hash.data.size());
@@ -112,6 +120,7 @@ namespace Consensus
 
     out.height = r.readU64();
     out.round = r.readU64();
+    out.signer_id = r.readU64();
     out.signer_index = r.readU16();
     out.is_nil = (r.readU8() != 0);
     r.readBytes(out.block_hash.data.data(), out.block_hash.data.size());

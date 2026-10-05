@@ -26,7 +26,7 @@ TEST_F(Core_ChainFixture, HeightIsZeroInitially)
 
 TEST_F(Core_ChainFixture, AppendGenesis)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
 
   auto result = chain_->appendBlock(genesis);
   EXPECT_EQ(result, Chain::AppendResult::Ok);
@@ -37,7 +37,7 @@ TEST_F(Core_ChainFixture, AppendGenesis)
 
 TEST_F(Core_ChainFixture, AppendGenesisIsIdempotent)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
 
   EXPECT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
   EXPECT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::AlreadyHave);
@@ -47,14 +47,14 @@ TEST_F(Core_ChainFixture, AppendGenesisIsIdempotent)
 
 TEST_F(Core_ChainFixture, AppendSequenceOfBlocks)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
 
   Crypto::Hash parent = genesis.hash();
 
   for (uint64_t h = 1; h <= 5; ++h)
   {
-    Block b = makeTestBlock(makeTestHeader(h, parent));
+    Block b = makeBlock(makeBlockHeader(h, parent));
     EXPECT_EQ(chain_->appendBlock(b), Chain::AppendResult::Ok)
         << "height " << h;
     EXPECT_EQ(chain_->height(), h);
@@ -66,11 +66,11 @@ TEST_F(Core_ChainFixture, AppendSequenceOfBlocks)
 
 TEST_F(Core_ChainFixture, AppendHeightMustBeParentPlusOne)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
 
   // Try to append a block at height 3 with genesis as parent.
-  Block b = makeTestBlock(makeTestHeader(/*height=*/3, genesis.hash()));
+  Block b = makeBlock(makeBlockHeader(/*height=*/3, genesis.hash()));
 
   EXPECT_EQ(chain_->appendBlock(b), Chain::AppendResult::InvalidParent);
   EXPECT_EQ(chain_->height(), 0u);
@@ -84,7 +84,7 @@ TEST_F(Core_ChainFixture, AppendHeightMustBeParentPlusOne)
 
 TEST_F(Core_ChainFixture, AppendRejectsUnknownParentHash)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
 
   // A parent hash that's not genesis and not in our DB.
@@ -92,7 +92,7 @@ TEST_F(Core_ChainFixture, AppendRejectsUnknownParentHash)
   for (size_t i = 0; i < 32; ++i)
     unknown_parent.data[i] = 0xEE;
 
-  Block b = makeTestBlock(makeTestHeader(/*height=*/1, unknown_parent));
+  Block b = makeBlock(makeBlockHeader(/*height=*/1, unknown_parent));
 
   EXPECT_EQ(chain_->appendBlock(b), Chain::AppendResult::NotConnected);
   EXPECT_EQ(chain_->height(), 0u);
@@ -100,10 +100,10 @@ TEST_F(Core_ChainFixture, AppendRejectsUnknownParentHash)
 
 TEST_F(Core_ChainFixture, AppendAlreadyHaveBlock)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
 
-  Block b = makeTestBlock(makeTestHeader(/*height=*/1, genesis.hash()));
+  Block b = makeBlock(makeBlockHeader(/*height=*/1, genesis.hash()));
   ASSERT_EQ(chain_->appendBlock(b), Chain::AppendResult::Ok);
 
   EXPECT_EQ(chain_->appendBlock(b), Chain::AppendResult::AlreadyHave);
@@ -114,14 +114,14 @@ TEST_F(Core_ChainFixture, AppendAlreadyHaveBlock)
 
 TEST_F(Core_ChainFixture, RejectsForkFromKnownParent)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
 
   // Two blocks at height 1, both with genesis as parent.
-  Block b1 = makeTestBlock(makeTestHeader(/*height=*/1, genesis.hash()));
+  Block b1 = makeBlock(makeBlockHeader(/*height=*/1, genesis.hash()));
   ASSERT_EQ(chain_->appendBlock(b1), Chain::AppendResult::Ok);
 
-  Block b2 = makeTestBlock(makeTestHeader(/*height=*/1, genesis.hash()));
+  Block b2 = makeBlock(makeBlockHeader(/*height=*/1, genesis.hash()));
   b2.header.timestamp_ms += 1;
 
   // The chain has moved to b1's head. b2's parent (genesis) is known
@@ -136,10 +136,10 @@ TEST_F(Core_ChainFixture, HeadPersistsAcrossReopen)
 {
   const auto &path = tmp_path();
 
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
 
-  Block b1 = makeTestBlock(makeTestHeader(/*height=*/1, genesis.hash()));
+  Block b1 = makeBlock(makeBlockHeader(/*height=*/1, genesis.hash()));
   ASSERT_EQ(chain_->appendBlock(b1), Chain::AppendResult::Ok);
 
   Crypto::Hash expected_head = b1.hash();
@@ -164,7 +164,7 @@ TEST_F(Core_ChainFixture, HeadPersistsAcrossReopen)
 
 TEST_F(Core_ChainFixture, IsSyncingWhenFarBehind)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
 
   chain_->setBestPeerHeight(100);
@@ -173,7 +173,7 @@ TEST_F(Core_ChainFixture, IsSyncingWhenFarBehind)
 
 TEST_F(Core_ChainFixture, NotSyncingWhenCaughtUp)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
 
   chain_->setBestPeerHeight(3);
@@ -182,7 +182,7 @@ TEST_F(Core_ChainFixture, NotSyncingWhenCaughtUp)
 
 TEST_F(Core_ChainFixture, NotSyncingWhenPeerBehind)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
 
   chain_->setBestPeerHeight(0);
@@ -193,10 +193,10 @@ TEST_F(Core_ChainFixture, NotSyncingWhenPeerBehind)
 
 TEST_F(Core_ChainFixture, AppendedBlockIsRetrievable)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
 
-  Block b1 = makeTestBlock(makeTestHeader(/*height=*/1, genesis.hash()));
+  Block b1 = makeBlock(makeBlockHeader(/*height=*/1, genesis.hash()));
   ASSERT_EQ(chain_->appendBlock(b1), Chain::AppendResult::Ok);
 
   // Retrieve through the chain wrapper.
@@ -214,7 +214,7 @@ TEST_F(Core_ChainFixture, AppendedBlockIsRetrievable)
 
 TEST_F(Core_ChainFixture, LongChainIntegrity)
 {
-  Block genesis = makeTestBlock(makeTestHeader(/*height=*/0));
+  Block genesis = makeBlock(makeBlockHeader(/*height=*/0));
   ASSERT_EQ(chain_->appendBlock(genesis), Chain::AppendResult::Ok);
 
   Crypto::Hash parent = genesis.hash();
@@ -222,7 +222,7 @@ TEST_F(Core_ChainFixture, LongChainIntegrity)
 
   for (uint64_t h = 1; h <= 100; ++h)
   {
-    Block b = makeTestBlock(makeTestHeader(h, parent));
+    Block b = makeBlock(makeBlockHeader(h, parent));
     ASSERT_EQ(chain_->appendBlock(b), Chain::AppendResult::Ok)
         << "height " << h;
     parent = b.hash();

@@ -23,10 +23,51 @@ using namespace Tests;
 
 namespace
 {
+  //  Node::start() is asynchronous: it posts initialization to the
+  //  node's io_context and returns immediately. Genesis is written on
+  //  that background thread. Any test that needs to read the genesis
+  //  block hash from the chain DB, or that builds a block whose
+  //  parent_hash has to be the genesis hash, must wait for genesis to
+  //  land first.
+  void waitForGenesis(Node::Node &n)
+  {
+    for (int i = 0; i < 200; ++i)
+    {
+      if (!NodeTestAccess::chainDb(n).getHead().hash.isNull())
+        return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    FAIL() << "genesis never applied after start()";
+  }
+
+  //  Read the active set from the node's state at genesis version (0).
+  //  applyGenesis writes "active_set" as a global during genesis
+  //  application, committed at version 0. The block being built must
+  //  declare the same active_validator_count and validator_set_root
+  //  that BlockProcessor::applyBlock will derive from the same state.
+  std::vector<Id> readActiveSetFromState(State::StateDB &db)
+  {
+    std::vector<Id> ids;
+    State::StateAccess state(db, /*version=*/0);
+
+    std::vector<uint8_t> bytes;
+    if (!state.getGlobal("active_set", bytes))
+      return ids;
+
+    for (size_t i = 0; i + 8 <= bytes.size(); i += 8)
+    {
+      uint64_t id = 0;
+      for (int j = 0; j < 8; ++j)
+        id |= uint64_t(bytes[i + j]) << (j * 8);
+      ids.push_back(id);
+    }
+    return ids;
+  }
+
   // Build a valid empty block at the given height, parented to the
-  // chain's current head, signed by the seed validators. Same shape
-  // as Node_BlockFixture::buildValidEmptyBlock, extracted here so
-  // the sync test doesn't need the block fixture.
+  // chain's current head, signed by the seed validators. Kept local
+  // because these sync tests build blocks on nodes that are started
+  // without going through the consensus harness.
   Core::Block buildAndSignBlock(Node::Node &node,
                                 const Core::GenesisConfig &genesis,
                                 const Crypto::KeyPair &seed1,
@@ -36,14 +77,17 @@ namespace
     auto &db = NodeTestAccess::stateDb(node);
     auto &chain_db = NodeTestAccess::chainDb(node);
 
-    auto head = chain_db.getHead();
-    Crypto::Hash parent = head.hash;
+    const auto head = chain_db.getHead();
+
+    //  Mirror the state-derived active set into the header, the same
+    //  way BftConsensus::buildFreshBlock mirrors deps_.active_set().
+    std::vector<Id> active_set = readActiveSetFromState(db);
 
     Core::Block b;
     b.header.version = GlobalConfig::CURRENT_BLOCK_VERSION;
     b.header.chain_id = genesis.chain_id;
     b.header.height = height;
-    b.header.parent_hash = parent;
+    b.header.parent_hash = head.hash;
     b.header.timestamp_ms = 1'700'000'000'000ULL + height * 1000;
     b.header.proposer = Crypto::Address{};
     for (size_t i = 0; i < 32; ++i)
@@ -52,13 +96,19 @@ namespace
     b.header.rotation_index = height / Core::ROTATION_INTERVAL;
     b.header.commit_round = 0;
     b.header.tx_root = Core::computeTxRoot({});
-    b.header.state_root = Crypto::Hash{};
+
+    //  Non-null placeholder. isWellFormed() requires a non-null state
+    //  root on any non-genesis block, but the real root can only be
+    //  computed by simulating the block, which runs isWellFormed first.
+    b.header.state_root.data[0] = 0x01;
+
     b.header.receipts_root = Crypto::Hash{};
-    b.header.validator_set_root = Core::computeValidatorSetRoot({1, 2});
-    b.header.active_validator_count = 2;
+    b.header.validator_set_root = Core::computeValidatorSetRoot(active_set);
+    b.header.active_validator_count =
+        static_cast<uint32_t>(active_set.size());
     b.header.tx_count = 0;
     b.header.total_fees = 0;
-    b.participants = {1, 2};
+    b.participants = active_set;
     b.quorum_signatures.clear();
 
     // Simulate to compute state root.
@@ -70,13 +120,15 @@ namespace
       ctx.current_height = height;
       ctx.dry_run = true;
       Core::BlockResult r = Core::BlockProcessor::applyBlock(state, b, ctx);
-      txn.abort();
-      if (r.valid)
+
+      if (r.valid && !r.new_state_root.isNull())
         b.header.state_root = r.new_state_root;
+
+      txn.abort();
     }
 
     // Sign.
-    Crypto::Hash signing_hash = Consensus::voteSigningHash(
+    const Crypto::Hash signing_hash = Consensus::voteSigningHash(
         b.header.height, b.header.commit_round, false, b.hash());
     b.quorum_signatures.push_back({0, Crypto::sign(signing_hash, seed1.secretKey)});
     b.quorum_signatures.push_back({1, Crypto::sign(signing_hash, seed2.secretKey)});
@@ -93,23 +145,31 @@ TEST_F(Node_EndToEndFixture, BehindNodeCatchesUpFromAheadNode)
 {
   // Two seed validators. Node 0 will stay behind. Node 1 will be
   // pre-loaded with 5 blocks before we connect them.
-  makeValidators(2);
+  setValidatorCount(2);
+
+  //  These tests bypass startNodes(), so they must populate dirs_,
+  //  genesis_, and env_ themselves. makeConfig() reads dirs_, and the
+  //  node's genesis path reads genesis_. Both must be set up before any
+  //  Node is constructed or every block fails header validation.
+  makeExtraNodes(2);
+  buildGenesis();
+  buildEnv();
 
   const uint16_t port0 = pickFreePort();
   const uint16_t port1 = pickFreePort();
 
-  // Get the two seeds used by the fixture's genesis.
-  const Crypto::KeyPair seed1 = deterministicValidatorKey(1);
-  const Crypto::KeyPair seed2 = deterministicValidatorKey(2);
+  const Crypto::KeyPair seed1 = keys_.at(0).reward_kp;
+  const Crypto::KeyPair seed2 = keys_.at(1).reward_kp;
 
   // Pre-apply blocks on node 1's data dir before starting it with
-  // P2P. The block fixture pattern: start node 1 headless, apply
-  // blocks directly, stop it. Then restart it with P2P enabled.
-  Node::NodeConfig cfg1_headless = makeConfig(1);
+  // P2P. Start node 1 headless, apply blocks directly, stop it.
+  // Then restart it with P2P enabled.
+  Node::NodeConfig cfg1_headless = makeNonValidatorConfig(1);
   cfg1_headless.enable_p2p = false;
   {
     Node::Node n1(cfg1_headless, logger_);
     n1.start();
+    waitForGenesis(n1);
     for (uint64_t h = 1; h <= 5; ++h)
     {
       Core::Block b = buildAndSignBlock(n1, genesis_, seed1, seed2, h);
@@ -122,20 +182,19 @@ TEST_F(Node_EndToEndFixture, BehindNodeCatchesUpFromAheadNode)
   }
 
   // Now start both nodes with P2P enabled on their respective ports.
-  auto cfg0 = makeConfigWithP2P(0, port0);
-  auto cfg1 = makeConfigWithP2P(1, port1);
-  cfg1.enable_p2p = true;
-  cfg1.p2p_port = port1;
+  // Non-validators: no live consensus, so the test controls exactly
+  // which blocks exist.
+  auto cfg0 = makeNonValidatorConfigWithP2P(0, port0);
+  auto cfg1 = makeNonValidatorConfigWithP2P(1, port1);
 
   nodes_.clear();
-  consensuses_.clear();
-  offline_.assign(2, false);
-
   nodes_.push_back(std::make_unique<Node::Node>(cfg0, logger_));
   nodes_.push_back(std::make_unique<Node::Node>(cfg1, logger_));
 
   nodes_[0]->start();
   nodes_[1]->start();
+  waitForGenesis(*nodes_[0]);
+  waitForGenesis(*nodes_[1]);
 
   std::thread t0([&]
                  { nodes_[0]->run(); });
@@ -206,22 +265,24 @@ TEST_F(Node_EndToEndFixture, AheadNodeDoesNotSync)
 {
   // Both nodes at height 0. SyncManager should stay idle; no
   // GetHeaders should be sent, no blocks should be applied.
-  makeValidators(2);
+  setValidatorCount(2);
+  makeExtraNodes(2);
+  buildGenesis();
+  buildEnv();
 
   const uint16_t port0 = pickFreePort();
   const uint16_t port1 = pickFreePort();
 
   nodes_.clear();
-  consensuses_.clear();
-  offline_.assign(2, false);
-
   nodes_.push_back(std::make_unique<Node::Node>(
-      makeConfigWithP2P(0, port0), logger_));
+      makeNonValidatorConfigWithP2P(0, port0), logger_));
   nodes_.push_back(std::make_unique<Node::Node>(
-      makeConfigWithP2P(1, port1), logger_));
+      makeNonValidatorConfigWithP2P(1, port1), logger_));
 
   nodes_[0]->start();
   nodes_[1]->start();
+  waitForGenesis(*nodes_[0]);
+  waitForGenesis(*nodes_[1]);
 
   std::thread t0([&]
                  { nodes_[0]->run(); });
@@ -256,20 +317,24 @@ TEST_F(Node_EndToEndFixture, AheadNodeDoesNotSync)
 
 TEST_F(Node_EndToEndFixture, BestPeerHeightUpdatedOnEstablish)
 {
-  makeValidators(2);
+  setValidatorCount(2);
+  makeExtraNodes(2);
+  buildGenesis();
+  buildEnv();
 
   const uint16_t port0 = pickFreePort();
   const uint16_t port1 = pickFreePort();
 
   // Node 1 with 3 blocks pre-applied.
-  const Crypto::KeyPair seed1 = deterministicValidatorKey(1);
-  const Crypto::KeyPair seed2 = deterministicValidatorKey(2);
+  const Crypto::KeyPair seed1 = keys_.at(0).reward_kp;
+  const Crypto::KeyPair seed2 = keys_.at(1).reward_kp;
 
-  Node::NodeConfig cfg1_headless = makeConfig(1);
+  Node::NodeConfig cfg1_headless = makeNonValidatorConfig(1);
   cfg1_headless.enable_p2p = false;
   {
     Node::Node n1(cfg1_headless, logger_);
     n1.start();
+    waitForGenesis(n1);
     for (uint64_t h = 1; h <= 3; ++h)
     {
       Core::Block b = buildAndSignBlock(n1, genesis_, seed1, seed2, h);
@@ -280,16 +345,15 @@ TEST_F(Node_EndToEndFixture, BestPeerHeightUpdatedOnEstablish)
   }
 
   nodes_.clear();
-  offline_.assign(2, false);
   nodes_.push_back(std::make_unique<Node::Node>(
-      makeConfigWithP2P(0, port0), logger_));
-  auto cfg1 = makeConfigWithP2P(1, port1);
-  cfg1.enable_p2p = true;
-  cfg1.p2p_port = port1;
-  nodes_.push_back(std::make_unique<Node::Node>(cfg1, logger_));
+      makeNonValidatorConfigWithP2P(0, port0), logger_));
+  nodes_.push_back(std::make_unique<Node::Node>(
+      makeNonValidatorConfigWithP2P(1, port1), logger_));
 
   nodes_[0]->start();
   nodes_[1]->start();
+  waitForGenesis(*nodes_[0]);
+  waitForGenesis(*nodes_[1]);
 
   std::thread t0([&]
                  { nodes_[0]->run(); });
@@ -304,7 +368,8 @@ TEST_F(Node_EndToEndFixture, BestPeerHeightUpdatedOnEstablish)
 
   // Wait for node 0 to know about node 1's height.
   bool saw_best = waitFor([&]
-                          { return NodeTestAccess::chain(*nodes_[0]).bestPeerHeight() >= 3; }, std::chrono::seconds(5));
+                          { return NodeTestAccess::chain(*nodes_[0]).bestPeerHeight() >= 3; },
+                          std::chrono::seconds(5));
 
   EXPECT_TRUE(saw_best) << "node0 never learned node1's best height";
   EXPECT_GE(NodeTestAccess::chain(*nodes_[0]).bestPeerHeight(), 3u);
@@ -328,26 +393,33 @@ TEST_F(Node_EndToEndFixture, IdleNodeDiscoversNewBlocksViaRefresh)
   // the periodic SyncManager::tick() refresh and catch up — WITHOUT
   // any Block message being relayed (we're bypassing broadcastBlock
   // by applying the block directly on node 1).
+  //
+  //  Both nodes are non-validators. If they were validators,
+  //  connecting them would start live consensus and they would
+  //  commit blocks before the test could observe the "idle" state.
+  //  The sync-manager refresh path is independent of consensus.
 
-  makeValidators(2);
+  setValidatorCount(2);
+  makeExtraNodes(2);
+  buildGenesis();
+  buildEnv();
 
   const uint16_t port0 = pickFreePort();
   const uint16_t port1 = pickFreePort();
 
-  const Crypto::KeyPair seed1 = deterministicValidatorKey(1);
-  const Crypto::KeyPair seed2 = deterministicValidatorKey(2);
+  const Crypto::KeyPair seed1 = keys_.at(0).reward_kp;
+  const Crypto::KeyPair seed2 = keys_.at(1).reward_kp;
 
   nodes_.clear();
-  consensuses_.clear();
-  offline_.assign(2, false);
-
   nodes_.push_back(std::make_unique<Node::Node>(
-      makeConfigWithP2P(0, port0), logger_));
+      makeNonValidatorConfigWithP2P(0, port0), logger_));
   nodes_.push_back(std::make_unique<Node::Node>(
-      makeConfigWithP2P(1, port1), logger_));
+      makeNonValidatorConfigWithP2P(1, port1), logger_));
 
   nodes_[0]->start();
   nodes_[1]->start();
+  waitForGenesis(*nodes_[0]);
+  waitForGenesis(*nodes_[1]);
 
   std::thread t0([&]
                  { nodes_[0]->run(); });
@@ -370,14 +442,17 @@ TEST_F(Node_EndToEndFixture, IdleNodeDiscoversNewBlocksViaRefresh)
   ASSERT_EQ(NodeTestAccess::chain(*nodes_[1]).height(), 0u);
 
   // Shorten the refresh interval on node 0 so the test doesn't take
-  // 30 seconds. 500ms is plenty — the refresh fires, GetHeaders goes
-  // out, the response comes back.
+  // 30 seconds. 500ms is plenty.
   NodeTestAccess::setSyncRefreshIntervalForTest(
       *nodes_[0], std::chrono::milliseconds(500));
 
   // Apply a block on node 1 only. No broadcast — we're simulating a
   // peer that advanced but hasn't told us yet. The sync manager on
   // node 0 must discover this on its own.
+  //
+  //  Node 1 is a non-validator, but applyCommittedBlock works
+  //  regardless of validator status. It's the same code path a node
+  //  uses when it receives a block from a peer.
   {
     Core::Block b = buildAndSignBlock(*nodes_[1], genesis_, seed1, seed2, 1);
     std::string error;

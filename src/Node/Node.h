@@ -210,6 +210,27 @@ namespace Node
     void armSyncTickTimer();
     void onSyncTickTimer(const boost::system::error_code &ec);
 
+    // ---- Write-ahead log helpers ----
+    //
+    //  Key layout (big-endian for prefix scans):
+    //
+    //    vote: [u64 height][u32 kind=0][u64 round][u64 signer_id]
+    //    lock: [u64 height][u32 kind=1][u64 round]
+    //
+    //  Height first, so wal_truncate can prefix-scan on
+    //  "height <= H".
+    static std::vector<uint8_t> walVoteKey(Height height,
+                                           Round round,
+                                           Id signer_id);
+    static std::vector<uint8_t> walLockKey(Height height, Round round);
+    static std::vector<uint8_t> walPrefixForHeightOrLower(Height max_height);
+
+    static std::vector<uint8_t> walEncodeVoteRecord(const Consensus::Vote &v,
+                                                    bool is_precommit);
+    static bool walDecodeVoteRecord(const std::vector<uint8_t> &bytes,
+                                    Consensus::Vote &out_v,
+                                    bool &out_is_precommit);
+
     NodeConfig config_;
     Logging::ILogger &logger_;
     std::unique_ptr<Logging::LoggerRef> log_;

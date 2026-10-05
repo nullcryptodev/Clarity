@@ -54,23 +54,26 @@ namespace Core
   //
   //    1. The payload does not decode into exactly two votes of the
   //       expected size, with no trailing bytes.
-  //    2. The two votes do not share (height, round, signer_index).
+  //    2. The two votes do not share (height, round, signer_id).
   //    3. The two votes do not differ in (block_hash, is_nil).
-  //    4. signer_index is out of range for active_set.
-  //    5. The validator at active_set[signer_index] is not registered.
+  //    4. signer_id is INVALID_ID, or the validator is not registered
+  //       in state.
+  //    5. The validator is not a member of active_set (when active_set
+  //       is non-empty).
   //    6. Either signature fails to verify against the validator's
-  //       public key over voteSigningHash(height, round, is_nil,
-  //       block_hash).
+  //       effective consensus key over voteSigningHash(height, round,
+  //       is_nil, block_hash).
+  //
+  //  The signer is resolved from signer_id, not from signer_index.
+  //  A proof is therefore self-contained across an emergency
+  //  rotation that changes what signer_index means. The active_set
+  //  parameter is a policy input — "is this signer currently
+  //  slashable?" — not a resolution input.
   //
   //  Seeds are NOT rejected here. The seed exemption is a slashing
   //  policy, not a proof-validity question — a seed that equivocates
   //  produces a valid proof, and TransactionExecutor::executeSystemSlash
-  //  is what refuses to act on it. Splitting the two lets the proof
-  //  verifier stay a pure function of (bytes, active_set, state), and
-  //  keeps the policy decision in one place.
-  //
-  //  The public key is looked up the same way BlockProcessor::checkQuorum
-  //  does: active_set[signer_index] -> ValidatorInfo -> reward_address.
+  //  is what refuses to act on it.
   std::optional<Id> verifyEquivocationProof(
       const std::vector<uint8_t> &payload,
       const std::vector<Id> &active_set,

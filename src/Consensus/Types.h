@@ -33,14 +33,30 @@ namespace Consensus
   {
     Height height{0};
     Round round{0};
+
+    //  The set-relative position of the signer. Advisory: used only
+    //  when packing quorum_signatures into a committing block, where
+    //  the on-chain format stays compact. Do NOT use this to resolve
+    //  the signer's public key — index 0 is one validator in the
+    //  committed set and a different one in an emergency set.
     Index signer_index{INVALID_INDEX};
+
+    //  The authoritative signer. Unambiguous across set transitions,
+    //  and sufficient on its own to resolve a public key via
+    //  state_lookup_validator. A vote with signer_id == INVALID_ID
+    //  is resolvable only by index, which is a pre-upgrade
+    //  compatibility path, not a supported mode.
+    Id signer_id{INVALID_ID};
+
     bool is_nil{false};
     Crypto::Hash block_hash{};
     Crypto::Signature signature{};
 
     bool isValid() const noexcept
     {
-      return signer_index != INVALID_INDEX && !signature.isNull();
+      return signer_id != INVALID_ID &&
+             signer_index != INVALID_INDEX &&
+             !signature.isNull();
     }
   };
 
@@ -48,14 +64,28 @@ namespace Consensus
   {
     Height height{0};
     Round round{0};
+
+    //  Authoritative proposer identity. See Vote::signer_id.
+    Id signer_id{INVALID_ID};
+
+    //  Advisory: the proposer's position in the set the proposer
+    //  believed applied at (height, round). A receiver re-derives
+    //  the position from signer_id against the set the block's
+    //  emergency flag selects, and rejects the proposal if the two
+    //  disagree.
     Index signer_index{INVALID_INDEX};
+
     Crypto::Hash block_hash{};
     std::vector<uint8_t> block_bytes;
     Crypto::Signature signature{};
 
     bool isValid() const noexcept
     {
-      return signer_index != INVALID_INDEX && !signature.isNull() && !block_hash.isNull() && !block_bytes.empty();
+      return signer_id != INVALID_ID &&
+             signer_index != INVALID_INDEX &&
+             !signature.isNull() &&
+             !block_hash.isNull() &&
+             !block_bytes.empty();
     }
   };
 
@@ -73,6 +103,11 @@ namespace Consensus
   // a second vote from the same signer disagrees with the first.
   // Consumed by the proposer when building a block: it becomes the
   // payload of a TxType::Slash system transaction.
+  //
+  //  Both votes must carry the same signer_id. The on-chain verifier
+  //  resolves the signer from that id, not from signer_index, so
+  //  evidence survives an emergency-set rotation that would change
+  //  what signer_index means.
   struct EquivocationEvidence
   {
     Vote vote_a;
@@ -80,7 +115,7 @@ namespace Consensus
 
     // The validator the evidence is against. Both votes must share
     // this signer for the evidence to be usable.
-    Index signer_index{INVALID_INDEX};
+    Id signer_id{INVALID_ID};
 
     // Convenience: does this evidence describe a real conflict?
     // Same (height, round, signer) and different (block_hash, is_nil).
@@ -90,9 +125,11 @@ namespace Consensus
         return false;
       if (vote_a.round != vote_b.round)
         return false;
-      if (vote_a.signer_index != vote_b.signer_index)
+      if (vote_a.signer_id != vote_b.signer_id)
         return false;
-      if (vote_a.signer_index == INVALID_INDEX)
+      if (vote_a.signer_id == INVALID_ID)
+        return false;
+      if (signer_id != INVALID_ID && signer_id != vote_a.signer_id)
         return false;
       if (vote_a.is_nil == vote_b.is_nil &&
           vote_a.block_hash == vote_b.block_hash)
@@ -112,12 +149,12 @@ namespace Consensus
     {
       return vote_a.height == other.vote_a.height &&
              vote_a.round == other.vote_a.round &&
-             vote_a.signer_index == other.vote_a.signer_index &&
+             vote_a.signer_id == other.vote_a.signer_id &&
              vote_a.is_nil == other.vote_a.is_nil &&
              vote_a.block_hash == other.vote_a.block_hash &&
              vote_b.height == other.vote_b.height &&
              vote_b.round == other.vote_b.round &&
-             vote_b.signer_index == other.vote_b.signer_index &&
+             vote_b.signer_id == other.vote_b.signer_id &&
              vote_b.is_nil == other.vote_b.is_nil &&
              vote_b.block_hash == other.vote_b.block_hash;
     }
@@ -127,7 +164,16 @@ namespace Consensus
   {
     Height height{0};
     Round round{0};
+
+    //  See Vote::signer_index — advisory only.
     Index signer_index{INVALID_INDEX};
+
+    //  Authoritative signer. Timeout votes are cast against the
+    //  committed set (never the emergency set), so this is stable
+    //  across a rotation; the id is what a verifier should resolve
+    //  against.
+    Id signer_id{INVALID_ID};
+
     Crypto::Signature signature{};
   };
 

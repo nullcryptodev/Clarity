@@ -27,14 +27,20 @@
 
 namespace Consensus
 {
-  //  Maximum number of equivocation evidence entries retained per
-  //  consensus instance. Evidence survives height transitions so
-  //  that a proposer at height H+1 can still include a conflict it
-  //  observed at height H. The bound prevents a peer that feeds
-  //  conflicting votes from growing the buffer without limit. In
-  //  practice this is never reached.
+  // Cap on the local equivocation-evidence buffer.
+  //
+  // Evidence survives height transitions, so a proposer at H+1 can
+  // still include a conflict it saw at H. The bound stops a peer
+  // that feeds conflicting votes from growing the buffer without
+  // limit. It is never reached in practice: an equivocating
+  // validator is a single (height, round, signer) event, and the
+  // buffer is cleared on commit of a block that includes the
+  // evidence.
   inline constexpr size_t MAX_EQUIVOCATION_EVIDENCE = 256;
 
+  // Key for the (height, round) -> block_hash map used to answer
+  // "which block did this round propose?". Hashable because it's
+  // used as a key in an unordered_map.
   struct RoundKey
   {
     Height height{0};
@@ -55,61 +61,197 @@ namespace Consensus
     }
   };
 
+  // Outbound message hooks. Called from the consensus thread.
+  //
+  // The consensus engine never touches the network directly. Every
+  // outbound message goes through a callback so the node can tag it
+  // for P2P, log it, or drop it if the transport is not ready.
   struct Callbacks
   {
     std::function<void(const Proposal &)> broadcast_proposal;
 
-    // Prevotes and precommits are distinct message types on the wire.
-    // The callbacks are split so the caller (the node) can tag the
-    // outbound P2P message with the correct type. A single
-    // broadcast_vote(Vote) callback would lose the distinction at the
-    // boundary — the Vote struct carries no type field, because the
-    // wire format doesn't need one when the message type is carried
-    // alongside.
+    // Prevotes and precommits share a wire type but are distinct
+    // message types on the P2P layer. The callbacks are split so
+    // the node can route each to the correct handler on receipt.
     std::function<void(const Vote &)> broadcast_prevote;
     std::function<void(const Vote &)> broadcast_precommit;
 
-    //  Timeout attestations, broadcast when a round times out. The
-    //  node routes these to the P2P layer as their own message type;
-    //  peers feed them back to onTimeoutVote.
+    // Timeout attestations, broadcast when a round times out.
+    // These accumulate into the certificate an emergency proposal
+    // carries.
     std::function<void(const TimeoutVote &)> broadcast_timeout_vote;
 
+    // Mempool selection for a fresh block. Returns transactions
+    // the proposer should include, bounded by size and count. Not
+    // called for a re-proposal: the block's transaction set is
+    // fixed once it has been voted on.
     std::function<std::vector<Core::Transaction>(uint64_t max_bytes,
                                                  uint64_t max_txs)>
         select_transactions;
 
+    // Called after a block is committed. The node applies it to
+    // state, stores it, and advances the chain head.
     std::function<void(const Core::Block &)> on_block_committed;
+
+    // Called after the commit callback. A separate hook so the
+    // node can log or meter height advances independently of the
+    // block-application work.
     std::function<void(Height)> on_height_advanced;
   };
 
+  // Inbound dependencies. All of these are provided by the node;
+  // the consensus engine is otherwise self-contained.
+  //
+  // Every function is called from the consensus thread, under the
+  // consensus mutex. The node is responsible for making them safe
+  // to call re-entrantly (in particular, `simulate_block` runs
+  // while the mutex is held and may not re-enter consensus).
   struct Dependencies
   {
+    // Our own validator id, or INVALID_ID if we're not a validator.
+    // A non-validator node never proposes or votes; it only
+    // applies committed blocks.
     std::function<Id()> my_validator_id;
+
+    // Sign a hash with our consensus key. Returns a null signature
+    // if the key is not available; every caller treats a null
+    // signature as "we can't vote this round."
     std::function<Crypto::Signature(const Crypto::Hash &)> sign;
+
+    // Our current chain height. Used as the base for the next
+    // height's proposal and as a sanity check in a few places.
     std::function<Height()> current_height;
 
-    //  Returns the active set. When `force_rotation` is true, the
-    //  caller has observed enough consecutive round timeouts to
-    //  conclude the committed set can no longer form quorum, and the
-    //  derived emergency set is returned instead.
+    // The active set for a given round.
+    //
+    // When `force_rotation` is true, the caller has observed enough
+    // consecutive timeouts at this height to conclude the committed
+    // set can no longer form quorum, and the derived emergency set
+    // is returned instead.
+    //
+    // The function must be a pure function of (state, height,
+    // force_rotation): every honest node that calls it with the
+    // same arguments gets the same set, or quorum never forms.
     std::function<std::vector<Id>(bool force_rotation)> active_set;
 
+    // Look up a validator by id. Returns false if the id is not
+    // registered. Used to resolve a signer id to a public key and
+    // to check whether a validator is still slashable.
     std::function<bool(Id, Core::ValidatorInfo &)> state_lookup_validator;
 
-    std::function<std::optional<Crypto::PublicKey>(Index)> signer_public_key;
-
+    // Our chain id. Stamped into every proposed block's header.
+    // Without this, proposals carry chain_id 0 and every receiver
+    // rejects them.
     std::function<uint64_t()> chain_id;
+
+    // Parent hash for a fresh proposal. Read fresh on each call so
+    // the proposer sees the head that was just committed, not a
+    // cached value from the previous round.
     std::function<Crypto::Hash()> parent_hash;
+
+    // Dry-run a block against committed state and return the
+    // resulting state root. Must not commit anything.
+    //
+    // Called from both propose() (to compute the root the proposer
+    // will publish) and validateProposal() (to verify the root a
+    // proposer published). Both uses are the same computation, so
+    // they cannot drift.
     std::function<std::optional<Crypto::Hash>(const Core::Block &)> simulate_block;
+
+    // The address that appears in the proposed block's header. For
+    // v1 this is the validator's reward address, matching the
+    // convention used throughout for consensus identity.
     std::function<Crypto::Address()> my_address;
 
+    // Wall-clock milliseconds. Used to stamp a fresh proposal's
+    // timestamp. The consensus engine never reads the clock
+    // directly so tests can make time deterministic.
     std::function<uint64_t()> now_ms;
+
+    // Verify a Slash transaction's payload before including it in a
+    // block. Returns true if the proof is valid against the current
+    // active set and state.
+    //
+    // The proposer includes local equivocation evidence one proof
+    // per Slash transaction. Without this callback, a single
+    // malformed proof poisons the entire transaction and the whole
+    // block is rejected on-chain. With it, the proposer skips the
+    // bad proof and includes the rest.
+    //
+    // Optional. When unset, the proposer includes all locally-held
+    // evidence and lets on-chain verification sort it out.
+    std::function<bool(const std::vector<uint8_t> &payload)>
+        verify_slash_proof;
+
+    // The WAL exists to prevent self-slashing on restart. A
+    // validator that crashes mid-round and comes back without its
+    // lock or its cast votes could re-sign a different vote for the
+    // same (height, round) and produce evidence against itself. The
+    // WAL records the irreversible facts (our own votes, our lock)
+    // before they become irreversible.
+    //
+    // Only the local validator's own votes are written. Recording
+    // other validators' votes would help recovery but is not needed
+    // for the self-slashing property, and it would grow the WAL by
+    // a factor of the active set size.
+
+    // Record one of our own votes. Must be durable before the
+    // function returns: a crash after return but before the vote is
+    // broadcast must not result in the node forgetting what it
+    // signed.
+    //
+    // Called from broadcastPrevote and broadcastPrecommit, after
+    // the signature is computed and before recordVote.
+    std::function<void(const Vote &vote, bool is_precommit)> wal_append_vote;
+
+    // Record a lock adoption. Must be durable before the function
+    // returns: a crash after return but before the precommit that
+    // motivated the lock is broadcast must not result in the
+    // validator re-entering the round without a lock and signing a
+    // conflicting precommit.
+    //
+    // Called from enterPrecommit, before `locked_` is set.
+    std::function<void(Height, Round, const Crypto::Hash &)> wal_append_lock;
+
+    // Replay the WAL for a specific height. Called from
+    // enterNewHeight, after resetForNewHeight has cleared the
+    // containers, so replayed entries land in a clean slate.
+    //
+    // The callback is expected to invoke the vote lambda once per
+    // WAL vote entry for `for_height`, and the lock lambda once per
+    // WAL lock entry. Entries at other heights are the callback's
+    // responsibility to filter — the consensus engine does not read
+    // the WAL directly.
+    std::function<void(Height for_height,
+                       std::function<void(const Vote &, bool)> on_vote,
+                       std::function<void(Height, Round, const Crypto::Hash &)> on_lock)>
+        wal_replay;
+
+    // Discard WAL entries at heights <= `committed_height`. Called
+    // after a successful commit. Entries at the committed height
+    // are no longer needed: the block is durable in the chain DB,
+    // and any vote or lock at that height has served its purpose.
+    // Entries at the next height survive for the next height's
+    // replay.
+    std::function<void(Height committed_height)> wal_truncate;
   };
 
+  // Consensus-engine tuning. Defaults are suitable for regtest and
+  // testnet; mainnet may want a larger block budget.
   struct Config
   {
+    // Maximum serialized block size the proposer will produce.
+    // Receivers enforce this independently via the block's own
+    // well-formedness check.
     uint64_t max_block_bytes{256 * 1024};
+
+    // Maximum number of transactions in a proposed block. A hard
+    // upper bound on how much work a proposer can hand to a
+    // validator in one round.
     uint64_t max_block_txs{5'000};
+
+    // How often pollTimers() is expected to be called. The consensus
+    // engine does not own a timer; the node drives it.
     uint64_t poll_interval_ms{100};
   };
 
@@ -126,152 +268,348 @@ namespace Consensus
     BftConsensus(const BftConsensus &) = delete;
     BftConsensus &operator=(const BftConsensus &) = delete;
 
+    // Begin consensus at `height`. Idempotent: a second call while
+    // running is a no-op. The node calls this once enough peers are
+    // Established to form a quorum; calling it earlier would make
+    // the first proposer broadcast into an empty peer table.
     void start(Height height);
+
+    // Halt consensus. Cancels the round timer and stops responding
+    // to messages. Idempotent. Does not flush the WAL: entries
+    // written before stop are durable, entries written during a
+    // round in progress are durable as soon as the corresponding
+    // wal_append_* call returns.
     void stop();
+
     bool isRunning() const;
 
-    // Message entry points. Prevotes and precommits are distinct
-    // message types on the wire and must be routed distinctly here —
-    // a precommit is not a prevote and vice versa. The step field
-    // determines which bucket a vote is stored in, not the local
-    // receiving state.
+    // Inbound message handlers. Each is a no-op if the message is
+    // for a height or round the engine has no use for; the engine
+    // buffers where buffering is safe and drops where it isn't.
+    // See BftConsensus.cpp for the buffering rules.
+    //
+    // Each also checks `running_` first: a stopped instance must
+    // not process any inbound message, or a state machine that is
+    // supposed to be frozen can still advance.
     void onProposal(const Proposal &p);
     void onPrevote(const Vote &v);
     void onPrecommit(const Vote &v);
     void onTimeoutVote(const TimeoutVote &tv);
 
+    // Drive the round timer. The node calls this on its poll
+    // interval; if the timer has expired, the engine advances the
+    // round. No-op if the engine is stopped.
+    //
+    // If a commit is pending (see pending_height_), this drains the
+    // pending height transition first, regardless of whether the
+    // round timer has expired. The pending transition is deferred
+    // out of enterCommit to break a recursion; pollTimers is where
+    // it lands.
     void pollTimers();
+
+    // Attempt to propose a block for the current round. Called
+    // internally when the proposer is chosen; exposed for tests
+    // that need to drive the proposer without waiting for a timer.
     void tryPropose();
 
-    // Force the current round timer to expire on the next pollTimers().
-    // Used by tests to drive state transitions without sleeping. In
-    // production nothing calls this — a real caller just waits for
-    // the timer to expire naturally.
+    // Force the round timer to expire on the next pollTimers().
+    // Tests use this to advance the state machine without sleeping.
     void forceTimerExpiryForTest();
 
+    // Snapshot of the engine's externally-visible state. All fields
+    // are copies; nothing in this struct aliases internal storage.
     struct State
     {
       Height height{0};
       Round round{0};
       Step step{Step::NewHeight};
+
+      // True if this validator is the proposer for the current
+      // round. Recomputed from my_validator_id and the proposer
+      // selection function on every call to state().
       bool is_proposer{false};
+
+      // Lock state. `locked_round` is the round at which the lock
+      // was adopted; `locked_hash` is the block hash the lock
+      // references. A validator with a lock prevotes the locked
+      // block in preference to the current proposal.
       bool locked{false};
       Crypto::Hash locked_hash{};
       Round locked_round{0};
+
+      // How many votes for the current (height, round) have been
+      // recorded. Informational; the engine's decision to advance
+      // is driven by quorumValue, not by these counts.
       size_t prevote_count{0};
       size_t precommit_count{0};
     };
 
     State state() const;
 
+    // Number of equivocation evidence entries currently held. Used
+    // by tests to assert that a conflict was recorded.
     size_t equivocationCount() const;
 
-    //  Number of consecutive rounds at the current height that ended
-    //  without a commit. Reset on successful commit and on entering a
-    //  new height. Drives the emergency rotation trigger.
+    // Rounds at the current height that ended without a commit.
+    // Reset on successful commit and on entering a new height.
     Round consecutiveTimeouts() const;
 
-    //  True when consecutiveTimeouts() has reached
-    //  Core::EMERGENCY_ROTATION_ROUNDS. The proposer sets
-    //  block.header.emergency_rotation when this is true.
+    // True when consecutiveTimeouts() has reached
+    // EMERGENCY_ROTATION_ROUNDS. In this state, active_set(true) is
+    // used for proposer selection and quorum thresholds.
     bool emergencyRotationActive() const;
 
+    // Verify a timeout certificate against a committed set. The
+    // block carries the certificate; this checks that its
+    // signatures are valid and that the height and round fields
+    // agree with the block's own. Called from validateProposal and
+    // from BlockProcessor on the on-chain path.
     bool verifyTimeoutCertificate(const Core::Block &block,
                                   const std::vector<Id> &committed_set,
                                   Height height) const;
 
+    // The current round's proposal, if any. Used by tests and by the
+    // node's restart path to redeliver a proposal to a node that
+    // just came back online.
     std::optional<Proposal> currentProposalForTest() const;
 
+    // Return a block at `height` for which we hold a precommit
+    // quorum, if any. Used by the node to prefer a committed block
+    // over a conflicting emergency proposal: a block that already
+    // has quorum beats an emergency proposal, which is only a claim
+    // that the normal path is stuck.
+    //
+    // Returns nullopt if `height` is not our current height or if
+    // no block at this height has a precommit quorum yet.
+    std::optional<Core::Block> heldQuorumBlock(Height height) const;
+
   private:
+    // Each `enter*` function sets the corresponding step and performs
+    // the step's local action (propose a block, broadcast a vote,
+    // advance to commit). Transitions are the only place where the
+    // step_ field changes.
+    //
+    // All of them are re-entrant: an action they perform (a
+    // broadcast, a recordVote call) can synchronously drive the
+    // engine into another transition. Callers guard by re-checking
+    // height_ and round_ after any call that can re-enter.
+
     void enterNewHeight(Height height);
     void enterPropose(Height height, Round round);
     void enterPrevote(Height height, Round round);
     void enterPrecommit(Height height, Round round);
     void enterCommit(Height height, Round round);
 
+    // Each handler applies the buffering and dispatch rules for its
+    // message type. The rules are documented at the definition site
+    // in BftConsensus.cpp; the header only names the entry points.
+
     void handleProposal(const Proposal &p);
     void handlePrevote(const Vote &v);
     void handlePrecommit(const Vote &v);
 
+    // Timeout attestations. These accumulate locally until enough
+    // exist to assemble a certificate for the emergency proposal.
     void handleTimeoutVote(const TimeoutVote &tv);
+
+    // Called by pollTimers when the round timer expires and the
+    // engine is in the corresponding step. Each broadcasts a timeout
+    // attestation and advances the state machine.
 
     void onProposeTimeout();
     void onPrevoteTimeout();
     void onPrecommitTimeout();
 
+    // Propose a block for the current round. Returns false if
+    // proposal construction failed (simulation error, no certificate
+    // for an emergency round). A false return does not advance the
+    // round; the round timer will fire and the next proposer will
+    // try.
     bool propose();
+
+    // Build a fresh block with a fresh transaction set. Called only
+    // when no lock or valid value is available to re-propose.
+    Core::Block buildFreshBlock() const;
+
+    // Verify a proposal's signature, certificate, and state root.
+    // Returns false on any failure; the caller logs the specific
+    // reason.
     bool validateProposal(const Proposal &p, const Core::Block &block);
+
+    // Verify a proposal's signature against the set the block's
+    // emergency flag selects. Used to filter a proposal before it
+    // is buffered or installed.
+    bool verifyProposalSignature(const Proposal &p) const;
+
+    // Compute a block's state root by dry-running it. Returns
+    // nullopt if simulation failed. The block is not mutated and
+    // nothing is committed.
     std::optional<Crypto::Hash> simulateBlock(const Core::Block &block);
 
+    // Record a vote from a peer or from ourselves. Returns true if
+    // the vote was accepted (either as a first vote from that
+    // signer, or as evidence of equivocation against a previous
+    // vote from the same signer). Returns false if the vote was
+    // rejected for any reason.
+    //
+    // Keyed by signer_id, not signer_index. The index means
+    // different things in the committed and emergency sets; the
+    // id is stable across a set transition.
+    //
+    // A precommit quorum fires enterCommit regardless of the current
+    // step. The block referenced by the quorum is known (that is a
+    // precondition of quorumValue returning a hash), so committing
+    // early is safe and is what makes round-crossing recovery work:
+    // a validator that reaches Prevote in a new round but observes a
+    // precommit quorum for the previous round's block must commit
+    // that block, not wait for its own Precommit step.
     bool recordVote(const Vote &v, bool is_precommit);
+
+    // Buffer a vote for a future round. Returns true if it was
+    // buffered, false if it was rejected (wrong round, cap reached,
+    // signature invalid, or a vote from the same signer is already
+    // buffered). Verification happens before buffering, so a peer
+    // cannot squat a validator's slot with junk.
+    bool bufferFutureVote(const Vote &v, bool is_precommit);
+
+    // Return the block hash with a quorum of non-nil votes, if any.
+    // The threshold is computed per block hash, from that block's
+    // own emergency flag — not from a single threshold applied
+    // across the whole container.
     std::optional<Crypto::Hash> quorumValue(bool is_precommit) const;
+
+    // Count non-nil votes for a specific block hash. Informational.
     size_t countVotesFor(bool is_precommit, const Crypto::Hash &block_hash) const;
+
+    // Count nil votes. Informational.
     size_t countNilVotes(bool is_precommit) const;
 
+    // The quorum threshold for a set. bftQuorum(n) = 2n/3 + 1.
+    // Computed from the set size the caller specifies, not from a
+    // cached count.
     size_t quorumThreshold(bool emergency) const;
+
+    // Our own position in the set the current round is using, or
+    // INVALID_INDEX if we're not a member. Recomputed on every call,
+    // so it tracks set changes at rotation boundaries.
     Index mySignerIndex() const;
+
+    // Resolve a vote's signer against the set the vote was cast
+    // against. `signer_id` is authoritative; `signer_index` is a
+    // pre-upgrade fallback. Returns INVALID_ID if the vote cannot be
+    // resolved.
+    Id resolveVoteSigner(const Vote &v, bool &out_emergency) const;
+
+    // Verify a vote's signature against the resolved signer's
+    // effective consensus key. Separate from resolveVoteSigner so
+    // callers can check resolution and verification independently.
+    bool verifyVoteSignature(const Vote &v, Id signer_id) const;
+
+    // Full verifiability check for a vote: resolve the signer,
+    // verify the signature, and confirm the vote references a block
+    // or round we can reason about. Used by every buffering path.
+    bool voteIsVerifiable(const Vote &v, Id *out_signer = nullptr) const;
+
+    // The block we would prevote in the current round, or nullptr
+    // for nil. Shared by propose() and enterPrevote so the proposer
+    // and the voters cannot disagree about what the round's
+    // candidate block is.
+    const Core::Block *selectPrevoteBlock() const;
+
+    // Outbound message construction
 
     void broadcastProposal(const Proposal &p);
     void broadcastPrevote(bool is_nil, const Crypto::Hash &block_hash);
     void broadcastPrecommit(bool is_nil, const Crypto::Hash &block_hash);
-
-    //  Broadcast a timeout attestation for `round`. Called from the
-    //  three timeout handlers before the round advances; a no-op if
-    //  we are not a validator or if no broadcast callback is wired.
     void broadcastTimeoutVote(Round round);
 
-    //  Assemble an f+1 certificate for the smallest round at or above
-    //  EMERGENCY_ROTATION_ROUNDS for which we hold enough distinct
-    //  signers from the committed set. Returns false if we can't. On
-    //  success, `out_round` is set to the round the certificate
-    //  attests to — the proposer must stamp that value into
-    //  block.header.emergency_rotation, since the verifier checks the
-    //  certificate against the header's round.
-    bool assembleTimeoutCertificate(Round &out_round, TimeoutCertificate &out) const;
+    // Assemble a timeout certificate from accumulated attestations.
+    // Returns false if there aren't enough distinct signers at any
+    // round to meet the f+1 threshold.
+    bool assembleTimeoutCertificate(Round &out_round,
+                                    TimeoutCertificate &out) const;
 
+    // Reset all per-height state. Called at the start of a new
+    // height, before any messages for that height can be processed.
+    // Clears locks, valid values, proposals, and vote containers.
+    // Preserves equivocation evidence, which survives height
+    // transitions.
     void resetForNewHeight(Height height);
+
+    // Reset all per-round state. Called at the start of each round
+    // within a height. Preserves locks and valid values, which
+    // persist across rounds so the prevote rule can compare them.
     void resetForNewRound(Round round);
 
-    // Deliver any stashed proposal for the current round. Called from
-    // resetForNewRound after the round counter is updated.
+    // Each drain function moves messages from a future-scoped buffer
+    // into the current round's processing path. Called at the point
+    // where the buffer's key becomes current: enterPropose for
+    // future proposals and votes, enterPrevote/enterPrecommit for
+    // pending votes at the current round.
+    //
+    // Drained messages are re-run through the message handler, not
+    // installed directly, so the handler's verification and buffering
+    // rules apply.
+
     void drainFutureProposal();
-
-    //  Deliver any buffered votes whose step is now current. A vote
-    //  whose block isn't known yet stays buffered unless we already
-    //  hold a vote from the same signer — in that case it's a
-    //  potential equivocation and must reach recordVote.
+    void drainFutureRoundVotes();
     void drainPendingVotes(bool is_precommit);
-
-    //  Deliver any buffered votes and the proposal for the current
-    //  height. Called from resetForNewHeight after height_ is updated.
     void drainFutureHeightVotes();
     void drainFutureHeightProposal();
 
-    //  True if we can verify the signature of a vote — that is, if we
-    //  know which active set the round ran on, and thus which key to
-    //  check the signature against.
-    bool voteIsVerifiable(const Vote &v) const;
-
-    //  Active-set resolution helpers. See the comment block in the
-    //  .cpp for the design.
+    // Which set applies to a (height, round) or to a specific vote.
+    // Determined by the block's emergency flag for a non-nil vote,
+    // or by the round's proposal for a nil vote. If neither is
+    // known, falls back to the local consecutive_timeouts_ counter.
     bool roundUsesEmergencySet(Height height, Round round) const;
     bool roundUsesEmergencySetForVote(const Vote &v) const;
 
+    // Whether this node is currently in emergency mode. True when
+    // consecutive_timeouts_ has reached the threshold. Reads the
+    // counter directly; not a function of the WAL or the set.
     bool useEmergencySet() const noexcept;
+
+    // Replay the WAL for `height` into local state. Called from
+    // enterNewHeight after resetForNewHeight has cleared the
+    // containers, so the replayed votes land in a clean slate.
+    void replayWalForHeight(Height height);
+
+    bool storeTimeoutVote(const TimeoutVote &tv);
+    void retryEmergencyPropose();
+
+    std::optional<Crypto::PublicKey> resolveConsensusKey(Index idx, bool emergency) const;
 
     Dependencies deps_;
     Callbacks callbacks_;
     Config config_;
     Logging::LoggerRef log_;
 
+    // Guards every public method and every private method that
+    // mutates state. Held across callbacks into the node — see the
+    // re-entrancy contract on Dependencies.
     mutable std::mutex mutex_;
+
+    // Current round
 
     Height height_{0};
     Round round_{0};
     Step step_{Step::NewHeight};
     bool running_{false};
 
+    // The proposer for the current round. Recomputed on every
+    // enterPropose. INVALID_ID if the set is empty or the proposer
+    // selection failed.
     Id proposer_{INVALID_ID};
+
+    // The lock is the block this validator has committed to
+    // precommitting in preference to any other. The valid value is
+    // the most recent block that saw a prevote quorum. Both are
+    // preserved across rounds within a height and cleared on a
+    // height transition.
+    //
+    // The prevote rule (Tendermint): prevote validValue if
+    // validRound > lockedRound, else lockedValue if locked, else
+    // the current proposal, else nil.
 
     bool locked_{false};
     Crypto::Hash locked_hash_{};
@@ -281,96 +619,98 @@ namespace Consensus
     Crypto::Hash valid_hash_{};
     Round valid_round_{0};
 
-    // The proposal most recently accepted from the network, or the one
-    // we ourselves proposed. Used for the round/height check in
-    // enterPrevote. The block itself lives in proposals_by_hash_.
+    // The current round's proposal, as received or as proposed by
+    // us. Nullopt until a valid proposal arrives.
     std::optional<Proposal> proposal_;
 
-    // Every block we've accepted as a proposal at the current height,
-    // keyed by the block's hash. Retained across rounds within a
-    // height: if a precommit quorum forms on a block proposed in an
-    // earlier round, the block is still here for us to apply. Cleared
-    // when the height advances.
+    // Blocks we've seen, keyed by hash. Populated when a proposal
+    // is accepted, and kept for the lifetime of the height so that
+    // re-proposals can reference them.
     std::unordered_map<Crypto::Hash, Core::Block> proposals_by_hash_;
 
-    std::unordered_map<Index, Vote> prevotes_;
-    std::unordered_map<Index, Vote> precommits_;
+    // Votes for the current (height, round), keyed by signer id.
+    // Keyed by id, not index, because the index is not stable
+    // across a set transition.
+    std::unordered_map<Id, Vote> prevotes_;
+    std::unordered_map<Id, Vote> precommits_;
 
+    // Round timer. The consensus engine does not own a thread; the
+    // node polls pollTimers() on its own schedule, and pollTimers
+    // checks this timer's expiry.
     std::unique_ptr<Common::RoundTimer> round_timer_;
 
-    // Proposals received for a round we haven't reached yet. Keyed by
-    // round number. When resetForNewRound advances us to round N, any
-    // stashed proposal for N is processed before we enter the propose
-    // step.
-    //
-    // Why this matters: a proposer in round N+1 can send its proposal
-    // while a slow validator is still finishing round N. Without the
-    // queue, the slow validator's `p.round != round_` check drops the
-    // proposal on the floor and the round stalls until the proposer
-    // times out and tries again — which in the 2-validator case means
-    // the chain never advances.
-    //
-    // Cleared in resetForNewHeight. Retained across rounds within a
-    // height.
+    // A peer must not be able to grow any buffer without limit.
+    // These caps are per-buffer, and for the vote buffers they are
+    // per-signer: a single signer can fill at most one slot per
+    // (height, round).
+
+    static constexpr Round MAX_FUTURE_ROUNDS = 64;
+    static constexpr size_t MAX_FUTURE_VOTES_PER_ROUND = 512;
+    static constexpr size_t MAX_PENDING_VOTES = 4096;
+    static constexpr size_t MAX_TIMEOUT_VOTES = 4096;
+
+    // Proposals received for a round we haven't reached yet.
     std::unordered_map<Round, Proposal> future_proposals_;
 
-    // Votes received for our current height/round but before we entered
-    // the corresponding step. Delivered when we enter the step.
+    // Votes received at the current (height, round) before we
+    // entered the corresponding step. Moved into the vote containers
+    // by drainPendingVotes.
     std::vector<Vote> pending_prevotes_;
     std::vector<Vote> pending_precommits_;
 
-    //  Votes received for height_ + 1 while we are still finishing
-    //  height_. Under randomized delivery (and under a brief partition)
-    //  a fast validator can broadcast its next-height prevotes and
-    //  precommits before a slow validator has finished committing the
-    //  current height. Those votes would otherwise be silently dropped
-    //  by the `v.height != height_` guard, and the slow validator would
-    //  have no way to form quorum at the new height except by timing
-    //  out and hoping a live proposer exists.
+    // Height to enter after the current commit completes. Set by
+    // enterCommit, drained by pollTimers.
     //
-    //  We buffer at most one height ahead. A vote for height_ + 2 cannot
-    //  be verified (we don't yet know the round set for height_ + 1, and
-    //  the vote's signature commits to a round set we can't resolve), so
-    //  buffering further ahead would just be a memory-growth vector for
-    //  a peer feeding us garbage.
+    // Deferring the transition breaks the recursion
+    // recordVote -> enterCommit -> enterNewHeight -> enterPropose ->
+    // propose -> broadcastPrecommit -> recordVote, which is unbounded
+    // at n=1 where every vote is a quorum.
     //
-    //  Cleared on height transition, after draining into the pending
-    //  buffers for the new height.
-    std::unordered_map<Height, std::vector<Vote>> future_height_prevotes_;
-    std::unordered_map<Height, std::vector<Vote>> future_height_precommits_;
+    // The drain in pollTimers runs *after* the running_ check, so a
+    // stopped instance does not enter a pending height. That is what
+    // makes stop() mean "inert": a stopped instance cannot advance
+    // even if it had a commit in flight when it was stopped.
+    std::optional<Height> pending_height_;
+
+    // Votes received for rounds ahead of the local round, keyed by
+    // round and then by signer id.
+    std::unordered_map<Round, std::unordered_map<Id, Vote>>
+        future_round_prevotes_;
+    std::unordered_map<Round, std::unordered_map<Id, Vote>>
+        future_round_precommits_;
+
+    // Votes received for height_ + 1 while we are still finishing
+    // height_. Keyed by height and then by signer id. Drained by
+    // enterNewHeight into the pending buffers, which are in turn
+    // drained once the step for the new height is set.
+    std::unordered_map<Height, std::unordered_map<Id, Vote>>
+        future_height_prevotes_;
+    std::unordered_map<Height, std::unordered_map<Id, Vote>>
+        future_height_precommits_;
     std::unordered_map<Height, Proposal> future_height_proposals_;
 
-    //  For each (height, round) we've accepted a proposal for, the
-    //  block hash of that proposal. Lets vote verification look up the
-    //  emergency flag from the block that the round ran on, rather
-    //  than consulting the local timeout counter.
+    // For each (height, round) we've accepted a proposal for, the
+    // block hash of that proposal. Used to answer "which block did
+    // this round propose?" without holding the full block.
     std::unordered_map<RoundKey, Crypto::Hash, RoundKeyHash> proposal_for_round_;
 
-    //  Evidence of equivocation seen at the current height. Appended
-    //  to (never overwritten) in recordVote when a second vote from a
-    //  signer conflicts with the first. Drained by the proposer when
-    //  it builds a block, and erased from every node when a block
-    //  containing the evidence commits.
-    //
-    //  Not cleared on height transition — evidence observed at height
-    //  H may not be included in a block until H+1 or later. Bounded by
-    //  MAX_EQUIVOCATION_EVIDENCE to prevent unbounded growth from a
-    //  peer that feeds conflicting votes.
+    // Evidence of equivocation seen at this height. Survives height
+    // transitions so a proposer at H+1 can still include a conflict
+    // it observed at H. Cleared for a specific (signer, height,
+    // round) when a block containing that evidence is committed.
     std::vector<EquivocationEvidence> equivocations_;
 
-    //  Timeout attestations seen at the current height, at rounds >=
-    //  EMERGENCY_ROTATION_ROUNDS. Collected from the network; used by
-    //  the proposer to assemble a TimeoutCertificate. Cleared on
-    //  height transition, NOT on round transition — votes from
-    //  earlier rounds at this height accumulate toward a certificate.
+    // Timeout attestations seen at the current height, at rounds
+    // >= EMERGENCY_ROTATION_ROUNDS. Accumulated until enough exist
+    // to assemble a certificate; then carried in the emergency
+    // proposal's header.
     std::vector<TimeoutVote> timeout_votes_;
 
-    //  Consecutive rounds that ended without a commit, counted at the
-    //  current height. Reset to zero when a block commits. When this
-    //  reaches EMERGENCY_ROTATION_ROUNDS, the proposer for the next
-    //  round sets block.header.emergency_rotation, and every node
-    //  derives the emergency active set for that round's votes and
-    //  block verification.
+    // Consecutive rounds at the current height that ended without a
+    // commit. Reset to zero on commit and on entering a new height.
+    // When it reaches EMERGENCY_ROTATION_ROUNDS, the engine enters
+    // emergency mode and uses the derived emergency set for
+    // proposer selection and quorum.
     Round consecutive_timeouts_{0};
   };
 

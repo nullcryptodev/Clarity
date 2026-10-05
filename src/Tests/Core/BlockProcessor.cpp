@@ -719,8 +719,20 @@ TEST_F(Core_BlockProcessorFixture, RotationNoOpWhenOnlySeedsActive)
 
 TEST_F(Core_BlockProcessorFixture, RotationPromotesWaitingValidator)
 {
+  //  The rotation target size is derived from traffic:
+  //
+  //      target = ACTIVE_SET_MIN + (traffic * (MAX - MIN)) / SATURATION
+  //             = 2 + (traffic * 98) / 1000
+  //
+  //  With the fixture's active set of {1, 2}, the target must exceed 2
+  //  for the grow branch of planRotation to fire. That requires
+  //  traffic >= 11 (11 * 98 / 1000 == 1, giving target = 3).
+  //
+  //  So we build a block with 11 transfers. The transfers must succeed
+  //  (executor validation, nonce ordering, sufficient balance), which
+  //  is why they're issued from Alice in nonce order rather than
+  //  being stubs.
 
-  // Seed the pool with a waiting validator.
   ValidatorInfo waiting;
   waiting.id = 3;
   waiting.reward_address = carol_.publicKey;
@@ -733,9 +745,13 @@ TEST_F(Core_BlockProcessorFixture, RotationPromotesWaitingValidator)
   putValidatorDirect(waiting);
   setNextValidatorId(4);
 
-  // Apply a block at height 59 — the last block before an epoch
-  // boundary. Rotation should fire and promote validator 3.
-  BlockResult r = applyBlock(59, genesis_hash_, {});
+  //  11 transfers from Alice, nonce 0..10. The fixture funds Alice
+  //  with 1e9 at setup, so 11 * (100 + 2) is well within budget.
+  std::vector<Transaction> txs;
+  for (uint64_t n = 0; n < 11; ++n)
+    txs.push_back(makeSignedTransfer(alice_, bob_.publicKey, 100, 2, n));
+
+  BlockResult r = applyBlock(59, genesis_hash_, txs);
   ASSERT_TRUE(r.valid) << r.error;
 
   auto active = readActiveSet();
@@ -819,9 +835,9 @@ TEST_F(Core_BlockProcessorFixture, RotationPersistsTargetSize)
   BlockResult r = applyBlock(59, genesis_hash_, {});
   ASSERT_TRUE(r.valid) << r.error;
 
-  // The target size with zero traffic is ACTIVE_SET_MIN (11), not
-  // ACTIVE_SET_DEFAULT (21). computeTargetActiveSetSize interpolates
-  // linearly from MIN at zero traffic to MAX at saturation.
+  // The target size with zero traffic is ACTIVE_SET_MIN (2).
+  // computeTargetActiveSetSize interpolates linearly from MIN at
+  // zero traffic to MAX at saturation.
   const uint64_t expected_target = computeTargetActiveSetSize(0);
   EXPECT_EQ(expected_target, GlobalConfig::ACTIVE_SET_MIN)
       << "sanity: zero traffic should target the minimum";
@@ -1164,99 +1180,153 @@ TEST_F(Core_BlockProcessorFixture, MixedActiveSet_PaysNormalSplit)
 // ============================================================================
 //  Emergency rotation
 // ============================================================================
+//
+//  These tests exercise the block-processor path for an emergency
+//  block: the block carries emergency_rotation > 0 and a certificate
+//  whose signatures come from the committed set, and the block's
+//  quorum is formed against the emergency set (committed minus
+//  offline, plus promotions from the pool).
+//
+//  verifyTimeoutCertificate requires a committed set of at least 4
+//  validators (it computes f = (n-1)/3 and requires f+1 attestations).
+//  With n = 2 the certificate cannot exist, so the fixture cannot
+//  build a well-formed emergency block. Each test below therefore
+//  builds a 4-validator committed set.
+//
+//  The setup for all three is the same:
+//
+//      committed = {1, 2, 3, 4}      (written to state as "active_set")
+//      1 is offline at height 100    (last_seen_height = 0)
+//      2, 3, 4 are live              (last_seen_height = 100)
+//      5 is a pool candidate         (registered, not active, healthy)
+//
+//  resolveActiveSet(committed, 100, true) drops 1, promotes 5, and
+//  returns {2, 3, 4, 5}. The block is built with that as its
+//  emergency set and a certificate signed by the first f+1 = 2
+//  members of the committed set.
+
+namespace
+{
+  //  Shared setup for the three emergency-block tests. Kept as a
+  //  lambda so each test body can read its own pre-state cleanly.
+  constexpr uint64_t EMERGENCY_HEIGHT = 100;
+
+  //  The committed set as the tests set it up. Used to construct the
+  //  certificate and to assert what resolveActiveSet should produce.
+  inline std::vector<Id> emergencyCommittedSet() { return {1, 2, 3, 4}; }
+
+  //  The expected emergency set: committed minus offline 1, plus
+  //  promotion of 5.
+  inline std::vector<Id> emergencyDerivedSet() { return {2, 3, 4, 5}; }
+} // anonymous namespace
 
 TEST_F(Core_BlockProcessorFixture, EmergencyBlock_CommitsNewActiveSet)
 {
-  //  Setup: seed 1 is offline by height criteria, seed 2 is live,
-  //  validator 3 is a pool candidate.
-  //
-  //  At the emergency block's height (100), the height-based offline
-  //  predicate is:
-  //
-  //      current_height - last_seen_height >= OFFLINE_KICK_BLOCKS (20)
-  //
-  //  So seed 1 with last_seen_height = 0 is offline at height >= 20.
-  //  Seed 2 and validator 3 must have recent last_seen_height.
+  //  Register validators 3 and 4 as active non-seeds. Validator 5 is
+  //  a pool candidate (registered, not active).
+  auto key3 = Crypto::generateKeyPair();
+  auto key4 = Crypto::generateKeyPair();
+  auto key5 = Crypto::generateKeyPair();
 
-  auto pool_kp = Crypto::generateKeyPair();
-  registerPoolValidator(3, pool_kp);
+  registerValidatorWithKey(3, key3, /*stake=*/1'000'000'000ULL,
+                           /*is_seed=*/false, /*is_active=*/true);
+  registerValidatorWithKey(4, key4, /*stake=*/1'000'000'000ULL,
+                           /*is_seed=*/false, /*is_active=*/true);
+  registerValidatorWithKey(5, key5, /*stake=*/1'000'000'000ULL,
+                           /*is_seed=*/false, /*is_active=*/false);
 
+  //  Write the committed set to state. This is what
+  //  BlockProcessor::applyBlock reads as committed_set, and what the
+  //  certificate's signers must be drawn from.
+  withState([&](State::StateAccess &s)
+            { s.putGlobal("active_set",
+                          encodeActiveSet(emergencyCommittedSet())); });
+
+  //  Liveness. 1 is offline; 2, 3, 4 are current; 5 is fresh.
   setValidatorLastSeen(1, 0);
-  setValidatorLastSeen(2, 100);
-  setValidatorLastSeen(3, 100);
+  setValidatorLastSeen(2, EMERGENCY_HEIGHT);
+  setValidatorLastSeen(3, EMERGENCY_HEIGHT);
+  setValidatorLastSeen(4, EMERGENCY_HEIGHT);
+  setValidatorLastSeen(5, EMERGENCY_HEIGHT);
 
-  //  The emergency derivation drops seed 1 and promotes validator 3,
-  //  producing {2, 3}.
-  const std::vector<Id> emergency_set = {2, 3};
+  //  Also set the "next_validator_id" global so any subsequent
+  //  bookkeeping that walks the registry sees 5.
+  setNextValidatorId(6);
 
-  //  Build the parent chain: state must reflect a chain that has
-  //  advanced to height 100 for the height-based offline predicate to
-  //  fire. We can't just apply 100 blocks — too slow and each block
-  //  would re-rotate. Instead, the fixture's state already has
-  //  last_seen_height values set directly, and we pass height = 100
-  //  to the block.
-  //
-  //  But applyBlock checks block.header.height against the parent.
-  //  We need the block to be at the height the fixture's state
-  //  already represents. Since the fixture's state has no
-  //  chain-height variable, we just pass the height we want and let
-  //  the block's parent be genesis_hash_.
-
-  const uint64_t emergency_height = 100;
-
+  //  Build the block. The active_set argument is the emergency set
+  //  (the block's header commits to it); committed_set is the set the
+  //  certificate's signers are drawn from.
   Block b = makeProcessableBlock(
-      emergency_height, genesis_hash_, {}, emergency_set,
-      /*emergency_rotation=*/emergency_height);
+      EMERGENCY_HEIGHT,
+      genesis_hash_,
+      /*txs=*/{},
+      emergencyDerivedSet(),
+      /*emergency_rotation=*/EMERGENCY_HEIGHT,
+      /*committed_set=*/emergencyCommittedSet());
+
+  ASSERT_EQ(b.header.emergency_rotation, EMERGENCY_HEIGHT);
+  ASSERT_FALSE(b.header.timeout_certificate.votes.empty())
+      << "fixture failed to build a certificate for the committed set";
 
   BlockResult r = applyPrebuiltBlock(b);
   ASSERT_TRUE(r.valid) << r.error;
 
   //  State reflects the emergency set.
   auto active = readActiveSet();
-  EXPECT_EQ(active, emergency_set);
+  EXPECT_EQ(active, emergencyDerivedSet());
 
   //  Flags updated to match.
-  ValidatorInfo v1, v3;
+  ValidatorInfo v1, v5;
   ASSERT_TRUE(readValidator(1, v1));
-  ASSERT_TRUE(readValidator(3, v3));
+  ASSERT_TRUE(readValidator(5, v5));
   EXPECT_FALSE(v1.is_active)
-      << "offline validator should have been demoted";
-  EXPECT_TRUE(v3.is_active)
-      << "promoted pool validator should be active";
+      << "offline validator 1 should have been demoted";
+  EXPECT_TRUE(v5.is_active)
+      << "promoted pool validator 5 should be active";
 
-  //  The emergency block committed at the emergency height.
-  EXPECT_EQ(b.header.height, emergency_height);
+  //  The block was applied at the emergency height.
+  EXPECT_EQ(b.header.height, EMERGENCY_HEIGHT);
 }
 
 TEST_F(Core_BlockProcessorFixture, EmergencyBlock_QuorumVerifiedAgainstDerivedSet)
 {
-  auto pool_kp = Crypto::generateKeyPair();
-  registerPoolValidator(3, pool_kp);
+  auto key3 = Crypto::generateKeyPair();
+  auto key4 = Crypto::generateKeyPair();
+  auto key5 = Crypto::generateKeyPair();
+
+  registerValidatorWithKey(3, key3, 1'000'000'000ULL, false, true);
+  registerValidatorWithKey(4, key4, 1'000'000'000ULL, false, true);
+  registerValidatorWithKey(5, key5, 1'000'000'000ULL, false, false);
+
+  withState([&](State::StateAccess &s)
+            { s.putGlobal("active_set",
+                          encodeActiveSet(emergencyCommittedSet())); });
 
   setValidatorLastSeen(1, 0);
-  setValidatorLastSeen(2, 100);
-  setValidatorLastSeen(3, 100);
+  setValidatorLastSeen(2, EMERGENCY_HEIGHT);
+  setValidatorLastSeen(3, EMERGENCY_HEIGHT);
+  setValidatorLastSeen(4, EMERGENCY_HEIGHT);
+  setValidatorLastSeen(5, EMERGENCY_HEIGHT);
+  setNextValidatorId(6);
 
-  const std::vector<Id> emergency_set = {2, 3};
-  const uint64_t emergency_height = 100;
-
-  //  Build a valid emergency block first.
   Block good = makeProcessableBlock(
-      emergency_height, genesis_hash_, {}, emergency_set,
-      /*emergency_rotation=*/emergency_height);
+      EMERGENCY_HEIGHT, genesis_hash_, {},
+      emergencyDerivedSet(),
+      EMERGENCY_HEIGHT,
+      emergencyCommittedSet());
 
   //  Corrupt one quorum signature. checkQuorum resolves signer_index 0
-  //  against active_set[0]. For an emergency block, active_set is the
-  //  derived emergency set, so active_set[0] = 2, not 1. The signature
-  //  was produced by seed2_'s key (index 0 of emergency_set's keys).
-  //  Corrupting it fails verification.
+  //  against the derived emergency set, so emergency_set[0] = 2. The
+  //  signature was produced by validator 2's key. Corrupting it fails
+  //  verification.
   Block bad = good;
+  ASSERT_FALSE(bad.quorum_signatures.empty());
   bad.quorum_signatures[0].signature.data[0] ^= 0xFF;
 
   //  Apply the corrupted block first, from a throwaway txn, so the
   //  real state stays at the pre-block root for the second apply.
   {
-    BlockContext ctx = makeContext(emergency_height);
+    BlockContext ctx = makeContext(EMERGENCY_HEIGHT);
     auto t = db_->beginWrite();
     State::StateAccess s(*db_, t, 0);
     BlockResult r = BlockProcessor::applyBlock(s, bad, ctx);
@@ -1285,19 +1355,30 @@ TEST_F(Core_BlockProcessorFixture, EmergencyBlock_StateRootMatchesDerivedSet)
   //  the emergency set. Their roots differ, and the block is rejected
   //  even though everything else is correct.
 
-  auto pool_kp = Crypto::generateKeyPair();
-  registerPoolValidator(3, pool_kp);
+  auto key3 = Crypto::generateKeyPair();
+  auto key4 = Crypto::generateKeyPair();
+  auto key5 = Crypto::generateKeyPair();
+
+  registerValidatorWithKey(3, key3, 1'000'000'000ULL, false, true);
+  registerValidatorWithKey(4, key4, 1'000'000'000ULL, false, true);
+  registerValidatorWithKey(5, key5, 1'000'000'000ULL, false, false);
+
+  withState([&](State::StateAccess &s)
+            { s.putGlobal("active_set",
+                          encodeActiveSet(emergencyCommittedSet())); });
 
   setValidatorLastSeen(1, 0);
-  setValidatorLastSeen(2, 100);
-  setValidatorLastSeen(3, 100);
-
-  const std::vector<Id> emergency_set = {2, 3};
-  const uint64_t emergency_height = 100;
+  setValidatorLastSeen(2, EMERGENCY_HEIGHT);
+  setValidatorLastSeen(3, EMERGENCY_HEIGHT);
+  setValidatorLastSeen(4, EMERGENCY_HEIGHT);
+  setValidatorLastSeen(5, EMERGENCY_HEIGHT);
+  setNextValidatorId(6);
 
   Block b = makeProcessableBlock(
-      emergency_height, genesis_hash_, {}, emergency_set,
-      /*emergency_rotation=*/emergency_height);
+      EMERGENCY_HEIGHT, genesis_hash_, {},
+      emergencyDerivedSet(),
+      EMERGENCY_HEIGHT,
+      emergencyCommittedSet());
 
   //  The block's header state_root was produced by the fixture's
   //  dry-run simulation. Applying the block for real must produce

@@ -1,5 +1,12 @@
 #pragma once
 
+#include <atomic>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
 #include <gtest/gtest.h>
 
 #include "Crypto/Blake2b.h"
@@ -76,13 +83,6 @@ namespace Tests
       for (size_t i = 8; i < 32; ++i)
         seed.data[i] = uint8_t(0xC0 + i);
       return Crypto::generateKeyPairFromSeed(seed);
-    }
-
-    static Crypto::Address addressOf(const Crypto::KeyPair &kp)
-    {
-      Crypto::Address a;
-      std::memcpy(a.data.data(), kp.publicKey.data.data(), 32);
-      return a;
     }
 
     // ---- Fixture genesis ----
@@ -360,9 +360,9 @@ namespace Tests
 
     // ---- Header ----
 
-    Core::BlockHeader makeHeaderSkeleton(uint64_t height,
-                                         const Crypto::Hash &parent,
-                                         const std::vector<Id> &active_set)
+    Core::BlockHeader makeBlockHeaderSkeleton(uint64_t height,
+                                              const Crypto::Hash &parent,
+                                              const std::vector<Id> &active_set)
     {
       Core::BlockHeader h;
       h.version = GlobalConfig::CURRENT_BLOCK_VERSION;
@@ -406,13 +406,14 @@ namespace Tests
           result = v.reward_address; });
       return result;
     }
+
     // ---- Real quorum signatures ----
 
     // Produces a set of quorum signatures over the block's hash,
     // signed by the given keypairs. `block` must already have its
-    // final `commit_round`, `emergency_rotation`, and `state_root`
-    // set — the signature covers the block hash, which covers all
-    // three.
+    // final `commit_round`, `emergency_rotation`, `timeout_certificate`,
+    // and `state_root` set — the signature covers the block hash,
+    // which covers all of those.
     //
     // Signature i is produced by keys[i], and is tagged with
     // signer_index i. The caller is responsible for passing a key list
@@ -478,25 +479,103 @@ namespace Tests
       return quorum_keys;
     }
 
+    // ---- Timeout certificate builder ----
+
+    //  Build a valid timeout certificate for the given committed set,
+    //  height, and round. Every vote is signed by the corresponding
+    //  validator's registered key. Returns an empty certificate if
+    //  the committed set is too small (< 4) — that's below the
+    //  minimum verifyTimeoutCertificate will accept, so building one
+    //  is a test bug, not a runtime failure. Callers that pass a
+    //  too-small set will see isWellFormed reject the resulting
+    //  block with the same "certificate empty" error they'd get for
+    //  a genuinely missing certificate, which is a good enough
+    //  failure mode.
+    //
+    //  Signer indices are positions in the committed set, matching
+    //  what verifyTimeoutCertificate expects. Signer ids are the
+    //  validator ids at those positions, matching Vote's convention.
+    Consensus::TimeoutCertificate makeTimeoutCertificate(
+        const std::vector<Id> &committed_set,
+        uint64_t height,
+        uint64_t round)
+    {
+      Consensus::TimeoutCertificate cert;
+
+      const size_t n = committed_set.size();
+      if (n < 4)
+        return cert;
+
+      const size_t f = (n - 1) / 3;
+      const size_t required = f + 1;
+
+      const Crypto::Hash signing_hash =
+          Consensus::timeoutVoteSigningHash(height, round);
+
+      for (size_t i = 0; i < required; ++i)
+      {
+        const Id vid = committed_set[i];
+        auto it = validator_keys_.find(vid);
+        if (it == validator_keys_.end())
+          continue;
+
+        Consensus::TimeoutVote tv;
+        tv.height = height;
+        tv.round = round;
+        tv.signer_index = static_cast<Index>(i);
+        tv.signer_id = vid;
+        tv.signature = Crypto::sign(signing_hash, it->second.secretKey);
+        cert.votes.push_back(tv);
+      }
+
+      return cert;
+    }
+
     // ---- Block builder ----
     //
     //  `emergency_rotation` is set before simulation so that the
     //  dry-run applyBlock derives the same emergency active set the
-    //  real application will. The field is part of the block hash, so
-    //  it must be present before signing.
+    //  real application will. The certificate and its hash must be
+    //  set before the quorum signatures are produced, because the
+    //  block hash covers both, and the signatures cover the block
+    //  hash.
+    //
+    //  `committed_set` is the set the certificate's signers are drawn
+    //  from. For a non-emergency block it's ignored (no certificate
+    //  is built). For an emergency block it MUST be the committed
+    //  set, not the emergency set — the certificate is evidence that
+    //  the committed set stalled, so its signatures come from the
+    //  committed set. Passing the emergency set here would produce a
+    //  certificate that verifyTimeoutCertificate rejects.
     Core::Block makeProcessableBlock(uint64_t height,
                                      const Crypto::Hash &parent,
                                      const std::vector<Core::Transaction> &txs,
                                      const std::vector<Id> &active_set,
-                                     uint64_t emergency_rotation = 0)
+                                     uint64_t emergency_rotation = 0,
+                                     const std::vector<Id> &committed_set = {})
     {
       Core::Block b;
-      b.header = makeHeaderSkeleton(height, parent, active_set);
+      b.header = makeBlockHeaderSkeleton(height, parent, active_set);
       b.header.emergency_rotation = emergency_rotation;
       b.transactions = txs;
       b.header.tx_count = static_cast<uint32_t>(txs.size());
       b.header.active_validator_count =
           static_cast<uint32_t>(active_set.size());
+
+      //  Emergency certificate. Set before anything that reads the
+      //  block hash (simulation, signing). A block with
+      //  emergency_rotation > 0 but no certificate fails
+      //  BlockHeader::isWellFormed, which is correct — the flag is a
+      //  claim that needs evidence.
+      if (emergency_rotation > 0)
+      {
+        const std::vector<Id> &cert_set =
+            committed_set.empty() ? active_set : committed_set;
+        b.header.timeout_certificate =
+            makeTimeoutCertificate(cert_set, height, emergency_rotation);
+        b.header.timeout_certificate_hash =
+            Core::computeTimeoutCertificateHash(b.header.timeout_certificate);
+      }
 
       uint64_t total_fees = 0;
       for (const auto &tx : txs)
@@ -661,12 +740,15 @@ namespace Tests
 
     std::filesystem::path test_dir_;
     std::unique_ptr<State::StateDB> db_;
+
     Crypto::KeyPair alice_;
     Crypto::KeyPair bob_;
     Crypto::KeyPair carol_;
     Crypto::KeyPair seed1_;
     Crypto::KeyPair seed2_;
+
     std::unordered_map<Id, Crypto::KeyPair> validator_keys_;
+
     Core::GenesisConfig genesis_config_;
     Crypto::Hash genesis_hash_;
   };

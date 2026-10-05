@@ -408,7 +408,7 @@ namespace Core
     validator.uptime_score = 10'000;
     validator.is_seed = false;
     validator.is_active = false;
-    std::memcpy(validator.node_key.data.data(), tx.payload.data(), 32);
+    std::memcpy(validator.consensus_key.data.data(), tx.payload.data(), 32);
 
     state.putValidator(validator);
 

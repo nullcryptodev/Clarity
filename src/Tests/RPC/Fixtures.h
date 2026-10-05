@@ -39,10 +39,10 @@ namespace Tests
       std::filesystem::remove_all(s_data_dir);
 
       s_node = std::make_unique<Node::Node>(
-          makeTestNodeConfig(s_data_dir.string()), s_logger);
+          makeNodeConfig(s_data_dir.string()), s_logger);
       s_node->start();
 
-      Rpc::RpcConfig rpc_cfg = makeTestRpcConfig();
+      Rpc::RpcConfig rpc_cfg = makeRpcConfig();
       s_dispatcher = std::make_unique<Rpc::JsonRpcDispatcher>(*s_node, rpc_cfg);
       registerAllNonAdminMethods(*s_dispatcher);
     };
@@ -186,10 +186,10 @@ namespace Tests
       std::filesystem::remove_all(data_dir_);
 
       node_ = std::make_unique<Node::Node>(
-          makeTestNodeConfig(data_dir_.string()), logger_);
+          makeNodeConfig(data_dir_.string()), logger_);
       node_->start();
 
-      Rpc::RpcConfig rpc_cfg = makeTestRpcConfig();
+      Rpc::RpcConfig rpc_cfg = makeRpcConfig();
       dispatcher_ = std::make_unique<Rpc::JsonRpcDispatcher>(*node_, rpc_cfg);
       registerAllNonAdminMethods(*dispatcher_);
     };

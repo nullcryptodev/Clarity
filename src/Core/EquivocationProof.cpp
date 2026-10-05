@@ -20,63 +20,16 @@ namespace Core
     //  Wire size of one Consensus::Vote, computed once from a
     //  default-constructed vote. Using encodeVote itself means this
     //  constant tracks the encoder: if the wire format changes, this
-    //  changes with it.
+    //  changes with it. The only assumption the rest of this file
+    //  makes about the wire format is that both votes in a proof
+    //  have the same fixed size — which is guaranteed by construction,
+    //  since encodeVote always writes the same number of bytes.
     const size_t VOTE_WIRE_SIZE = []
     {
       Consensus::Vote v;
       return Consensus::encodeVote(v).size();
     }();
-    constexpr size_t VOTE_PREFIX_SIZE = 8 + 8 + 2 + 1 + 32; // no signature
 
-    //  Core-local mirror of Consensus::Vote. Only the fields needed
-    //  for verification, decoded from the wire bytes. Kept private
-    //  to this file so nothing outside can accidentally depend on it.
-    struct DecodedVote
-    {
-      uint64_t height{0};
-      uint64_t round{0};
-      uint16_t signer_index{0};
-      bool is_nil{false};
-      Crypto::Hash block_hash{};
-      Crypto::Signature signature{};
-    };
-
-    uint16_t readU16LE(const uint8_t *p)
-    {
-      return uint16_t(p[0]) | (uint16_t(p[1]) << 8);
-    }
-
-    uint64_t readU64LE(const uint8_t *p)
-    {
-      uint64_t v = 0;
-      for (int i = 0; i < 8; ++i)
-        v |= uint64_t(p[i]) << (i * 8);
-      return v;
-    }
-
-    bool decodeVoteBytes(const uint8_t *data, size_t len, DecodedVote &out)
-    {
-      if (len != VOTE_WIRE_SIZE)
-        return false;
-
-      size_t off = 0;
-
-      out.height = readU64LE(data + off);
-      off += 8;
-      out.round = readU64LE(data + off);
-      off += 8;
-      out.signer_index = readU16LE(data + off);
-      off += 2;
-      out.is_nil = (data[off] != 0);
-      off += 1;
-
-      std::memcpy(out.block_hash.data.data(), data + off, 32);
-      off += 32;
-      std::memcpy(out.signature.data.data(), data + off, 64);
-      off += 64;
-
-      return true;
-    }
     //  Domain-separated signing hash for a vote.
     //
     //  MUST match Consensus::voteSigningHash byte for byte. The
@@ -143,24 +96,50 @@ namespace Core
       State::StateAccess &state)
   {
     //  ---- 1. Decode framing ----
-
+    //
     //  Wire format: two fixed-size votes, back to back, no framing.
+    //
+    //  The decoding is delegated to Consensus::decodeVote. A local
+    //  hand-rolled decoder used to live here, and it silently went
+    //  out of sync with encodeVote when the Vote wire format gained
+    //  signer_id. Every field it read after (round) was off by the
+    //  width of the new field, so signer_index decoded to the low
+    //  half of signer_id and every proof failed verification. Calling
+    //  the canonical decoder removes the class of bug entirely.
     if (payload.size() != 2 * VOTE_WIRE_SIZE)
       return std::nullopt;
 
-    DecodedVote va, vb;
-    if (!decodeVoteBytes(payload.data(), VOTE_WIRE_SIZE, va))
+    Consensus::Vote va, vb;
+    if (!Consensus::decodeVote(payload.data(), VOTE_WIRE_SIZE, va))
       return std::nullopt;
-    if (!decodeVoteBytes(payload.data() + VOTE_WIRE_SIZE, VOTE_WIRE_SIZE, vb))
+    if (!Consensus::decodeVote(payload.data() + VOTE_WIRE_SIZE,
+                               VOTE_WIRE_SIZE, vb))
       return std::nullopt;
 
-    //  ---- 2. Same (height, round, signer_index) ----
-
+    //  ---- 2. Same (height, round, signer) ----
+    //
+    //  signer_id is authoritative. Two votes that agree on
+    //  signer_index but disagree on signer_id are not a valid proof
+    //  of anything: the index means different things in different
+    //  sets, and the id is the only field that identifies the
+    //  equivocator unambiguously.
     if (va.height != vb.height)
       return std::nullopt;
     if (va.round != vb.round)
       return std::nullopt;
-    if (va.signer_index != vb.signer_index)
+    if (va.signer_id == INVALID_ID || vb.signer_id == INVALID_ID)
+      return std::nullopt;
+    if (va.signer_id != vb.signer_id)
+      return std::nullopt;
+
+    //  If the votes carry signer_index at all, they must agree. A
+    //  mismatch means the two votes were cast against different sets,
+    //  which cannot be an equivocation by a single validator at a
+    //  single (height, round) — it's two different validators, or a
+    //  malformed proof.
+    if (va.signer_index != INVALID_INDEX &&
+        vb.signer_index != INVALID_INDEX &&
+        va.signer_index != vb.signer_index)
       return std::nullopt;
 
     //  ---- 3. Different value ----
@@ -175,25 +154,44 @@ namespace Core
     if (same_block && same_nil)
       return std::nullopt;
 
-    //  ---- 4. signer_index in range ----
-
-    if (va.signer_index >= active_set.size())
-      return std::nullopt;
-
-    //  ---- 5. Validator is registered ----
-
-    const Id validator_id = active_set[va.signer_index];
+    //  ---- 4. Validator is registered ----
+    //
+    //  Resolve from signer_id, not from active_set[signer_index].
+    //  The active_set lookup would tie the proof's validity to the
+    //  set that happens to be current when the proof is applied —
+    //  which, after an emergency rotation, is not the set the votes
+    //  were cast against. The id is stable; the index is not.
+    const Id validator_id = va.signer_id;
 
     ValidatorInfo v;
     if (!state.getValidator(validator_id, v))
       return std::nullopt;
 
-    //  ---- 6. Both signatures verify ----
+    //  ---- 5. The signer is in the set the proof is being applied
+    //          against ----
+    //
+    //  A validator that has been fully removed from the active set
+    //  shouldn't be slashable by a fresh proof; the removal already
+    //  happened. The active_set parameter is the caller's view of
+    //  the set the proof must be against. If it's empty, the caller
+    //  is saying "don't require set membership" — used during
+    //  migration and by tests that want to verify a proof's signature
+    //  without constructing a set.
+    if (!active_set.empty())
+    {
+      const bool in_set =
+          std::find(active_set.begin(), active_set.end(), validator_id) !=
+          active_set.end();
+      if (!in_set)
+        return std::nullopt;
+    }
 
+    //  ---- 6. Both signatures verify ----
+    //
     //  Codebase convention: a validator's signing key is its
     //  reward_address. Same convention as BlockProcessor::checkQuorum
     //  and Node::getSignerPublicKey.
-    const Crypto::PublicKey pk = v.reward_address;
+    const Crypto::PublicKey pk = v.effectiveConsensusKey();
 
     Crypto::Hash ha = localVoteSigningHash(va.height, va.round,
                                            va.is_nil, va.block_hash);
@@ -226,6 +224,7 @@ namespace Core
     Consensus::EquivocationEvidence ev;
     ev.vote_a = vote_a;
     ev.vote_b = vote_b;
+    ev.signer_id = vote_a.signer_id;
     return ev;
   }
 } // namespace Core

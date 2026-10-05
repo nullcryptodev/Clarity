@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <unordered_set>
+#include <iostream>
 
 #include "GlobalConfig.h"
 #include "ValidatorRotation.h"
@@ -469,9 +470,10 @@ namespace Core
         live.push_back(vid);
     }
 
-    //  If nothing is actually offline, there's nothing to rotate.
-    //  The chain's stall must have a different cause (network
-    //  partition, clock skew, etc.) — the emergency path can't help.
+    //  If nothing is offline by the liveness predicate, there is no
+    //  emergency to resolve. Return the committed set unchanged. This
+    //  is the documented contract: emergency rotation is a response
+    //  to observed offline validators, not a proactive shuffle.
     if (offline.empty())
       return committed;
 
@@ -515,6 +517,7 @@ namespace Core
     std::sort(live.begin(), live.end());
     return live;
   }
+
   //  Emergency active set resolution
 
   std::vector<Id> resolveActiveSet(

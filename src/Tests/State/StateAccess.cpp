@@ -345,7 +345,7 @@ TEST_F(State_StateAccessFixture, ValidatorRoundTrip)
   v.id = 5;
   v.reward_address = makeAddress(1);
   v.owner = makeAddress(1);
-  v.stake = 1'000'000;
+  v.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
   v.uptime_score = 9'500;
   v.is_active = true;
 
@@ -355,7 +355,7 @@ TEST_F(State_StateAccessFixture, ValidatorRoundTrip)
   ASSERT_TRUE(s().getValidator(5, got));
   EXPECT_EQ(got.id, 5u);
   EXPECT_EQ(got.reward_address, v.reward_address);
-  EXPECT_EQ(got.stake, 1'000'000u);
+  EXPECT_EQ(got.stake, GlobalConfig::VALIDATOR_MIN_STAKE);
   EXPECT_EQ(got.uptime_score, 9'500);
   EXPECT_TRUE(got.is_active);
 }

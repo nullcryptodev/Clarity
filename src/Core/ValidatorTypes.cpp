@@ -95,6 +95,7 @@ namespace Core
   {
     s(id, "id");
     s(reward_address, "reward_address");
+    s(consensus_key, "consensus_key");
     s(node_key, "node_key");
     s(owner, "owner");
     s(registered_at_height, "registered_at_height");
@@ -120,6 +121,7 @@ namespace Core
   {
     s(id, "id");
     s(reward_address, "reward_address");
+    s(consensus_key, "consensus_key");
     s(node_key, "node_key");
     s(owner, "owner");
     s(registered_at_height, "registered_at_height");

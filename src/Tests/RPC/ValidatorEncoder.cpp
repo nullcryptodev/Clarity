@@ -21,7 +21,7 @@ namespace
     v.reward_address = Crypto::addrFromHex(
         "1111111111111111111111111111111111111111111111111111111111111111");
     v.owner = v.reward_address;
-    v.stake = 1'000'000;
+    v.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
     v.uptime_score = 10'000;
     v.reward_multiplier = 10'000;
     v.is_active = true;

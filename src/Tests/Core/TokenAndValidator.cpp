@@ -14,6 +14,36 @@
 using namespace Core;
 using namespace Tests;
 
+namespace
+{
+  Core::ValidatorInfo makeValidator()
+  {
+    Core::ValidatorInfo v;
+    v.id = 1;
+    v.reward_address = Crypto::addrFromHex(
+        "1111111111111111111111111111111111111111111111111111111111111111");
+    v.owner = v.reward_address;
+
+    //  Stake at exactly the minimum so meetsStakeRequirement() and
+    //  canBeActive() pass their positive cases. The tests below
+    //  decrement from this value by 1 to exercise the negative case,
+    //  which only works if the starting value is the threshold itself.
+    //
+    //  Previous value (1'000'000) was a stale literal from before
+    //  ATOMIC_UNITS_PER_COIN was introduced; VALIDATOR_MIN_STAKE is
+    //  now 1000 * 100'000 = 100'000'000, so 1'000'000 was well below
+    //  the threshold and every positive assertion failed.
+    v.stake = GlobalConfig::VALIDATOR_MIN_STAKE;
+
+    v.uptime_score = 10'000;
+    v.reward_multiplier = 10'000;
+    v.is_active = true;
+    v.is_seed = false;
+    v.last_seen_height = 100;
+    return v;
+  }
+}
+
 TEST(Core_TokenInfo, DefaultIsNativePlaceholder)
 {
   TokenInfo t;

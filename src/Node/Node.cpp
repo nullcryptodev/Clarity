@@ -8,6 +8,7 @@
 #include "Core/Genesis.h"
 #include "Core/TransactionExecutor.h"
 #include "Core/ValidatorRotation.h"
+#include "Core/EquivocationProof.h"
 #include "Consensus/Message.h"
 #include "P2P/MessageTypes.h"
 #include "P2P/VersionMessage.h"
@@ -26,6 +27,41 @@ using namespace std::chrono_literals;
 
 namespace Node
 {
+  namespace
+  {
+    constexpr uint32_t WAL_KIND_VOTE = 0;
+    constexpr uint32_t WAL_KIND_LOCK = 1;
+
+    void writeU32BE(std::vector<uint8_t> &out, uint32_t v)
+    {
+      out.push_back(uint8_t((v >> 24) & 0xFF));
+      out.push_back(uint8_t((v >> 16) & 0xFF));
+      out.push_back(uint8_t((v >> 8) & 0xFF));
+      out.push_back(uint8_t((v) & 0xFF));
+    }
+
+    void writeU64BE(std::vector<uint8_t> &out, uint64_t v)
+    {
+      for (int i = 7; i >= 0; --i)
+        out.push_back(uint8_t((v >> (i * 8)) & 0xFF));
+    }
+
+    uint32_t readU32BE(const uint8_t *p)
+    {
+      return (uint32_t(p[0]) << 24) |
+             (uint32_t(p[1]) << 16) |
+             (uint32_t(p[2]) << 8) |
+             (uint32_t(p[3]));
+    }
+
+    uint64_t readU64BE(const uint8_t *p)
+    {
+      uint64_t v = 0;
+      for (int i = 0; i < 8; ++i)
+        v = (v << 8) | uint64_t(p[i]);
+      return v;
+    }
+  } // anonymous namespace
 
   //  Construction / Destruction
 
@@ -282,9 +318,6 @@ namespace Node
     (*log_)(Logging::INFO)
         << "Empty state detected, applying genesis for "
         << networkName(config_.network);
-
-    Core::applyGenesis(state, cfg);
-    state.commit(0);
 
     Core::applyGenesis(state, cfg);
     state.commit(0);
@@ -587,9 +620,6 @@ namespace Node
           state, committed, chain_->height(), force_rotation);
     };
 
-    deps.signer_public_key = [this](Index idx)
-    { return getSignerPublicKey(idx); };
-
     deps.state_lookup_validator =
         [this](Id id, Core::ValidatorInfo &out) -> bool
     {
@@ -664,6 +694,138 @@ namespace Node
         txn.abort();
         return std::nullopt;
       }
+    };
+
+    // ---- verify_slash_proof ----
+    //  Called by the proposer for each piece of local equivocation
+    //  evidence before including it in a Slash tx.
+    //
+    //  Pass an empty active set: the proposer's job is to filter
+    //  obviously-malformed proofs, not to be the final arbiter of set
+    //  membership. Core::verifyEquivocationProof treats an empty set
+    //  as "no membership check," and the on-chain verifier (via
+    //  BlockProcessor::applySlash, which has the correct set for the
+    //  block's height) is the authority on whether a proof is valid
+    //  in context.
+    deps.verify_slash_proof =
+        [this](const std::vector<uint8_t> &payload) -> bool
+    {
+      State::StateAccess state(*state_db_, /*version=*/0);
+      std::vector<Id> empty;
+      auto result = Core::verifyEquivocationProof(payload, empty, state);
+      return result.has_value();
+    };
+
+    // ---- WAL ----
+    //
+    //  Every vote we sign is written to TBL_CONSENSUS_WAL before it
+    //  is broadcast. The write is durable (StateDB::rawPut commits
+    //  with MDBX's default sync behavior), so a crash after the
+    //  return but before the broadcast still leaves a durable
+    //  record that we signed this vote. On restart, wal_replay
+    //  reads it back, and the validator will not re-sign a
+    //  different vote for the same (height, round).
+    //
+    //  Only our own votes are WAL'd. Recording other validators'
+    //  votes would help recovery but isn't needed for the
+    //  self-slashing safety property, and it would grow the WAL by
+    //  a factor of the active set size.
+    deps.wal_append_vote =
+        [this](const Consensus::Vote &v, bool is_precommit)
+    {
+      const auto key = walVoteKey(v.height, v.round, v.signer_id);
+      const auto value = walEncodeVoteRecord(v, is_precommit);
+      state_db_->rawPut(State::StateDB::TBL_CONSENSUS_WAL,
+                        key.data(), key.size(),
+                        value.data(), value.size());
+    };
+
+    deps.wal_append_lock =
+        [this](Height h, Round r, const Crypto::Hash &hash)
+    {
+      const auto key = walLockKey(h, r);
+      state_db_->rawPut(State::StateDB::TBL_CONSENSUS_WAL,
+                        key.data(), key.size(),
+                        hash.data.data(), hash.data.size());
+    };
+
+    deps.wal_replay =
+        [this](Height for_height,
+               std::function<void(const Consensus::Vote &, bool)> on_vote,
+               std::function<void(Height, Round, const Crypto::Hash &)> on_lock)
+    {
+      state_db_->forEachEntry(
+          State::StateDB::TBL_CONSENSUS_WAL,
+          [&](const std::vector<uint8_t> &key,
+              const std::vector<uint8_t> &value) -> bool
+          {
+            if (key.size() < 12)
+              return true;
+            const uint64_t h = readU64BE(key.data());
+            if (h != for_height)
+              return true; // only replay this height
+
+            const uint32_t kind = readU32BE(key.data() + 8);
+
+            if (kind == WAL_KIND_VOTE)
+            {
+              if (key.size() < 28)
+                return true;
+              Consensus::Vote v;
+              bool is_precommit = false;
+              if (walDecodeVoteRecord(value, v, is_precommit))
+                on_vote(v, is_precommit);
+            }
+            else if (kind == WAL_KIND_LOCK)
+            {
+              if (key.size() < 20 || value.size() != 32)
+                return true;
+              const Round r = readU64BE(key.data() + 12);
+              Crypto::Hash hash;
+              std::memcpy(hash.data.data(), value.data(), 32);
+              on_lock(h, r, hash);
+            }
+            return true;
+          });
+    };
+
+    deps.wal_truncate =
+        [this](Height committed_height)
+    {
+      //  Collect keys to delete, then delete them in a single txn.
+      //  The WAL is small in absolute terms but a truncate after a
+      //  long-active validator could touch a few hundred entries; one
+      //  MDBX commit is faster than N, and it keeps the truncation
+      //  atomic from the DB's point of view.
+      std::vector<std::vector<uint8_t>> to_delete;
+
+      auto collect_txn = state_db_->beginWrite();
+      collect_txn.forEach(
+          State::StateDB::TBL_CONSENSUS_WAL,
+          [&](const std::vector<uint8_t> &key,
+              const std::vector<uint8_t> &) -> bool
+          {
+            if (key.size() < 8)
+              return true;
+            const uint64_t h = readU64BE(key.data());
+            if (h <= committed_height)
+              to_delete.push_back(key);
+            return true;
+          });
+      collect_txn.abort();
+
+      if (to_delete.empty())
+        return;
+
+      auto delete_txn = state_db_->beginWrite();
+      for (const auto &k : to_delete)
+        delete_txn.del(State::StateDB::TBL_CONSENSUS_WAL,
+                       k.data(), k.size());
+      delete_txn.commit();
+
+      (*log_)(Logging::DEBUGGING)
+          << "WAL truncated at height " << committed_height
+          << ", removed " << to_delete.size() << " entries";
     };
 
     return deps;
@@ -963,6 +1125,52 @@ namespace Node
     {
       (*log_)(Logging::DEBUGGING) << "Malformed proposal received";
       return;
+    }
+
+    //  Emergency-set fork guard. Before accepting an emergency
+    //  proposal for the next height, check whether the consensus
+    //  layer holds a conflicting quorum-signed block at that
+    //  height. A quorum-signed block beats an emergency proposal:
+    //  the emergency proposal is a *claim* that the normal path is
+    //  stuck, and a block that already has quorum is evidence that
+    //  it isn't. Applying the held block advances the chain and
+    //  makes the emergency proposal stale.
+    //
+    //  The check is cheap: it only runs when the proposal is for
+    //  the next height and its block carries an emergency flag.
+    if (chain_ &&
+        p.height == chain_->height() + 1)
+    {
+      Core::Block proposed_block;
+      if (Core::Block::deserialize(p.block_bytes.data(),
+                                   p.block_bytes.size(),
+                                   proposed_block) &&
+          proposed_block.header.emergency_rotation > 0)
+      {
+        auto held = consensus_->heldQuorumBlock(p.height);
+        if (held.has_value() &&
+            held->hash() != proposed_block.hash())
+        {
+          (*log_)(Logging::WARNING)
+              << "Emergency proposal for h=" << p.height
+              << " conflicts with held quorum block "
+              << held->hash().toString().substr(0, 16)
+              << "; applying held block";
+
+          std::string error;
+          if (applyCommittedBlock(*held, error))
+          {
+            broadcastBlock(*held);
+            return; // drop the emergency proposal
+          }
+
+          //  If the held block doesn't apply, fall through. The
+          //  emergency proposal is the last chance at this height.
+          (*log_)(Logging::WARNING)
+              << "Held quorum block failed to apply: " << error
+              << "; falling through to emergency proposal";
+        }
+      }
     }
 
     consensus_->onProposal(p);
@@ -1689,5 +1897,64 @@ namespace Node
 
     // Re-arm for the next tick.
     armSyncTickTimer();
+  }
+
+  std::vector<uint8_t> Node::walVoteKey(Height height, Round round, Id signer_id)
+  {
+    std::vector<uint8_t> key;
+    key.reserve(8 + 4 + 8 + 8);
+    writeU64BE(key, height);
+    writeU32BE(key, WAL_KIND_VOTE);
+    writeU64BE(key, round);
+    writeU64BE(key, signer_id);
+    return key;
+  }
+
+  std::vector<uint8_t> Node::walLockKey(Height height, Round round)
+  {
+    std::vector<uint8_t> key;
+    key.reserve(8 + 4 + 8);
+    writeU64BE(key, height);
+    writeU32BE(key, WAL_KIND_LOCK);
+    writeU64BE(key, round);
+    return key;
+  }
+
+  std::vector<uint8_t> Node::walPrefixForHeightOrLower(Height max_height)
+  {
+    //  We iterate-with-prefix and filter; the caller checks
+    //  height <= max_height. To keep the prefix small, we use the
+    //  empty prefix (scan everything) — the WAL is small.
+    return {};
+  }
+
+  std::vector<uint8_t> Node::walEncodeVoteRecord(const Consensus::Vote &v,
+                                                 bool is_precommit)
+  {
+    //  We store the wire encoding produced by Consensus::encodeVote,
+    //  plus a 1-byte tag for prevote vs precommit. That keeps the
+    //  decoding on the way back simple, and means the WAL bytes and
+    //  the wire bytes are the same format — one less thing to keep
+    //  in sync.
+    auto bytes = Consensus::encodeVote(v);
+    std::vector<uint8_t> out;
+    out.reserve(1 + bytes.size());
+    out.push_back(is_precommit ? 1 : 0);
+    out.insert(out.end(), bytes.begin(), bytes.end());
+    return out;
+  }
+
+  bool Node::walDecodeVoteRecord(const std::vector<uint8_t> &bytes,
+                                 Consensus::Vote &out_v,
+                                 bool &out_is_precommit)
+  {
+    if (bytes.empty())
+      return false;
+
+    out_is_precommit = (bytes[0] != 0);
+
+    return Consensus::decodeVote(bytes.data() + 1,
+                                 bytes.size() - 1,
+                                 out_v);
   }
 } // namespace Node

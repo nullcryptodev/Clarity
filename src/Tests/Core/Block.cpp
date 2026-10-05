@@ -10,6 +10,8 @@
 #include "Core/Block.h"
 #include "Core/Transaction.h"
 
+#include "Consensus/Types.h"
+
 using namespace Core;
 using namespace Tests;
 
@@ -19,47 +21,47 @@ using namespace Tests;
 
 TEST(Core_Core_BlockHeader, WellFormedBaseline)
 {
-  EXPECT_TRUE(makeHeader().isWellFormed());
+  EXPECT_TRUE(makeBlockHeader().isWellFormed());
 }
 
 TEST(Core_Core_BlockHeader, RejectsWrongVersion)
 {
-  BlockHeader h = makeHeader();
+  BlockHeader h = makeBlockHeader();
   h.version = 999;
   EXPECT_FALSE(h.isWellFormed());
 }
 
 TEST(Core_Core_BlockHeader, RejectsZeroChainId)
 {
-  BlockHeader h = makeHeader();
+  BlockHeader h = makeBlockHeader();
   h.chain_id = 0;
   EXPECT_FALSE(h.isWellFormed());
 }
 
 TEST(Core_Core_BlockHeader, RejectsNullProposer)
 {
-  BlockHeader h = makeHeader();
+  BlockHeader h = makeBlockHeader();
   h.proposer = Crypto::Address{};
   EXPECT_FALSE(h.isWellFormed());
 }
 
 TEST(Core_Core_BlockHeader, RejectsZeroActiveValidators)
 {
-  BlockHeader h = makeHeader();
+  BlockHeader h = makeBlockHeader();
   h.active_validator_count = 0;
   EXPECT_FALSE(h.isWellFormed());
 }
 
 TEST(Core_Core_BlockHeader, HashIsDeterministic)
 {
-  BlockHeader h = makeHeader();
+  BlockHeader h = makeBlockHeader();
   EXPECT_EQ(h.hash().toString(), h.hash().toString());
 }
 
 TEST(Core_Core_BlockHeader, HashChangesWithContent)
 {
-  BlockHeader h1 = makeHeader();
-  BlockHeader h2 = makeHeader();
+  BlockHeader h1 = makeBlockHeader();
+  BlockHeader h2 = makeBlockHeader();
   h2.height += 1;
 
   EXPECT_NE(h1.hash().toString(), h2.hash().toString());
@@ -79,10 +81,10 @@ TEST(Core_Core_BlockHeader, HashChangesWithContent)
 
 TEST(Core_Core_BlockHeader, CommitRoundNotInHash)
 {
-  BlockHeader h1 = makeHeader();
+  BlockHeader h1 = makeBlockHeader();
   h1.commit_round = 5;
 
-  BlockHeader h2 = makeHeader();
+  BlockHeader h2 = makeBlockHeader();
   h2.commit_round = 99;
 
   EXPECT_EQ(h1.hash().toString(), h2.hash().toString())
@@ -91,10 +93,10 @@ TEST(Core_Core_BlockHeader, CommitRoundNotInHash)
 
 TEST(Core_Core_BlockHeader, EmergencyRotationInHash)
 {
-  BlockHeader h1 = makeHeader();
+  BlockHeader h1 = makeBlockHeader();
   h1.emergency_rotation = 0;
 
-  BlockHeader h2 = makeHeader();
+  BlockHeader h2 = makeBlockHeader();
   h2.emergency_rotation = 1;
 
   EXPECT_NE(h1.hash().toString(), h2.hash().toString())
@@ -103,7 +105,7 @@ TEST(Core_Core_BlockHeader, EmergencyRotationInHash)
 
 TEST(Core_Core_BlockHeader, SerializeRoundTrip)
 {
-  BlockHeader original = makeHeader();
+  BlockHeader original = makeBlockHeader();
 
   auto bytes = original.serialize();
   BlockHeader restored;
@@ -130,7 +132,7 @@ TEST(Core_Core_BlockHeader, SerializeRoundTrip)
 
 TEST(Core_Core_BlockHeader, SerializeDeterministic)
 {
-  BlockHeader h = makeHeader();
+  BlockHeader h = makeBlockHeader();
   EXPECT_EQ(h.serialize(), h.serialize());
 }
 
@@ -141,7 +143,7 @@ TEST(Core_Core_BlockHeader, SerializeDeterministic)
 TEST(Core_Block, WellFormedEmpty)
 {
   Block b;
-  b.header = makeHeader();
+  b.header = makeBlockHeader();
   b.header.tx_count = 0;
   b.header.active_validator_count = 21;
 
@@ -154,7 +156,7 @@ TEST(Core_Block, WellFormedEmpty)
 TEST(Core_Block, WellFormedWithQuorum)
 {
   Block b;
-  b.header = makeHeader();
+  b.header = makeBlockHeader();
   b.header.tx_count = 0;
   b.header.active_validator_count = 21;
 
@@ -175,14 +177,40 @@ TEST(Core_Block, WellFormedWithQuorum)
 
 TEST(Core_Block, WellFormedWithEmergencyRotation)
 {
-  //  A block carrying a nonzero emergency_rotation is still
-  //  well-formed. The field changes what set the block was validated
-  //  against, not whether the header is structurally valid.
+  //  A block carrying a nonzero emergency_rotation is well-formed
+  //  when it also carries a certificate. The header's isWellFormed
+  //  enforces the invariant: emergency_rotation > 0 implies a
+  //  non-empty certificate and a non-null timeout_certificate_hash.
+  //
+  //  We build a minimal one-vote certificate. isWellFormed only
+  //  checks that the certificate is non-empty and the hash matches;
+  //  full signature verification happens in the block processor, not
+  //  in isWellFormed. But we sign it properly so the test doesn't
+  //  depend on the "isWellFormed doesn't verify signatures" detail
+  //  staying true forever.
   Block b;
-  b.header = makeHeader();
+  b.header = makeBlockHeader();
   b.header.tx_count = 0;
   b.header.active_validator_count = 21;
   b.header.emergency_rotation = 42;
+
+  //  Build a one-vote certificate at the same round as the block's
+  //  emergency_rotation. The domain-separated signing hash is
+  //  timeoutVoteSigningHash(height, round).
+  const Crypto::KeyPair kp = Crypto::generateKeyPair();
+
+  Consensus::TimeoutVote tv;
+  tv.height = b.header.height;
+  tv.round = b.header.emergency_rotation;
+  tv.signer_index = 0;
+  tv.signer_id = 1;
+  tv.signature = Crypto::sign(
+      Consensus::timeoutVoteSigningHash(tv.height, tv.round),
+      kp.secretKey);
+
+  b.header.timeout_certificate.votes.push_back(tv);
+  b.header.timeout_certificate_hash =
+      computeTimeoutCertificateHash(b.header.timeout_certificate);
 
   for (int i = 0; i < 15; ++i)
   {
@@ -196,10 +224,71 @@ TEST(Core_Block, WellFormedWithEmergencyRotation)
   EXPECT_TRUE(b.isWellFormed());
 }
 
+TEST(Core_Block, WellFormedWithEmergencyRotationRejectsNullHash)
+{
+  //  The certificate and the hash must agree. A block that sets
+  //  emergency_rotation > 0, carries a non-empty certificate, but
+  //  leaves timeout_certificate_hash null is not well-formed: the
+  //  header's commitment to the certificate is missing, and a
+  //  receiver has no way to check that the certificate wasn't
+  //  swapped in transit.
+  Block b;
+  b.header = makeBlockHeader();
+  b.header.tx_count = 0;
+  b.header.active_validator_count = 21;
+  b.header.emergency_rotation = 42;
+
+  Consensus::TimeoutVote tv;
+  tv.height = b.header.height;
+  tv.round = b.header.emergency_rotation;
+  tv.signer_index = 0;
+  tv.signer_id = 1;
+  tv.signature = Crypto::Signature{};
+  tv.signature.data[0] = 0x01;
+  b.header.timeout_certificate.votes.push_back(tv);
+  // hash intentionally left null
+
+  for (int i = 0; i < 15; ++i)
+  {
+    Crypto::ValidatorSignature vs;
+    vs.signer_index = static_cast<Index>(i);
+    for (size_t j = 0; j < 64; ++j)
+      vs.signature.data[j] = static_cast<uint8_t>(i + j);
+    b.quorum_signatures.push_back(vs);
+  }
+
+  EXPECT_FALSE(b.isWellFormed());
+}
+
+TEST(Core_Block, WellFormedWithEmergencyRotationRejectsEmptyCertificate)
+{
+  //  A block that sets emergency_rotation > 0 but carries no
+  //  certificate at all is not well-formed. The flag is a claim that
+  //  the committed set stalled; without a certificate there is no
+  //  evidence, and isWellFormed rejects the header outright.
+  Block b;
+  b.header = makeBlockHeader();
+  b.header.tx_count = 0;
+  b.header.active_validator_count = 21;
+  b.header.emergency_rotation = 42;
+  // certificate and hash both left empty
+
+  for (int i = 0; i < 15; ++i)
+  {
+    Crypto::ValidatorSignature vs;
+    vs.signer_index = static_cast<Index>(i);
+    for (size_t j = 0; j < 64; ++j)
+      vs.signature.data[j] = static_cast<uint8_t>(i + j);
+    b.quorum_signatures.push_back(vs);
+  }
+
+  EXPECT_FALSE(b.isWellFormed());
+}
+
 TEST(Core_Block, RejectsTxCountMismatch)
 {
   Block b;
-  b.header = makeHeader();
+  b.header = makeBlockHeader();
   b.header.tx_count = 5;  // claims 5 txs
   b.transactions.clear(); // but has 0
 
@@ -218,7 +307,7 @@ TEST(Core_Block, RejectsTxCountMismatch)
 TEST(Core_Block, SerializeRoundTripEmpty)
 {
   Block original;
-  original.header = makeHeader();
+  original.header = makeBlockHeader();
   original.header.tx_count = 0;
 
   for (int i = 0; i < 15; ++i)
@@ -244,12 +333,12 @@ TEST(Core_Block, SerializeRoundTripEmpty)
 TEST(Core_Block, SerializeRoundTripWithTransactions)
 {
   Block original;
-  original.header = makeHeader();
+  original.header = makeBlockHeader();
   original.header.tx_count = 3;
 
-  original.transactions.push_back(makeSimpleTx(1));
-  original.transactions.push_back(makeSimpleTx(2));
-  original.transactions.push_back(makeSimpleTx(3));
+  original.transactions.push_back(makeTransaction(1));
+  original.transactions.push_back(makeTransaction(2));
+  original.transactions.push_back(makeTransaction(3));
 
   for (int i = 0; i < 15; ++i)
   {
@@ -273,7 +362,7 @@ TEST(Core_Block, SerializeRoundTripWithTransactions)
 TEST(Core_Block, SerializeRoundTripWithParticipants)
 {
   Block original;
-  original.header = makeHeader();
+  original.header = makeBlockHeader();
   original.header.tx_count = 0;
 
   for (int i = 0; i < 15; ++i)
@@ -305,7 +394,7 @@ TEST(Core_Block, SerializeRoundTripWithParticipants)
 TEST(Core_Block, SerializeDeterministic)
 {
   Block b;
-  b.header = makeHeader();
+  b.header = makeBlockHeader();
   b.header.tx_count = 0;
   for (int i = 0; i < 15; ++i)
   {
@@ -322,10 +411,10 @@ TEST(Core_Block, SerializeDeterministic)
 TEST(Core_Block, SerializedSizeMatchesActual)
 {
   Block b;
-  b.header = makeHeader();
+  b.header = makeBlockHeader();
   b.header.tx_count = 2;
-  b.transactions.push_back(makeSimpleTx(1));
-  b.transactions.push_back(makeSimpleTx(2));
+  b.transactions.push_back(makeTransaction(1));
+  b.transactions.push_back(makeTransaction(2));
 
   for (int i = 0; i < 15; ++i)
   {
@@ -344,7 +433,7 @@ TEST(Core_Block, SerializedSizeMatchesActual)
 TEST(Core_Block, HashEqualsHeaderHash)
 {
   Block b;
-  b.header = makeHeader();
+  b.header = makeBlockHeader();
   EXPECT_EQ(b.hash().toString(), b.header.hash().toString());
 }
 
@@ -412,8 +501,8 @@ TEST(Core_MerkleRoot, ChangesWithLeaves)
 TEST(Core_TxRoot, Deterministic)
 {
   std::vector<Transaction> txs;
-  txs.push_back(makeSimpleTx(1));
-  txs.push_back(makeSimpleTx(2));
+  txs.push_back(makeTransaction(1));
+  txs.push_back(makeTransaction(2));
 
   EXPECT_EQ(computeTxRoot(txs).toString(),
             computeTxRoot(txs).toString());
@@ -422,10 +511,10 @@ TEST(Core_TxRoot, Deterministic)
 TEST(Core_TxRoot, ChangesWithTransactions)
 {
   std::vector<Transaction> txs1;
-  txs1.push_back(makeSimpleTx(1));
+  txs1.push_back(makeTransaction(1));
 
   std::vector<Transaction> txs2;
-  txs2.push_back(makeSimpleTx(2));
+  txs2.push_back(makeTransaction(2));
 
   EXPECT_NE(computeTxRoot(txs1).toString(),
             computeTxRoot(txs2).toString());
@@ -519,6 +608,24 @@ TEST(Core_BlockRoundTrip, HashSurvivesWithEmergencyRotation)
   original.header.total_fees = 0;
   original.header.emergency_rotation = 42;
 
+  //  A matching certificate so the header is well-formed, and so the
+  //  certificate hash round-trips through serialize/deserialize with
+  //  the block hash unchanged.
+  const Crypto::KeyPair kp = Crypto::generateKeyPair();
+
+  Consensus::TimeoutVote tv;
+  tv.height = original.header.height;
+  tv.round = original.header.emergency_rotation;
+  tv.signer_index = 0;
+  tv.signer_id = 1;
+  tv.signature = Crypto::sign(
+      Consensus::timeoutVoteSigningHash(tv.height, tv.round),
+      kp.secretKey);
+
+  original.header.timeout_certificate.votes.push_back(tv);
+  original.header.timeout_certificate_hash =
+      Core::computeTimeoutCertificateHash(original.header.timeout_certificate);
+
   Crypto::Hash hash_before = original.hash();
 
   auto bytes = original.serialize();
@@ -526,5 +633,8 @@ TEST(Core_BlockRoundTrip, HashSurvivesWithEmergencyRotation)
   ASSERT_TRUE(Core::Block::deserialize(bytes.data(), bytes.size(), restored));
 
   EXPECT_EQ(restored.header.emergency_rotation, 42u);
+  ASSERT_EQ(restored.header.timeout_certificate.votes.size(), 1u);
+  EXPECT_EQ(restored.header.timeout_certificate_hash,
+            original.header.timeout_certificate_hash);
   EXPECT_EQ(hash_before, restored.hash());
 }

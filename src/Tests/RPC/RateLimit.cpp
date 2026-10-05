@@ -80,11 +80,11 @@ namespace
 
 TEST(RPC_RpcRateLimit, DisabledByDefaultNoLimit)
 {
-  Node::NodeConfig ncfg = makeTestNodeConfig("/tmp/clrty_ratelimit_disabled");
+  Node::NodeConfig ncfg = makeNodeConfig("/tmp/clrty_ratelimit_disabled");
   NoopLogger logger;
   Node::Node node(ncfg, logger);
 
-  Rpc::RpcConfig cfg = makeTestRpcConfig();
+  Rpc::RpcConfig cfg = makeRpcConfig();
   cfg.rate_limit_burst = 0;
   cfg.rate_limit_per_second = 0;
 
@@ -106,11 +106,11 @@ TEST(RPC_RpcRateLimit, DisabledByDefaultNoLimit)
 
 TEST(RPC_RpcRateLimit, ExhaustedBurstReturns429)
 {
-  Node::NodeConfig ncfg = makeTestNodeConfig("/tmp/clrty_ratelimit_burst");
+  Node::NodeConfig ncfg = makeNodeConfig("/tmp/clrty_ratelimit_burst");
   NoopLogger logger;
   Node::Node node(ncfg, logger);
 
-  Rpc::RpcConfig cfg = makeTestRpcConfig();
+  Rpc::RpcConfig cfg = makeRpcConfig();
   cfg.rate_limit_burst = 3;
   cfg.rate_limit_per_second = 1;
 

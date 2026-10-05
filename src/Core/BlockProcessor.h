@@ -25,20 +25,6 @@ namespace Core
   //  Stateless validator that applies a block to state and verifies the
   //  resulting commitments. Given the same block and state, it always
   //  produces the same result on every node.
-  //
-  //  Two entry points:
-  //
-  //    applyBlock — the mutating path. Applies all transactions, distributes
-  //                 rewards, processes order expiries, and updates state.
-  //                 Called by the chain when a block is added.
-  //
-  //    validateBlock — the read-only path. Given a block and the pre-state,
-  //                    simulates the application and returns whether the
-  //                    block is valid. Called by the consensus engine before
-  //                    voting on a proposed block.
-  //
-  //  Both paths share the same logic. validateBlock can be implemented by
-  //  cloning the state, applying, and discarding.
 
   struct BlockContext
   {
@@ -49,8 +35,8 @@ namespace Core
     //
     // When true, applyBlock still applies every state mutation but
     // SKIPS the three commitment checks (state_root, receipts_root,
-    // validator_set_root). This lets a caller compute what the post-state
-    // root *would* be without having to first know it.
+    // validator_set_root). This lets a caller compute what the
+    // post-state root *would* be without having to first know it.
     //
     // Production code paths always leave this false. The value is
     // ignored when the block's state_root is the null hash — see
@@ -75,44 +61,21 @@ namespace Core
   class BlockProcessor
   {
   public:
-    // Apply a block to state. Mutates state on success.
-    //
-    // The caller is expected to be inside a transaction. On failure, the
-    // caller should discard the state changes (e.g., by using a fresh
-    // StateAccess or by aborting the underlying DB txn).
-    //
-    // `state` is expected to represent the state *after* the block's parent
-    // (i.e., the pre-state). We apply the block's transactions in order.
     static BlockResult applyBlock(State::StateAccess &state,
                                   const Block &block,
                                   const BlockContext &ctx);
 
-    // Validate a block without mutating state. Since StateAccess is not
-    // copyable and SMT updates are not trivially reversible, this method
-    // is implemented by applying to a *throwaway* view.
-    //
-    // For v1, we simply call applyBlock and discard — the caller is
-    // responsible for providing a state that won't be persisted.
     static BlockResult validateBlock(State::StateAccess &state,
                                      const Block &block,
                                      const BlockContext &ctx);
 
     static ValidatorRegistry loadValidatorRegistry(State::StateAccess &state);
 
-    //  Resolve the active set for a block.
-    //
-    //  When force_rotation is false, returns the committed set from
-    //  state — same as loadActiveSet. When true, derives the emergency
-    //  set from (committed_set, validator registry, height).
-    //
-    //  The derivation must be a pure function of state and height: the
-    //  proposer (via Node::buildConsensusDeps::active_set) and every
-    //  verifier call this with the same inputs, and any dependence on
-    //  node-local data would make them diverge.
-    static std::vector<Id> resolveActiveSet(State::StateAccess &state,
-                                            const std::vector<Id> &committed_set,
-                                            uint64_t current_height,
-                                            bool force_rotation);
+    static std::vector<Id> resolveActiveSet(
+        State::StateAccess &state,
+        const std::vector<Id> &committed_set,
+        uint64_t current_height,
+        bool force_rotation);
 
   private:
     // ---- Pre-checks (before any state mutation) ----
@@ -131,16 +94,22 @@ namespace Core
                                       const std::vector<Id> &active_set,
                                       std::string &error);
 
+    //  Verify that the certificate carried in the header matches the
+    //  hash committed to in timeout_certificate_hash. Called from
+    //  checkHeader (via checkTimeoutCertificateHash) and from
+    //  checkTimeoutCertificate (which additionally verifies the
+    //  signatures in the certificate).
+    //
+    //  These are two separate checks: the hash binding is a wire
+    //  integrity check (the certificate bytes we received match what
+    //  the header committed to), and the signature check is a
+    //  consensus check (the certificate's votes are valid and come
+    //  from the right set). A block must pass both.
+    static bool checkTimeoutCertificateHash(const Block &block,
+                                            std::string &error);
+
     // ---- Application steps ----
 
-    // Apply all transactions, generating receipts.
-    //
-    // `active_set` is required because TxType::Slash transactions must
-    // resolve a signer_index to a validator id, and that resolution is
-    // "active_set[signer_index]". The set is loaded once by applyBlock
-    // and passed in — reloading it here would double the state reads
-    // per block and risk a mid-block inconsistency if rotation ran
-    // between the two loads.
     static bool applyTransactions(State::StateAccess &state,
                                   const Block &block,
                                   const BlockContext &ctx,
@@ -149,26 +118,21 @@ namespace Core
                                   std::vector<Crypto::Hash> &tx_hashes,
                                   std::string &error);
 
-    // Process order expiry for this block height.
     static void processOrderExpiries(State::StateAccess &state,
                                      uint64_t current_height);
 
-    // Distribute block rewards to active validators and staker pot.
     static void distributeRewards(State::StateAccess &state,
                                   const Block &block,
                                   const BlockContext &ctx);
 
-    // Update global counters that change per block (epoch tracking, etc.)
     static void updateGlobalState(State::StateAccess &state,
                                   const Block &block,
                                   const BlockContext &ctx);
 
-    // Process epoch boundary if this block is the last of an epoch.
     static void processEpochBoundary(State::StateAccess &state,
                                      const Block &block,
                                      const BlockContext &ctx);
 
-    // Process validator rotation if due.
     static void processRotation(State::StateAccess &state,
                                 const Block &block,
                                 const BlockContext &ctx);
@@ -187,26 +151,15 @@ namespace Core
 
     // ---- Helpers ----
 
-    // Load the active set used by consensus and block application.
-    // Under normal conditions this is the committed set. When the
-    // committed set can no longer form quorum by wall clock, this
-    // returns the derived emergency set instead. See
     static std::vector<Id> loadActiveSet(State::StateAccess &state);
 
-    // Compute the epoch number for a given block height.
     static uint64_t epochOf(uint64_t height) noexcept;
 
-    // Compute the rotation index for a given block height.
     static uint64_t rotationIndexOf(uint64_t height) noexcept;
 
     static void runOfflineCheck(State::StateAccess &state,
                                 const BlockContext &ctx);
 
-    // Verify and apply a TxType::Slash transaction.
-    //
-    // The proof is re-verified here on every node, independently of
-    // the proposer. A malformed or forged proof causes the block to
-    // be rejected — a proposer cannot sneak a slash past validation.
     static bool applySlash(State::StateAccess &state,
                            const Transaction &tx,
                            const std::vector<Id> &active_set,

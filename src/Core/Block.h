@@ -49,20 +49,23 @@ namespace Core
   //
   //  commit_round is the round in which the precommit quorum formed. It
   //  may differ from the round the block was proposed in when the round
-  //  advances between proposal and commit (validators locked on the
-  //  original block re-precommit it in a later round).
+  //  advances between proposal and commit.
   //
-  //  commit_round is intentionally EXCLUDED from the block's hash. The
-  //  block's identity is its header-minus-commit_round, its transactions,
-  //  its quorum signatures, and its participants. Validators sign over
-  //  the block hash in the round they are voting in, which is the round
-  //  that becomes commit_round. If commit_round were part of the hash,
-  //  the hash would change between proposal and commit in the
+  //  commit_round is intentionally EXCLUDED from the block's hash.
+  //  Validators sign over the block hash in the round they are voting
+  //  in, which becomes commit_round. If commit_round were part of the
+  //  hash, the hash would change between proposal and commit in the
   //  round-crossing case, and every signature would be over the old
-  //  hash. Excluding it from the hash keeps the hash stable and lets
-  //  commit_round record the truth.
+  //  hash. Excluding it keeps the hash stable.
   //
-  //  See BlockHeader::hash() in Block.cpp for the exact exclusion.
+  //  The timeout certificate IS committed to, via its hash
+  //  (timeout_certificate_hash). The certificate bytes are transmitted
+  //  in the wire format, but the header carries H(certificate) and the
+  //  hash covers it. This means a relayed block's certificate cannot be
+  //  swapped or stripped without invalidating the block hash. It also
+  //  means a proposer cannot change the certificate without changing
+  //  the block's identity — which is what we want, since the
+  //  certificate determines which set the block is validated against.
 
   struct BlockHeader
   {
@@ -89,11 +92,6 @@ namespace Core
     //  on the emergency active set, and the value is the round at
     //  which the emergency decision was made.
     //
-    //  Verifiers recompute the emergency set from (committed_set,
-    //  registry, current_height) and use it for quorum and set-root
-    //  checks. When the block commits, the emergency set is written
-    //  to state as the new committed set.
-    //
     //  Unlike commit_round, this field IS part of the block hash: it
     //  changes what set the block was validated against, so two blocks
     //  with identical header-except-emergency_rotation are different
@@ -106,17 +104,29 @@ namespace Core
     //  timeout attestations at rounds >= EMERGENCY_ROTATION_ROUNDS,
     //  drawn from the committed set. Empty otherwise.
     //
-    //  Excluded from the block hash. The certificate is evidence
-    //  attached to the block, not part of the block's identity — the
-    //  same treatment commit_round and quorum_signatures get. If it
-    //  were in the hash, a proposer could change the certificate
-    //  without changing the block hash, which is exactly the wrong
-    //  property.
+    //  The certificate BYTES travel in the wire format via serialize().
+    //  The certificate is also committed to via its hash, which is
+    //  covered by the block hash. A verifier reads the certificate from
+    //  the deserialized header, recomputes its hash, and compares
+    //  against timeout_certificate_hash before honouring
+    //  emergency_rotation.
     //
-    //  The certificate IS in the wire format (serialize()), so it
-    //  travels with the block. Verifiers read it from the deserialized
-    //  header and check it before honouring emergency_rotation.
+    //  Committing to the certificate is what stops a relaying peer from
+    //  stripping or swapping it: the block hash would no longer match
+    //  and the block would be rejected before any state mutation.
     Consensus::TimeoutCertificate timeout_certificate{};
+
+    //  H(timeout_certificate). Zero when the certificate is empty
+    //  (the normal, non-emergency case).
+    //
+    //  This field is part of the block hash. It's what makes the
+    //  certificate part of the block's identity without needing to
+    //  include the variable-length certificate bytes directly in the
+    //  hash input.
+    //
+    //  Set by the proposer after assembling the certificate. Verified
+    //  by every receiver before applying the block.
+    Crypto::Hash timeout_certificate_hash{};
 
     // ---- Commitments ----
     Crypto::Hash state_root{};
@@ -142,11 +152,7 @@ namespace Core
     // cache returned the pre-mutation hash; the serialized bytes
     // carried the post-mutation state_root. Receiver and proposer
     // disagreed on the block hash. A cache over a struct with public
-    // fields cannot be kept coherent; the cost of rehashing a 258-byte
-    // buffer is negligible, so there is no cache.
-    //
-    // The hash excludes commit_round. See the note at the top of this
-    // struct.
+    // fields cannot be kept coherent.
 
     Crypto::Hash hash() const;
     Crypto::Hash hashForSigning() const { return hash(); }
@@ -194,6 +200,12 @@ namespace Core
   Crypto::Hash computeMerkleRoot(const std::vector<Crypto::Hash> &leaves);
   Crypto::Hash computeTxRoot(const std::vector<Transaction> &txs);
   Crypto::Hash computeValidatorSetRoot(const std::vector<Id> &active_set);
+
+  //  H(certificate), domain-separated from other hashes in the block
+  //  header. Returns the null hash when the certificate has no votes.
+  //  Used by the proposer to set BlockHeader::timeout_certificate_hash
+  //  and by every verifier to check it.
+  Crypto::Hash computeTimeoutCertificateHash(const Consensus::TimeoutCertificate &cert);
 
   //  Maximum serialized header size.
   //
