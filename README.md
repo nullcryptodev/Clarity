@@ -1,40 +1,84 @@
-![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C716-blue)
+<img src='https://github.com/nullcryptodev/docs/blob/main/clarity/clarity-wide.png?raw=true'>
 
-## Build
+# Clarity
 
-```bash
-git clone https://github.com/nullcryptodev/Clarity
-cd Clarity
+![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C753-blue) ![Stage](https://img.shields.io/badge/Stage-Developmen-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue)
 
-# remove and re-add bugged external
-rm -rf external/json
-git clone --branch v3.11.3 --depth 1 https://github.com/nlohmann/json.git external/json
+#### Table of Contents
 
-mkdir build
-
-# Build Tests
-# cmake -DBUILD_TESTS=ON ..
-# OR just the main modules
-cmake ..
-
-make
-```
-
-Refer to [TESTING.md](https://github.com/nullcryptodev/Clarity/blob/main/TESTING.md)
-
-## Tests
-
-> You can launch `clairty_tests` with the gtest filter: `./clarity_tests --gtest_filter='Consensus*'` to run tests on individual modules.
-
-| Module | Amount of tests |
-| ----- | ----- |
-| Consensus | 171 |
+- [What it is](#what-it-is)
+- [The architecture](#the-architecture)
+- [Build](#build)
+- [Tests](#tests)
+- [**Consensus**: how blocks are produced](#consensus-how-blocks-are-produced)
+  - [Protocol](#protocol)
+  - [Proposer selection](#proposer-selection)
+  - [Rounds](#rounds)
+  - [Locking](#locking)
+  - [Finality](#finality)
+  - [Validator Set](#validator-set)
+  - [Seed Validators](#seed-validators)
+  - [Emergency Rotation](#emergency-rotation)
+  - [Dry-run vs. finalized validation](#dry-run-vs-finalized-validation)
+- [**State**: how the chain is stored](#state-how-the-chain-is-stored)
+  - [Storage](#storage)
+  - [State Commitment](#state-commitment)
+  - [State Access](#state-access)
+  - [Proofs](#proofs)
+  - [Versioning](#versioning)
+- [**Transactions**: what users can do](#transactions-what-users-can-do)
+  - [Native Transfers](#native-transfers)
+  - [Token Operations](#token-operations)
+  - [Staking](#staking)
+  - [Validator Operations](#validator-operations)
+  - [AMM Operations](#amm-operations)
+  - [Limit Orders](#limit-orders)
+  - [Claim Rewards](#claim-rewards)
+  - [System Transactions](#system-transactions)
+- [**Validator identity**: two keys, two roles](#validator-identity-two-keys-two-roles)
+  - [Consensus Key](#consensus-key)
+  - [Reward Address](#reward-address)
+  - [Tooling](#tooling)
+  - [Economics: how value flows](#economics-how-value-flows)
+  - [Block Reward](#block-reward)
+  - [Validator Pool](#validator-pool)
+  - [Validator Rewards](#validator-rewards)
+  - [Seed-only reward policy](#seed-only-reward-policy)
+  - [Staker Rewards](#staker-rewards)
+  - [APY Mechanism](#apy-mechanism)
+  - [Pot Mechanics](#pot-mechanics)
+  - [Total Supply](#total-supply)
+  - [Uptime and Penalties](#uptime-and-penalties)
+  - [Stake slashing for equivocation](#stake-slashing-for-equivocation)
+  - [How equivocation is detected and slashed](#how-equivocation-is-detected-and-slashed)
+  - [Timeout certificate](#timeout-certificate)
+- [**Network**: how nodes talk](#network-how-nodes-talk)
+  - [Message Framing](#message-framing)
+  - [Handshake](#handshake)
+  - [Authentication](#authentication)
+  - [Sync](#sync)
+  - [Idle Refresh](#idle-refresh)
+  - [Block Relay](#block-relay)
+  - [Transaction Relay](#transaction-relay)
+  - [Rate Limiting](#rate-limiting)
+  - [Peer Management](#peer-management)
+  - [Self-connection prevention](#self-connection-prevention)
+- [**RPC**: how clients talk](#rpc-how-clients-talk)
+- [**Wallet**: how keys are managed](#wallet-how-keys-are-managed)
+  - [Signing](#signing)
+  - [Address Codec](#address-codec)
+  - [Fingerprint](#fingerprint)
+  - [CLI wallet client](#cli-wallet-client)
+  - [Startup Wizard](#startup-wizard)
+  - [Address book pattern](#address-book-pattern)
+- [What's notably absent](#whats-notably-absent)
+- [Design choices worth noting](#design-choices-worth-noting)
 
 ## What it is
 
 Clarity is a **single-chain, Byzantine-fault-tolerant proof-of-stake network** with a native currency ($CLRTY), a general-purpose token system, an automated market maker, a limit-order book, validator rewards with a pot mechanism, and a growing feature set around staking, validator rotation, and on-chain governance of validator sets.
 
-It's not a fork of anything. The block format, consensus protocol, state model, and reward math are original. It uses well-known primitives (Ed25519, Blake2b, SHA-512, ChaCha20-Poly1305) from Monocypher, the Argon2 reference implementation for keystore KDF, the BLAKE2 reference code, and a project-internal Keccak implementation verified against the official Keccak test vectors.
+It's not a direct fork of anything. The block format, consensus protocol, state model, and reward math are original. It uses well-known primitives (Ed25519, Blake2b, SHA-512, ChaCha20-Poly1305) from Monocypher, the Argon2 reference implementation for keystore KDF, the BLAKE2 reference code, and a project-internal Keccak implementation verified against the official Keccak test vectors.
 
 The project is at the code-complete, pre-launch stage. The daemon builds, the full test suite passes, and the end-to-end path (from transaction submission through consensus through block application through state persistence through restart) has been exercised on a live two-validator regtest network. The RPC surface is complete and tested. The wallet layer (keystores, HD derivation, signing, address encoding) is complete and tested, and there is an interactive CLI wallet client. The P2P layer has authentication, sync, block relay, transaction relay, per-peer rate limiting, and periodic refresh. It has not been deployed to a public network.
 
@@ -68,9 +112,41 @@ transaction_signer  offline wallet transaction signer and submit if rpc
                       is connected
 ```
 
+
+## Build
+
+```bash
+git clone https://github.com/nullcryptodev/Clarity
+cd Clarity
+
+# remove and re-add bugged external
+rm -rf external/json
+git clone --branch v3.11.3 --depth 1 https://github.com/nlohmann/json.git external/json
+
+mkdir build
+
+# Build Tests
+# cmake -DBUILD_TESTS=ON ..
+# OR just the main modules
+cmake ..
+
+make
+```
+
+## Tests
+
+You can launch `clairty_tests` with the gtest filter: `./clarity_tests --gtest_filter='Consensus*'` to run tests on individual modules. Refer to [TESTING.md](https://github.com/nullcryptodev/Clarity/blob/main/TESTING.md)
+
+```bash
+cmake -DBUILD_TESTS=ON ..
+make
+./clarity_tests
+```
+
 ## Consensus: how blocks are produced
 
-**Protocol:** A variant of BFT with three phases per round — propose, prevote, precommit. When a quorum of precommits forms on a block, it commits. The protocol tolerates `f = (n - 1) / 3` Byzantine validators, with a quorum of `⌊2n/3⌋ + 1`. So four validators tolerate one fault (quorum 3); seven tolerate two (quorum 5); twenty-one tolerate six (quorum 15).
+#### Protocol
+A variant of BFT with three phases per round — propose, prevote, precommit. When a quorum of precommits forms on a block, it commits. The protocol tolerates `f = (n - 1) / 3` Byzantine validators, with a quorum of `⌊2n/3⌋ + 1`. So four validators tolerate one fault (quorum 3); seven tolerate two (quorum 5); twenty-one tolerate six (quorum 15).
 
 | Validators (N) | Quorum |
 | ----- | ----- |
@@ -84,19 +160,25 @@ transaction_signer  offline wallet transaction signer and submit if rpc
 | 11 | 8 |
 | 21 | 15 |
 
-**Proposer selection:** `proposer = active_set[(height + round) mod active_set_size]`. Deterministic, rotates with every height and every round. The proposer builds a block, broadcasts it, and the other validators vote.
+#### Proposer selection
+`proposer = active_set[(height + round) mod active_set_size]`. Deterministic, rotates with every height and every round. The proposer builds a block, broadcasts it, and the other validators vote.
 
-**Rounds:** If a round fails to reach quorum (proposer offline, network partition, timed-out proposal), the round number increments and a new proposer takes over. Timeouts scale exponentially with the round number, capped at a maximum. A proposal for a future round is queued and delivered when the local round advances, so a validator that's briefly behind doesn't drop the round's only proposal.
+#### Rounds
+If a round fails to reach quorum (proposer offline, network partition, timed-out proposal), the round number increments and a new proposer takes over. Timeouts scale exponentially with the round number, capped at a maximum. A proposal for a future round is queued and delivered when the local round advances, so a validator that's briefly behind doesn't drop the round's only proposal.
 
-**Locking:** A validator locks on a block when it **precommits to that block after seeing a prevote quorum (polka) for it**. The lock is set at precommit time, not prevote time, so a validator that prevoted X but never saw a polka for X is not committed to X and will prevote Y in the next round if Y is proposed. This is a **variant** of the standard Tendermint locking rule (which locks at prevote). The variant is safe — a validator that precommits X and later precommits Y requires a higher-round polka for Y, and the safety proof holds — but its liveness properties differ: a validator that saw a polka for X after entering precommit does *not* record it, and so doesn't prevote X in the next round. That's a rare case that delays round-crossing recovery but does not break safety.
+#### Locking
+A validator locks on a block when it **precommits to that block after seeing a prevote quorum (polka) for it**. The lock is set at precommit time, not prevote time, so a validator that prevoted X but never saw a polka for X is not committed to X and will prevote Y in the next round if Y is proposed. This is a **variant** of the standard Tendermint locking rule (which locks at prevote). The variant is safe — a validator that precommits X and later precommits Y requires a higher-round polka for Y, and the safety proof holds — but its liveness properties differ: a validator that saw a polka for X after entering precommit does *not* record it, and so doesn't prevote X in the next round. That's a rare case that delays round-crossing recovery but does not break safety.
 
 Once locked, at prevote time the validator prevotes the locked block unless a *newer* polka (from a round strictly greater than the lock round) supersedes the lock. At precommit time it precommits the block with a polka this round, or the locked block if no new polka has formed. The lock survives round transitions within a height and is cleared only on a height change.
 
-**Finality:** One block per round. Each committed block is final — no fork choice, no longest-chain rule, no reorgs. A block that reaches precommit quorum is the canonical block at that height.
+#### Finality
+One block per round. Each committed block is final — no fork choice, no longest-chain rule, no reorgs. A block that reaches precommit quorum is the canonical block at that height.
 
-**Validator set:** Bounded between 11 and 100. Rotates at epoch boundaries (every 60 blocks, `ROTATION_INTERVAL`). The rotation is sized to `min(ceil(n / 21), n - bftQuorum(n))`, a small enough fraction that rotation can never break quorum. At n=100 this gives 5, not 33 — the safety cap is `n - bftQuorum(n)` and `bftQuorum(100) = 67`, so the safety bound is 33; the epoch-proportional bound is `ceil(100/21) = 5`, and the smaller of the two wins.
+#### Validator set
+Bounded between 11 and 100. Rotates at epoch boundaries (every 60 blocks, `ROTATION_INTERVAL`). The rotation is sized to `min(ceil(n / 21), n - bftQuorum(n))`, a small enough fraction that rotation can never break quorum. At n=100 this gives 5, not 33 — the safety cap is `n - bftQuorum(n)` and `bftQuorum(100) = 67`, so the safety bound is 33; the epoch-proportional bound is `ceil(100/21) = 5`, and the smaller of the two wins.
 
-**Seed validators:** Two seed validators are declared in every network's genesis (mainnet, testnet, regtest). Each seed is derived from a single BIP-39 mnemonic, which produces two independent keys:
+#### Seed validators
+Two seed validators are declared in every network's genesis (mainnet, testnet, regtest). Each seed is derived from a single BIP-39 mnemonic, which produces two independent keys:
 
 - **Reward address**, at `m/44'/9000'/0'/0'/0'`, a bech32m address. Encoded per network (`clrty1...`, `tclrty1...`, `rclrty1...`), same underlying pubkey for all three.
 - **Consensus key**, at `m/44'/9000'/0'/2'/0'`, a raw 32-byte Ed25519 key. Same value on every network — it carries no HRP.
@@ -105,57 +187,75 @@ The two keys are independent. Rotating one does not affect the other. Both are r
 
 Seeds are never removed from the active set by normal rotation, offline removal, or unhealthy-culling. This is the trust anchor for bootstrap — the seeds are expected to be operated by the project itself. The mainnet and testnet genesis configs are defined and pinned but the networks are not live.
 
-**Emergency rotation:** If the committed set can no longer form quorum, `BftConsensus` counts consecutive round timeouts. At `EMERGENCY_ROTATION_ROUNDS` (30) the proposer assembles a **timeout certificate** — f+1 signed `TimeoutVote` attestations at rounds ≥ 30 from the committed set — and stamps `block.header.emergency_rotation` (set to the round at which the emergency was declared) plus the certificate into the block header. Every verifier reads the flag from the block, verifies the certificate against the committed set, and derives the same emergency set from `(committed_set, registry, height)`. The certificate is what makes the flag non-arbitrary: without f+1 validators attesting to the same stall, the block is rejected by every honest node. Seeds are droppable here, unlike the normal paths. When the emergency block commits, the derived set becomes the committed set. `emergency_rotation` is part of the block hash. The timeout certificate is transmitted in the header but is deliberately **excluded** from the hash, the same treatment `commit_round` and `quorum_signatures` receive — the certificate is evidence attached to the block, not part of its identity.
+#### Emergency rotation
+If the committed set can no longer form quorum, `BftConsensus` counts consecutive round timeouts. At `EMERGENCY_ROTATION_ROUNDS` (30) the proposer assembles a **timeout certificate** — f+1 signed `TimeoutVote` attestations at rounds ≥ 30 from the committed set — and stamps `block.header.emergency_rotation` (set to the round at which the emergency was declared) plus the certificate into the block header. Every verifier reads the flag from the block, verifies the certificate against the committed set, and derives the same emergency set from `(committed_set, registry, height)`. The certificate is what makes the flag non-arbitrary: without f+1 validators attesting to the same stall, the block is rejected by every honest node. Seeds are droppable here, unlike the normal paths. When the emergency block commits, the derived set becomes the committed set. `emergency_rotation` is part of the block hash. The timeout certificate is transmitted in the header but is deliberately **excluded** from the hash, the same treatment `commit_round` and `quorum_signatures` receive — the certificate is evidence attached to the block, not part of its identity.
 
 **The active set is a function of the block, not the local counter.** `handleProposal`, `recordVote`, `quorumThreshold`, and `mySignerIndex` all resolve the emergency flag from the block being voted on. For a vote that references a block, the flag is read from that block's header; for nil votes, from the current round's proposal; for the proposer's own proposal attempt, from the local counter, which is the only case where it's consulted. This prevents two nodes whose counters differ by one from computing different proposers. A vote's `signer_index` resolves through `active_set[signer_index]` → validator record → signing key, matching `checkQuorum`. Votes for unknown blocks buffer until the block arrives; a second vote from a known signer is routed to `recordVote` regardless, so a conflict is detectable without the block.
 
-**Dry-run vs. finalized validation:** The block processor distinguishes between *simulating* a block (the proposer needs to know what state root a candidate block would produce, but the block's state root and quorum signatures aren't populated yet) and *applying* a finalized block. `BlockContext::dry_run` skips structural header checks, quorum verification, and the state-root comparison; the non-dry path runs them all. This split is load-bearing — the consensus proposer relies on it, and the test suite exercises both paths.
+#### Dry-run vs. finalized validation
+The block processor distinguishes between *simulating* a block (the proposer needs to know what state root a candidate block would produce, but the block's state root and quorum signatures aren't populated yet) and *applying* a finalized block. `BlockContext::dry_run` skips structural header checks, quorum verification, and the state-root comparison; the non-dry path runs them all. This split is load-bearing — the consensus proposer relies on it, and the test suite exercises both paths.
 
 ## State: how the chain is stored
 
-**Storage:** MDBX, a memory-mapped key-value store. Sixteen tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, three index tables (stakers, validators, order expiry), receipts, tx index, blocks by hash, blocks by height, and the persistent mempool.
+#### Storage
+MDBX, a memory-mapped key-value store. Sixteen tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, three index tables (stakers, validators, order expiry), receipts, tx index, blocks by hash, blocks by height, and the persistent mempool.
 
-**State commitment:** A **sparse Merkle tree** of depth 256. Each key is a 32-byte hash (derived from an account address, token balance key, validator ID, or global state name). Each leaf commits to a value. The tree root is the state root, which is written into every block header. Any two nodes with the same state produce the same root.
+#### State commitment
+A **sparse Merkle tree** of depth 256. Each key is a 32-byte hash (derived from an account address, token balance key, validator ID, or global state name). Each leaf commits to a value. The tree root is the state root, which is written into every block header. Any two nodes with the same state produce the same root.
 
-**State access:** A `StateAccess` object wraps the DB and provides typed getters and setters for accounts, token balances, token metadata, validators, orders, AMM pools, AMM positions, receipts, and global state. Reads and writes go through the SMT so every change updates the root.
+#### State access
+A `StateAccess` object wraps the DB and provides typed getters and setters for accounts, token balances, token metadata, validators, orders, AMM pools, AMM positions, receipts, and global state. Reads and writes go through the SMT so every change updates the root.
 
-**Proofs:** Inclusion and non-inclusion proofs can be generated for any key. A proof is a list of sibling hashes down to the leaf; verification recomputes the root from the proof and compares. This is what a light client would need to verify that an account exists with a given balance at a given state root.
+#### Proofs
+Inclusion and non-inclusion proofs can be generated for any key. A proof is a list of sibling hashes down to the leaf; verification recomputes the root from the proof and compares. This is what a light client would need to verify that an account exists with a given balance at a given state root.
 
-**Versioning:** The SMT can save its root at a specific version number. `rootAtVersion(n)` retrieves a historical root. What's not yet implemented: retrieving a *key's value* as it was at version `n`, and pruning historical roots.
+#### Versioning
+The SMT can save its root at a specific version number. `rootAtVersion(n)` retrieves a historical root. What's not yet implemented: retrieving a *key's value* as it was at version `n`, and pruning historical roots.
 
 ## Transactions: what users can do
 
 Every transaction is signed with Ed25519 by the sender, has a nonce for replay protection, a chain ID, a fee, and a type-specific payload. There are roughly fifteen transaction types:
 
-**Native transfers.** Send CLRTY from one address to another. The `from` balance decreases by amount + fee; `to` increases by amount. Nonce bumps on success, stays on failure.
+#### Native transfers
+Send CLRTY from one address to another. The `from` balance decreases by amount + fee; `to` increases by amount. Nonce bumps on success, stays on failure.
 
-**Token operations.** Create a token with a name, symbol, decimals, max supply, optional royalty, and optional fingerprint (for bridged tokens). Mint tokens up to the max supply (creator only). Burn tokens (reduces the tracked supply). Transfer tokens. Update token metadata (creator only — changes name/symbol/royalty but not max supply).
+#### Token operations
+Create a token with a name, symbol, decimals, max supply, optional royalty, and optional fingerprint (for bridged tokens). Mint tokens up to the max supply (creator only). Burn tokens (reduces the tracked supply). Transfer tokens. Update token metadata (creator only — changes name/symbol/royalty but not max supply).
 
-**Staking.** Opt-in and opt-out of auto-staking. The auto-stake threshold determines when a balance becomes staked. Staked accounts are eligible for staking rewards at epoch boundaries.
+#### Staking
+Opt-in and opt-out of auto-staking. The auto-stake threshold determines when a balance becomes staked. Staked accounts are eligible for staking rewards at epoch boundaries.
 
-**Validator operations.** Register as a validator (requires a minimum stake). Unregister (returns the stake, forbidden for seeds, forbidden if it would drop the active set below the minimum). **Update reward address** — changes the address where block rewards are paid, with no effect on consensus participation. Registration writes a validator-by-address index entry that maps the reward address to the validator ID.
+#### Validator operations
+Register as a validator (requires a minimum stake). Unregister (returns the stake, forbidden for seeds, forbidden if it would drop the active set below the minimum). **Update reward address** — changes the address where block rewards are paid, with no effect on consensus participation. Registration writes a validator-by-address index entry that maps the reward address to the validator ID.
 
-**AMM operations.** Create a pool for a pair of tokens (or a token and native CLRTY). Add liquidity (mints LP position). Remove liquidity (burns the position and returns the reserves). Swap through the pool with a constant-product formula and a fee.
+#### AMM operations
+Create a pool for a pair of tokens (or a token and native CLRTY). Add liquidity (mints LP position). Remove liquidity (burns the position and returns the reserves). Swap through the pool with a constant-product formula and a fee.
 
-**Limit orders.** Create an order that locks funds, specifying which token to buy, how much of it, and a minimum acceptable amount. Orders expire at a specified height. Cancel an order returns the locked funds. There is also an expiry index that tracks which orders expire at which heights.
+#### Limit orders
+Create an order that locks funds, specifying which token to buy, how much of it, and a minimum acceptable amount. Orders expire at a specified height. Cancel an order returns the locked funds. There is also an expiry index that tracks which orders expire at which heights.
 
-**Claim rewards.** Move an account's pending rewards into its balance. Recomputes staked amount after the transfer.
+#### Claim rewards
+Move an account's pending rewards into its balance. Recomputes staked amount after the transfer.
 
-**System transactions.** `BlockReward`, `OrderExpired`, `Slash` — used internally by the block processor to record events. Users cannot submit these.
+#### System transactions
+`BlockReward`, `OrderExpired`, `Slash` — used internally by the block processor to record events. Users cannot submit these.
 
 ## Validator identity: two keys, two roles
 
 Every validator has two keys with independent lifecycles:
 
-**Consensus key (`ValidatorInfo::consensus_key`).** Signs proposals, prevotes, precommits, and timeout attestations. It is the validator's identity for BFT purposes and for the equivocation-proof and timeout-certificate machinery. **Immutable after registration** — rotating it requires unregistering and re-registering, which forfeits uptime history. Held as a raw hex secret read by the daemon at startup (`--consensus-key <hex>`).
+#### Consensus key
+Signs proposals, prevotes, precommits, and timeout attestations. It is the validator's identity for BFT purposes and for the equivocation-proof and timeout-certificate machinery. **Immutable after registration** — rotating it requires unregistering and re-registering, which forfeits uptime history. Held as a raw hex secret read by the daemon at startup (`--consensus-key <hex>`).
 
-**Reward address (`ValidatorInfo::reward_address`).** The address where the validator's block rewards are paid. It is a user-facing key, normally backed by a mnemonic keystore. **Freely changeable** via the `UpdateRewardAddress` transaction, with no effect on consensus participation. The daemon never touches it.
+#### Reward address
+The address where the validator's block rewards are paid. It is a user-facing key, normally backed by a mnemonic keystore. **Freely changeable** via the `UpdateRewardAddress` transaction, with no effect on consensus participation. The daemon never touches it.
 
 Both keys are 32-byte Ed25519 public keys. They can be the same value — a validator registered with a single key uses it for both roles, which is the default for the seed validators. They don't have to be, and the whole point of the split is that they don't.
 
 The daemon resolves the signing key through `ValidatorInfo::effectiveConsensusKey()`, which returns `consensus_key` when set and falls back to `reward_address` otherwise. The fallback keeps every pre-split validator record verifiable: a validator whose `consensus_key` is null signs and verifies with its reward address, exactly as before the split. New registrations set `consensus_key = reward_address` explicitly, and the first `UpdateRewardAddress` on a legacy validator pins the current effective key so the reward address can move without rotating the signing key.
 
-**Tooling.** A single `address` binary handles all key management for validators and users:
+#### Tooling
+A single `address` binary handles all key management for validators and users:
 
 - `address --new -o <path>` creates a fresh keystore from a new BIP-39 mnemonic. It derives and prints both keys for all three networks in one run.
 - `address --import -o <path>` creates a keystore from an existing mnemonic.
@@ -165,65 +265,85 @@ The daemon resolves the signing key through `ValidatorInfo::effectiveConsensusKe
 
 ## Economics: how value flows
 
-**Block reward:** Each block issues a fixed reward in CLRTY. The reward splits into a validator pool (60%) and a staker pool (40%).
+#### Block reward
+Each block issues a fixed reward in CLRTY. The reward splits into a validator pool (60%) and a staker pool (40%).
 
-**Validator pool:** The validator pool splits into a producer bonus (20% of the pool, paid to the block's proposer) and a set share (80% of the pool, split across the active set).
+#### Validator pool
+The validator pool splits into a producer bonus (20% of the pool, paid to the block's proposer) and a set share (80% of the pool, split across the active set).
 
-**Validator rewards:** Under the normal path, the producer bonus goes to the proposer and the set share is split evenly across active validators, weighted by their `reward_multiplier`. A validator that has been penalized for infractions has a reduced multiplier, and the difference is routed to the pot. Any validator ID in the active set with no corresponding validator record has its share routed to the pot. Rewards are paid to each validator's `reward_address`, not its consensus key — moving the reward address redirects future rewards without affecting the validator's ability to sign.
+#### Validator rewards
+Under the normal path, the producer bonus goes to the proposer and the set share is split evenly across active validators, weighted by their `reward_multiplier`. A validator that has been penalized for infractions has a reduced multiplier, and the difference is routed to the pot. Any validator ID in the active set with no corresponding validator record has its share routed to the pot. Rewards are paid to each validator's `reward_address`, not its consensus key — moving the reward address redirects future rewards without affecting the validator's ability to sign.
 
-**Seed-only reward policy:** When every validator in the active set is a seed, the normal split is replaced. The producer bonus is distributed evenly across all seeds — the producing seed earns no more than any other seed, because seeds are operated as a single entity and the distinction between producing and signing is bookkeeping noise. The entire set share (80% of the validator pool) is routed to the pot, along with the staker pool.
+#### Seed-only reward policy
+When every validator in the active set is a seed, the normal split is replaced. The producer bonus is distributed evenly across all seeds — the producing seed earns no more than any other seed, because seeds are operated as a single entity and the distinction between producing and signing is bookkeeping noise. The entire set share (80% of the validator pool) is routed to the pot, along with the staker pool.
 
 This is deliberate: paying seeds the full validator pool on a chain with no other validators would concentrate wealth and provide no incentive for new validators to register. The policy fires only when *every* active validator is a seed — a single non-seed in the set resumes normal distribution, so a validator that joins a seed-heavy chain starts earning its share immediately.
 
 The degenerate case is one seed: the seed earns the full producer bonus, and the set share plus staker pool go to the pot. The invariant `validator_earnings + pot_earnings == block_reward` holds in every case.
 
-**Staker rewards:** The staker pool accumulates in a "pot" on a per-block basis. At each epoch boundary (every 60 blocks), the pot is drained to pay stakers a target APY. Stakers are weighted by their staked balance, with a bonus for large balances (`BALANCE_BONUS_THRESHOLD`, `BALANCE_BONUS_BPS`), and time-weighted by how long they've been staked during the epoch.
+#### Staker rewards
+The staker pool accumulates in a "pot" on a per-block basis. At each epoch boundary (every 60 blocks), the pot is drained to pay stakers a target APY. Stakers are weighted by their staked balance, with a bonus for large balances (`BALANCE_BONUS_THRESHOLD`, `BALANCE_BONUS_BPS`), and time-weighted by how long they've been staked during the epoch.
 
-**APY mechanism:** The target APY is `base + activity + pot_bonus`. Base is a fixed 5% (`APY_BASE_BPS = 500`). Activity scales with transaction throughput, up to a cap of +5% (`APY_ACTIVITY_MAX_BPS = 500`). Pot bonus scales with how full the pot is, up to a cap of +3% (`APY_POT_BONUS_MAX_BPS = 300`). The effective APY is capped at 13%. The payout is computed deterministically from the state at the epoch boundary, so the exact number a staker receives is knowable in advance. The *target* is a policy parameter, not a promise; if the pot is low the actual distribution is lower.
+#### APY mechanism
+The target APY is `base + activity + pot_bonus`. Base is a fixed 5% (`APY_BASE_BPS = 500`). Activity scales with transaction throughput, up to a cap of +5% (`APY_ACTIVITY_MAX_BPS = 500`). Pot bonus scales with how full the pot is, up to a cap of +3% (`APY_POT_BONUS_MAX_BPS = 300`). The effective APY is capped at 13%. The payout is computed deterministically from the state at the epoch boundary, so the exact number a staker receives is knowable in advance. The *target* is a policy parameter, not a promise; if the pot is low the actual distribution is lower.
 
-**Pot mechanics:** The pot accumulates 40% of each block reward as it's issued, plus the set share during seed-only blocks, plus the difference from any validator's reward multiplier penalty, plus any slash proceeds. At the epoch boundary, the protocol tries to pay stakers the target APY. If the pot doesn't have enough, it pays what it has and drains. If the pool (this epoch's 40% contribution) doesn't cover the target, the pot fills in the gap. If the pot exceeds a maximum, the excess is burned.
+#### Pot mechanics
+The pot accumulates 40% of each block reward as it's issued, plus the set share during seed-only blocks, plus the difference from any validator's reward multiplier penalty, plus any slash proceeds. At the epoch boundary, the protocol tries to pay stakers the target APY. If the pot doesn't have enough, it pays what it has and drains. If the pool (this epoch's 40% contribution) doesn't cover the target, the pot fills in the gap. If the pot exceeds a maximum, the excess is burned.
 
-**Total supply:** Increases by the block reward each block. Genesis has an initial supply of 100k CLRTY on mainnet (38k to treasury, 60k to community, 1k per seed). Total supply grows without a cap, but the growth rate is bounded by the block reward.
+#### Total supply
+Increases by the block reward each block. Genesis has an initial supply of 100k CLRTY on mainnet (38k to treasury, 60k to community, 1k per seed). Total supply grows without a cap, but the growth rate is bounded by the block reward.
 
-**Uptime and penalties:** Each validator has an uptime score, an EMA updated based on how many pings they respond to. Below a threshold, they're removed from the active set. Infractions reduce the validator's `reward_multiplier`, with a floor of 20%. No automatic recovery from a multiplier penalty.
+#### Uptime and penalties
+Each validator has an uptime score, an EMA updated based on how many pings they respond to. Below a threshold, they're removed from the active set. Infractions reduce the validator's `reward_multiplier`, with a floor of 20%. No automatic recovery from a multiplier penalty.
 
-**Stake slashing for equivocation:** A validator that signs two conflicting votes at the same `(height, round)` loses 5% of its stake (`SLASH_AMOUNT_BPS = 500`). The slashed stake is credited to the staker pot. The validator's reward multiplier is also reduced by the standard penalty (`REWARD_MULTIPLIER_PENALTY`), so the economic cost is both a one-time loss of principal and a persistent reduction in future earnings. Seed validators are exempt (`SEED_SLASH_EXEMPT`).
+#### Stake slashing for equivocation
+A validator that signs two conflicting votes at the same `(height, round)` loses 5% of its stake (`SLASH_AMOUNT_BPS = 500`). The slashed stake is credited to the staker pot. The validator's reward multiplier is also reduced by the standard penalty (`REWARD_MULTIPLIER_PENALTY`), so the economic cost is both a one-time loss of principal and a persistent reduction in future earnings. Seed validators are exempt (`SEED_SLASH_EXEMPT`).
 
 A validator whose post-slash stake falls below `VALIDATOR_MIN_STAKE` becomes ineligible for the active set via the existing `canBeActive` check, and rotation removes it on the next epoch boundary.
 
-**How equivocation is detected and slashed:** Nodes detect conflicting votes during the prevote phase. Both votes' signatures are verified before the conflict is recorded as evidence. A forged conflict — a second vote from a known signer with a garbage signature — is rejected rather than stored, because an unverifiable conflict would otherwise poison the proposer's evidence buffer and prevent it from proposing. A conflict whose block is not yet known is dropped and re-delivered when the block arrives. Evidence survives round and height transitions, bounded by `MAX_EQUIVOCATION_EVIDENCE` (256 entries), and the proposer includes a `TxType::Slash` transaction carrying the proof in the next block it builds. Every node independently verifies the proof during block application. Verification checks framing, `(height, round, signer)` agreement, value disagreement, signer range, validator registration, and both Ed25519 signatures over the domain-separated vote hash. A block containing an invalid Slash proof is rejected. Once a Slash tx commits, every node erases matching evidence by scanning the committed block.
+#### How equivocation is detected and slashed
+Nodes detect conflicting votes during the prevote phase. Both votes' signatures are verified before the conflict is recorded as evidence. A forged conflict — a second vote from a known signer with a garbage signature — is rejected rather than stored, because an unverifiable conflict would otherwise poison the proposer's evidence buffer and prevent it from proposing. A conflict whose block is not yet known is dropped and re-delivered when the block arrives. Evidence survives round and height transitions, bounded by `MAX_EQUIVOCATION_EVIDENCE` (256 entries), and the proposer includes a `TxType::Slash` transaction carrying the proof in the next block it builds. Every node independently verifies the proof during block application. Verification checks framing, `(height, round, signer)` agreement, value disagreement, signer range, validator registration, and both Ed25519 signatures over the domain-separated vote hash. A block containing an invalid Slash proof is rejected. Once a Slash tx commits, every node erases matching evidence by scanning the committed block.
 
 Signatures are verified against `ValidatorInfo::effectiveConsensusKey()`, so a validator that has split its reward address from its consensus key remains slashable for any vote signed under its consensus key.
 
-**Timeout certificate:** Each round that times out is attested by a broadcast `TimeoutVote` — a signature over `(height, round)` with the attesting validator's index in the committed set. A node that has timed out 30 or more consecutive rounds and holds f+1 valid attestations at a round ≥ 30 can include them in an emergency block header. A node that has not yet accumulated f+1 attestations refuses to propose an emergency block; the round stalls rather than emitting a block every verifier will reject. The certificate is verified by every node's `validateProposal` and re-verified on-chain by `BlockProcessor::applyBlock` before the emergency set is honoured. The certificate's signers are drawn from the **committed** set, since that's the set that was trying to run when the stall began; the emergency set only exists once a certificate is honoured.
+#### Timeout certificate
+Each round that times out is attested by a broadcast `TimeoutVote` — a signature over `(height, round)` with the attesting validator's index in the committed set. A node that has timed out 30 or more consecutive rounds and holds f+1 valid attestations at a round ≥ 30 can include them in an emergency block header. A node that has not yet accumulated f+1 attestations refuses to propose an emergency block; the round stalls rather than emitting a block every verifier will reject. The certificate is verified by every node's `validateProposal` and re-verified on-chain by `BlockProcessor::applyBlock` before the emergency set is honoured. The certificate's signers are drawn from the **committed** set, since that's the set that was trying to run when the stall began; the emergency set only exists once a certificate is honoured.
 
 ## Network: how nodes talk
 
 **TCP transport** over IPv4 and IPv6. Each peer connection goes through a handshake: exchange version messages, verify protocol compatibility, exchange a signed challenge, exchange addresses. Once established, peers route messages by type — proposals, votes, transactions, block announcements, sync requests, and peer address requests.
 
-**Message framing:** 10-byte header (4-byte magic, 2-byte type, 4-byte length) followed by an opaque payload. Magic is chain-ID-based, so peers on different networks don't connect. Max message size is 16 MiB.
+#### Message framing
+10-byte header (4-byte magic, 2-byte type, 4-byte length) followed by an opaque payload. Magic is chain-ID-based, so peers on different networks don't connect. Max message size is 16 MiB.
 
-### P2P layer
+#### Handshake
+After TCP connect, the two peers exchange `Version` messages (protocol version, network nonce, agent string, best chain height, listen port). They then exchange `Verack` acknowledgements. Finally, they exchange `Auth` messages — a signed challenge-response that proves possession of the public key declared in the message.
 
-**Handshake.** After TCP connect, the two peers exchange `Version` messages (protocol version, network nonce, agent string, best chain height, listen port). They then exchange `Verack` acknowledgements. Finally, they exchange `Auth` messages — a signed challenge-response that proves possession of the public key declared in the message.
-
-**Authentication.** Every peer must complete the `Auth` exchange before reaching `Established`. The challenge is `Blake2b(initiator_nonce || responder_nonce || pubkey)`, so a signature captured from one session can't be replayed in another. The pubkey is bound to the peer's validator ID by looking up the validator whose consensus key matches — a non-validator peer is still authenticated but claims `validator_id = 0`. Failed auth is an immediate ban. Peers are not encrypted; a MITM can drop or substitute messages but cannot forge signatures.
+#### Authentication
+Every peer must complete the `Auth` exchange before reaching `Established`. The challenge is `Blake2b(initiator_nonce || responder_nonce || pubkey)`, so a signature captured from one session can't be replayed in another. The pubkey is bound to the peer's validator ID by looking up the validator whose consensus key matches — a non-validator peer is still authenticated but claims `validator_id = 0`. Failed auth is an immediate ban. Peers are not encrypted; a MITM can drop or substitute messages but cannot forge signatures.
 
 On a validator node, the daemon uses the validator's consensus key as its node identity. On a non-validator, it loads or generates a per-node key at `<data_dir>/node_key`.
 
-**Sync.** A peer that falls behind catches up via `GetHeaders` / `Headers` / `GetBlocks` / `Blocks`. The `SyncManager` per peer drives a small state machine — request headers, receive them, request blocks, apply them, repeat — bounded by `MAX_HEADERS_PER_REQUEST = 2000` and a computed `MAX_BLOCKS_PER_REQUEST` that fits in one message. Blocks are applied through `Node::applyCommittedBlock`, the same path consensus uses, so sync and consensus stay consistent. Requests time out (30 s for headers, 60 s for blocks); timeouts score the peer but don't disconnect.
+#### Sync
+A peer that falls behind catches up via `GetHeaders` / `Headers` / `GetBlocks` / `Blocks`. The `SyncManager` per peer drives a small state machine — request headers, receive them, request blocks, apply them, repeat — bounded by `MAX_HEADERS_PER_REQUEST = 2000` and a computed `MAX_BLOCKS_PER_REQUEST` that fits in one message. Blocks are applied through `Node::applyCommittedBlock`, the same path consensus uses, so sync and consensus stay consistent. Requests time out (30 s for headers, 60 s for blocks); timeouts score the peer but don't disconnect.
 
-**Idle refresh.** A `SyncManager` that's caught up periodically re-issues `GetHeaders` (default every 30 s) so that a peer that commits new blocks while we're Idle is discovered without needing a relay message. This is what makes a node self-heal after briefly falling behind.
+#### Idle refresh
+A `SyncManager` that's caught up periodically re-issues `GetHeaders` (default every 30 s) so that a peer that commits new blocks while we're Idle is discovered without needing a relay message. This is what makes a node self-heal after briefly falling behind.
 
-**Block relay.** After a validator commits a block, it broadcasts the full serialized block to every `Established` peer. Recipients apply it if it's the next block, then re-broadcast. A node that already has the block drops it silently — this is what breaks the propagation loop. A block that doesn't connect to the current head is dropped; sync fills the gap.
+#### Block relay
+After a validator commits a block, it broadcasts the full serialized block to every `Established` peer. Recipients apply it if it's the next block, then re-broadcast. A node that already has the block drops it silently — this is what breaks the propagation loop. A block that doesn't connect to the current head is dropped; sync fills the gap.
 
-**Transaction relay.** A node that accepts a transaction into its mempool broadcasts it. Recipients add it and re-broadcast. A node that already has the tx (`mempool_->contains(txid)`) drops it silently — same loop-breaking discipline as block relay. This is what lets a non-validator node submit a transaction to the network.
+#### Transaction relay
+A node that accepts a transaction into its mempool broadcasts it. Recipients add it and re-broadcast. A node that already has the tx (`mempool_->contains(txid)`) drops it silently — same loop-breaking discipline as block relay. This is what lets a non-validator node submit a transaction to the network.
 
-**Rate limiting.** Each peer has a token bucket for its message stream, plus a stricter separate bucket for consensus messages. The cost per message reflects the asymmetry of work — `GetHeaders` costs 20 tokens, `Tx` costs 5, control messages cost 1, consensus messages use the separate bucket. A peer that floods expensive-to-serve messages is cut off and disconnected. The RPC layer has its own per-source-IP token bucket with the same `Common::RateLimiter`.
+#### Rate limiting
+Each peer has a token bucket for its message stream, plus a stricter separate bucket for consensus messages. The cost per message reflects the asymmetry of work — `GetHeaders` costs 20 tokens, `Tx` costs 5, control messages cost 1, consensus messages use the separate bucket. A peer that floods expensive-to-serve messages is cut off and disconnected. The RPC layer has its own per-source-IP token bucket with the same `Common::RateLimiter`.
 
-**Peer management:** An address book stores known peers, persisted to disk. A ban list records misbehaving peers, with a threshold at which they're banned. Outbound connection maintenance dials enough peers to maintain a target. The manager also handles inbound connections up to a maximum.
+#### Peer management
+An address book stores known peers, persisted to disk. A ban list records misbehaving peers, with a threshold at which they're banned. Outbound connection maintenance dials enough peers to maintain a target. The manager also handles inbound connections up to a maximum.
 
-**Self-connection prevention:** Each node generates a random 64-bit network nonce at startup. The nonce is exchanged during handshake. If a node receives a version message with its own nonce, it closes the connection — it has dialed itself.
+#### Self-connection prevention
+Each node generates a random 64-bit network nonce at startup. The nonce is exchanged during handshake. If a node receives a version message with its own nonce, it closes the connection — it has dialed itself.
 
 ## RPC: how clients talk
 
@@ -254,13 +374,17 @@ Validator objects returned by the consensus methods expose both `reward_address`
 
 All components are hardened, since SLIP-0010 for Ed25519 requires hardened-only derivation.
 
-**Signing:** A `LocalSigner` wraps an unlocked keystore and registers derived keys by public key. `sign(hash)`, `signAtPath(path, hash)`, and `signBatch` produce Ed25519 signatures. All signing fails while the keystore is locked, and a derived key that hasn't been registered can't be signed with (the signer refuses rather than deriving on the fly).
+#### Signing
+A `LocalSigner` wraps an unlocked keystore and registers derived keys by public key. `sign(hash)`, `signAtPath(path, hash)`, and `signBatch` produce Ed25519 signatures. All signing fails while the keystore is locked, and a derived key that hasn't been registered can't be signed with (the signer refuses rather than deriving on the fly).
 
-**Address codec:** Bech32m with distinct HRPs per network (`clrty`, `tclrty`, `rclrty`). Decoding is strict: mixed case rejected, wrong network rejected, tampered checksum rejected. Addresses are 32-byte Ed25519 public keys with a one-byte witness version prefix.
+#### Address codec
+Bech32m with distinct HRPs per network (`clrty`, `tclrty`, `rclrty`). Decoding is strict: mixed case rejected, wrong network rejected, tampered checksum rejected. Addresses are 32-byte Ed25519 public keys with a one-byte witness version prefix.
 
-**Fingerprint:** A stable, per-mnemonic identifier computed from the seed, used to detect when a keystore file's declared fingerprint doesn't match the one derived on unlock. This catches accidental keystore swaps or restores.
+#### Fingerprint
+A stable, per-mnemonic identifier computed from the seed, used to detect when a keystore file's declared fingerprint doesn't match the one derived on unlock. This catches accidental keystore swaps or restores.
 
-**CLI wallet client.** An interactive `clarity-wallet` binary opens a keystore, connects to a node's RPC endpoint, and provides a REPL for common operations:
+#### CLI wallet client
+An interactive `clarity-wallet` binary opens a keystore, connects to a node's RPC endpoint, and provides a REPL for common operations:
 
 ```
 balance [address]              show the balance of an address
@@ -279,9 +403,11 @@ open / close / connect         session management
 
 The wallet derives keys locally, signs with the reward key, and submits via `clrty_sendRawTransaction`. It does not manage consensus keys — those are raw hex secrets the daemon reads directly.
 
-**Startup wizard.** If no `--keystore` is passed, the wallet runs an interactive setup: probe the RPC endpoint (with retry/offline options), discover keystores in the working directory, confirm the selected one, and unlock it. If `--keystore` is passed, the wizard skips discovery and goes straight to unlock.
+#### Startup wizard
+If no `--keystore` is passed, the wallet runs an interactive setup: probe the RPC endpoint (with retry/offline options), discover keystores in the working directory, confirm the selected one, and unlock it. If `--keystore` is passed, the wizard skips discovery and goes straight to unlock.
 
-**Address book pattern:** The wallet layer supports the operations you'd need for an address book — multiple keystores, independent derivation paths, labels — but the CLI does not yet expose those operations. Integrators drive the library directly.
+#### Address book pattern
+The wallet layer supports the operations you'd need for an address book — multiple keystores, independent derivation paths, labels — but the CLI does not yet expose those operations. Integrators drive the library directly.
 
 ## What's notably absent
 
