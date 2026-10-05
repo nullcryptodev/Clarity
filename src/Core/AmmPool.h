@@ -71,6 +71,23 @@ namespace Core
       return reserve_a > 0 && reserve_b > 0;
     }
 
+    // True when the pool has been fully drained: every LP has
+    // withdrawn, both reserves are zero, and no liquidity remains.
+    // A pool in this state is functionally inert — you can't swap
+    // through it (division by zero), and AddLiquidity rejects it —
+    // and RemoveLiquidity deletes the record when this becomes true.
+    //
+    // Historical reads still see the pool at any version where it
+    // existed: the historical SMT row is written when the pool is
+    // created and updated on every swap and liquidity change, and
+    // deleting the current record does not remove those rows.
+    bool isClosed() const noexcept
+    {
+      return total_liquidity == 0 &&
+             reserve_a == 0 &&
+             reserve_b == 0;
+    }
+
     // Constant product invariant.
     // Uses 128-bit intermediate to avoid overflow.
     __uint128_t k() const noexcept

@@ -1236,6 +1236,28 @@ namespace Core
     // a zeroed one.
     state.deletePositionIndex(pos.owner, pos.pool_id);
 
+    //  Auto-close. If this was the last position and the pool's
+    //  reserves are now zero, delete the pool record.
+    //
+    //  A pool in this state is functionally inert: Swap divides by
+    //  reserve_a and reserve_b, both zero; AddLiquidity rejects a
+    //  pool with a zero reserve; nothing else can act on it. Leaving
+    //  the record behind would create a zombie state that callers
+    //  would have to special-case, and that a block explorer would
+    //  have to filter out. Deleting it here is what makes "remove all
+    //  liquidity" mean "the pool no longer exists."
+    //
+    //  Historical reads are unaffected: getAtVersion on the pool's
+    //  SMT key still returns the pool at any version where it
+    //  existed, because historical rows are written independently of
+    //  the current-record deletion. A block explorer can ask "what
+    //  did pool 7 look like at block 1000?" and get an answer even
+    //  after the pool closed at block 1050.
+    if (pool.isClosed())
+    {
+      state.deleteAmmPool(pool.id);
+    }
+
     return {ReceiptStatus::Success, tx.fee};
   }
 

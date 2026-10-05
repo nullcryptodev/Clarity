@@ -53,6 +53,10 @@ namespace State
 
     void load();
     void save(uint64_t version);
+
+    // Delete historical SMT rows for versions strictly below
+    // keepFrom. Current-version reads are unaffected. Historical
+    // reads for versions below keepFrom will return nullopt.
     void pruneHistory(uint64_t keepFrom);
 
     bool readChildren(const Crypto::Hash &node_hash,
@@ -60,6 +64,24 @@ namespace State
                       Crypto::Hash &right) const;
 
     static const Crypto::Hash &defaultHash(size_t depth) noexcept;
+
+    // Historical SMT access, txn-aware. Used by getAtVersionRecursive.
+    bool getNodeAtVersionImpl(const Crypto::Hash &hash,
+                              uint64_t version,
+                              std::vector<uint8_t> &out) const;
+
+    bool getLeafDataAtVersionImpl(const Crypto::Hash &leaf_hash,
+                                  uint64_t version,
+                                  std::vector<uint8_t> &out) const;
+
+    // Recursive walk of the tree at a specific version. Mirrors
+    // getRecursive, except internal nodes and leaf data are fetched
+    // from the historical tables.
+    std::optional<std::vector<uint8_t>> getAtVersionRecursive(
+        const Crypto::Hash &subtree_hash,
+        const Crypto::Hash &key,
+        size_t depth,
+        uint64_t version) const;
 
   private:
     struct InternalNode

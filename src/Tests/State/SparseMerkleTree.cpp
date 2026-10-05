@@ -1,8 +1,3 @@
-// Copyright (c) 2018-2026 Conceal Network & Conceal Devs
-//
-// Distributed under the MIT/X11 software license, see the accompanying
-// file COPYING or http://www.opensource.org/licenses/mit-license.php.
-
 #include "Fixtures.h"
 
 #include "Crypto/Blake2b.h"
@@ -195,7 +190,6 @@ TEST_F(State_SmtPersistenceFixture, RootSurvivesSaveAndLoad)
 {
   Crypto::Hash root_before;
 
-  // ---- Write phase ----
   {
     auto db = openDB();
     auto txn = db->beginWrite();
@@ -211,7 +205,6 @@ TEST_F(State_SmtPersistenceFixture, RootSurvivesSaveAndLoad)
     db->close();
   }
 
-  // ---- Read phase: fresh DB ----
   {
     auto db = openDB();
     SparseMerkleTree tree2(*db);
@@ -223,7 +216,6 @@ TEST_F(State_SmtPersistenceFixture, RootSurvivesSaveAndLoad)
 
 TEST_F(State_SmtPersistenceFixture, DataSurvivesSaveAndLoad)
 {
-  // ---- Write phase ----
   {
     auto db = openDB();
     auto txn = db->beginWrite();
@@ -237,7 +229,6 @@ TEST_F(State_SmtPersistenceFixture, DataSurvivesSaveAndLoad)
     db->close();
   }
 
-  // ---- Read phase ----
   {
     auto db = openDB();
     SparseMerkleTree tree2(*db);
@@ -492,4 +483,211 @@ TEST_F(State_SmtFixture, ReadChildrenOnUnknownHashFails)
   for (size_t i = 0; i < 32; ++i)
     unknown.data[i] = 0xEE;
   EXPECT_FALSE(tree_->readChildren(unknown, left, right));
+}
+
+// ============================================================================
+//  Versioned reads.
+//
+//  The SMT stores a historical row for every (node-hash, version) pair
+//  that was written. A node that did not change between versions is not
+//  re-stored, but it remains reachable from the later version's root
+//  because the tree is content-addressed: the same hash appears in both
+//  versions' trees.
+//
+//  These tests exercise the write path (which versions get rows), the
+//  read path (getAtVersion walks the historical tables), and pruning.
+// ============================================================================
+
+TEST_F(State_SmtFixture, ReadValueAtPriorVersion)
+{
+  setVersion(1);
+  update(1, 100);
+  save();
+
+  setVersion(2);
+  update(1, 200);
+  save();
+
+  // Current read gives the newest value.
+  auto current = get(1);
+  ASSERT_TRUE(current.has_value());
+  EXPECT_EQ(*current, makeValue(200));
+
+  // Historical read at version 1 gives the old value.
+  auto v1 = getAtVersion(1, 1);
+  ASSERT_TRUE(v1.has_value());
+  EXPECT_EQ(*v1, makeValue(100));
+
+  // Historical read at version 2 gives the newer value.
+  auto v2 = getAtVersion(1, 2);
+  ASSERT_TRUE(v2.has_value());
+  EXPECT_EQ(*v2, makeValue(200));
+}
+
+TEST_F(State_SmtFixture, ReadNonInclusionAtPriorVersion)
+{
+  setVersion(1);
+  save(); // empty tree at version 1
+
+  setVersion(2);
+  update(1, 100);
+  save();
+
+  // At version 1, the key did not exist.
+  EXPECT_FALSE(getAtVersion(1, 1).has_value());
+
+  // At version 2, it does.
+  auto v2 = getAtVersion(1, 2);
+  ASSERT_TRUE(v2.has_value());
+  EXPECT_EQ(*v2, makeValue(100));
+}
+
+TEST_F(State_SmtFixture, UnchangedKeyReadableAtLaterVersion)
+{
+  // Write key 1 at version 1.
+  setVersion(1);
+  update(1, 100);
+  save();
+
+  // Write key 2 at version 2. Key 1's subtree is unchanged, so the
+  // write path skips re-storing it. But key 1's value at version 1
+  // must still be reachable from version 2's root, because the tree
+  // is content-addressed and key 1's leaf hash is the same.
+  setVersion(2);
+  update(2, 200);
+  save();
+
+  // Read key 1 at version 2.
+  auto v1_at_2 = getAtVersion(1, 2);
+  ASSERT_TRUE(v1_at_2.has_value());
+  EXPECT_EQ(*v1_at_2, makeValue(100));
+
+  // And key 2 did not exist at version 1.
+  EXPECT_FALSE(getAtVersion(2, 1).has_value());
+}
+
+TEST_F(State_SmtFixture, RemovedKeyIsAbsentAtLaterVersion)
+{
+  setVersion(1);
+  update(1, 100);
+  save();
+
+  setVersion(2);
+  remove(1);
+  save();
+
+  // Version 1 had key 1.
+  auto v1 = getAtVersion(1, 1);
+  ASSERT_TRUE(v1.has_value());
+  EXPECT_EQ(*v1, makeValue(100));
+
+  // Version 2 does not.
+  EXPECT_FALSE(getAtVersion(1, 2).has_value());
+}
+
+TEST_F(State_SmtFixture, GetAtUnwrittenVersionReturnsNullopt)
+{
+  setVersion(1);
+  update(1, 100);
+  save();
+
+  // Version 2 has no saved root.
+  EXPECT_FALSE(getAtVersion(1, 2).has_value());
+}
+
+TEST_F(State_SmtFixture, GetAtVersionMatchesRootAtVersion)
+{
+  //  Two writes at different versions, then reads. The proof-free
+  //  invariant: if a version has a saved root, getAtVersion must
+  //  reflect the tree that produced that root.
+  setVersion(7);
+  update(1, 100);
+  update(2, 200);
+  save();
+  auto root_7 = tree_->root();
+
+  setVersion(9);
+  update(3, 300);
+  save();
+  auto root_9 = tree_->root();
+
+  ASSERT_TRUE(tree_->rootAtVersion(7).has_value());
+  ASSERT_TRUE(tree_->rootAtVersion(9).has_value());
+  EXPECT_EQ(*tree_->rootAtVersion(7), root_7);
+  EXPECT_EQ(*tree_->rootAtVersion(9), root_9);
+  EXPECT_NE(root_7, root_9);
+
+  // At version 7, key 3 is absent, keys 1 and 2 are present.
+  EXPECT_FALSE(getAtVersion(3, 7).has_value());
+  ASSERT_TRUE(getAtVersion(1, 7).has_value());
+  ASSERT_TRUE(getAtVersion(2, 7).has_value());
+
+  // At version 9, all three are present.
+  ASSERT_TRUE(getAtVersion(1, 9).has_value());
+  ASSERT_TRUE(getAtVersion(2, 9).has_value());
+  ASSERT_TRUE(getAtVersion(3, 9).has_value());
+}
+
+TEST_F(State_SmtFixture, PruneRemovesOldVersions)
+{
+  setVersion(1);
+  update(1, 100);
+  save();
+
+  setVersion(2);
+  update(1, 200);
+  save();
+
+  setVersion(3);
+  update(1, 300);
+  save();
+
+  // Prune everything below version 2.
+  tree_->pruneHistory(2);
+
+  // Version 1 is gone.
+  EXPECT_FALSE(getAtVersion(1, 1).has_value());
+
+  // Versions 2 and 3 are still readable.
+  auto v2 = getAtVersion(1, 2);
+  ASSERT_TRUE(v2.has_value());
+  EXPECT_EQ(*v2, makeValue(200));
+
+  auto v3 = getAtVersion(1, 3);
+  ASSERT_TRUE(v3.has_value());
+  EXPECT_EQ(*v3, makeValue(300));
+
+  // Current read is unaffected.
+  auto cur = get(1);
+  ASSERT_TRUE(cur.has_value());
+  EXPECT_EQ(*cur, makeValue(300));
+}
+
+TEST_F(State_SmtFixture, PruneIsIdempotent)
+{
+  setVersion(1);
+  update(1, 100);
+  save();
+
+  setVersion(2);
+  update(1, 200);
+  save();
+
+  tree_->pruneHistory(2);
+  tree_->pruneHistory(2); // second call is a no-op
+
+  EXPECT_FALSE(getAtVersion(1, 1).has_value());
+  ASSERT_TRUE(getAtVersion(1, 2).has_value());
+}
+
+TEST_F(State_SmtFixture, PruneBelowAllVersionsIsNoOp)
+{
+  setVersion(1);
+  update(1, 100);
+  save();
+
+  // keepFrom = 0 is below every version.
+  tree_->pruneHistory(0);
+
+  ASSERT_TRUE(getAtVersion(1, 1).has_value());
 }

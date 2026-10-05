@@ -47,12 +47,13 @@ namespace Tests
 
     Crypto::Hash update(uint64_t key_num, uint64_t value_num)
     {
-      return tree_->update(makeKey(key_num), makeValue(value_num), 0);
+      return tree_->update(makeKey(key_num), makeValue(value_num),
+                           current_version_);
     }
 
     Crypto::Hash remove(uint64_t key_num)
     {
-      return tree_->remove(makeKey(key_num), 0);
+      return tree_->remove(makeKey(key_num), current_version_);
     }
 
     std::optional<std::vector<uint8_t>> get(uint64_t key_num)
@@ -60,9 +61,36 @@ namespace Tests
       return tree_->get(makeKey(key_num));
     }
 
+    //  Versioned read. Same argument convention as get(), plus the
+    //  version to read at. Returns nullopt if the version has no
+    //  saved root, or the key did not exist at that version.
+    std::optional<std::vector<uint8_t>> getAtVersion(uint64_t key_num,
+                                                     uint64_t version)
+    {
+      return tree_->getAtVersion(makeKey(key_num), version);
+    }
+
+    //  Save the current root at the current version.
+    void save()
+    {
+      tree_->save(current_version_);
+    }
+
+    //  Set the version used by subsequent update/remove/save calls.
+    //  Tests that want to exercise historical reads call this between
+    //  writes. Tests that don't care leave it at the default 0 and
+    //  behave exactly as before.
+    void setVersion(uint64_t v)
+    {
+      current_version_ = v;
+    }
+
     TempDB db_;
     std::optional<State::StateDB::Txn> txn_;
     std::unique_ptr<State::SparseMerkleTree> tree_;
+
+  private:
+    uint64_t current_version_{0};
   };
 
   //  StateDBTestFixture — one DB, no txn held. Tests manage their own.

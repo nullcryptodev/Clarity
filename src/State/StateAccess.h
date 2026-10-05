@@ -109,6 +109,17 @@ namespace State
     bool getAmmPool(Id pool_id, Core::AmmPool &out) const;
     void putAmmPool(const Core::AmmPool &pool);
 
+    // Delete an AMM pool record. Called by TransactionExecutor when
+    // the last LP withdraws and the pool's reserves and liquidity
+    // reach zero — a pool in that state is functionally inert and is
+    // removed rather than left as a zombie record.
+    //
+    // Historical reads are unaffected: getAtVersion on the pool's
+    // SMT key returns the pool at any version where it existed,
+    // because the historical rows are written independently of the
+    // current-record deletion.
+    void deleteAmmPool(Id pool_id);
+
     // ---- AMM Positions ----
 
     bool getAmmPosition(Id pos_id, Core::AmmPosition &out) const;
@@ -172,9 +183,8 @@ namespace State
 
     // Expose the SMT's historical root lookup. Returns the root
     // committed at `version`, or nullopt if no root was saved for
-    // that version. This is a metadata lookup only — it does not
-    // enable historical key reads (see SparseMerkleTree::getAtVersion,
-    // which currently returns nullopt for any non-current version).
+    // that version. Historical key reads are available via
+    // getRawAtVersion and its typed wrappers, below.
     std::optional<Crypto::Hash> smtRootAtVersion(uint64_t version) const;
 
     // Iterate all validator records. The visitor is called for each
@@ -188,6 +198,39 @@ namespace State
     // this from RPC and diagnostic code where modification isn't
     // possible.
     void forEachValidator(const std::function<void(const Core::ValidatorInfo &)> &fn) const;
+
+    // ---- Versioned reads ----
+    //
+    // Read a key's raw value as it existed at `version`. Returns
+    // nullopt if the version's root is not available (pruned, or
+    // never written), or if the key did not exist at that version.
+    //
+    // The key is an SMT key as produced by the Keys::* functions.
+    // Callers that want a typed read compose:
+    //
+    //   auto bytes = state.getRawAtVersion(Keys::account(addr), v);
+    //   if (bytes) { Account a; Account::deserializeState(...); }
+    //
+    // For the three types that RPC methods ask about most often,
+    // typed wrappers are provided below to avoid the composition.
+    std::optional<std::vector<uint8_t>> getRawAtVersion(
+        const Crypto::Hash &smt_key, uint64_t version) const;
+
+    // ---- Typed historical reads ----
+    //
+    // Convenience wrappers over getRawAtVersion. Each returns false /
+    // default-constructs on missing or malformed data, matching the
+    // current-version getters.
+    Core::Account getAccountAtVersion(const Crypto::Address &address,
+                                      uint64_t version) const;
+
+    bool getValidatorAtVersion(uint64_t validator_id,
+                               uint64_t version,
+                               Core::ValidatorInfo &out) const;
+
+    bool getGlobalAtVersion(const std::string &name,
+                            uint64_t version,
+                            std::vector<uint8_t> &out) const;
 
   private:
     // Txn-aware storage helpers.

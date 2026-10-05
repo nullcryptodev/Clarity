@@ -70,15 +70,25 @@ TEST_F(State_StateAccessFixture, SystemSlash_ValidProof_ReducesStakeAndMultiplie
 
 // ============================================================================
 //  Eligibility gates
+//
+//  Ineligibility is a no-op, not a failure: executeSystemSlash returns
+//  Success with a zero receipt for a seed, an unregistered validator,
+//  or a validator with nothing left to slash. This is the contract that
+//  keeps a Slash tx against an ineligible target from rejecting the
+//  block that carries it — otherwise a proposer could halt the chain by
+//  including one such tx in every block. The tests below assert both
+//  the Success status and the fact that the target's record is
+//  untouched.
 // ============================================================================
 
-TEST_F(State_StateAccessFixture, SystemSlash_SeedExempt_Rejected)
+TEST_F(State_StateAccessFixture, SystemSlash_SeedExempt_NoOp)
 {
   seedValidator(s(), 1, 1000ULL * 100'000ULL, /*is_seed=*/true);
 
   auto r = Core::TransactionExecutor::executeSystemSlash(
       s(), 1, 42, ctxAt(42));
-  EXPECT_EQ(r.status, Core::ReceiptStatus::Failure);
+  EXPECT_EQ(r.status, Core::ReceiptStatus::Success);
+  EXPECT_EQ(r.fee_paid, 0u);
 
   Core::ValidatorInfo v;
   ASSERT_TRUE(s().getValidator(1, v));
@@ -89,11 +99,15 @@ TEST_F(State_StateAccessFixture, SystemSlash_SeedExempt_Rejected)
   EXPECT_EQ(readU64GlobalSV(s(), Core::GLOBAL_POT), 0u);
 }
 
-TEST_F(State_StateAccessFixture, SystemSlash_UnregisteredValidator_Rejected)
+TEST_F(State_StateAccessFixture, SystemSlash_UnregisteredValidator_NoOp)
 {
+  // No validator record for id 999. The slash is a no-op; the caller's
+  // proof validation is what rejects genuinely-malformed Slash txs,
+  // not this executor.
   auto r = Core::TransactionExecutor::executeSystemSlash(
       s(), 999, 42, ctxAt(42));
-  EXPECT_EQ(r.status, Core::ReceiptStatus::Failure);
+  EXPECT_EQ(r.status, Core::ReceiptStatus::Success);
+  EXPECT_EQ(r.fee_paid, 0u);
 
   EXPECT_EQ(readU64GlobalSV(s(), Core::GLOBAL_POT), 0u);
 }

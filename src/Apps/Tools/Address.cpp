@@ -352,13 +352,13 @@ namespace
 
     if (show_secrets)
     {
-      std::cout << "  secret        : " << keys.reward_secret_hex << "\n";
+      std::cout << "  secret        : " << keys.reward_secret_hex << "\n"; // use --consensus-key with clarityd
     }
 
     std::cout << "\n";
     std::cout << "  ---- validator consensus key ----\n";
     std::cout << "\n";
-    std::cout << "  pubkey        : " << keys.consensus_pubkey_hex << "\n";
+    std::cout << "  pubkey        : " << keys.consensus_pubkey_hex << "\n"; // goes into global config if seed
     std::cout << "  derivation    : " << keys.consensus_derivation << "\n";
 
     if (show_secrets)

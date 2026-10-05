@@ -517,6 +517,12 @@ namespace State
     smt_.update(key, value, version_);
   }
 
+  void StateAccess::deleteAmmPool(Id pool_id)
+  {
+    Crypto::Hash key = Keys::ammPool(pool_id);
+    smt_.remove(key, version_);
+  }
+
   //  AMM Positions
 
   bool StateAccess::getAmmPosition(Id pos_id, Core::AmmPosition &out) const
@@ -760,5 +766,50 @@ namespace State
       if (getValidator(id, v))
         fn(v);
     }
+  }
+
+  //  Versioned reads
+
+  std::optional<std::vector<uint8_t>> StateAccess::getRawAtVersion(
+      const Crypto::Hash &smt_key, uint64_t version) const
+  {
+    return smt_.getAtVersion(smt_key, version);
+  }
+
+  Core::Account StateAccess::getAccountAtVersion(
+      const Crypto::Address &address, uint64_t version) const
+  {
+    Core::Account result;
+
+    Crypto::Hash key = Keys::account(address);
+    auto value = smt_.getAtVersion(key, version);
+    if (!value.has_value())
+      return result;
+
+    Core::Account::deserializeState(value->data(), value->size(), result);
+    return result;
+  }
+
+  bool StateAccess::getValidatorAtVersion(uint64_t validator_id,
+                                          uint64_t version,
+                                          Core::ValidatorInfo &out) const
+  {
+    Crypto::Hash key = Keys::validator(validator_id);
+    auto value = smt_.getAtVersion(key, version);
+    if (!value.has_value())
+      return false;
+    return Core::ValidatorInfo::deserializeState(value->data(), value->size(), out);
+  }
+
+  bool StateAccess::getGlobalAtVersion(const std::string &name,
+                                       uint64_t version,
+                                       std::vector<uint8_t> &out) const
+  {
+    Crypto::Hash key = Keys::global(name);
+    auto value = smt_.getAtVersion(key, version);
+    if (!value.has_value())
+      return false;
+    out = std::move(*value);
+    return true;
   }
 } // namespace State

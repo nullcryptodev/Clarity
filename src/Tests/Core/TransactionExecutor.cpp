@@ -810,20 +810,33 @@ TEST_F(Core_ExecutorFixture, RemoveLiquidity)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
+  //  The pool record is gone. Alice was the only LP, so her full
+  //  removal drained the pool and triggered the auto-close. Under
+  //  the old behavior the record survived with zero reserves; that
+  //  assertion was removed along with the old behavior — the close
+  //  is now the observable post-condition.
   AmmPool pool_after;
-  ASSERT_TRUE(state_->getAmmPool(pool_id, pool_after));
-  EXPECT_EQ(pool_after.reserve_a, 0u);
-  EXPECT_EQ(pool_after.reserve_b, 0u);
-  EXPECT_EQ(pool_after.total_liquidity, 0u);
+  EXPECT_FALSE(state_->getAmmPool(pool_id, pool_after));
 
+  //  Alice got her share of both reserves back, minus the fee.
   EXPECT_EQ(balanceOf(alice_.publicKey),
             alice_native_before + pool_before.reserve_a - 1);
   EXPECT_EQ(state_->getTokenBalance(alice_.publicKey, token_b),
             alice_token_before + pool_before.reserve_b);
 
+  //  The position is zeroed. The record itself is retained (it's
+  //  unreachable from the position index, which was removed, so it's
+  //  inert), but its liquidity is zero.
   AmmPosition pos_after;
   ASSERT_TRUE(state_->getAmmPosition(position_id, pos_after));
   EXPECT_EQ(pos_after.liquidity, 0u);
+
+  //  The position index entry is gone, so a future AddLiquidity would
+  //  create a fresh position rather than merge into the zeroed one.
+  //  (In practice there's no pool to add to — see the closed-pool
+  //  test — but the index cleanup is worth asserting separately.)
+  uint64_t idx = 0;
+  EXPECT_FALSE(state_->getPositionIndex(alice_.publicKey, pool_id, idx));
 }
 
 TEST_F(Core_ExecutorFixture, SwapXForY)
@@ -2430,4 +2443,174 @@ TEST_F(Core_ExecutorFixture, UpdateTokenMetaDoesNotChangeMaxSupply)
   TokenInfo t;
   ASSERT_TRUE(state_->getToken(token, t));
   EXPECT_EQ(t.maxSupply, 1000u); // unchanged
+}
+
+TEST_F(Core_ExecutorFixture, RemoveLastLiquidityClosesPool)
+{
+  const Id token_b = 100;
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
+                                token_b, 1000);
+  ASSERT_NE(pool_id, 0u);
+
+  //  Find Alice's position — the one created by createPool.
+  uint64_t position_id = 0;
+  ASSERT_TRUE(state_->getPositionIndex(alice_.publicKey, pool_id,
+                                       position_id));
+
+  AmmPosition pos_before;
+  ASSERT_TRUE(state_->getAmmPosition(position_id, pos_before));
+  ASSERT_GT(pos_before.liquidity, 0u);
+
+  //  Alice removes her full share. She's the only LP, so the pool
+  //  drains completely.
+  Transaction tx = TransactionBuilder()
+                       .type(TxType::RemoveLiquidity)
+                       .from(alice_)
+                       .to(Crypto::Address{})
+                       .amount(1)
+                       .fee(1)
+                       .nonce(1)
+                       .chainId(EXEC_CHAIN_ID)
+                       .payload(makeRemoveLiquidityPayload(position_id))
+                       .build();
+
+  ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
+
+  //  The pool record must be gone. This is the auto-close.
+  AmmPool pool;
+  EXPECT_FALSE(state_->getAmmPool(pool_id, pool));
+}
+
+TEST_F(Core_ExecutorFixture, ClosedPoolRejectsSwap)
+{
+  const Id token_b = 100;
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
+                                token_b, 1000);
+  ASSERT_NE(pool_id, 0u);
+
+  uint64_t position_id = 0;
+  ASSERT_TRUE(state_->getPositionIndex(alice_.publicKey, pool_id,
+                                       position_id));
+
+  //  Drain and close.
+  {
+    Transaction tx = TransactionBuilder()
+                         .type(TxType::RemoveLiquidity)
+                         .from(alice_)
+                         .to(Crypto::Address{})
+                         .amount(1)
+                         .fee(1)
+                         .nonce(1)
+                         .chainId(EXEC_CHAIN_ID)
+                         .payload(makeRemoveLiquidityPayload(position_id))
+                         .build();
+    ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
+  }
+
+  //  A swap against the closed pool fails at the "pool not found"
+  //  check, because getAmmPool returns false for a deleted record.
+  //  This is what makes the close observable to users: the pool is
+  //  not just inert, it's absent.
+  Transaction swap = TransactionBuilder()
+                         .type(TxType::Swap)
+                         .from(alice_)
+                         .to(alice_.publicKey)
+                         .amount(10)
+                         .fee(1)
+                         .nonce(2)
+                         .tokenId(NATIVE_TOKEN_ID)
+                         .chainId(EXEC_CHAIN_ID)
+                         .payload(makeSwapPayload(pool_id, /*min_out=*/1))
+                         .build();
+
+  EXPECT_EQ(run(swap).status, ReceiptStatus::Failure);
+
+  //  And so does adding liquidity to it.
+  Transaction add = TransactionBuilder()
+                        .type(TxType::AddLiquidity)
+                        .from(alice_)
+                        .to(Crypto::Address{})
+                        .amount(500)
+                        .fee(1)
+                        .nonce(3)
+                        .tokenId(NATIVE_TOKEN_ID)
+                        .chainId(EXEC_CHAIN_ID)
+                        .payload(makeAddLiquidityPayload(pool_id, 500))
+                        .build();
+
+  EXPECT_EQ(run(add).status, ReceiptStatus::Failure);
+}
+
+TEST_F(Core_ExecutorFixture, PartialRemovalDoesNotClosePool)
+{
+  const Id token_b = 100;
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(bob_.publicKey, token_b, 100'000);
+
+  //  Alice creates the pool.
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
+                                token_b, 1000);
+  ASSERT_NE(pool_id, 0u);
+
+  //  Bob adds liquidity. Now the pool has two LPs.
+  {
+    Transaction tx = TransactionBuilder()
+                         .type(TxType::AddLiquidity)
+                         .from(bob_)
+                         .to(Crypto::Address{})
+                         .amount(500)
+                         .fee(1)
+                         .nonce(0)
+                         .tokenId(NATIVE_TOKEN_ID)
+                         .chainId(EXEC_CHAIN_ID)
+                         .payload(makeAddLiquidityPayload(pool_id, 500))
+                         .build();
+    ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
+  }
+
+  //  Alice removes her full share. Bob still has liquidity, so the
+  //  pool has not drained.
+  uint64_t alice_pos = 0;
+  ASSERT_TRUE(state_->getPositionIndex(alice_.publicKey, pool_id,
+                                       alice_pos));
+
+  {
+    Transaction tx = TransactionBuilder()
+                         .type(TxType::RemoveLiquidity)
+                         .from(alice_)
+                         .to(Crypto::Address{})
+                         .amount(1)
+                         .fee(1)
+                         .nonce(1)
+                         .chainId(EXEC_CHAIN_ID)
+                         .payload(makeRemoveLiquidityPayload(alice_pos))
+                         .build();
+    ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
+  }
+
+  //  The pool record must still exist, with Bob's liquidity.
+  AmmPool pool;
+  ASSERT_TRUE(state_->getAmmPool(pool_id, pool));
+  EXPECT_GT(pool.total_liquidity, 0u);
+  EXPECT_GT(pool.reserve_a, 0u);
+  EXPECT_GT(pool.reserve_b, 0u);
+
+  //  And a swap should still succeed.
+  Transaction swap = TransactionBuilder()
+                         .type(TxType::Swap)
+                         .from(alice_)
+                         .to(alice_.publicKey)
+                         .amount(10)
+                         .fee(1)
+                         .nonce(2)
+                         .tokenId(NATIVE_TOKEN_ID)
+                         .chainId(EXEC_CHAIN_ID)
+                         .payload(makeSwapPayload(pool_id, /*min_out=*/1))
+                         .build();
+
+  EXPECT_EQ(run(swap).status, ReceiptStatus::Success);
 }

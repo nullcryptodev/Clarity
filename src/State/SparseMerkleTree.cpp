@@ -23,6 +23,33 @@ namespace State
     constexpr uint8_t NODE_INTERNAL = 0x01;
     constexpr uint8_t NODE_LEAF = 0x00;
 
+    // ---- Historical key encoders ----
+    //
+    // These must match the encoders used by StateDB::putNodeAtVersion
+    // and StateDB::putLeafDataAtVersion byte for byte. They are
+    // duplicated here rather than exposed by StateDB so that the SMT's
+    // read path can construct keys without a DB round-trip.
+
+    std::array<uint8_t, 40> makeHistKey(const Crypto::Hash &hash,
+                                        uint64_t version)
+    {
+      std::array<uint8_t, 40> k{};
+      std::memcpy(k.data(), hash.data.data(), 32);
+      for (int i = 0; i < 8; ++i)
+        k[32 + i] = uint8_t(version >> ((7 - i) * 8));
+      return k;
+    }
+
+    std::array<uint8_t, 40> makeByVersionKey(uint64_t version,
+                                             const Crypto::Hash &hash)
+    {
+      std::array<uint8_t, 40> k{};
+      for (int i = 0; i < 8; ++i)
+        k[i] = uint8_t(version >> ((7 - i) * 8));
+      std::memcpy(k.data() + 8, hash.data.data(), 32);
+      return k;
+    }
+
     // ---- Hash helpers ----
 
     inline void blake2b(const uint8_t *data, size_t len, Crypto::Hash &out)
@@ -113,6 +140,13 @@ namespace State
   //  Every read/write of SMT nodes, leaves, and meta goes through one of
   //  these. If a txn is bound, the txn is used; otherwise the DB's raw
   //  autocommit path is used.
+  //
+  //  Historical writes are skipped at version 0. Version 0 is the
+  //  bootstrap version: the state before any block has been applied.
+  //  There is no prior state to look back at, and the SMT fixtures
+  //  that don't set a version use version 0 for every write, so
+  //  writing historical rows there would fill the DB with rows nobody
+  //  will ever read. The chain itself never reads version 0 history.
 
   bool SparseMerkleTree::getNodeImpl(const Crypto::Hash &hash,
                                      std::vector<uint8_t> &out) const
@@ -127,16 +161,32 @@ namespace State
 
   void SparseMerkleTree::putNodeImpl(const Crypto::Hash &hash,
                                      const std::vector<uint8_t> &children,
-                                     uint64_t /*version*/)
+                                     uint64_t version)
   {
     if (txn_)
     {
       txn_->put(StateDB::TBL_SMT_NODES,
                 hash.data.data(), hash.data.size(),
                 children.data(), children.size());
+
+      if (version != 0)
+      {
+        auto hist = makeHistKey(hash, version);
+        txn_->put(StateDB::TBL_SMT_NODES_HIST,
+                  hist.data(), hist.size(),
+                  children.data(), children.size());
+
+        auto by_ver = makeByVersionKey(version, hash);
+        txn_->put(StateDB::TBL_SMT_NODES_BY_VER,
+                  by_ver.data(), by_ver.size(),
+                  nullptr, 0);
+      }
       return;
     }
+
     db_.putNode(hash, children, 0);
+    if (version != 0)
+      db_.putNodeAtVersion(hash, version, children);
   }
 
   bool SparseMerkleTree::getLeafDataImpl(const Crypto::Hash &leaf_hash,
@@ -152,16 +202,59 @@ namespace State
 
   void SparseMerkleTree::putLeafDataImpl(const Crypto::Hash &leaf_hash,
                                          const std::vector<uint8_t> &value,
-                                         uint64_t /*version*/)
+                                         uint64_t version)
   {
     if (txn_)
     {
       txn_->put(StateDB::TBL_SMT_LEAVES,
                 leaf_hash.data.data(), leaf_hash.data.size(),
                 value.data(), value.size());
+
+      if (version != 0)
+      {
+        auto hist = makeHistKey(leaf_hash, version);
+        txn_->put(StateDB::TBL_SMT_LEAVES_HIST,
+                  hist.data(), hist.size(),
+                  value.data(), value.size());
+
+        auto by_ver = makeByVersionKey(version, leaf_hash);
+        txn_->put(StateDB::TBL_SMT_LEAVES_BY_VER,
+                  by_ver.data(), by_ver.size(),
+                  nullptr, 0);
+      }
       return;
     }
+
     db_.putLeafData(leaf_hash, value, 0);
+    if (version != 0)
+      db_.putLeafDataAtVersion(leaf_hash, version, value);
+  }
+
+  bool SparseMerkleTree::getNodeAtVersionImpl(const Crypto::Hash &hash,
+                                              uint64_t version,
+                                              std::vector<uint8_t> &out) const
+  {
+    if (txn_)
+    {
+      auto hist = makeHistKey(hash, version);
+      return txn_->get(StateDB::TBL_SMT_NODES_HIST,
+                       hist.data(), hist.size(), out);
+    }
+    return db_.getNodeAtVersion(hash, version, out);
+  }
+
+  bool SparseMerkleTree::getLeafDataAtVersionImpl(
+      const Crypto::Hash &leaf_hash,
+      uint64_t version,
+      std::vector<uint8_t> &out) const
+  {
+    if (txn_)
+    {
+      auto hist = makeHistKey(leaf_hash, version);
+      return txn_->get(StateDB::TBL_SMT_LEAVES_HIST,
+                       hist.data(), hist.size(), out);
+    }
+    return db_.getLeafDataAtVersion(leaf_hash, version, out);
   }
 
   bool SparseMerkleTree::getMetaImpl(const std::string &key,
@@ -381,10 +474,24 @@ namespace State
       return defaultHash(depth);
     }
 
-    InternalNode n;
-    n.left = left_child;
-    n.right = right_child;
-    storeInternal(new_internal, n, version);
+    // Content-addressed node storage: if the computed hash matches the
+    // subtree we came in with, nothing below this point changed and the
+    // node is already stored. Skipping the write is what keeps the
+    // historical tables from filling with redundant rows — a re-write
+    // of the same node at a later version would produce the same hash,
+    // and the historical row for it is already present.
+    //
+    // Without this check, every update walk writes 256 historical rows
+    // per key, one per level, even for levels the change never reached.
+    // With it, only the levels from the leaf up to the first unchanged
+    // ancestor are written — typically a handful.
+    if (new_internal != subtree_hash)
+    {
+      InternalNode n;
+      n.left = left_child;
+      n.right = right_child;
+      storeInternal(new_internal, n, version);
+    }
 
     return new_internal;
   }
@@ -400,13 +507,54 @@ namespace State
       return std::nullopt;
     }
 
-    if (*historic_root != root_)
+    // Fast path: the requested version's root equals the current
+    // root. Either the requested version is the current one, or no
+    // state change has occurred since. Either way, the current tables
+    // are valid and we avoid the historical walk entirely.
+    if (*historic_root == root_)
+      return get(key);
+
+    return getAtVersionRecursive(*historic_root, key, DEPTH, version);
+  }
+
+  std::optional<std::vector<uint8_t>> SparseMerkleTree::getAtVersionRecursive(
+      const Crypto::Hash &subtree_hash,
+      const Crypto::Hash &key,
+      size_t depth,
+      uint64_t version) const
+  {
+    if (subtree_hash == defaultHash(depth))
+      return std::nullopt;
+
+    if (depth == 0)
     {
-      // TODO: support historic reads via versioned nodes.
+      if (subtree_hash == defaultHash(0))
+        return std::nullopt;
+
+      std::vector<uint8_t> leaf_value;
+      if (getLeafDataAtVersionImpl(subtree_hash, version, leaf_value))
+        return leaf_value;
       return std::nullopt;
     }
 
-    return get(key);
+    std::vector<uint8_t> bytes;
+    if (!getNodeAtVersionImpl(subtree_hash, version, bytes))
+      return std::nullopt;
+    if (bytes.size() != 64)
+      return std::nullopt;
+
+    const size_t bit_index = DEPTH - depth;
+    const uint8_t byte = key.data[bit_index / 8];
+    const uint8_t mask = 0x80 >> (bit_index % 8);
+    const bool go_right = (byte & mask) != 0;
+
+    Crypto::Hash child;
+    if (go_right)
+      std::memcpy(child.data.data(), bytes.data() + 32, 32);
+    else
+      std::memcpy(child.data.data(), bytes.data(), 32);
+
+    return getAtVersionRecursive(child, key, depth - 1, version);
   }
 
   //  Batch operations
@@ -438,9 +586,17 @@ namespace State
 
   //  Historical pruning
 
-  void SparseMerkleTree::pruneHistory(uint64_t /*keepFrom*/)
+  void SparseMerkleTree::pruneHistory(uint64_t keepFrom)
   {
-    // TODO: implement when we have versioned node storage.
+    // Delegate to StateDB, which owns the historical tables and the
+    // by-version index. If a txn is bound to this SMT, use the same
+    // txn for the prune, so rows that are still uncommitted in that
+    // txn are visible to the scan and are deleted from the same view.
+    // Otherwise, StateDB opens its own write txn.
+    if (txn_)
+      db_.pruneHistoryBeforeTxn(*txn_, keepFrom);
+    else
+      db_.pruneHistoryBefore(keepFrom);
   }
 
   bool SparseMerkleTree::readChildren(const Crypto::Hash &node_hash,

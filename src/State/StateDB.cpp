@@ -5,6 +5,7 @@
 
 #include "StateDB.h"
 
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
@@ -52,6 +53,14 @@ namespace State
       return "mempool";
     case TBL_CONSENSUS_WAL:
       return "consensus_wal";
+    case TBL_SMT_NODES_HIST:
+      return "smt_nodes_hist";
+    case TBL_SMT_LEAVES_HIST:
+      return "smt_leaves_hist";
+    case TBL_SMT_NODES_BY_VER:
+      return "smt_nodes_by_ver";
+    case TBL_SMT_LEAVES_BY_VER:
+      return "smt_leaves_by_ver";
     default:
       return "<unknown>";
     }
@@ -64,6 +73,98 @@ namespace State
     [[noreturn]] void throwMdbx(const char *what, int rc)
     {
       throw StateDBError(std::string(what) + ": " + mdbx_strerror(rc));
+    }
+
+    // Encode (hash, version) as 40 bytes: 32-byte hash followed by
+    // an 8-byte big-endian version. Used for the historical value
+    // tables, where lookups are always exact-match.
+    std::array<uint8_t, 40> histKey(const Crypto::Hash &hash, uint64_t version)
+    {
+      std::array<uint8_t, 40> k{};
+      std::memcpy(k.data(), hash.data.data(), 32);
+      for (int i = 0; i < 8; ++i)
+        k[32 + i] = uint8_t(version >> ((7 - i) * 8));
+      return k;
+    }
+
+    // Encode (version, hash) as 40 bytes: 8-byte big-endian version
+    // followed by a 32-byte hash. Used for the by-version index,
+    // where the primary access pattern is "scan versions below N in
+    // order", so version must sort first and in numeric order.
+    std::array<uint8_t, 40> byVersionKey(uint64_t version, const Crypto::Hash &hash)
+    {
+      std::array<uint8_t, 40> k{};
+      for (int i = 0; i < 8; ++i)
+        k[i] = uint8_t(version >> ((7 - i) * 8));
+      std::memcpy(k.data() + 8, hash.data.data(), 32);
+      return k;
+    }
+
+    uint64_t readVersionBE(const uint8_t *p)
+    {
+      uint64_t v = 0;
+      for (int i = 0; i < 8; ++i)
+        v = (v << 8) | p[i];
+      return v;
+    }
+
+    //  Delete every row in `index_table` whose key's first 8 bytes
+    //  (big-endian version) are < keepFrom, plus the matching row in
+    //  `hist_table`.
+    //
+    //  The index is keyed by (version_be || hash), so a single cursor
+    //  scan visits rows in version order and can stop at the first
+    //  version >= keepFrom. That's O(rows-pruned), not O(rows-total).
+    //
+    //  The iteration and deletion mechanisms are injected so this can
+    //  be used both with a live write txn (txn.forEach / txn.del) and
+    //  with the DB's autocommit path (forEachEntry + an outer write
+    //  txn's del). Both variants use the same deletion order and the
+    //  same key transformation.
+    //
+    //  Collection is separated from deletion because the DB's
+    //  forEachEntry holds the mutex during iteration and cannot be
+    //  re-entered; the txn-bound forEach does not, but the two-phase
+    //  approach keeps the implementation identical for both callers.
+    template <typename ForEachFn, typename DelFn>
+    void pruneOneTableImpl(ForEachFn &&forEach,
+                           DelFn &&del,
+                           uint32_t index_table,
+                           uint32_t hist_table,
+                           uint64_t keepFrom)
+    {
+      std::vector<std::array<uint8_t, 40>> to_delete;
+
+      forEach(index_table,
+              [&](const std::vector<uint8_t> &key,
+                  const std::vector<uint8_t> &) -> bool
+              {
+                if (key.size() != 40)
+                  return true;
+
+                const uint64_t version = readVersionBE(key.data());
+                if (version >= keepFrom)
+                  return false; // stop: keys are ordered by version first
+
+                std::array<uint8_t, 40> k{};
+                std::memcpy(k.data(), key.data(), 40);
+                to_delete.push_back(k);
+                return true;
+              });
+
+      for (const auto &k : to_delete)
+      {
+        // The index row.
+        del(index_table, k.data(), k.size());
+
+        // The historical row. Its key is (hash || version_be), which
+        // is the reverse of the index key's (version_be || hash).
+        std::array<uint8_t, 40> hist_key{};
+        std::memcpy(hist_key.data(), k.data() + 8, 32);
+        std::memcpy(hist_key.data() + 32, k.data(), 8);
+
+        del(hist_table, hist_key.data(), hist_key.size());
+      }
     }
   } // anonymous namespace
 
@@ -607,6 +708,156 @@ namespace State
     if (getLeafData(leaf_hash, out))
       return out;
     return std::nullopt;
+  }
+
+  //  Historical SMT access
+
+  void StateDB::putNodeAtVersion(const Crypto::Hash &hash,
+                                 uint64_t version,
+                                 const std::vector<uint8_t> &children)
+  {
+    auto hist = histKey(hash, version);
+    auto by_ver = byVersionKey(version, hash);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    MDBX_txn *txn = nullptr;
+    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
+    if (rc != MDBX_SUCCESS)
+      throwMdbx("putNodeAtVersion: txn_begin", rc);
+
+    MDBX_val hk = toVal(hist.data(), hist.size());
+    MDBX_val hv = toVal(children.data(), children.size());
+    rc = mdbx_put(txn, tableHandle(TBL_SMT_NODES_HIST), &hk, &hv, MDBX_UPSERT);
+    if (rc != MDBX_SUCCESS)
+    {
+      mdbx_txn_abort(txn);
+      throwMdbx("putNodeAtVersion: put hist", rc);
+    }
+
+    MDBX_val bk = toVal(by_ver.data(), by_ver.size());
+    MDBX_val bv = toVal("", 0);
+    rc = mdbx_put(txn, tableHandle(TBL_SMT_NODES_BY_VER), &bk, &bv, MDBX_UPSERT);
+    if (rc != MDBX_SUCCESS)
+    {
+      mdbx_txn_abort(txn);
+      throwMdbx("putNodeAtVersion: put index", rc);
+    }
+
+    rc = mdbx_txn_commit(txn);
+    if (rc != MDBX_SUCCESS)
+    {
+      mdbx_txn_abort(txn);
+      throwMdbx("putNodeAtVersion: commit", rc);
+    }
+  }
+
+  bool StateDB::getNodeAtVersion(const Crypto::Hash &hash,
+                                 uint64_t version,
+                                 std::vector<uint8_t> &out) const
+  {
+    auto hist = histKey(hash, version);
+    return rawGet(TBL_SMT_NODES_HIST, hist.data(), hist.size(), out);
+  }
+
+  void StateDB::putLeafDataAtVersion(const Crypto::Hash &leaf_hash,
+                                     uint64_t version,
+                                     const std::vector<uint8_t> &value)
+  {
+    auto hist = histKey(leaf_hash, version);
+    auto by_ver = byVersionKey(version, leaf_hash);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    MDBX_txn *txn = nullptr;
+    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
+    if (rc != MDBX_SUCCESS)
+      throwMdbx("putLeafDataAtVersion: txn_begin", rc);
+
+    MDBX_val hk = toVal(hist.data(), hist.size());
+    MDBX_val hv = toVal(value.data(), value.size());
+    rc = mdbx_put(txn, tableHandle(TBL_SMT_LEAVES_HIST), &hk, &hv, MDBX_UPSERT);
+    if (rc != MDBX_SUCCESS)
+    {
+      mdbx_txn_abort(txn);
+      throwMdbx("putLeafDataAtVersion: put hist", rc);
+    }
+
+    MDBX_val bk = toVal(by_ver.data(), by_ver.size());
+    MDBX_val bv = toVal("", 0);
+    rc = mdbx_put(txn, tableHandle(TBL_SMT_LEAVES_BY_VER), &bk, &bv, MDBX_UPSERT);
+    if (rc != MDBX_SUCCESS)
+    {
+      mdbx_txn_abort(txn);
+      throwMdbx("putLeafDataAtVersion: put index", rc);
+    }
+
+    rc = mdbx_txn_commit(txn);
+    if (rc != MDBX_SUCCESS)
+    {
+      mdbx_txn_abort(txn);
+      throwMdbx("putLeafDataAtVersion: commit", rc);
+    }
+  }
+
+  bool StateDB::getLeafDataAtVersion(const Crypto::Hash &leaf_hash,
+                                     uint64_t version,
+                                     std::vector<uint8_t> &out) const
+  {
+    auto hist = histKey(leaf_hash, version);
+    return rawGet(TBL_SMT_LEAVES_HIST, hist.data(), hist.size(), out);
+  }
+
+  //  Historical pruning
+
+  void StateDB::pruneHistoryBefore(uint64_t keepFrom)
+  {
+    //  Non-txn path. Opens its own write txn so the scan and the
+    //  deletes see a consistent view, and so the outer entry point
+    //  matches the txn-bound variant's semantics. The scan uses
+    //  forEachEntry (which opens its own read txn under the mutex);
+    //  the deletes go through the write txn opened here.
+    auto txn = beginWrite();
+
+    pruneOneTableImpl(
+        [this](uint32_t table, const EntryVisitor &v)
+        { forEachEntry(table, v); },
+        [&txn](uint32_t table, const void *k, size_t len)
+        { txn.del(table, k, len); },
+        TBL_SMT_NODES_BY_VER, TBL_SMT_NODES_HIST, keepFrom);
+
+    pruneOneTableImpl(
+        [this](uint32_t table, const EntryVisitor &v)
+        { forEachEntry(table, v); },
+        [&txn](uint32_t table, const void *k, size_t len)
+        { txn.del(table, k, len); },
+        TBL_SMT_LEAVES_BY_VER, TBL_SMT_LEAVES_HIST, keepFrom);
+
+    txn.commit();
+  }
+
+  void StateDB::pruneHistoryBeforeTxn(Txn &txn, uint64_t keepFrom)
+  {
+    //  Txn-bound path. Uses the caller's write txn for both the scan
+    //  and the deletes, so rows that are still uncommitted in that
+    //  txn are visible to the scan and are deleted from the same view.
+    //  This is the variant the SparseMerkleTree calls when it holds a
+    //  txn: a fixture that binds a txn to the SMT writes its
+    //  historical rows into that txn, and those rows must be pruned
+    //  from the same txn before it commits.
+    pruneOneTableImpl(
+        [&txn](uint32_t table, const EntryVisitor &v)
+        { txn.forEach(table, v); },
+        [&txn](uint32_t table, const void *k, size_t len)
+        { txn.del(table, k, len); },
+        TBL_SMT_NODES_BY_VER, TBL_SMT_NODES_HIST, keepFrom);
+
+    pruneOneTableImpl(
+        [&txn](uint32_t table, const EntryVisitor &v)
+        { txn.forEach(table, v); },
+        [&txn](uint32_t table, const void *k, size_t len)
+        { txn.del(table, k, len); },
+        TBL_SMT_LEAVES_BY_VER, TBL_SMT_LEAVES_HIST, keepFrom);
   }
 
   //  Diagnostics

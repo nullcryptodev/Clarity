@@ -50,7 +50,28 @@ namespace State
       TBL_BLOCKS_BY_HEIGHT = 14,
       TBL_MEMPOOL = 15,
       TBL_CONSENSUS_WAL = 16,
-      TBL_COUNT = 17,
+
+      // Historical SMT. Two index tables and two value tables.
+      //
+      //   TBL_SMT_NODES_HIST:      (hash || version_be) -> children
+      //   TBL_SMT_LEAVES_HIST:     (hash || version_be) -> leaf value
+      //   TBL_SMT_NODES_BY_VER:    (version_be || hash) -> empty
+      //   TBL_SMT_LEAVES_BY_VER:   (version_be || hash) -> empty
+      //
+      // The historical tables are keyed by (hash, version) for O(1)
+      // historical reads. The by-version tables are keyed by
+      // (version, hash) for O(entries-pruned) historical pruning.
+      //
+      // Version is big-endian in the by-version index so that
+      // lexicographic order matches numeric order, which lets
+      // pruneHistory stop at the first version >= keepFrom instead of
+      // scanning the whole index.
+      TBL_SMT_NODES_HIST = 17,
+      TBL_SMT_LEAVES_HIST = 18,
+      TBL_SMT_NODES_BY_VER = 19,
+      TBL_SMT_LEAVES_BY_VER = 20,
+
+      TBL_COUNT = 21,
     };
 
     using EntryVisitor = std::function<bool(const std::vector<uint8_t> &key,
@@ -193,6 +214,58 @@ namespace State
                      std::vector<uint8_t> &out) const;
 
     std::optional<std::vector<uint8_t>> getLeafData(const Crypto::Hash &leaf_hash) const;
+
+    // ---- Historical SMT access ----
+    //
+    // Reads and writes the (hash, version)-keyed historical tables.
+    // A historical write also writes the by-version index entry, so
+    // that pruneHistory can find rows to delete without a full scan.
+    //
+    // Callers that write both a current and a historical row (the
+    // SMT update path) use these alongside putNode/putLeafData; they
+    // are not replacements.
+
+    void putNodeAtVersion(const Crypto::Hash &hash,
+                          uint64_t version,
+                          const std::vector<uint8_t> &children);
+
+    bool getNodeAtVersion(const Crypto::Hash &hash,
+                          uint64_t version,
+                          std::vector<uint8_t> &out) const;
+
+    void putLeafDataAtVersion(const Crypto::Hash &leaf_hash,
+                              uint64_t version,
+                              const std::vector<uint8_t> &value);
+
+    bool getLeafDataAtVersion(const Crypto::Hash &leaf_hash,
+                              uint64_t version,
+                              std::vector<uint8_t> &out) const;
+
+    // ---- Historical pruning ----
+    //
+    // Delete every historical row whose version is strictly less than
+    // keepFrom, from both the historical table and the by-version
+    // index. The index is keyed by (version, hash), so a single cursor
+    // scan finds every row to delete, in version order, and stops at
+    // the first version >= keepFrom.
+    //
+    // Two entry points:
+    //
+    //   pruneHistoryBefore(keepFrom)
+    //     Opens its own write txn. Used by callers that don't already
+    //     hold one (e.g. a startup maintenance pass).
+    //
+    //   pruneHistoryBeforeTxn(txn, keepFrom)
+    //     Uses the caller's write txn. Required when the rows to be
+    //     pruned were written in that same txn — for example when a
+    //     SparseMerkleTree is bound to a txn and its historical rows
+    //     are still uncommitted.
+    //
+    // Both are safe to call from any thread that can hold the DB
+    // mutex. Not called during block application.
+    void pruneHistoryBefore(uint64_t keepFrom);
+
+    void pruneHistoryBeforeTxn(Txn &txn, uint64_t keepFrom);
 
     // =================================================================
     //  Diagnostics

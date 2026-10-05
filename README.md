@@ -2,7 +2,7 @@
 
 # Clarity
 
-![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C753-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue)
+![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C768-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue)
 
 #### Table of Contents
 
@@ -90,7 +90,7 @@ Ten main modules, from bottom to top:
 Crypto           hashes, signatures, AEAD, key types
 Common           encodings (Base58, Base64, hex), CRC32, JSON, varint, rate limiter, wire codec
 Serialization    binary, KV-binary, JSON serializers
-State            MDBX storage, sparse Merkle tree, state access, proofs
+State            MDBX storage, sparse Merkle tree, state access, proofs, historical reads
 Core             blocks, transactions, execution, block processing, rewards, equivocation proofs
 Consensus        BFT state machine, proposer selection, message encoding
 P2P              TCP transport, peer management, message framing, auth, sync, relay
@@ -112,7 +112,6 @@ transaction_signer  offline wallet transaction signer and submit if rpc
                       is connected
 ```
 
-
 ## Build
 
 ```bash
@@ -125,12 +124,11 @@ git clone --branch v3.11.3 --depth 1 https://github.com/nlohmann/json.git extern
 
 mkdir build
 
-# Build Tests
-# cmake -DBUILD_TESTS=ON ..
-# OR just the main modules
 cmake ..
 
 make
+
+cd src/Apps
 ```
 
 ## Tests
@@ -139,7 +137,11 @@ You can launch `clairty_tests` with the gtest filter: `./clarity_tests --gtest_f
 
 ```bash
 cmake -DBUILD_TESTS=ON ..
+
 make
+
+cd src/Tests
+
 ./clarity_tests
 ```
 
@@ -198,7 +200,7 @@ The block processor distinguishes between *simulating* a block (the proposer nee
 ## State: how the chain is stored
 
 #### Storage
-MDBX, a memory-mapped key-value store. Sixteen tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, three index tables (stakers, validators, order expiry), receipts, tx index, blocks by hash, blocks by height, and the persistent mempool.
+MDBX, a memory-mapped key-value store. Twenty-one tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, three index tables (stakers, validators, order expiry), receipts, tx index, blocks by hash, blocks by height, the persistent mempool, the consensus WAL, and four historical SMT tables (nodes-history, leaves-history, nodes-by-version, leaves-by-version).
 
 #### State commitment
 A **sparse Merkle tree** of depth 256. Each key is a 32-byte hash (derived from an account address, token balance key, validator ID, or global state name). Each leaf commits to a value. The tree root is the state root, which is written into every block header. Any two nodes with the same state produce the same root.
@@ -210,7 +212,13 @@ A `StateAccess` object wraps the DB and provides typed getters and setters for a
 Inclusion and non-inclusion proofs can be generated for any key. A proof is a list of sibling hashes down to the leaf; verification recomputes the root from the proof and compares. This is what a light client would need to verify that an account exists with a given balance at a given state root.
 
 #### Versioning
-The SMT can save its root at a specific version number. `rootAtVersion(n)` retrieves a historical root. What's not yet implemented: retrieving a *key's value* as it was at version `n`, and pruning historical roots.
+The SMT saves its root at every version number, and stores a historical row for each SMT node and leaf it writes at a non-zero version. `rootAtVersion(n)` retrieves a historical root, and `SparseMerkleTree::getAtVersion(key, n)` retrieves a *key's value* as it was at version `n`. Typed historical reads are exposed on `StateAccess` as `getAccountAtVersion`, `getValidatorAtVersion`, and `getGlobalAtVersion`; the raw primitive is `getRawAtVersion`, which takes the same SMT keys the current-version getters use.
+
+Version 0 is the bootstrap version — the state before any block has been applied — and is not stored historically. The chain's genesis state is applied at version 0 and never queried historically, so skipping it keeps the historical tables from accumulating rows that nothing reads.
+
+Historical storage is content-addressed and deduplicated: a node whose subtree did not change between two versions is stored once, at the version where it first appeared, and remains reachable from every later version's root. In practice this means the historical tables grow with *state changes*, not with block count or write count.
+
+`pruneHistory(keepFrom)` deletes every historical row whose version is strictly less than `keepFrom`, from both the historical tables and their by-version indexes. Pruning is not wired into the node's normal operation — it's available for an operator to call from a startup pass or a periodic maintenance routine, and the retention policy is a local choice (two nodes with different pruning policies still agree on consensus, because pruning only affects local historical queries).
 
 ## Transactions: what users can do
 
@@ -226,10 +234,10 @@ Create a token with a name, symbol, decimals, max supply, optional royalty, and 
 Opt-in and opt-out of auto-staking. The auto-stake threshold determines when a balance becomes staked. Staked accounts are eligible for staking rewards at epoch boundaries.
 
 #### Validator operations
-Register as a validator (requires a minimum stake). Unregister (returns the stake, forbidden for seeds, forbidden if it would drop the active set below the minimum). **Update reward address** — changes the address where block rewards are paid, with no effect on consensus participation. Registration writes a validator-by-address index entry that maps the reward address to the validator ID.
+Register as a validator (requires a minimum stake). **Unregister** — starts an unbonding countdown: the validator is removed from the active set immediately, but its record, address index, and stake persist for `UNBONDING_PERIOD` (120 blocks, two rotation intervals) before being released to the owner. The validator cannot re-register while a pending unbond is in flight, and its record remains slashable for the entire window. Unregistration is forbidden for seeds, forbidden if the *active-set* removal would drop the set below the minimum, and rejected if a pending unbond is already in progress. **Update reward address** — changes the address where block rewards are paid, with no effect on consensus participation. Registration writes a validator-by-address index entry that maps the reward address to the validator ID.
 
 #### AMM operations
-Create a pool for a pair of tokens (or a token and native CLRTY). Add liquidity (mints LP position). Remove liquidity (burns the position and returns the reserves). Swap through the pool with a constant-product formula and a fee.
+Create a pool for a pair of tokens (or a token and native CLRTY). Add liquidity (mints LP position). Remove liquidity (burns the position and returns the reserves) — **removing the last LP's full share closes the pool**: the record is deleted from state, and the pool no longer exists for swaps or further liquidity additions. Swap through the pool with a constant-product formula and a fee.
 
 #### Limit orders
 Create an order that locks funds, specifying which token to buy, how much of it, and a minimum acceptable amount. Orders expire at a specified height. Cancel an order returns the locked funds. There is also an expiry index that tracks which orders expire at which heights.
@@ -299,12 +307,14 @@ Each validator has an uptime score, an EMA updated based on how many pings they 
 #### Stake slashing for equivocation
 A validator that signs two conflicting votes at the same `(height, round)` loses 5% of its stake (`SLASH_AMOUNT_BPS = 500`). The slashed stake is credited to the staker pot. The validator's reward multiplier is also reduced by the standard penalty (`REWARD_MULTIPLIER_PENALTY`), so the economic cost is both a one-time loss of principal and a persistent reduction in future earnings. Seed validators are exempt (`SEED_SLASH_EXEMPT`).
 
-A validator whose post-slash stake falls below `VALIDATOR_MIN_STAKE` becomes ineligible for the active set via the existing `canBeActive` check, and rotation removes it on the next epoch boundary.
+A validator whose post-slash stake falls below `VALIDATOR_MIN_STAKE` becomes ineligible for the active set via the existing `canBeActive` check, and rotation removes it on the next epoch boundary. A validator that has requested unregistration is *not* immediately immune: its record, address index, and stake persist for the full `UNBONDING_PERIOD`, and remain slashable throughout. A proof that lands during the window is applied as normal, and the stake return at expiry is the *post-slash* amount.
 
 #### How equivocation is detected and slashed
 Nodes detect conflicting votes during the prevote phase. Both votes' signatures are verified before the conflict is recorded as evidence. A forged conflict — a second vote from a known signer with a garbage signature — is rejected rather than stored, because an unverifiable conflict would otherwise poison the proposer's evidence buffer and prevent it from proposing. A conflict whose block is not yet known is dropped and re-delivered when the block arrives. Evidence survives round and height transitions, bounded by `MAX_EQUIVOCATION_EVIDENCE` (256 entries), and the proposer includes a `TxType::Slash` transaction carrying the proof in the next block it builds. Every node independently verifies the proof during block application. Verification checks framing, `(height, round, signer)` agreement, value disagreement, signer range, validator registration, and both Ed25519 signatures over the domain-separated vote hash. A block containing an invalid Slash proof is rejected. Once a Slash tx commits, every node erases matching evidence by scanning the committed block.
 
 Signatures are verified against `ValidatorInfo::effectiveConsensusKey()`, so a validator that has split its reward address from its consensus key remains slashable for any vote signed under its consensus key.
+
+A Slash tx whose target is ineligible — a seed, an unregistered validator, or a validator with nothing left to slash — is a no-op at the executor level: `executeSystemSlash` returns `Success` with a zero receipt, and the block is accepted. Ineligibility is a *policy* outcome, not evidence of a malformed block. Returning `Failure` here would let a proposer halt the chain by including a Slash tx against a seed in every block it produces, because `BlockProcessor` treats a failed Slash as a block-level error. The proof's *validity* is enforced upstream: `verifyEquivocationProof` rejects an invalid proof, and the block is rejected on that basis. The distinction matters: **policy rejection must not be a block-level error.**
 
 #### Timeout certificate
 Each round that times out is attested by a broadcast `TimeoutVote` — a signature over `(height, round)` with the attesting validator's index in the committed set. A node that has timed out 30 or more consecutive rounds and holds f+1 valid attestations at a round ≥ 30 can include them in an emergency block header. A node that has not yet accumulated f+1 attestations refuses to propose an emergency block; the round stalls rather than emitting a block every verifier will reject. The certificate is verified by every node's `validateProposal` and re-verified on-chain by `BlockProcessor::applyBlock` before the emergency set is honoured. The certificate's signers are drawn from the **committed** set, since that's the set that was trying to run when the stall began; the emergency set only exists once a certificate is honoured.
@@ -411,17 +421,11 @@ The wallet layer supports the operations you'd need for an address book — mult
 
 ## What's notably absent
 
-**No versioned state *queries*.** `rootAtVersion(n)` retrieves a historical root, but you cannot retrieve a *key's value* at version `n`. This makes it impossible to answer "what was this account's balance at block 1000?" against the SMT alone. A block-explorer-style service would need to maintain its own historical index.
-
-**No historical pruning.** Every state is retained. The DB grows unboundedly. Fine for a small network, not for a long-running one. The SMT has a `prune` hook that isn't wired up.
-
 **No divergence detection or repair.** With the atomic commit discipline (state writes, block index writes, and head update in one MDBX transaction), divergence shouldn't be possible. But if it happened — from a bug, or from a partially-written restart — the node has no detection or recovery path.
 
 **No light client mode.** Full nodes only. The SMT proof machinery exists and is exercised in tests, but there's no P2P message type for requesting or delivering proofs. Light-client support would need a `GetProof`/`Proof` message pair on top of the existing encoder.
 
 **No order matching engine.** Orders are stored, indexed by expiry, and can be cancelled — but nothing *fills* them. There is no code that matches buys against sells, no partial-fill logic, no price-time priority queue. The order book exists in the state model but not in the execution model. This is the single largest feature gap.
-
-**No AMM pool close.** Pools are permanent. There's no "remove all liquidity and close pool" operation. A creator who wants to stop market-making can drain the pool to zero liquidity, but the pool record stays.
 
 **No P2P encryption.** Authentication is done — every peer proves possession of its key. But the channel itself is plaintext. A MITM can drop messages or substitute them; they can't forge signatures, but they can cause liveness failures. An authenticated-encryption layer (Noise, or a simple ECDH + ChaCha20-Poly1305 wrap) would close this.
 
@@ -437,9 +441,11 @@ The wallet layer supports the operations you'd need for an address book — mult
 
 **No wallet CLI for address-book operations.** The `clarity-wallet` client covers balance, transfer, staking, and validator operations, but not multi-account management, address labels, or key rotation from the CLI. Integrators still drive those through the library.
 
-## Design choices worth noting
+**Historical pruning is not wired into the node.** `pruneHistory` is implemented and callable, but no startup path or config flag invokes it. The retention policy — how far back to keep history, whether to prune on startup or periodically — is left to the operator. This is a deliberate choice: pruning affects local historical queries but not consensus, so two nodes with different retention policies still agree on the chain.
 
-> Note: policy rejection must not be a block-level error
+**AMM positions are not deleted when a pool closes.** When the last LP drains a pool, the pool record is deleted but the zeroed `AmmPosition` record persists. It is unreachable from any index (the position index was removed in the same operation), so it is invisible to any caller that doesn't already know its id — but it costs 64 bytes per position ever created, and a `forEachPosition`-style scan would surface them. Cleaning them up would require either a `pool_id → [position_ids]` index or a scan bounded by how many LPs the pool ever had. Neither is worth the code today; the historical SMT already preserves the fact that the position existed.
+
+## Design choices worth noting
 
 **Base58 is CryptoNote-style, not Bitcoin-style.** The test file explicitly notes this. Addresses produced by Clarity are not interoperable with external Base58 tools. This is a legacy surface — the RPC and wallet layers emit Bech32m — but any code that still uses the Base58 encoder would need to migrate before clients expect external interoperability.
 
@@ -471,9 +477,17 @@ The wallet layer supports the operations you'd need for an address book — mult
 
 **Evidence is erased on commit, by every node.** When a block containing a Slash tx commits, every node scans the block's transactions, decodes each Slash tx, and erases matching evidence from its own pending list. Not just the proposer — every node. Only the proposer knows what it *tried* to include; a non-proposer only sees the block. Reading the block as the source of truth is what keeps all nodes in sync. Evidence is recorded only when both votes' signatures verify. A forged conflict is dropped rather than stored, because unverifiable evidence poisons the proposer's buffer and blocks it from proposing.
 
+**Policy rejection is not a block-level error.** A system transaction whose target is ineligible for the operation — a Slash tx against a seed, an unregistered validator, or a validator with nothing left to slash — is a no-op at the transaction level, not a block rejection. The distinction is load-bearing: if ineligibility rejected the block, a proposer could halt the chain by including one such transaction in every block it produced. Validity of the *evidence* is enforced upstream (`verifyEquivocationProof`); the executor only applies policy. The same principle applies to every future system-tx type.
+
+**AMM pools auto-close on full drain.** When the last LP withdraws and both reserves reach zero, the pool record is deleted rather than left in a zero-reserve state. A pool in that state is functionally inert — `Swap` divides by a zero reserve, `AddLiquidity` rejects it — and leaving the record behind would make callers special-case a state they can never usefully act on. Removing the record is what makes "remove all liquidity" mean "the pool no longer exists." Historical reads are unaffected: `getAtVersion` on a closed pool's key still returns the pool at any version where it existed, so a block explorer can ask "what did pool 7 look like at block 1000?" after the pool has been closed.
+
 **Seed rewards are stipend-based, not fee-based.** When the active set contains only seeds, the producer bonus is split evenly across seeds and the set share is routed to the pot. The producing seed earns no more than any other seed — seeds are a single operational entity, and the distinction between producing and signing is bookkeeping noise. This keeps a young chain's rewards flowing into the pot (where they eventually pay stakers) rather than concentrating in the seed operators' balances, and it preserves the incentive for new validators to register: the moment a non-seed joins the active set, normal distribution resumes.
 
 **Consensus key and reward address are separate, and derived from one mnemonic.** A validator's signing identity and its payout destination are two different things with two different lifecycles. Both are derived from the same BIP-39 mnemonic at distinct paths — `m/44'/9000'/0'/0'/0'` for the reward address, `m/44'/9000'/0'/2'/0'` for the consensus key — so one backup covers both, and one restore regenerates both. The signing key is set at registration and immutable; the reward address is mutable and can be changed without touching consensus. This split is what makes `UpdateRewardAddress` safe — before it, changing the reward address silently rotated the consensus key, which is a live-key hazard.
+
+**Unbonding delay for departing validators.** Unregistering no longer deletes a validator's record or refunds its stake immediately. Instead, the validator leaves the active set, and its record, address index, and stake persist for `UNBONDING_PERIOD` (120 blocks, two rotation intervals) before the stake is returned. The delay serves two purposes: it makes a validator that equivocates and immediately unregisters still *slashable* for the full window in which a proof can be observed and included in a block, and it prevents a departing validator from being re-promoted into the active set while its exit is in flight. `canBeActive()` requires `pending_unbond_height == 0`, so rotation and offline removal both skip a pending-unbond validator automatically.
+
+**Historical state is content-addressed and deduplicated.** The SMT stores a historical row for every (node-hash, version) pair that was *written* — that is, for every node whose subtree actually changed at that version. A subtree that did not change is stored once, at the version where it first appeared, and remains reachable from every later version's root because its hash is the same. This is what makes historical reads cheap enough to enable: the tables grow with state changes, not with write volume or block count. Version 0 is the bootstrap version and is not stored — it's the state before any block has been applied, and nothing queries it.
 
 **Persistent mempool.** The mempool writes through to a dedicated MDBX table (`TBL_MEMPOOL`) on every mutation — add, remove, removeIncluded, purgeExpired, clear. On startup, `Node::initMempool` rebuilds the pool by re-adding each persisted entry through the normal validation path; entries that fail (nonce too low, insufficient funds, expired, already on chain) are dropped and their rows deleted. This means a transaction submitted before a restart is still in the pool after the node comes back — important for the case where a user submits a tx and the operator restarts their validator before the next block commits it. The persisted entry carries the full `Entry` (tx, tier, fee rate, sequence, add time), not just the transaction, so priority status and eviction ordering survive a restart.
 

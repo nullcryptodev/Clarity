@@ -700,3 +700,161 @@ TEST_F(State_StateAccessFixture, UnindexStakerRemoves)
   ASSERT_EQ(found.size(), 1u);
   EXPECT_EQ(found[0], b);
 }
+
+// ============================================================================
+//  Versioned reads through StateAccess.
+//
+//  These tests use State_SmtPersistenceFixture, which gives explicit
+//  control over txn commit/abort and DB open/close. The
+//  State_StateAccessFixture aborts on setVersion, which is the right
+//  behavior for single-version tests but wrong for multi-version ones.
+// ============================================================================
+
+TEST_F(State_SmtPersistenceFixture, AccountAtVersion)
+{
+  auto addr = makeAddress(0xAA);
+
+  // Version 1: balance 1000.
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    StateAccess access(*db, txn, 1);
+
+    Core::Account a;
+    a.balance = 1000;
+    access.putAccount(addr, a);
+    access.commit(1);
+    txn.commit();
+    db->close();
+  }
+
+  // Version 2: balance 2000.
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    StateAccess access(*db, txn, 2);
+
+    Core::Account a = access.getAccount(addr);
+    a.balance = 2000;
+    access.putAccount(addr, a);
+    access.commit(2);
+    txn.commit();
+    db->close();
+  }
+
+  // Read at both versions through a fresh handle.
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    StateAccess access(*db, txn, 2);
+
+    // Current read.
+    EXPECT_EQ(access.getAccount(addr).balance, 2000u);
+
+    // Historical reads.
+    EXPECT_EQ(access.getAccountAtVersion(addr, 1).balance, 1000u);
+    EXPECT_EQ(access.getAccountAtVersion(addr, 2).balance, 2000u);
+
+    txn.abort();
+    db->close();
+  }
+}
+
+TEST_F(State_SmtPersistenceFixture, GlobalAtVersion)
+{
+  // Version 1.
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    StateAccess access(*db, txn, 1);
+
+    std::vector<uint8_t> v1 = {1, 2, 3};
+    access.putGlobal("test", v1);
+    access.commit(1);
+    txn.commit();
+    db->close();
+  }
+
+  // Version 2.
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    StateAccess access(*db, txn, 2);
+
+    std::vector<uint8_t> v2 = {4, 5, 6, 7};
+    access.putGlobal("test", v2);
+    access.commit(2);
+    txn.commit();
+    db->close();
+  }
+
+  // Read both.
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    StateAccess access(*db, txn, 2);
+
+    std::vector<uint8_t> got;
+    ASSERT_TRUE(access.getGlobalAtVersion("test", 1, got));
+    EXPECT_EQ(got, std::vector<uint8_t>({1, 2, 3}));
+
+    ASSERT_TRUE(access.getGlobalAtVersion("test", 2, got));
+    EXPECT_EQ(got, std::vector<uint8_t>({4, 5, 6, 7}));
+
+    txn.abort();
+    db->close();
+  }
+}
+
+TEST_F(State_SmtPersistenceFixture, ValidatorAtVersion)
+{
+  constexpr uint64_t VID = 5;
+
+  // Version 1.
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    StateAccess access(*db, txn, 1);
+
+    Core::ValidatorInfo v;
+    v.id = VID;
+    v.reward_address = makeAddress(1);
+    v.stake = 1'000'000;
+    access.putValidator(v);
+    access.commit(1);
+    txn.commit();
+    db->close();
+  }
+
+  // Version 2: stake increased.
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    StateAccess access(*db, txn, 2);
+
+    Core::ValidatorInfo v;
+    ASSERT_TRUE(access.getValidator(VID, v));
+    v.stake = 2'000'000;
+    access.putValidator(v);
+    access.commit(2);
+    txn.commit();
+    db->close();
+  }
+
+  // Read both.
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    StateAccess access(*db, txn, 2);
+
+    Core::ValidatorInfo v;
+    ASSERT_TRUE(access.getValidatorAtVersion(VID, 1, v));
+    EXPECT_EQ(v.stake, 1'000'000u);
+
+    ASSERT_TRUE(access.getValidatorAtVersion(VID, 2, v));
+    EXPECT_EQ(v.stake, 2'000'000u);
+
+    txn.abort();
+    db->close();
+  }
+}
