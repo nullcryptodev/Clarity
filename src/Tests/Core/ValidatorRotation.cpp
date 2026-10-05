@@ -201,6 +201,25 @@ TEST(Core_PlanRotation, GrowSet)
   EXPECT_EQ(plan.to_remove.size(), 0u);
 }
 
+TEST(Core_PlanRotation, PendingUnbondValidatorNotPromoted)
+{
+  //  A validator that has requested unregistration is not eligible
+  //  for promotion: canBeActive() requires pending_unbond_height == 0.
+  //  This is the clause that keeps a departing validator out of the
+  //  active set between the unregister request and the unbond expiry.
+  RotationBuilder b(30, 10);
+
+  //  Mark a pool validator (id 25) as pending-unbond.
+  b.setPendingUnbond(25, /*pending_unbond_height=*/5000);
+
+  auto plan = planRotation(b.reg, /*avg_tx_per_block=*/900);
+
+  ASSERT_GT(plan.new_target_size, 10u);
+  auto it = std::find(plan.to_add.begin(), plan.to_add.end(), 25u);
+  EXPECT_EQ(it, plan.to_add.end())
+      << "pending-unbond validator was scheduled for promotion";
+}
+
 TEST(Core_PlanRotation, ShrinkSet)
 {
   // 50 active, low traffic.

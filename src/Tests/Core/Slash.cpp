@@ -146,25 +146,6 @@ TEST_F(Core_BlockProcessorFixture, SlashTxInBlock_ReducesStakeAndCreditsPot)
   EXPECT_GE(currentPot() - pot_before, expected_slash);
 }
 
-TEST_F(Core_BlockProcessorFixture, SlashTxAgainstSeedIsRejected)
-{
-  //  Target is seed 1, sitting at signer index 0. The proof is
-  //  internally valid, but executeSystemSlash refuses to act on
-  //  seeds, so the block is rejected.
-  const std::vector<Id> slash_set = {1, 2};
-  constexpr Id SEED_ID = 1;
-
-  Consensus::Vote vote_a = makeSignedVote(seed1_, SEED_ID, 1, 0, 0, false, makeHash(2001));
-  Consensus::Vote vote_b = makeSignedVote(seed1_, SEED_ID, 1, 0, 0, false, makeHash(2002));
-
-  Transaction slash_tx = makeSlashTx(genesis_config_.chain_id, vote_a, vote_b);
-
-  BlockResult r = applyBlock(1, genesis_hash_, {slash_tx}, false, slash_set);
-  EXPECT_FALSE(r.valid);
-  EXPECT_NE(r.error.find("slash failed"), std::string::npos)
-      << "got: " << r.error;
-}
-
 TEST_F(Core_BlockProcessorFixture, SlashTxWithSameValueVotesIsRejected)
 {
   auto target_key = Crypto::generateKeyPair();
@@ -281,4 +262,109 @@ TEST_F(Core_BlockProcessorFixture, SlashTxChangesStateRoot)
   ASSERT_TRUE(readValidator(TARGET_ID, after));
   EXPECT_LT(after.stake, TARGET_STAKE);
   EXPECT_EQ(after.infraction_count, 1u);
+}
+
+// ============================================================================
+//  Slash against a validator that rotated out between the equivocation
+//  and the block that carries the proof.
+//
+//  verifyEquivocationProof resolves the signer from signer_id, not
+//  from active_set[signer_index], so the proof is self-contained
+//  across a rotation. But it also applies a set-membership check
+//  ("is this signer currently slashable?") that, on the on-chain
+//  path, is redundant with the checks executeSystemSlash performs
+//  against the record. BlockProcessor::applySlash passes an empty
+//  active_set to disable that redundant check.
+//
+//  Without the empty set, this test fails: the proof is rejected
+//  because the target is no longer active, and the block is refused.
+// ============================================================================
+
+TEST_F(Core_BlockProcessorFixture, SlashAgainstRotatedOutValidatorStillSlashes)
+{
+  auto target_key = Crypto::generateKeyPair();
+  constexpr Id TARGET_ID = 100;
+  constexpr uint64_t TARGET_STAKE = 1'000'000'000ULL;
+
+  // Register the target as an *inactive* validator. Its record
+  // exists and its key is registered for signing, but it is not in
+  // the active set. This is exactly the post-rotation state.
+  registerValidatorWithKey(TARGET_ID, target_key, TARGET_STAKE,
+                           /*is_seed=*/false, /*is_active=*/false);
+
+  // The active set for the slash block is {1, 2} — the seeds. The
+  // target is deliberately NOT in it.
+  const std::vector<Id> slash_set = {1, 2};
+
+  // The equivocation is at height 1, round 0, signer_id 100,
+  // signer_index 0. The index is meaningless here (it refers to a
+  // set the target has left) but verifyEquivocationProof resolves
+  // by id, so the proof is still valid.
+  Consensus::Vote vote_a = makeSignedVote(target_key, TARGET_ID, 1, 0, 0,
+                                          false, makeHash(8001));
+  Consensus::Vote vote_b = makeSignedVote(target_key, TARGET_ID, 1, 0, 0,
+                                          false, makeHash(8002));
+
+  Transaction slash_tx = makeSlashTx(genesis_config_.chain_id, vote_a, vote_b);
+
+  uint64_t pot_before = currentPot();
+  ValidatorInfo before;
+  ASSERT_TRUE(readValidator(TARGET_ID, before));
+  ASSERT_EQ(before.stake, TARGET_STAKE);
+
+  BlockResult r = applyBlock(1, genesis_hash_, {slash_tx},
+                             /*dry_run=*/false, slash_set);
+  ASSERT_TRUE(r.valid) << r.error;
+
+  ValidatorInfo after;
+  ASSERT_TRUE(readValidator(TARGET_ID, after));
+  const uint64_t expected_slash = applyBps(TARGET_STAKE, SLASH_AMOUNT_BPS);
+  EXPECT_EQ(after.stake, TARGET_STAKE - expected_slash);
+  EXPECT_EQ(after.infraction_count, 1u);
+
+  EXPECT_GE(currentPot() - pot_before, expected_slash);
+}
+
+// ============================================================================
+//  A Slash tx against a seed must be a no-op, not a block-rejection.
+//
+//  Before Change C, executeSystemSlash returned Failure for a seed
+//  target, and applySlash treated that Failure as a block-level
+//  error. A proposer that included a Slash against a seed in every
+//  block would halt the chain. Now the block is accepted and the
+//  seed's record is untouched.
+// ============================================================================
+
+TEST_F(Core_BlockProcessorFixture, SlashAgainstSeedIsAcceptedNoOp)
+{
+  // The seeds' keys are deterministic and already registered by the
+  // fixture. The active set is the seeds themselves.
+  const std::vector<Id> slash_set = {1, 2};
+  constexpr Id SEED_ID = 1;
+
+  // A real equivocation by seed 1. The proof is valid, but the seed
+  // exemption in executeSystemSlash turns it into a no-op.
+  Consensus::Vote vote_a = makeSignedVote(seed1_, SEED_ID, 1, 0, 0,
+                                          false, makeHash(9001));
+  Consensus::Vote vote_b = makeSignedVote(seed1_, SEED_ID, 1, 0, 0,
+                                          false, makeHash(9002));
+
+  Transaction slash_tx = makeSlashTx(genesis_config_.chain_id, vote_a, vote_b);
+
+  ValidatorInfo before;
+  ASSERT_TRUE(readValidator(SEED_ID, before));
+  const uint64_t stake_before = before.stake;
+  const uint16_t multiplier_before = before.reward_multiplier;
+  const uint16_t infractions_before = before.infraction_count;
+
+  BlockResult r = applyBlock(1, genesis_hash_, {slash_tx},
+                             /*dry_run=*/false, slash_set);
+  ASSERT_TRUE(r.valid) << r.error;
+
+  // Seed record is completely unchanged.
+  ValidatorInfo after;
+  ASSERT_TRUE(readValidator(SEED_ID, after));
+  EXPECT_EQ(after.stake, stake_before);
+  EXPECT_EQ(after.reward_multiplier, multiplier_before);
+  EXPECT_EQ(after.infraction_count, infractions_before);
 }

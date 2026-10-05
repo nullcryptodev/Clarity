@@ -45,6 +45,7 @@ namespace Core
 
     w.writeU64(became_active_at);
     w.writeU64(last_active_at);
+    w.writeU64(pending_unbond_height);
 
     return out;
   }
@@ -85,6 +86,7 @@ namespace Core
 
     out.became_active_at = r.readU64();
     out.last_active_at = r.readU64();
+    out.pending_unbond_height = r.readU64();
 
     return r.ok();
   }
@@ -115,6 +117,7 @@ namespace Core
     s(is_active, "is_active");
     s(became_active_at, "became_active_at");
     s(last_active_at, "last_active_at");
+    s(pending_unbond_height, "pending_unbond_height");
   }
 
   void ValidatorInfo::serialize(Serialization::ISerializer &s) const
@@ -141,6 +144,7 @@ namespace Core
     s(is_active, "is_active");
     s(became_active_at, "became_active_at");
     s(last_active_at, "last_active_at");
+    s(pending_unbond_height, "pending_unbond_height");
   }
 
   //  ValidatorRegistry

@@ -68,7 +68,35 @@ namespace Core
     uint64_t became_active_at{0};
     uint64_t last_active_at{0};
 
+    // ---- Unbonding ----
+    //
+    // Non-zero while the validator has requested unregistration and
+    // the unbonding delay has not yet elapsed. Between the request
+    // and the expiry:
+    //   - the validator is removed from the active set,
+    //   - the validator record is retained,
+    //   - the address index is retained,
+    //   - the stake is retained and remains slashable,
+    //   - the validator is ineligible for re-promotion (see
+    //     canBeActive()).
+    //
+    // At pending_unbond_height, BlockProcessor::processUnbondExpiries
+    // deletes the record, returns the stake to the owner, and removes
+    // the address index.
+    //
+    // A zero value means "not unbonding" and is the state of every
+    // registered validator. A validator cannot re-register while a
+    // pending unbond is in flight; the caller must wait for expiry.
+    uint64_t pending_unbond_height{0};
+
     // ---- Health checks ----
+
+    bool isOffline(uint64_t current_height) const noexcept
+    {
+      if (current_height < last_seen_height)
+        return false; // future, ignore
+      return (current_height - last_seen_height) >= OFFLINE_KICK_BLOCKS;
+    }
 
     bool isHealthy() const noexcept
     {
@@ -77,7 +105,10 @@ namespace Core
 
     bool canBeActive() const noexcept
     {
-      return isHealthy() && uptime_score >= UPTIME_ACTIVE_MIN_BPS && meetsStakeRequirement();
+      return pending_unbond_height == 0 &&
+             isHealthy() &&
+             uptime_score >= UPTIME_ACTIVE_MIN_BPS &&
+             meetsStakeRequirement();
     }
 
     bool meetsStakeRequirement() const noexcept
@@ -110,14 +141,6 @@ namespace Core
       last_infraction_height = height;
     }
 
-    // True if the validator has been offline too long.
-    bool isOffline(uint64_t current_height) const noexcept
-    {
-      if (current_height < last_seen_height)
-        return false; // future, ignore
-      return (current_height - last_seen_height) >= OFFLINE_KICK_BLOCKS;
-    }
-
     //  Returns `consensus_key` if it has been set. Falls back to
     //  `reward_address` for records that predate the split, or for
     //  genesis validators where no consensus key was declared. This
@@ -130,6 +153,25 @@ namespace Core
     const Crypto::PublicKey &effectiveConsensusKey() const noexcept
     {
       return consensus_key.isNull() ? reward_address : consensus_key;
+    }
+
+    // True if the validator has requested unregistration and the
+    // delay has not yet elapsed. A pending-unbond validator is not
+    // eligible for the active set, but its record and stake are
+    // still present and slashable.
+    bool isUnbonding(uint64_t current_height) const noexcept
+    {
+      if (pending_unbond_height == 0)
+        return false;
+      return current_height < pending_unbond_height;
+    }
+
+    // True if the unbonding delay has elapsed and the record is due
+    // for removal. Only meaningful when pending_unbond_height != 0.
+    bool isUnbondExpired(uint64_t current_height) const noexcept
+    {
+      return pending_unbond_height != 0 &&
+             current_height >= pending_unbond_height;
     }
 
     // ------------------------------------------------------------------
@@ -158,14 +200,16 @@ namespace Core
     //    [1]   flags (bit 0 = is_seed, bit 1 = is_active)
     //    [8]   became_active_at
     //    [8]   last_active_at
+    //    [8]   pending_unbond_height
     //
-    // Total: 241 bytes.
+    // Total: 249 bytes.
 
     std::vector<uint8_t> serializeState() const;
 
     static bool deserializeState(const uint8_t *data, size_t len,
                                  ValidatorInfo &out);
 
+    
     static constexpr size_t STATE_SIZE =
         8 +  // id
         32 + // reward_address
@@ -187,7 +231,8 @@ namespace Core
         8 +  // epochs_active
         1 +  // flags (is_seed, is_active)
         8 +  // became_active_at
-        8;   // last_active_at
+        8 +  // last_active_at
+        8;   // pending_unbond_height
 
     // ------------------------------------------------------------------
     //  Framework serialization

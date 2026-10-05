@@ -137,6 +137,16 @@ namespace Tests
         v->last_seen_height = h;
     }
 
+    // Mark a validator as pending-unbond with the given expiry
+    // height. Used by the unbonding tests to construct a validator
+    // that has requested unregistration but whose record has not
+    // yet been released.
+    void setPendingUnbond(Id id, uint64_t pending_unbond_height)
+    {
+      if (auto *v = reg.find(id))
+        v->pending_unbond_height = pending_unbond_height;
+    }
+
     // Set current target_size in the registry.
     void setTargetSize(uint64_t t) { reg.target_size = t; }
   };

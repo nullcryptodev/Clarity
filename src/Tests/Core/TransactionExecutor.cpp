@@ -1582,6 +1582,31 @@ TEST_F(Core_ExecutorFixture, RegisterValidatorWritesAddressIndex)
   EXPECT_EQ(v.owner, alice_.publicKey);
 }
 
+TEST_F(Core_ExecutorFixture, UnregisterRetainsAddressIndexUntilExpiry)
+{
+  // The address index must survive unregister so an equivocation
+  // proof against the validator can still resolve the signer. It's
+  // only removed at unbond expiry.
+  seedValidator(alice_, /*id=*/5);
+  bumpNextValidatorId(6);
+
+  Transaction tx = TransactionBuilder()
+                       .type(TxType::UnregisterValidator)
+                       .from(alice_)
+                       .to(Crypto::Address{})
+                       .amount(1)
+                       .fee(2)
+                       .nonce(0)
+                       .chainId(EXEC_CHAIN_ID)
+                       .build();
+
+  ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
+
+  uint64_t id = 0;
+  EXPECT_TRUE(state_->getValidatorByAddress(alice_.publicKey, id));
+  EXPECT_EQ(id, 5u);
+}
+
 // Order expiry index
 
 TEST_F(Core_ExecutorFixture, CreateOrderAddsToExpiryIndex)
@@ -1816,7 +1841,7 @@ TEST_F(Core_ExecutorFixture, ClaimRecomputesStaked)
 
 // Unregister Validator
 
-TEST_F(Core_ExecutorFixture, UnregisterReturnsStake)
+TEST_F(Core_ExecutorFixture, UnregisterStartsUnbondingInsteadOfReturningStake)
 {
   seedValidator(alice_, /*id=*/5);
   bumpNextValidatorId(6);
@@ -1835,8 +1860,15 @@ TEST_F(Core_ExecutorFixture, UnregisterReturnsStake)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // Balance gained the stake back, lost the fee.
-  EXPECT_EQ(balanceOf(alice_.publicKey), before + GlobalConfig::VALIDATOR_MIN_STAKE - 2);
+  // Only the fee left the balance. The stake is still held in the
+  // validator record.
+  EXPECT_EQ(balanceOf(alice_.publicKey), before - 2);
+
+  ValidatorInfo v;
+  ASSERT_TRUE(state_->getValidator(5, v));
+  EXPECT_EQ(v.pending_unbond_height,
+            100 + UNBONDING_PERIOD); // run() uses height 100
+  EXPECT_FALSE(v.canBeActive());
 }
 
 TEST_F(Core_ExecutorFixture, UnregisterRejectsSeed)
@@ -1877,7 +1909,71 @@ TEST_F(Core_ExecutorFixture, UnregisterRejectsUnknown)
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 }
 
-TEST_F(Core_ExecutorFixture, UnregisterClearsAddressIndex)
+TEST_F(Core_ExecutorFixture, UnregisterTwiceIsRejected)
+{
+  // The first unregister stamps pending_unbond_height. The second
+  // must be rejected — otherwise a caller could reset the clock and
+  // extend the slashable window indefinitely, or starve the stake
+  // return.
+  seedValidator(alice_, /*id=*/5);
+  bumpNextValidatorId(6);
+
+  auto make_unreg = [&](uint64_t nonce)
+  {
+    return TransactionBuilder()
+        .type(TxType::UnregisterValidator)
+        .from(alice_)
+        .to(Crypto::Address{})
+        .amount(1)
+        .fee(2)
+        .nonce(nonce)
+        .chainId(EXEC_CHAIN_ID)
+        .build();
+  };
+
+  ASSERT_EQ(run(make_unreg(0)).status, ReceiptStatus::Success);
+
+  ValidatorInfo v;
+  ASSERT_TRUE(state_->getValidator(5, v));
+  const uint64_t first_stamp = v.pending_unbond_height;
+  ASSERT_NE(first_stamp, 0u);
+
+  // Second attempt, different nonce so it passes the nonce check.
+  EXPECT_EQ(run(make_unreg(1)).status, ReceiptStatus::Failure);
+
+  // The stamp is unchanged.
+  ASSERT_TRUE(state_->getValidator(5, v));
+  EXPECT_EQ(v.pending_unbond_height, first_stamp);
+}
+
+TEST_F(Core_ExecutorFixture, UnregisterRejectsWhenAlreadyUnbonding)
+{
+  // Same as above but the pending_unbond_height is set directly, so
+  // the test doesn't depend on the unregister path having run first.
+  seedValidator(alice_, /*id=*/5);
+  bumpNextValidatorId(6);
+
+  {
+    ValidatorInfo v;
+    ASSERT_TRUE(state_->getValidator(5, v));
+    v.pending_unbond_height = 500;
+    state_->putValidator(v);
+  }
+
+  Transaction tx = TransactionBuilder()
+                       .type(TxType::UnregisterValidator)
+                       .from(alice_)
+                       .to(Crypto::Address{})
+                       .amount(1)
+                       .fee(2)
+                       .nonce(0)
+                       .chainId(EXEC_CHAIN_ID)
+                       .build();
+
+  EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
+}
+
+TEST_F(Core_ExecutorFixture, UnregisterRetainsRecordAndIndex)
 {
   seedValidator(alice_, /*id=*/5);
   bumpNextValidatorId(6);
@@ -1894,11 +1990,18 @@ TEST_F(Core_ExecutorFixture, UnregisterClearsAddressIndex)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  uint64_t id = 0;
-  EXPECT_FALSE(state_->getValidatorByAddress(alice_.publicKey, id));
-
+  // The record is retained until the unbond expires. `run()` uses
+  // height 100 by default, so the stamp is 100 + UNBONDING_PERIOD.
   ValidatorInfo v;
-  EXPECT_FALSE(state_->getValidator(5, v));
+  ASSERT_TRUE(state_->getValidator(5, v));
+  EXPECT_EQ(v.pending_unbond_height,
+            100u + UNBONDING_PERIOD);
+
+  // The address index is retained too — otherwise an equivocation
+  // proof landing between now and expiry couldn't resolve the signer.
+  uint64_t id = 0;
+  ASSERT_TRUE(state_->getValidatorByAddress(alice_.publicKey, id));
+  EXPECT_EQ(id, 5u);
 }
 
 TEST_F(Core_ExecutorFixture, UnregisterRemovesFromActiveSet)

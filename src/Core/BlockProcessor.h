@@ -121,6 +121,9 @@ namespace Core
     static void processOrderExpiries(State::StateAccess &state,
                                      uint64_t current_height);
 
+    static void processUnbondExpiries(State::StateAccess &state,
+                                      uint64_t current_height);
+
     static void distributeRewards(State::StateAccess &state,
                                   const Block &block,
                                   const BlockContext &ctx);

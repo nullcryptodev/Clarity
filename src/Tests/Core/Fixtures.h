@@ -286,6 +286,21 @@ namespace Tests
         } });
     }
 
+    // Set a validator's pending_unbond_height directly. Used by the
+    // unbonding tests to construct a pending-unbond validator without
+    // running the full unregister path.
+    void setValidatorPendingUnbond(Id id, uint64_t pending_height)
+    {
+      withState([&](State::StateAccess &s)
+                {
+    Core::ValidatorInfo v;
+    if (s.getValidator(id, v))
+    {
+      v.pending_unbond_height = pending_height;
+      s.putValidator(v);
+    } });
+    }
+
     // ---- Context ----
 
     Core::BlockContext makeContext(uint64_t height, bool dry_run = false)

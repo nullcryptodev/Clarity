@@ -157,4 +157,30 @@ namespace Core
 
   static_assert(SLASH_AMOUNT_BPS > 0 && SLASH_AMOUNT_BPS <= 10'000,
                 "Slash amount must be in (0, 100%]");
+
+  // ---- Unbonding ----
+
+  // Number of blocks a validator's record remains present after
+  // unregistering, during which the stake is still slashable.
+  //
+  // Must be strictly greater than the maximum window in which an
+  // equivocation proof can be observed and included in a block.
+  // That window is bounded by:
+  //   - the time for a proposer to observe a conflict (bounded by
+  //     the consensus round length, ~seconds),
+  //   - the time for the proposer to include the Slash tx in a
+  //     block (the next block it proposes — which for a low-uptime
+  //     validator may be many blocks away, but never more than one
+  //     full rotation interval in practice),
+  //   - block propagation.
+  //
+  // 2 * ROTATION_INTERVAL (120 blocks) covers at least two epoch
+  // boundaries, which is more than enough for any honest proposer
+  // to include a proof that any peer has observed. The value is a
+  // policy floor, not a safety bound: a longer delay is strictly
+  // safer and only costs the departing validator liquidity.
+  inline constexpr uint64_t UNBONDING_PERIOD = 2 * ROTATION_INTERVAL;
+
+  static_assert(UNBONDING_PERIOD > ROTATION_INTERVAL,
+                "Unbonding must outlast at least one full rotation");
 } // namespace Core

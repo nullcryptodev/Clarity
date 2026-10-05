@@ -247,6 +247,7 @@ namespace Core
     }
 
     processOrderExpiries(state, ctx.current_height);
+    processUnbondExpiries(state, ctx.current_height);
 
     distributeRewards(state, block, ctx);
 
@@ -615,6 +616,46 @@ namespace Core
     }
 
     state.clearOrderExpiry(current_height);
+  }
+
+  void BlockProcessor::processUnbondExpiries(State::StateAccess &state,
+                                             uint64_t current_height)
+  {
+    // Collect expired unbondings first, then mutate. Mutating while
+    // iterating is not safe, and forEachValidator explicitly
+    // documents that the visitor should not modify state.
+    std::vector<Id> expired;
+
+    state.forEachValidator([&](const ValidatorInfo &v)
+                           {
+      if (v.isUnbondExpired(current_height))
+        expired.push_back(v.id); });
+
+    for (Id vid : expired)
+    {
+      ValidatorInfo v;
+      if (!state.getValidator(vid, v))
+        continue;
+
+      // Return the stake to the owner. The account may have been
+      // touched since the request; recalculateStaked brings the
+      // cached staked value in line with the new balance.
+      Account acct = state.getAccount(v.owner);
+      acct.balance += v.stake;
+      acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
+      state.putAccount(v.owner, acct);
+
+      // Remove the address index and the record, in that order.
+      // If the process crashes between the two, the index entry
+      // points at a missing record; getValidatorByAddress will
+      // return the id, and the subsequent getValidator will fail,
+      // and the caller treats that as "not registered". The
+      // alternative (deleting the record first) would leave a
+      // dangling address index that resolves to a non-existent
+      // validator — the same failure mode, but harder to diagnose.
+      state.deleteValidatorByAddress(v.reward_address);
+      state.deleteValidator(v.id);
+    }
   }
 
   //  Reward distribution
@@ -1227,7 +1268,22 @@ namespace Core
                                   const BlockContext &ctx,
                                   std::string &error)
   {
-    auto decoded = verifyEquivocationProof(tx.payload, active_set, state);
+    //  The proof resolves the signer by id, and the policy check
+    //  ("is this signer still slashable?") is enforced by
+    //  executeSystemSlash against the validator record: it rejects
+    //  seeds, rejects a validator that has been fully removed, and
+    //  succeeds for one that is merely rotated out or pending
+    //  unbond. Passing an empty active_set disables the verifier's
+    //  set-membership check, which would otherwise reject a proof
+    //  against a validator that rotated out between the vote and
+    //  the block — a legitimate slash that must not be lost.
+    //
+    //  The set-membership check in verifyEquivocationProof remains
+    //  useful for callers that want it (tests, migration tooling);
+    //  the on-chain path does not need it.
+    auto decoded = verifyEquivocationProof(tx.payload,
+                                           /*active_set=*/{},
+                                           state);
     if (!decoded.has_value())
     {
       error = "invalid equivocation proof";

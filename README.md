@@ -22,6 +22,14 @@ make
 
 Refer to [TESTING.md](https://github.com/nullcryptodev/Clarity/blob/main/TESTING.md)
 
+## Tests
+
+> You can launch `clairty_tests` with the gtest filter: `./clarity_tests --gtest_filter='Consensus*'` to run tests on individual modules.
+
+| Module | Amount of tests |
+| ----- | ----- |
+| Consensus | 171 |
+
 ## What it is
 
 Clarity is a **single-chain, Byzantine-fault-tolerant proof-of-stake network** with a native currency ($CLRTY), a general-purpose token system, an automated market maker, a limit-order book, validator rewards with a pot mechanism, and a growing feature set around staking, validator rotation, and on-chain governance of validator sets.
@@ -299,15 +307,13 @@ The wallet derives keys locally, signs with the reward key, and submits via `clr
 
 **No consensus key rotation.** A validator's consensus key is set at registration and immutable. Rotating it means unregistering and re-registering, which forfeits uptime history. This is a deliberate choice — mutable consensus keys would invalidate every prior signature by the same validator and complicate equivocation proofs — but it means a validator with a compromised consensus key has no recovery path short of full re-registration.
 
-**Slashing does not cover unregistered validators.** A validator that equivocates and then unregisters before the proof lands in a block loses nothing — the record is gone, so `executeSystemSlash` cannot collect. The window is narrow (evidence is included by the next proposer), but a determined attacker can exploit it. **The clean fix is an unbonding delay longer than the evidence window**: unregistering starts a countdown, and the validator remains slashable and its record remains present until the delay expires. A permanent infraction registry patches one symptom; the unbonding delay fixes the class. Neither is implemented today.
-
-**Slashing does not survive rotation.** A proof's `signer_index` resolves against the active set at the block being applied. If rotation runs between detection and inclusion, the proof fails and the proposer's `state_lookup_validator` filter drops it before inclusion. A versioned active-set store would let a proof resolve against the set at the height it names. This is orthogonal to the reward-address split — it's a property of the vote's `(signer_index, height, round)` coordinates resolving through the wrong active set, not of which key the vote was signed with.
-
 **Emergency rotation is tested in isolation but not end to end.** The derivation, the block path, the timeout counter, the certificate verifier, vote verification, and evidence lifetime all have unit tests. What is *not* tested is a live network driving through 30 rounds of genuine stall and asserting recovery — the `ConsensusNetwork` fixture does not model offline validators or pool promotion candidates. A randomized multi-node simulator with partition and offline-node injection would close this.
 
 **No wallet CLI for address-book operations.** The `clarity-wallet` client covers balance, transfer, staking, and validator operations, but not multi-account management, address labels, or key rotation from the CLI. Integrators still drive those through the library.
 
 ## Design choices worth noting
+
+> Note: policy rejection must not be a block-level error
 
 **Base58 is CryptoNote-style, not Bitcoin-style.** The test file explicitly notes this. Addresses produced by Clarity are not interoperable with external Base58 tools. This is a legacy surface — the RPC and wallet layers emit Bech32m — but any code that still uses the Base58 encoder would need to migrate before clients expect external interoperability.
 

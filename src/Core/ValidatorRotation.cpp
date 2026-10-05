@@ -401,30 +401,11 @@ namespace Core
   bool applyInfractionPenalty(ValidatorInfo &validator,
                               uint64_t current_height) noexcept
   {
-    uint16_t current = validator.reward_multiplier;
-    if (current <= REWARD_MULTIPLIER_FLOOR)
-    {
-      // Already at floor. Still record the infraction.
-      validator.infraction_count++;
-      validator.last_infraction_height = current_height;
-      return false;
-    }
-
-    uint16_t next = current > REWARD_MULTIPLIER_PENALTY
-                        ? uint16_t(current - REWARD_MULTIPLIER_PENALTY)
-                        : REWARD_MULTIPLIER_FLOOR;
-
-    if (next < REWARD_MULTIPLIER_FLOOR)
-    {
-      next = REWARD_MULTIPLIER_FLOOR;
-    }
-
-    validator.reward_multiplier = next;
-    validator.infraction_count++;
-    validator.last_infraction_height = current_height;
-
-    return true;
+    const uint16_t before = validator.reward_multiplier;
+    validator.applyInfractionPenalty(current_height);
+    return validator.reward_multiplier < before;
   }
+
   //  Emergency active set
 
   std::vector<Id> computeEmergencyActiveSet(

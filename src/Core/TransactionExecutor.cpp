@@ -430,7 +430,7 @@ namespace Core
 
   Receipt TransactionExecutor::executeUnregisterValidator(State::StateAccess &state,
                                                           const Transaction &tx,
-                                                          const TxExecutionContext & /*ctx*/)
+                                                          const TxExecutionContext & ctx)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
@@ -477,19 +477,30 @@ namespace Core
       saveActiveSet(state, new_set);
     }
 
-    // Return the validator's stake to their balance. Under the current
-    // registration model, stake == the full balance at registration
-    // time, and it has been held out of balance ever since.
-    Account acct = state.getAccount(validator.owner);
-    acct.balance += validator.stake;
-    acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
-    state.putAccount(validator.owner, acct);
+    // Already unbonding — reject a second request. The caller must
+    // wait for the first to expire. This keeps the state machine
+    // single-shot and prevents a validator from resetting its own
+    // unbond clock (which would extend the slashable window
+    // indefinitely, but also prevent the stake from ever being
+    // returned).
+    if (validator.pending_unbond_height != 0)
+      return failure;
 
-    // Remove the address index.
-    state.deleteValidatorByAddress(validator.reward_address);
-
-    // Remove the validator record itself.
-    state.deleteValidator(validator.id);
+    // Do NOT delete the record, refund the stake, or remove the
+    // address index. All three happen at the unbond expiry, in
+    // BlockProcessor::processUnbondExpiries. The record must
+    // remain present and findable so an equivocation proof
+    // landing between now and the expiry can still resolve the
+    // signer and slash the stake.
+    //
+    // The active-set removal above is the only immediate effect.
+    // The validator is now inactive; it cannot be re-promoted
+    // (canBeActive() requires pending_unbond_height == 0), and it
+    // will not appear in any future rotation plan.
+    validator.is_active = false;
+    validator.last_active_at = ctx.current_height;
+    validator.pending_unbond_height = ctx.current_height + UNBONDING_PERIOD;
+    state.putValidator(validator);
 
     return {ReceiptStatus::Success, tx.fee};
   }
@@ -1535,49 +1546,38 @@ namespace Core
     return {ReceiptStatus::Success, tx.fee};
   }
 
-  //  System: Slash
+  // Applies a consensus-generated slash. Bypasses the user-tx prechecks
+  // (signature, nonce, fee) because the proof has already been verified
+  // by the consensus layer that produced it.
   //
-  //  Applied when the consensus layer has verified an equivocation
-  //  proof against a validator. The proof is not re-verified here; see
-  //  the header for the contract.
+  // Returns Success if the slash was applied OR if the target was
+  // ineligible for slashing (seed, unregistered, or nothing left to
+  // slash). Ineligibility is a policy outcome, not a block-level
+  // error: a proposer that includes a Slash tx against an
+  // ineligible target is not malicious, and rejecting the block
+  // would give an attacker a liveness lever (include an
+  // ineligible-target Slash in every block and halt the chain).
   //
-  //  Effects, in order:
-  //    1. Load the validator. Reject if not registered.
-  //    2. Reject if seed and SEED_SLASH_EXEMPT.
-  //    3. Compute slash_amount = applyBps(stake, SLASH_AMOUNT_BPS).
-  //    4. Reduce stake by slash_amount. If stake is already zero,
-  //       slash_amount is zero and this is a no-op.
-  //    5. Apply the reward-multiplier penalty (persistent record).
-  //    6. Write the validator back.
-  //    7. Credit the pot with slash_amount.
-  //
-  //  Note on balance vs. stake: the validator's `stake` field is the
-  //  slashable principal, held in the validator record and returned to
-  //  the owner's account balance on unregister. It is NOT the same as
-  //  the owner's current account balance. The slash reduces stake only;
-  //  the account balance is untouched until unregister.
-  //
-  //  Note on state root: crediting the pot is a global-state write and
-  //  therefore changes the state root, exactly as maintaining
-  //  total_staked does in putAccount. A slash is not root-neutral.
-
+  // The receipt's fee_paid is zero: the Slash tx pays no fee, and
+  // no fee is charged on a no-op.
   Receipt TransactionExecutor::executeSystemSlash(State::StateAccess &state,
                                                   uint64_t validator_id,
                                                   uint64_t slash_height,
                                                   const TxExecutionContext & /*ctx*/)
   {
-    Receipt failure{ReceiptStatus::Failure, 0};
+    //  Ineligibility is a no-op, not a failure. See the header for
+    //  why: a Slash tx that cannot be applied must not reject the
+    //  block, or an attacker can halt the chain by including one
+    //  such tx in every block it proposes.
+    const Receipt no_op{ReceiptStatus::Success, 0};
 
     ValidatorInfo validator;
     if (!state.getValidator(validator_id, validator))
-      return failure;
+      return no_op;
 
     if (SEED_SLASH_EXEMPT && validator.is_seed)
-      return failure;
+      return no_op;
 
-    // Compute the stake reduction. applyBps is overflow-safe and
-    // floors, which is the correct direction: a validator is never
-    // slashed more than the configured fraction.
     const uint64_t slash_amount =
         applyBps(validator.stake, SLASH_AMOUNT_BPS);
 
@@ -1590,15 +1590,17 @@ namespace Core
 
     // The multiplier penalty is applied unconditionally. The proof is
     // valid; the infraction is recorded even if there was nothing left
-    // to slash from the stake.
+    // to slash from the stake. This is deliberate — the persistent
+    // reduction in future earnings is part of the punishment, and a
+    // validator with zero stake should not be able to re-register
+    // with a clean multiplier.
+    //
+    // Note: applyInfractionPenalty is the member function, not the
+    // free function in ValidatorRotation.h. See Change D.
     validator.applyInfractionPenalty(slash_height);
 
     state.putValidator(validator);
 
-    // Credit the pot. The pot is credited every block by
-    // BlockProcessor::distributeRewards with the reward-multiplier
-    // penalty proceeds and the staker share; a slash is a one-time
-    // additional contribution to the same pot.
     if (slash_amount > 0)
     {
       GlobalStateReader reader(state);
