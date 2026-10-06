@@ -33,6 +33,10 @@ namespace P2P
       return "getblocks";
     case MessageType::Blocks:
       return "blocks";
+    case MessageType::GetProof:
+      return "getproof";
+    case MessageType::Proof:
+      return "proof";
     case MessageType::Inv:
       return "inv";
     case MessageType::GetData:
@@ -58,9 +62,7 @@ namespace P2P
     // Costs reflect the work the *receiver* does per message, relative
     // to a cheap control message. Cheap-to-send, expensive-to-serve
     // types are charged more. Consensus types are not listed — they're
-    // charged only to the consensus bucket, which is checked separately
-    // (see Peer::handleReadHeader and the body-read lambda in
-    // Peer::startRead's continuation).
+    // charged only to the consensus bucket, which is checked separately.
     switch (t)
     {
     case MessageType::GetHeaders:
@@ -69,8 +71,20 @@ namespace P2P
     case MessageType::GetBlocks:
       return 20; // server loops up to MAX_BLOCKS_PER_REQUEST (128) getBlock calls, each deserializing
 
+    case MessageType::GetProof:
+      // Server walks up to 256 SMT levels, reading nodes from disk,
+      // then serializes ~9 KB of proof. Same order of work as
+      // GetHeaders, plus a Blake2b chain over every sibling.
+      return 50;
+
     case MessageType::Blocks:
       return 10; // we deserialize up to 128 blocks
+
+    case MessageType::Proof:
+      // We deserialize a ~9 KB proof and re-verify it (256 Blake2b
+      // hashes). Cheaper than serving one, but not cheap enough to
+      // treat as a control message.
+      return 5;
 
     case MessageType::Block:
       return 10; // we deserialize + apply one block, then re-broadcast
@@ -85,9 +99,7 @@ namespace P2P
     case MessageType::Prevote:
     case MessageType::Precommit:
       // Consensus types are not charged to this bucket; the consensus
-      // bucket handles them. Return 1 as a defensive default so that
-      // if messageCost() is ever called on them, the value is
-      // meaningful (1 is the cheapest possible cost).
+      // bucket handles them. Return 1 as a defensive default.
       return 1;
 
     case MessageType::Version:
@@ -103,9 +115,6 @@ namespace P2P
       return 1;
 
     default:
-      // Unknown / future message types get a nominal cost. This is the
-      // safe default: a new type that's cheap to send and expensive to
-      // serve doesn't silently bypass the limiter.
       return 1;
     }
   }

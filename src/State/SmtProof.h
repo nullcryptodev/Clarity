@@ -60,6 +60,23 @@ namespace State
 
   std::optional<SmtProof> prove(const SparseMerkleTree &tree, const Crypto::Hash &key);
 
+  //  Proof generation against an explicit root.
+  //
+  //  Walks from `root` rather than from `tree.root()`. This is what the
+  //  P2P GetProof handler uses to serve proofs against historical roots:
+  //  the tree reads nodes through its DB/txn binding, but the walk starts
+  //  from a root the caller supplies, which may be a version's root rather
+  //  than the current one.
+  //
+  //  `prove(tree, key)` is equivalent to
+  //  `proveAtRoot(tree, tree.root(), key)`.
+  //
+  //  Returns nullopt if the tree is corrupted (missing nodes along the
+  //  path). Should never happen with a consistent DB.
+  std::optional<SmtProof> proveAtRoot(const SparseMerkleTree &tree,
+                                      const Crypto::Hash &root,
+                                      const Crypto::Hash &key);
+
   //  Proof verification
   //
   //  Recomputes the root from the proof and compares to `expected_root`.

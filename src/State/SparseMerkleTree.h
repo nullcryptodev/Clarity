@@ -30,6 +30,11 @@ namespace State
 
     std::optional<std::vector<uint8_t>> get(const Crypto::Hash &key) const;
 
+    //  Read leaf data by its content hash. See the note on
+    //  proveFromRoot for why this exists separately from get().
+    bool getLeafDataByHash(const Crypto::Hash &leaf_hash,
+                           std::vector<uint8_t> &out) const;
+
     Crypto::Hash update(const Crypto::Hash &key,
                         const std::vector<uint8_t> &value,
                         uint64_t version);

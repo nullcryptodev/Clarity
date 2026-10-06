@@ -12,6 +12,7 @@
 #include "Consensus/Message.h"
 #include "P2P/MessageTypes.h"
 #include "P2P/VersionMessage.h"
+#include "P2P/ProofMessages.h"
 
 #include "Crypto/Ed25519.h"
 #include "Logging/ILogger.h"
@@ -1079,6 +1080,9 @@ namespace Node
     case P2P::MessageType::Headers:
       handleIncomingHeaders(msg, from);
       break;
+    case P2P::MessageType::GetProof:
+      handleGetProof(msg, from);
+      break;
     case P2P::MessageType::Blocks:
       handleIncomingBlocks(msg, from);
       break;
@@ -1760,6 +1764,95 @@ namespace Node
     }
 
     it->second->onBlocks(blocks);
+  }
+
+  void Node::handleGetProof(const P2P::Message &msg, P2P::PeerId from)
+  {
+    P2P::GetProofMessage req;
+    if (!P2P::deserializeGetProof(msg.payload.data(), msg.payload.size(), req))
+    {
+      (*log_)(Logging::WARNING)
+          << "Malformed GetProof from peer " << from;
+      return;
+    }
+
+    if (!chain_ || !p2p_)
+      return;
+
+    P2P::ProofMessage resp;
+
+    //  Step 1: resolve the (key_type, key_bytes) descriptor to an SMT
+    //  key. A Malformed reply means the client sent bytes that don't
+    //  match the layout its declared key_type requires — a client bug,
+    //  not a server error.
+    auto key = P2P::resolveProofKey(req.key_type, req.key_bytes);
+    if (!key.has_value())
+    {
+      resp.status = P2P::ProofMessage::Status::Malformed;
+      P2P::Message reply;
+      reply.type = P2P::MessageType::Proof;
+      reply.payload = P2P::serializeProof(resp);
+      p2p_->sendTo(from, reply);
+      return;
+    }
+
+    //  Step 2: resolve the version. PROOF_VERSION_CURRENT means "the
+    //  current head", which we translate to a concrete height before
+    //  doing anything else, so the reply's version field is always a
+    //  real number.
+    const uint64_t resolved_version =
+        (req.version == P2P::PROOF_VERSION_CURRENT)
+            ? chain_->height()
+            : req.version;
+
+    resp.version = resolved_version;
+
+    //  Step 3: get the version's root. This is what the client will
+    //  verify against. If the version has no saved root — pruned, or
+    //  never existed — we report VersionUnavailable.
+    auto state = std::make_unique<State::StateAccess>(
+        *state_db_, resolved_version);
+
+    auto root = state->smtRootAtVersion(resolved_version);
+    if (!root.has_value())
+    {
+      resp.status = P2P::ProofMessage::Status::VersionUnavailable;
+      P2P::Message reply;
+      reply.type = P2P::MessageType::Proof;
+      reply.payload = P2P::serializeProof(resp);
+      p2p_->sendTo(from, reply);
+      return;
+    }
+
+    resp.state_root = *root;
+
+    //  Step 4: produce the proof. The StateAccess is at the requested
+    //  version, so its tree and the version's nodes are consistent —
+    //  see the contract comment on proveAtVersion.
+    auto proof = state->proveAtVersion(*key, resolved_version);
+    if (!proof.has_value())
+    {
+      resp.status = P2P::ProofMessage::Status::KeyNotFound;
+      P2P::Message reply;
+      reply.type = P2P::MessageType::Proof;
+      reply.payload = P2P::serializeProof(resp);
+      p2p_->sendTo(from, reply);
+      return;
+    }
+
+    resp.status = P2P::ProofMessage::Status::Ok;
+    resp.proof = std::move(*proof);
+
+    P2P::Message reply;
+    reply.type = P2P::MessageType::Proof;
+    reply.payload = P2P::serializeProof(resp);
+    p2p_->sendTo(from, reply);
+
+    (*log_)(Logging::DEBUGGING)
+        << "Served proof for peer " << from
+        << " key_type=" << static_cast<int>(req.key_type)
+        << " version=" << resolved_version
+        << " proof_bytes=" << reply.payload.size();
   }
 
   void Node::updateBestPeerHeight()

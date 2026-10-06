@@ -153,63 +153,116 @@ namespace State
       Crypto::blake2b(buf, sizeof(buf), h.data.data(), 32);
       return h;
     }
+
+    //  The SMT walk, parameterised by root. Both prove() and
+    //  proveAtRoot() go through here; the only difference between them
+    //  is which root the walk starts from.
+    //  The leaf value and the sibling list must come from the same
+    //  walk from the same root. Reading the leaf separately via
+    //  tree.get() would read from the tree's *current* root, which
+    //  produces a proof whose value and siblings are inconsistent
+    //  whenever the requested root is historical.
+    std::optional<SmtProof> proveFromRoot(const SparseMerkleTree &tree,
+                                          const Crypto::Hash &root,
+                                          const Crypto::Hash &key)
+    {
+      SmtProof proof;
+      proof.key = key;
+      proof.siblings.resize(SparseMerkleTree::DEPTH);
+
+      Crypto::Hash current = root;
+
+      for (size_t i = 0; i < SparseMerkleTree::DEPTH; ++i)
+      {
+        const size_t depth = SparseMerkleTree::DEPTH - i;
+
+        // Once we enter an empty subtree, every remaining sibling is a
+        // default hash for its own depth. The leaf is the empty leaf,
+        // i.e. non-inclusion.
+        if (current == SparseMerkleTree::defaultHash(depth))
+        {
+          for (size_t j = i; j < SparseMerkleTree::DEPTH; ++j)
+          {
+            proof.siblings[j] =
+                SparseMerkleTree::defaultHash(SparseMerkleTree::DEPTH - j - 1);
+          }
+          proof.value.reset();
+          return proof;
+        }
+
+        // At depth 1 we're about to descend into the leaf. Do it
+        // directly so we can capture the value, then stop.
+        if (depth == 1)
+        {
+          Crypto::Hash left, right;
+          if (!tree.readChildren(current, left, right))
+            return std::nullopt;
+
+          const uint8_t byte = key.data[i / 8];
+          const uint8_t mask = 0x80 >> (i % 8);
+          const bool go_right = (byte & mask) != 0;
+
+          proof.siblings[i] = go_right ? left : right;
+          const Crypto::Hash &leaf_hash = go_right ? right : left;
+
+          //  The empty leaf is a non-inclusion: the key's slot is
+          //  unoccupied, so `value` is nullopt.
+          if (leaf_hash == SparseMerkleTree::defaultHash(0))
+          {
+            proof.value.reset();
+          }
+          else
+          {
+            //  Read the leaf value by its hash. The tree holds the
+            //  leaf-hash -> value mapping, and the version's nodes
+            //  are content-addressed, so this returns the value at
+            //  the requested root.
+            std::vector<uint8_t> leaf_value;
+            if (!tree.getLeafDataByHash(leaf_hash, leaf_value))
+              return std::nullopt;
+            proof.value = std::move(leaf_value);
+          }
+
+          return proof;
+        }
+
+        Crypto::Hash left, right;
+        if (!tree.readChildren(current, left, right))
+        {
+          return std::nullopt; // corrupted tree
+        }
+
+        const uint8_t byte = key.data[i / 8];
+        const uint8_t mask = 0x80 >> (i % 8);
+        const bool go_right = (byte & mask) != 0;
+
+        if (go_right)
+        {
+          proof.siblings[i] = left;
+          current = right;
+        }
+        else
+        {
+          proof.siblings[i] = right;
+          current = left;
+        }
+      }
+
+      //  Unreachable: the loop returns at depth == 1.
+      return std::nullopt;
+    }
   } // anonymous namespace
 
   std::optional<SmtProof> prove(const SparseMerkleTree &tree, const Crypto::Hash &key)
   {
-    SmtProof proof;
-    proof.key = key;
-    proof.siblings.resize(SparseMerkleTree::DEPTH);
+    return proveFromRoot(tree, tree.root(), key);
+  }
 
-    // Read the leaf value (nullopt for non-inclusion).
-    proof.value = tree.get(key);
-
-    // Walk down from the root. Siblings are stored root-first:
-    //   siblings[0]  = sibling at the root level (depth 256)
-    //   siblings[i]  = sibling at depth (DEPTH - i)
-    //   siblings[255]= sibling at the leaf's parent level (depth 1)
-    Crypto::Hash current = tree.root();
-
-    for (size_t i = 0; i < SparseMerkleTree::DEPTH; ++i)
-    {
-      const size_t depth = SparseMerkleTree::DEPTH - i;
-
-      // Once we enter an empty subtree, every remaining sibling is a
-      // default hash for its own depth, and every subsequent parent
-      // hash will be the default for one level up.
-      if (current == SparseMerkleTree::defaultHash(depth))
-      {
-        for (size_t j = i; j < SparseMerkleTree::DEPTH; ++j)
-        {
-          proof.siblings[j] =
-              SparseMerkleTree::defaultHash(SparseMerkleTree::DEPTH - j - 1);
-        }
-        return proof;
-      }
-
-      Crypto::Hash left, right;
-      if (!tree.readChildren(current, left, right))
-      {
-        return std::nullopt; // corrupted tree
-      }
-
-      const uint8_t byte = key.data[i / 8];
-      const uint8_t mask = 0x80 >> (i % 8);
-      const bool go_right = (byte & mask) != 0;
-
-      if (go_right)
-      {
-        proof.siblings[i] = left;
-        current = right;
-      }
-      else
-      {
-        proof.siblings[i] = right;
-        current = left;
-      }
-    }
-
-    return proof;
+  std::optional<SmtProof> proveAtRoot(const SparseMerkleTree &tree,
+                                      const Crypto::Hash &root,
+                                      const Crypto::Hash &key)
+  {
+    return proveFromRoot(tree, root, key);
   }
 
   //  Proof verification

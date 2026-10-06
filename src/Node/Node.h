@@ -133,6 +133,7 @@ namespace Node
     void handleIncomingBlock(const P2P::Message &msg, P2P::PeerId from);
     void handleGetHeaders(const P2P::Message &msg, P2P::PeerId from);
     void handleGetBlocks(const P2P::Message &msg, P2P::PeerId from);
+    void handleGetProof(const P2P::Message &msg, P2P::PeerId from);
 
     void onP2PPeerEstablished(const P2P::P2PManager::PeerEstablishedInfo &info);
     void handleIncomingHeaders(const P2P::Message &msg, P2P::PeerId from);

@@ -257,6 +257,12 @@ namespace State
     return db_.getLeafDataAtVersion(leaf_hash, version, out);
   }
 
+  bool SparseMerkleTree::getLeafDataByHash(const Crypto::Hash &leaf_hash,
+                                           std::vector<uint8_t> &out) const
+  {
+    return getLeafDataImpl(leaf_hash, out);
+  }
+
   bool SparseMerkleTree::getMetaImpl(const std::string &key,
                                      std::vector<uint8_t> &out) const
   {

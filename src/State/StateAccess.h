@@ -22,6 +22,7 @@
 #include "Crypto/Types.h"
 #include "SparseMerkleTree.h"
 #include "StateDB.h"
+#include "SmtProof.h"
 
 namespace State
 {
@@ -231,6 +232,24 @@ namespace State
     bool getGlobalAtVersion(const std::string &name,
                             uint64_t version,
                             std::vector<uint8_t> &out) const;
+
+    // ---- Proof generation at a specific version ----
+    //
+    //  Produces an SMT proof for `key` at `version`. The proof is
+    //  against the version's root, not the current root; the caller
+    //  receives the root separately (via smtRootAtVersion) so the
+    //  client can verify independently.
+    //
+    //  Returns nullopt if `version` has no saved root, or if the SMT
+    //  walk fails (corrupt DB).
+    //
+    //  The `key` is an SMT key as produced by the Keys::* functions —
+    //  the same key the current-version getters use, and the same key
+    //  resolveProofKey produces from a (key_type, key_bytes) pair.
+    //
+    //  Used by Node::handleGetProof. Not used by any consensus path.
+    std::optional<State::SmtProof> proveAtVersion(
+        const Crypto::Hash &key, uint64_t version) const;
 
   private:
     // Txn-aware storage helpers.

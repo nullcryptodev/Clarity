@@ -2,7 +2,7 @@
 
 # Clarity
 
-![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C768-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue)
+![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C791-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue)
 
 #### Table of Contents
 
@@ -60,6 +60,7 @@
   - [Idle Refresh](#idle-refresh)
   - [Block Relay](#block-relay)
   - [Transaction Relay](#transaction-relay)
+  - [Proof Serving](#proof-serving)
   - [Rate Limiting](#rate-limiting)
   - [Peer Management](#peer-management)
   - [Self-connection prevention](#self-connection-prevention)
@@ -80,7 +81,7 @@ Clarity is a **single-chain, Byzantine-fault-tolerant proof-of-stake network** w
 
 It's not a direct fork of anything. The block format, consensus protocol, state model, and reward math are original. It uses well-known primitives (Ed25519, Blake2b, SHA-512, ChaCha20-Poly1305) from Monocypher, the Argon2 reference implementation for keystore KDF, the BLAKE2 reference code, and a project-internal Keccak implementation verified against the official Keccak test vectors.
 
-The project is at the code-complete, pre-launch stage. The daemon builds, the full test suite passes, and the end-to-end path (from transaction submission through consensus through block application through state persistence through restart) has been exercised on a live two-validator regtest network. The RPC surface is complete and tested. The wallet layer (keystores, HD derivation, signing, address encoding) is complete and tested, and there is an interactive CLI wallet client. The P2P layer has authentication, sync, block relay, transaction relay, per-peer rate limiting, and periodic refresh. It has not been deployed to a public network.
+The project is at the code-complete, pre-launch stage. The daemon builds, the full test suite passes, and the end-to-end path (from transaction submission through consensus through block application through state persistence through restart) has been exercised on a live two-validator regtest network. The RPC surface is complete and tested. The wallet layer (keystores, HD derivation, signing, address encoding) is complete and tested, and there is an interactive CLI wallet client. The P2P layer has authentication, sync, block relay, transaction relay, proof serving, per-peer rate limiting, and periodic refresh. It has not been deployed to a public network.
 
 ## The architecture
 
@@ -93,7 +94,7 @@ Serialization    binary, KV-binary, JSON serializers
 State            MDBX storage, sparse Merkle tree, state access, proofs, historical reads
 Core             blocks, transactions, execution, block processing, rewards, equivocation proofs
 Consensus        BFT state machine, proposer selection, message encoding
-P2P              TCP transport, peer management, message framing, auth, sync, relay
+P2P              TCP transport, peer management, message framing, auth, sync, relay, proof serving
 Node             assembles everything into a running daemon
 RPC              JSON-RPC 2.0 server, dispatcher, method handlers, encoders
 Wallet           keystores, HD derivation (BIP39/SLIP10), signing, addresses
@@ -115,33 +116,51 @@ transaction_signer  offline wallet transaction signer and submit if rpc
 ## Build
 
 ```bash
+# Clone repo
 git clone https://github.com/nullcryptodev/Clarity
+
+# Enter cloned dir
 cd Clarity
 
-# remove and re-add bugged external
+# Remove bugged external
 rm -rf external/json
+
+# Re-add bugged external
 git clone --branch v3.11.3 --depth 1 https://github.com/nlohmann/json.git external/json
 
+# Make new dir
 mkdir build
 
+# Enter build dir
+cd build
+
+# Run cmake command
 cmake ..
 
+# Run make command
 make
 
+# Enter built apps dir
 cd src/Apps
 ```
 
 ## Tests
 
-You can launch `clairty_tests` with the gtest filter: `./clarity_tests --gtest_filter='Consensus*'` to run tests on individual modules. Refer to [TESTING.md](https://github.com/nullcryptodev/Clarity/blob/main/TESTING.md)
+You can launch `clairty_tests` with the gtest filter: `./clarity_tests --gtest_filter='Consensus*'` to run tests on individual modules.
 
 ```bash
+# Follow steps from Build, until cmake command
+
+# Run cmake command
 cmake -DBUILD_TESTS=ON ..
 
+# Run make command
 make
 
+# Enter tests dir
 cd src/Tests
 
+# Run test program
 ./clarity_tests
 ```
 
@@ -209,7 +228,9 @@ A **sparse Merkle tree** of depth 256. Each key is a 32-byte hash (derived from 
 A `StateAccess` object wraps the DB and provides typed getters and setters for accounts, token balances, token metadata, validators, orders, AMM pools, AMM positions, receipts, and global state. Reads and writes go through the SMT so every change updates the root.
 
 #### Proofs
-Inclusion and non-inclusion proofs can be generated for any key. A proof is a list of sibling hashes down to the leaf; verification recomputes the root from the proof and compares. This is what a light client would need to verify that an account exists with a given balance at a given state root.
+Inclusion and non-inclusion proofs can be generated for any key. A proof is a list of sibling hashes down to the leaf; verification recomputes the root from the proof and compares. Proofs are a pure-function construction: `verifyProof(expected_root, proof)` performs no DB access and no signature checks, so a caller that holds only a state root can verify a proof without trusting the server that produced it. Proof generation is exposed over P2P via the `GetProof`/`Proof` message pair (see [Proof Serving](#proof-serving)), and the same machinery is used in-process by tests and diagnostic tooling.
+
+`proveAtRoot(tree, root, key)` produces a proof against an explicit root, which is what lets a node serve proofs against *historical* state, not just the current head. A proof's value and its sibling list must come from a single walk from a single root — reading the leaf separately from the current tree would produce a proof whose value and siblings disagree whenever the requested root is historical.
 
 #### Versioning
 The SMT saves its root at every version number, and stores a historical row for each SMT node and leaf it writes at a non-zero version. `rootAtVersion(n)` retrieves a historical root, and `SparseMerkleTree::getAtVersion(key, n)` retrieves a *key's value* as it was at version `n`. Typed historical reads are exposed on `StateAccess` as `getAccountAtVersion`, `getValidatorAtVersion`, and `getGlobalAtVersion`; the raw primitive is `getRawAtVersion`, which takes the same SMT keys the current-version getters use.
@@ -321,7 +342,7 @@ Each round that times out is attested by a broadcast `TimeoutVote` — a signatu
 
 ## Network: how nodes talk
 
-**TCP transport** over IPv4 and IPv6. Each peer connection goes through a handshake: exchange version messages, verify protocol compatibility, exchange a signed challenge, exchange addresses. Once established, peers route messages by type — proposals, votes, transactions, block announcements, sync requests, and peer address requests.
+**TCP transport** over IPv4 and IPv6. Each peer connection goes through a handshake: exchange version messages, verify protocol compatibility, exchange a signed challenge, exchange addresses. Once established, peers route messages by type — proposals, votes, transactions, block announcements, sync requests, proof requests, and peer address requests.
 
 #### Message framing
 10-byte header (4-byte magic, 2-byte type, 4-byte length) followed by an opaque payload. Magic is chain-ID-based, so peers on different networks don't connect. Max message size is 16 MiB.
@@ -346,8 +367,17 @@ After a validator commits a block, it broadcasts the full serialized block to ev
 #### Transaction relay
 A node that accepts a transaction into its mempool broadcasts it. Recipients add it and re-broadcast. A node that already has the tx (`mempool_->contains(txid)`) drops it silently — same loop-breaking discipline as block relay. This is what lets a non-validator node submit a transaction to the network.
 
+#### Proof serving
+A client that holds a state root can request a proof for any key at any version via `GetProof` / `Proof`. The request carries a typed descriptor — an account address, a `(address, token id)` pair, a validator id, a global state name, or an AMM pool id — rather than a raw SMT key, so the client never has to know how keys are derived. The server resolves the descriptor to the same 32-byte SMT key the state layer uses, walks the tree from the requested version's root, and replies with the proof *and* the root it was proven against.
+
+The root travels with the proof because the client's verification must be self-contained: `verifyProof(expected_root, proof)` recomputes the root from the proof and compares. The client does not need to trust that the server picked the right root, because if it picked a wrong one, verification fails. This is what makes a light client possible without syncing the chain.
+
+Proofs can be requested against the current head (a sentinel version) or against any historical version that hasn't been pruned. Non-inclusion proofs (the account is empty at that version) and inclusion proofs use the same message; the client distinguishes them by inspecting the proof's `value` field. A reply carries a status field: `Ok` when a proof was produced, `VersionUnavailable` when the requested version has no saved root, `KeyNotFound` for a server that cannot serve the key (a pruned or inconsistent DB), and `Malformed` when the request's descriptor didn't match its declared type.
+
+Serving a proof is expensive — a 256-level tree walk plus a ~9 KB response — so `GetProof` carries a higher rate-limit cost than a header request, and `Proof` carries a non-trivial cost because the receiving peer still has to deserialize and re-verify the proof.
+
 #### Rate limiting
-Each peer has a token bucket for its message stream, plus a stricter separate bucket for consensus messages. The cost per message reflects the asymmetry of work — `GetHeaders` costs 20 tokens, `Tx` costs 5, control messages cost 1, consensus messages use the separate bucket. A peer that floods expensive-to-serve messages is cut off and disconnected. The RPC layer has its own per-source-IP token bucket with the same `Common::RateLimiter`.
+Each peer has a token bucket for its message stream, plus a stricter separate bucket for consensus messages. The cost per message reflects the asymmetry of work — `GetHeaders` and `GetBlocks` cost 20 tokens, `GetProof` costs 50, `Tx` costs 5, `Proof` costs 5, control messages cost 1, consensus messages use the separate bucket. A peer that floods expensive-to-serve messages is cut off and disconnected. The RPC layer has its own per-source-IP token bucket with the same `Common::RateLimiter`.
 
 #### Peer management
 An address book stores known peers, persisted to disk. A ban list records misbehaving peers, with a threshold at which they're banned. Outbound connection maintenance dials enough peers to maintain a target. The manager also handles inbound connections up to a maximum.
@@ -423,8 +453,6 @@ The wallet layer supports the operations you'd need for an address book — mult
 
 **No divergence detection or repair.** With the atomic commit discipline (state writes, block index writes, and head update in one MDBX transaction), divergence shouldn't be possible. But if it happened — from a bug, or from a partially-written restart — the node has no detection or recovery path.
 
-**No light client mode.** Full nodes only. The SMT proof machinery exists and is exercised in tests, but there's no P2P message type for requesting or delivering proofs. Light-client support would need a `GetProof`/`Proof` message pair on top of the existing encoder.
-
 **No order matching engine.** Orders are stored, indexed by expiry, and can be cancelled — but nothing *fills* them. There is no code that matches buys against sells, no partial-fill logic, no price-time priority queue. The order book exists in the state model but not in the execution model. This is the single largest feature gap.
 
 **No P2P encryption.** Authentication is done — every peer proves possession of its key. But the channel itself is plaintext. A MITM can drop messages or substitute them; they can't forge signatures, but they can cause liveness failures. An authenticated-encryption layer (Noise, or a simple ECDH + ChaCha20-Poly1305 wrap) would close this.
@@ -445,11 +473,11 @@ The wallet layer supports the operations you'd need for an address book — mult
 
 **AMM positions are not deleted when a pool closes.** When the last LP drains a pool, the pool record is deleted but the zeroed `AmmPosition` record persists. It is unreachable from any index (the position index was removed in the same operation), so it is invisible to any caller that doesn't already know its id — but it costs 64 bytes per position ever created, and a `forEachPosition`-style scan would surface them. Cleaning them up would require either a `pool_id → [position_ids]` index or a scan bounded by how many LPs the pool ever had. Neither is worth the code today; the historical SMT already preserves the fact that the position existed.
 
+**No client-side use of the proof protocol.** The `GetProof`/`Proof` message pair exists and is served by the node, and `verifyProof` is a pure function a client can call against any state root it trusts — but nothing in the wallet currently uses it. A wallet that proves a balance without trusting the RPC server is the whole point of the protocol; wiring the wallet to actually request and verify proofs is the natural next step. The library layer has everything it needs; only the integration is missing.
+
 ## Design choices worth noting
 
 **Base58 is CryptoNote-style, not Bitcoin-style.** The test file explicitly notes this. Addresses produced by Clarity are not interoperable with external Base58 tools. This is a legacy surface — the RPC and wallet layers emit Bech32m — but any code that still uses the Base58 encoder would need to migrate before clients expect external interoperability.
-
-**Full nodes only.** The SMT proof machinery exists but isn't wired to a light-client protocol. Proofs are generated and verified in tests, but there's no P2P message type for requesting or delivering them.
 
 **One block per round, immediate finality.** No fork choice, no probabilistic finality, no reorgs. Simpler than Bitcoin-style consensus and matches the BFT model, but the network can't make progress if fewer than `bftQuorum` validators are online.
 
@@ -471,7 +499,7 @@ The wallet layer supports the operations you'd need for an address book — mult
 
 **Proposals for future rounds are queued.** A proposal for round N+1 arriving at a validator in round N is stashed and delivered when the local round advances, rather than dropped. This is what makes the round-crossing case (a validator that timed out in round N while a proposer moved on to N+1) work on a real network with jitter. A precommit for the *locked* block is processed at any step at or after Prevote, not only at Precommit, so a validator that locked on X in round N and is still in Propose in round N+1 will record a precommit quorum for X and commit. This is the round-crossing lock case.
 
-**Messages are weighted for rate limiting.** The per-peer token bucket charges by message type: cheap control messages cost 1, `Tx` costs 5, `GetHeaders` and `GetBlocks` cost 20. This reflects the asymmetry of work — a `GetHeaders` is 12 bytes on the wire but causes the server to do up to 2000 lookups. Consensus messages use a separate, stricter bucket.
+**Messages are weighted for rate limiting.** The per-peer token bucket charges by message type: cheap control messages cost 1, `Tx` costs 5, `GetHeaders` and `GetBlocks` cost 20, `GetProof` costs 50. This reflects the asymmetry of work — a `GetHeaders` is 12 bytes on the wire but causes the server to do up to 2000 lookups, and a `GetProof` causes a 256-level tree walk. Consensus messages use a separate, stricter bucket.
 
 **Slashing is automatic, not voted.** A proof of equivocation is a mathematical fact — two valid signatures over conflicting values at the same `(height, round)`. It isn't subject to a vote, because a Byzantine majority could vote to slash an honest validator but cannot forge a signature. Automatic application means the safety argument of BFT is economically enforced: a validator that equivocates loses stake and earnings, regardless of what the other validators think about it.
 
@@ -480,6 +508,12 @@ The wallet layer supports the operations you'd need for an address book — mult
 **Policy rejection is not a block-level error.** A system transaction whose target is ineligible for the operation — a Slash tx against a seed, an unregistered validator, or a validator with nothing left to slash — is a no-op at the transaction level, not a block rejection. The distinction is load-bearing: if ineligibility rejected the block, a proposer could halt the chain by including one such transaction in every block it produced. Validity of the *evidence* is enforced upstream (`verifyEquivocationProof`); the executor only applies policy. The same principle applies to every future system-tx type.
 
 **AMM pools auto-close on full drain.** When the last LP withdraws and both reserves reach zero, the pool record is deleted rather than left in a zero-reserve state. A pool in that state is functionally inert — `Swap` divides by a zero reserve, `AddLiquidity` rejects it — and leaving the record behind would make callers special-case a state they can never usefully act on. Removing the record is what makes "remove all liquidity" mean "the pool no longer exists." Historical reads are unaffected: `getAtVersion` on a closed pool's key still returns the pool at any version where it existed, so a block explorer can ask "what did pool 7 look like at block 1000?" after the pool has been closed.
+
+**Proof serving is a pure additive protocol.** A `GetProof` request carries a typed descriptor rather than a raw SMT key — a wallet knows an address, not a `Blake2b("acct" || address)` digest — so the server does the key derivation. The reply carries the proof *and* the root it was proven against, so the client's `verifyProof(expected_root, proof)` call is self-contained: no DB access, no signature checks, no trust in the server's choice of root beyond what the proof itself establishes. A wrong root produces a failing verification, not a false acceptance.
+
+Proofs can be requested against historical versions because the SMT keeps historical node rows (see [Versioning](#versioning)). A proof against a version older than the pruning horizon returns `VersionUnavailable`, which the client can distinguish from `KeyNotFound` and `Malformed`. The two-call shape — request, then verify locally — is what makes the protocol light-client-safe: a client that doesn't want to trust the server can send the same request to two servers and accept the result only if both produce proofs that verify against the same root.
+
+**A proof's value and siblings come from one walk.** `proveAtRoot` walks the SMT once, from the given root, and captures both the leaf value and the sibling hashes during that walk. An earlier implementation read the leaf via `tree.get()`, which walks from the tree's *current* root — the two walks could disagree, producing a proof whose value and siblings were inconsistent whenever the requested root was historical. The failing case is subtle and worth recording: for a single-leaf tree, the two versions' siblings happen to be identical (both `defaultHash` at every level), so only the leaf hash distinguishes them. `verifyProof(root_v1, proof)` failed while `verifyProof(root_v2, proof)` passed — a proof that was correct in one sense and wrong in another. The fix is to produce the value and the siblings from a single walk from a single root; the invariant is now documented on `proveFromRoot`.
 
 **Seed rewards are stipend-based, not fee-based.** When the active set contains only seeds, the producer bonus is split evenly across seeds and the set share is routed to the pot. The producing seed earns no more than any other seed — seeds are a single operational entity, and the distinction between producing and signing is bookkeeping noise. This keeps a young chain's rewards flowing into the pot (where they eventually pay stakers) rather than concentrating in the seed operators' balances, and it preserves the incentive for new validators to register: the moment a non-seed joins the active set, normal distribution resumes.
 

@@ -812,4 +812,30 @@ namespace State
     out = std::move(*value);
     return true;
   }
+
+  //  Proof generation at a specific version
+
+  std::optional<State::SmtProof> StateAccess::proveAtVersion(
+      const Crypto::Hash &key, uint64_t version) const
+  {
+    //  Contract: the caller has constructed this StateAccess at
+    //  `version`. The tree walks the current-node table, which holds
+    //  the state at `version` — not the state at the caller's own
+    //  version if they differ. A caller that wants a proof at a
+    //  version different from its own must construct a fresh
+    //  StateAccess at that version, which is what Node::handleGetProof
+    //  does.
+    //
+    //  The root lookup below is what ties the proof to `version`
+    //  rather than to the tree's loaded root. If the two disagree,
+    //  the walk reads nodes at the tree's state and produces a proof
+    //  that fails verification against `*root` — a loud failure, not
+    //  a silent one.
+
+    auto root = smt_.rootAtVersion(version);
+    if (!root.has_value())
+      return std::nullopt;
+
+    return State::proveAtRoot(smt_, *root, key);
+  }
 } // namespace State
