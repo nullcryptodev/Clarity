@@ -7,6 +7,11 @@ set(UPNPC_BUILD_TESTS OFF CACHE BOOL "Build test executables")
 add_subdirectory(miniupnpc)
 add_subdirectory(json)
 add_subdirectory(monocypher)
+add_subdirectory(linenoise)
+
+if(TARGET linenoise)
+  set_target_properties(linenoise PROPERTIES SYSTEM TRUE)
+endif()
 
 if (DO_TESTS)
   add_subdirectory(gtest)
