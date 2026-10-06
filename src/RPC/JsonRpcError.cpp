@@ -71,6 +71,10 @@ namespace Rpc
       return "ReceiptNotFound";
     case ErrorCode::StateReadInternal:
       return "StateReadInternal";
+    case ErrorCode::ProofVersionUnavailable:
+      return "ProofVersionUnavailable";
+    case ErrorCode::ProofNotAvailable:
+      return "ProofNotAvailable";
 
     // ---- Chain ----
     case ErrorCode::BlockNotFound:
@@ -160,6 +164,10 @@ namespace Rpc
       return "Receipt not found";
     case ErrorCode::StateReadInternal:
       return "State read failed";
+    case ErrorCode::ProofVersionUnavailable:
+      return "No committed state root at the requested version";
+    case ErrorCode::ProofNotAvailable:
+      return "Proof could not be produced for this key";
 
     case ErrorCode::BlockNotFound:
       return "Block not found";

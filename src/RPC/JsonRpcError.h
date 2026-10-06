@@ -82,6 +82,8 @@ namespace Rpc
     OrderNotFound = 1054,
     ReceiptNotFound = 1055,
     StateReadInternal = 1056,
+    ProofVersionUnavailable = 1057,
+    ProofNotAvailable = 1058,
 
     // ---- Application: chain lookup (1100..1149) ----
 

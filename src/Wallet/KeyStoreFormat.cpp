@@ -345,6 +345,23 @@ namespace Wallet
       }
     }
 
+    //  Run the format's validation rules on the parsed structure.
+    //  parseKeyStoreFile is the single choke point for reading a
+    //  keystore from JSON — whether that JSON came from disk or from
+    //  a caller that constructed it in memory — and every reader of
+    //  a keystore file must see the same rejection semantics. Doing
+    //  validation here means an invalid field is caught at parse time
+    //  with the specific error code the caller expects, rather than
+    //  surfacing later as a KDF failure or an authentication failure
+    //  with a misleading cause.
+    const WalletError verr = validateKeyStoreFile(f);
+    if (verr != WalletError::Ok)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(verr, walletErrorMessage(verr));
+      return std::nullopt;
+    }
+
     return f;
   }
 
@@ -450,6 +467,18 @@ namespace Wallet
     if (f.version != KEYSTORE_VERSION)
       return WalletError::KeyStoreUnsupportedVersion;
 
+    // ---- top-level scalar checks ----
+    if (f.chain_id == 0)
+      return WalletError::KeyStoreCorrupt;
+
+    if (f.network != "mainnet" &&
+        f.network != "testnet" &&
+        f.network != "regtest")
+    {
+      return WalletError::KeyStoreCorrupt;
+    }
+
+    // ---- crypto structural checks ----
     if (f.crypto.cipher != CIPHER_XCHACHA20_POLY1305)
       return WalletError::KeyStoreUnsupportedCipher;
 
@@ -459,18 +488,56 @@ namespace Wallet
     if (f.crypto.mac.size() != 16)
       return WalletError::KeyStoreCorrupt;
 
+    //  Ciphertext is the encrypted seed, so it's bounded by the seed
+    //  length: non-empty, at most 64 bytes. An empty ciphertext would
+    //  decrypt to nothing; an oversized one can't be a seed.
+    if (f.crypto.ciphertext.empty() || f.crypto.ciphertext.size() > 64)
+      return WalletError::KeyStoreCorrupt;
+
+    //  AAD must match the format's fixed string. The AAD binds the
+    //  ciphertext to a specific format version; a mismatch is either
+    //  tampering or a file from a format we don't recognize.
+    if (f.crypto.aad != KEYSTORE_AAD)
+      return WalletError::KeyStoreCorrupt;
+
+    // ---- KDF parameters ----
     if (f.crypto.kdf == KDF_ARGON2ID)
     {
       if (!f.crypto.argon2.has_value())
         return WalletError::KeyStoreCorrupt;
-      if (f.crypto.argon2->salt.size() != KEYSTORE_SALT_LENGTH)
+      const auto &a = *f.crypto.argon2;
+      if (a.salt.size() != KEYSTORE_SALT_LENGTH)
+        return WalletError::KeyStoreCorrupt;
+
+      //  Argon2id parameter bounds. RFC 9106 requires m_cost >=
+      //  8 * p_cost; a smaller value would be rejected by the KDF
+      //  implementation, but we reject it earlier so the failure is
+      //  a clean validation error rather than a KDF failure.
+      if (a.m_cost_kib < 8)
+        return WalletError::KeyStoreCorrupt;
+      if (a.t_cost == 0)
+        return WalletError::KeyStoreCorrupt;
+      if (a.p_cost == 0)
+        return WalletError::KeyStoreCorrupt;
+      if (a.m_cost_kib < 8 * a.p_cost)
+        return WalletError::KeyStoreCorrupt;
+      //  Upper bound: 8 GiB. Rejects absurd memory allocations that
+      //  would OOM the host rather than produce a key.
+      if (a.m_cost_kib > 8 * 1024 * 1024)
         return WalletError::KeyStoreCorrupt;
     }
     else if (f.crypto.kdf == KDF_PBKDF2_HMAC_SHA512)
     {
       if (!f.crypto.pbkdf2.has_value())
         return WalletError::KeyStoreCorrupt;
-      if (f.crypto.pbkdf2->salt.size() != KEYSTORE_SALT_LENGTH)
+      const auto &p = *f.crypto.pbkdf2;
+      if (p.salt.size() != KEYSTORE_SALT_LENGTH)
+        return WalletError::KeyStoreCorrupt;
+
+      //  PBKDF2 iteration floor: 100,000. Below this the derived key
+      //  is too weak to be a meaningful barrier, and a keystore that
+      //  claims a low count is either corrupt or hostile.
+      if (p.iterations < 100'000)
         return WalletError::KeyStoreCorrupt;
     }
     else
@@ -478,10 +545,14 @@ namespace Wallet
       return WalletError::KeyStoreUnsupportedKdf;
     }
 
+    // ---- public key and HD ----
     if (f.pubkey.size() != 32)
       return WalletError::KeyStoreCorrupt;
 
     if (f.hd.seed_fingerprint.size() != 4)
+      return WalletError::KeyStoreCorrupt;
+
+    if (f.hd.default_path.empty())
       return WalletError::KeyStoreCorrupt;
 
     return WalletError::Ok;

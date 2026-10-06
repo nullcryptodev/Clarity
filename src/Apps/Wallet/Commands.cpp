@@ -82,6 +82,12 @@ namespace Wallet
          "Change the RPC endpoint.",
          cmd_connect},
 
+        {"connect-peer", "connect-peer <host:port>",
+         "Configure a second RPC endpoint for proof verification. When set,\n"
+         "`balance --verify` requires both endpoints to agree on the state\n"
+         "root before verifying proofs against it.",
+         cmd_connect_peer},
+
         {"help", "help [command]",
          "Show help. With no argument, lists all commands.",
          cmd_help},
@@ -484,10 +490,21 @@ namespace Wallet
     if (!requireRpc(session))
       return;
 
-    std::string address;
-    if (args.size() >= 2)
+    //  Parse --verify flag. The rest of the args are positional.
+    bool verify = false;
+    std::vector<std::string> positional;
+    for (size_t i = 1; i < args.size(); ++i)
     {
-      address = args[1];
+      if (args[i] == "--verify")
+        verify = true;
+      else
+        positional.push_back(args[i]);
+    }
+
+    std::string address;
+    if (!positional.empty())
+    {
+      address = positional[0];
     }
     else if (session.hasKeystore())
     {
@@ -499,15 +516,66 @@ namespace Wallet
       return;
     }
 
+    if (!verify)
+    {
+      //  Fast path: single RPC call, trusting the server.
+      std::string err;
+      auto balance = Wallet::getBalance(*session.rpc, address, &err);
+      if (!balance.has_value())
+      {
+        std::cerr << "error: " << err << "\n";
+        return;
+      }
+      std::cout << Wallet::formatAmount(*balance) << " CLRTY\n";
+      return;
+    }
+
+    //  Verified path: fetch a trusted root, get a proof, verify it,
+    //  and only then report the balance. Slower (at least three RPC
+    //  round trips) but the value comes from a proof rather than the
+    //  server's word.
+    if (!session.rpc_peer)
+    {
+      std::cerr << "warning: no peer endpoint configured. Set one with\n"
+                << "  connect-peer <host:port>\n"
+                << "to require two independent servers to agree on the state\n"
+                << "root. Falling back to single-server trust for this call.\n";
+    }
+
+    Wallet::Network network = session.currentNetwork();
+
     std::string err;
-    auto balance = Wallet::getBalance(*session.rpc, address, &err);
-    if (!balance.has_value())
+    auto verified = Wallet::fetchVerifiedBalance(
+        *session.rpc,
+        session.rpc_peer.get(),
+        address,
+        network,
+        &err);
+
+    if (!verified.has_value())
     {
       std::cerr << "error: " << err << "\n";
       return;
     }
 
-    std::cout << Wallet::formatAmount(*balance) << " CLRTY\n";
+    //  Report the balance with a marker showing how the root was
+    //  obtained.
+    std::cout << Wallet::formatAmount(verified->balance) << " CLRTY";
+    if (verified->is_empty)
+      std::cout << " (account has never been touched)";
+    std::cout << "\n";
+
+    std::cout << "  verified against state root "
+              << verified->state_root.toString().substr(0, 16) << "...\n";
+    std::cout << "  at version " << verified->version << "\n";
+    if (verified->peer_verified)
+    {
+      std::cout << "  root confirmed by two independent endpoints\n";
+    }
+    else
+    {
+      std::cout << "  root obtained from a single endpoint\n";
+    }
   }
 
   // ===========================================================================
@@ -1130,6 +1198,52 @@ namespace Wallet
     session.rpc = std::make_unique<Wallet::RpcClient>(session.rpc_endpoint);
 
     std::cout << "Connected to " << host << ":" << port << "\n";
+  }
+
+  void cmd_connect_peer(WalletSession &session,
+                        const std::vector<std::string> &args)
+  {
+    if (args.size() < 2)
+    {
+      std::cerr << "usage: connect-peer <host:port>\n"
+                << "  Use 'connect-peer none' to clear the peer.\n";
+      return;
+    }
+
+    const std::string &spec = args[1];
+
+    if (spec == "none")
+    {
+      session.rpc_peer.reset();
+      session.rpc_peer_endpoint = Wallet::RpcEndpoint{};
+      std::cout << "Peer endpoint cleared.\n";
+      return;
+    }
+
+    const size_t colon = spec.find(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= spec.size())
+    {
+      std::cerr << "error: expected host:port\n";
+      return;
+    }
+
+    std::string host = spec.substr(0, colon);
+    std::string port_str = spec.substr(colon + 1);
+
+    char *end = nullptr;
+    const unsigned long port = std::strtoul(port_str.c_str(), &end, 10);
+    if (end == port_str.c_str() || *end != '\0' || port == 0 || port > 65535)
+    {
+      std::cerr << "error: invalid port: " << port_str << "\n";
+      return;
+    }
+
+    session.rpc_peer_endpoint.host = host;
+    session.rpc_peer_endpoint.port = static_cast<uint16_t>(port);
+    session.rpc_peer = std::make_unique<Wallet::RpcClient>(
+        session.rpc_peer_endpoint);
+
+    std::cout << "Peer endpoint set to " << host << ":" << port << "\n";
   }
 
   // ===========================================================================

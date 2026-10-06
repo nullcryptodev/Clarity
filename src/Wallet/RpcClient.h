@@ -11,6 +11,9 @@
 
 #include "Common/Json.h"
 
+#include "State/ProofKeys.h"
+#include "State/SmtProof.h"
+
 namespace Wallet
 {
   //  RpcClient
@@ -171,5 +174,52 @@ namespace Wallet
       RpcClient &rpc,
       const std::string &address_bech32m,
       bool *is_not_found,
+      std::string *error_out = nullptr);
+
+  //  Fetch the node's current chain height and state root. Two
+  //  RPC calls: `blockNumber` for the height, then
+  //  `getBlockHeaderByNumber` for the header at that height.
+  //
+  //  Returns nullopt on transport error, RPC error, or malformed
+  //  response.
+  //
+  //  This is the *trusting* half of the light-client verification:
+  //  the caller is trusting the node to report its own current root
+  //  honestly. To distrust, call this against two independent
+  //  endpoints and require agreement — see
+  //  WalletOperations::fetchTrustedRoot.
+  struct HeaderInfo
+  {
+    uint64_t height{0};
+    Crypto::Hash state_root{};
+  };
+
+  //  The result of a getProof call. Mirrors the P2P ProofMessage's
+  //  status enum, but flattened for RPC use — the RPC method returns
+  //  an error code instead of a status field for the non-ok cases.
+  struct ProofResult
+  {
+    Crypto::Hash state_root{};
+    uint64_t version{0};
+    State::SmtProof proof{};
+  };
+
+  std::optional<HeaderInfo> getCurrentHeader(
+      RpcClient &rpc,
+      std::string *error_out = nullptr);
+
+  //  Fetch a proof from the node's RPC. `key_type` and `key_bytes`
+  //  use the same layouts as the P2P GetProof message.
+  //
+  //  Returns nullopt on any failure and populates error_out with a
+  //  human-readable message. A successful return means the server
+  //  produced a proof; the caller must still verify it with
+  //  State::verifyProof(state_root, proof) against a root it
+  //  trusts.
+  std::optional<ProofResult> getProof(
+      RpcClient &rpc,
+      State::ProofKeyType key_type,
+      const std::vector<uint8_t> &key_bytes,
+      uint64_t version,
       std::string *error_out = nullptr);
 } // namespace Wallet

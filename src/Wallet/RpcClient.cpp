@@ -35,12 +35,26 @@ namespace Wallet
     constexpr const char *GetNonce = "getNonce";
     constexpr const char *SendRawTransaction = "sendRawTransaction";
     constexpr const char *GetTransactionReceipt = "getTransactionReceipt";
+    constexpr const char *GetProof = "getProof";
+    constexpr const char *GetBlockHeaderByNumber = "getBlockHeaderByNumber";
+    constexpr const char *BlockNumber = "blockNumber";
   } // namespace RpcMethods
 
   //  ---- Hex helpers ----
 
   namespace
   {
+
+    constexpr char HEX_LOWER[] = "0123456789abcdef";
+
+    //  The ReceiptNotFound error code. This duplicates the value in
+    //  Rpc/JsonRpcError.h so the wallet client doesn't need to link
+    //  against the RPC server headers. If the code changes on the
+    //  server side, the client will retry on the wrong error code and
+    //  the failure will be visible as a hung waitForReceipt. Watch
+    //  for that if you ever renumber the ErrorCode enum.
+    constexpr int RECEIPT_NOT_FOUND_CODE = 1055; // should match ErrorCode::ReceiptNotFound
+
     //  Parse a "0x..." hex string into a uint64_t. Returns nullopt on
     //  malformed input or if the value doesn't fit. Empty after the
     //  prefix is treated as "0".
@@ -74,13 +88,89 @@ namespace Wallet
       return value;
     }
 
-    //  The ReceiptNotFound error code. This duplicates the value in
-    //  Rpc/JsonRpcError.h so the wallet client doesn't need to link
-    //  against the RPC server headers. If the code changes on the
-    //  server side, the client will retry on the wrong error code and
-    //  the failure will be visible as a hung waitForReceipt. Watch
-    //  for that if you ever renumber the ErrorCode enum.
-    constexpr int RECEIPT_NOT_FOUND_CODE = 1055; // should match ErrorCode::ReceiptNotFound
+    //  Parse a 0x-prefixed hex string into a 32-byte hash. Returns
+    //  false if the string isn't exactly 66 characters (0x + 64 hex).
+    bool parseHashHex(const std::string &s, Crypto::Hash &out)
+    {
+      if (s.size() != 66 || s[0] != '0' ||
+          (s[1] != 'x' && s[1] != 'X'))
+        return false;
+
+      auto nib = [](char c) -> int
+      {
+        if (c >= '0' && c <= '9')
+          return c - '0';
+        if (c >= 'a' && c <= 'f')
+          return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+          return c - 'A' + 10;
+        return -1;
+      };
+
+      for (size_t i = 0; i < 32; ++i)
+      {
+        const int hi = nib(s[2 + i * 2]);
+        const int lo = nib(s[2 + i * 2 + 1]);
+        if (hi < 0 || lo < 0)
+          return false;
+        out.data[i] = static_cast<uint8_t>((hi << 4) | lo);
+      }
+      return true;
+    }
+
+    //  Parse a 0x-prefixed hex string into a byte vector. Returns
+    //  false on malformed input.
+    bool parseBytesHex(const std::string &s, std::vector<uint8_t> &out)
+    {
+      if (s.size() < 2 || s[0] != '0' || (s[1] != 'x' && s[1] != 'X'))
+        return false;
+      if (((s.size() - 2) & 1) != 0)
+        return false;
+
+      auto nib = [](char c) -> int
+      {
+        if (c >= '0' && c <= '9')
+          return c - '0';
+        if (c >= 'a' && c <= 'f')
+          return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+          return c - 'A' + 10;
+        return -1;
+      };
+
+      out.clear();
+      out.reserve((s.size() - 2) / 2);
+      for (size_t i = 2; i < s.size(); i += 2)
+      {
+        const int hi = nib(s[i]);
+        const int lo = nib(s[i + 1]);
+        if (hi < 0 || lo < 0)
+          return false;
+        out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+      }
+      return true;
+    }
+
+    std::string encodeU64Hex(uint64_t v)
+    {
+      if (v == 0)
+        return "0x0";
+
+      std::string out = "0x";
+      bool started = false;
+      for (int i = 15; i >= 0; --i)
+      {
+        uint8_t nib = uint8_t((v >> (i * 4)) & 0xF);
+        if (!started)
+        {
+          if (nib == 0)
+            continue;
+          started = true;
+        }
+        out.push_back(HEX_LOWER[nib]);
+      }
+      return out;
+    }
   } // anonymous namespace
 
   //  ---- RpcClient ----
@@ -405,5 +495,199 @@ namespace Wallet
     }
 
     return result.result;
+  }
+
+  std::optional<HeaderInfo> getCurrentHeader(
+      RpcClient &rpc,
+      std::string *error_out)
+  {
+    //  Step 1: current height.
+    auto height_result = rpc.call(RpcMethods::BlockNumber,
+                                  Common::Json::object());
+    if (!height_result.ok())
+    {
+      if (error_out)
+        *error_out = height_result.error->message;
+      return std::nullopt;
+    }
+    if (!height_result.result.is_object() ||
+        !height_result.result.contains("height"))
+    {
+      if (error_out)
+        *error_out = "blockNumber: response missing 'height' field";
+      return std::nullopt;
+    }
+
+    const auto &h = height_result.result["height"];
+    if (!h.is_string())
+    {
+      if (error_out)
+        *error_out = "blockNumber: 'height' is not a string";
+      return std::nullopt;
+    }
+    auto parsed_height = parseHexU64(h.get<std::string>());
+    if (!parsed_height.has_value())
+    {
+      if (error_out)
+        *error_out = "blockNumber: 'height' is not valid hex";
+      return std::nullopt;
+    }
+
+    //  Step 2: header at that height.
+    Common::Json params = Common::Json::object();
+    params["height"] = "0x" + [&]
+    {
+      static const char hex[] = "0123456789abcdef";
+      std::string s;
+      uint64_t v = *parsed_height;
+      if (v == 0)
+      {
+        s = "0";
+        return s;
+      }
+      while (v)
+      {
+        s.push_back(hex[v & 0xF]);
+        v >>= 4;
+      }
+      std::reverse(s.begin(), s.end());
+      return s;
+    }();
+
+    auto header_result = rpc.call(RpcMethods::GetBlockHeaderByNumber, params);
+    if (!header_result.ok())
+    {
+      if (error_out)
+        *error_out = header_result.error->message;
+      return std::nullopt;
+    }
+    if (!header_result.result.is_object() ||
+        !header_result.result.contains("state_root"))
+    {
+      if (error_out)
+        *error_out = "getBlockHeaderByNumber: response missing 'state_root'";
+      return std::nullopt;
+    }
+
+    const auto &sr = header_result.result["state_root"];
+    if (!sr.is_string())
+    {
+      if (error_out)
+        *error_out = "getBlockHeaderByNumber: 'state_root' is not a string";
+      return std::nullopt;
+    }
+
+    HeaderInfo info;
+    info.height = *parsed_height;
+    if (!parseHashHex(sr.get<std::string>(), info.state_root))
+    {
+      if (error_out)
+        *error_out = "getBlockHeaderByNumber: 'state_root' is not a valid hash";
+      return std::nullopt;
+    }
+
+    return info;
+  }
+
+  std::optional<ProofResult> getProof(
+      RpcClient &rpc,
+      State::ProofKeyType key_type,
+      const std::vector<uint8_t> &key_bytes,
+      uint64_t version,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["key_type"] = static_cast<uint64_t>(key_type);
+    params["key_bytes"] = "0x" + [&]
+    {
+      static const char hex[] = "0123456789abcdef";
+      std::string s;
+      s.reserve(key_bytes.size() * 2);
+      for (uint8_t b : key_bytes)
+      {
+        s.push_back(hex[b >> 4]);
+        s.push_back(hex[b & 0x0F]);
+      }
+      return s;
+    }();
+
+    if (version == State::PROOF_VERSION_CURRENT)
+    {
+      params["version"] = "current";
+    }
+    else
+    {
+      params["version"] = encodeU64Hex(version);
+    }
+
+    auto result = rpc.call(RpcMethods::GetProof, params);
+    if (!result.ok())
+    {
+      if (error_out)
+        *error_out = result.error->message;
+      return std::nullopt;
+    }
+
+    if (!result.result.is_object())
+    {
+      if (error_out)
+        *error_out = "getProof: response is not an object";
+      return std::nullopt;
+    }
+
+    const auto &obj = result.result;
+    if (!obj.contains("state_root") || !obj["state_root"].is_string())
+    {
+      if (error_out)
+        *error_out = "getProof: missing or malformed 'state_root'";
+      return std::nullopt;
+    }
+    if (!obj.contains("version") || !obj["version"].is_string())
+    {
+      if (error_out)
+        *error_out = "getProof: missing or malformed 'version'";
+      return std::nullopt;
+    }
+    if (!obj.contains("proof") || !obj["proof"].is_string())
+    {
+      if (error_out)
+        *error_out = "getProof: missing or malformed 'proof'";
+      return std::nullopt;
+    }
+
+    ProofResult pr;
+    if (!parseHashHex(obj["state_root"].get<std::string>(), pr.state_root))
+    {
+      if (error_out)
+        *error_out = "getProof: 'state_root' is not a valid hash";
+      return std::nullopt;
+    }
+    auto parsed_version = parseHexU64(obj["version"].get<std::string>());
+    if (!parsed_version.has_value())
+    {
+      if (error_out)
+        *error_out = "getProof: 'version' is not valid hex";
+      return std::nullopt;
+    }
+    pr.version = *parsed_version;
+
+    std::vector<uint8_t> proof_bytes;
+    if (!parseBytesHex(obj["proof"].get<std::string>(), proof_bytes))
+    {
+      if (error_out)
+        *error_out = "getProof: 'proof' is not valid hex";
+      return std::nullopt;
+    }
+
+    if (!State::SmtProof::deserialize(proof_bytes.data(),
+                                      proof_bytes.size(),
+                                      pr.proof))
+    {
+      if (error_out)
+        *error_out = "getProof: proof failed to deserialize";
+      return std::nullopt;
+    }
+
+    return pr;
   }
 } // namespace Wallet

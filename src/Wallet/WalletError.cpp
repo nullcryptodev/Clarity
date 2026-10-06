@@ -98,6 +98,15 @@ namespace Wallet
     case WalletError::Locked:
       return "Locked";
 
+    case WalletError::ProofVerificationFailed:
+      return "ProofVerificationFailed";
+    case WalletError::RootDisagreement:
+      return "RootDisagreement";
+    case WalletError::NoTrustedRoot:
+      return "NoTrustedRoot";
+    case WalletError::PeerUnreachable:
+      return "PeerUnreachable";
+
     case WalletError::Internal:
       return "Internal";
     }
@@ -192,6 +201,15 @@ namespace Wallet
       return "Object not found";
     case WalletError::Locked:
       return "Wallet is locked";
+
+    case WalletError::ProofVerificationFailed:
+      return "Proof did not verify against the trusted state root";
+    case WalletError::RootDisagreement:
+      return "Independent endpoints disagree on the state root";
+    case WalletError::NoTrustedRoot:
+      return "No trusted state root is available";
+    case WalletError::PeerUnreachable:
+      return "Configured peer endpoint is unreachable";
 
     case WalletError::Internal:
       return "Internal error";

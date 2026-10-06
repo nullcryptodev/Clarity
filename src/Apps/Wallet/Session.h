@@ -35,6 +35,16 @@ namespace Wallet
     Wallet::RpcEndpoint rpc_endpoint;
     std::unique_ptr<Wallet::RpcClient> rpc;
 
+    //  Optional second RPC endpoint for proof verification. When set,
+    //  the wallet fetches the current state root from both this and
+    //  `rpc` and requires them to agree before trusting either. See
+    //  WalletOperations::fetchTrustedRoot.
+    //
+    //  Not required for basic operation. `balance --verify` warns and
+    //  falls back to single-endpoint trust if this is not configured.
+    Wallet::RpcEndpoint rpc_peer_endpoint;
+    std::unique_ptr<Wallet::RpcClient> rpc_peer;
+
     //  True if the RPC endpoint responded to the initial probe.
     //  Set by the startup wizard; may go stale if the node stops
     //  later, but that's fine — commands re-check on each call.

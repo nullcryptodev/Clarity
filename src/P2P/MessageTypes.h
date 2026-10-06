@@ -80,38 +80,6 @@ namespace P2P
     }
   }
 
-  // ---- Proof key types ----
-  //
-  //  A light client does not know how SMT keys are derived — it knows
-  //  addresses and ids. A GetProof message carries a typed descriptor,
-  //  and the server resolves it to the same 32-byte SMT key the
-  //  current-version getters use. This is what makes light-client
-  //  support possible without shipping the key derivation code to the
-  //  client.
-  //
-  //  Key byte layouts, one per type:
-  //
-  //    Account:       32-byte address
-  //    TokenBalance:  32-byte address || 4-byte token id (LE)
-  //    Validator:     8-byte validator id (LE)
-  //    Global:        UTF-8 name, max 64 bytes, not null-terminated
-  //    AmmPool:       8-byte pool id (LE)
-
-  enum class ProofKeyType : uint8_t
-  {
-    Account = 0,
-    TokenBalance = 1,
-    Validator = 2,
-    Global = 3,
-    AmmPool = 4,
-  };
-
-  // Sentinel for "the version the server considers current". Chosen as
-  // UINT64_MAX so it cannot collide with any real version: heights are
-  // uint64_t but a chain never reaches 2^64 blocks, and version 0
-  // means "genesis root" (which the chain does use).
-  inline constexpr uint64_t PROOF_VERSION_CURRENT = UINT64_MAX;
-
   // ---- Ban reasons (informational) ----
 
   enum class BanReason : uint8_t

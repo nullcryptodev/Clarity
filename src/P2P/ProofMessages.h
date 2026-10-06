@@ -12,6 +12,7 @@
 #include "MessageTypes.h"
 
 #include "Crypto/Types.h"
+#include "State/ProofKeys.h"
 #include "State/SmtProof.h"
 
 namespace P2P
@@ -24,6 +25,15 @@ namespace P2P
   //  client can verify independently. The client needs no DB access
   //  and no knowledge of the chain's state beyond the root it's
   //  checking against.
+  //
+  //  The key descriptor type (ProofKeyType) and its resolver
+  //  (resolveProofKey) live in State — the resolution is a state-layer
+  //  concern, and both this protocol and the RPC getProof method
+  //  consume it. Bring them into scope here so callers of this header
+  //  don't need to include State/ProofKeys.h separately.
+  using State::PROOF_VERSION_CURRENT;
+  using State::ProofKeyType;
+  using State::resolveProofKey;
 
   struct GetProofMessage
   {
@@ -107,15 +117,5 @@ namespace P2P
   std::vector<uint8_t> serializeProof(const ProofMessage &m);
   bool deserializeProof(const uint8_t *data, size_t len,
                         ProofMessage &out);
-
-  //  Resolve a (key_type, key_bytes) pair to the SMT key the same
-  //  current-version getters use. Returns nullopt when key_bytes does
-  //  not match the layout its key_type requires.
-  //
-  //  This is the client/server contract: both sides agree on the
-  //  layouts documented on ProofKeyType, and the server resolves them
-  //  via the same Keys::* functions the state layer uses.
-  std::optional<Crypto::Hash> resolveProofKey(ProofKeyType type,
-                                              const std::vector<uint8_t> &key_bytes);
 
 } // namespace P2P

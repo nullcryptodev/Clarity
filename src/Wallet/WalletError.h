@@ -79,6 +79,12 @@ namespace Wallet
     NotFound,
     Locked,
 
+    // Proof / light-client verification
+    ProofVerificationFailed,
+    RootDisagreement,
+    NoTrustedRoot,
+    PeerUnreachable,
+
     // Internal
     Internal,
   };

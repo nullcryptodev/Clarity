@@ -13,6 +13,7 @@
 #include "Core/Transaction.h"
 #include "Crypto/Types.h"
 #include "RpcClient.h"
+#include "WalletTypes.h"
 
 namespace Wallet
 {
@@ -71,7 +72,7 @@ namespace Wallet
       const Core::Transaction &tx,
       std::string *error_out = nullptr);
 
-    //  Poll for a transaction receipt until either it appears or the
+  //  Poll for a transaction receipt until either it appears or the
   //  timeout expires.
   //
   //  Returns:
@@ -98,4 +99,69 @@ namespace Wallet
   //  indicates a server bug, not a transaction outcome).
   bool receiptSucceeded(const Common::Json &receipt);
 
+  //  TrustedRoot
+  //
+  //  A state root the wallet is willing to verify proofs against.
+  //  `peer_verified` is true when two independent endpoints returned
+  //  the same root — meaning the wallet is not trusting a single
+  //  server. When false, the wallet fell back to single-server trust
+  //  (either no peer was configured, or the peer was unreachable and
+  //  the caller asked to proceed anyway).
+  struct TrustedRoot
+  {
+    Crypto::Hash root;
+    uint64_t height{0};
+    bool peer_verified{false};
+  };
+
+  //  Fetch a root to verify proofs against. If `peer` is non-null,
+  //  the peer's header at the same height must agree with the
+  //  primary's, or the fetch fails. If `peer` is null, the primary's
+  //  root is returned with `peer_verified == false`.
+  //
+  //  Returns nullopt on any RPC failure, or on disagreement. The
+  //  error_out message distinguishes them.
+  std::optional<TrustedRoot> fetchTrustedRoot(
+      RpcClient &primary,
+      RpcClient *peer,
+      std::string *error_out = nullptr);
+
+  //  VerifiedBalance
+  //
+  //  A balance confirmed by an SMT proof against a trusted root. The
+  //  wallet refuses to return a value it couldn't verify.
+  //
+  //  `is_empty` is true for a non-inclusion proof — the account has
+  //  never been touched, so its balance is zero by construction.
+  struct VerifiedBalance
+  {
+    uint64_t balance{0};
+    bool is_empty{false};
+    Crypto::Hash state_root;
+    uint64_t version{0};
+    bool peer_verified{false};
+  };
+
+  //  Fetch and verify the balance of an account.
+  //
+  //  Flow:
+  //    1. fetchTrustedRoot(primary, peer) — get a root to verify against.
+  //    2. getProof(primary, Account, address_bytes, root.height) — get
+  //       a proof for the account at that version.
+  //    3. If the proof's state_root doesn't match the trusted root,
+  //       fail. The server is inconsistent with itself.
+  //    4. State::verifyProof(trusted.root, proof.proof) — verify
+  //       locally. If it fails, the server lied about the value and
+  //       the wallet refuses to return it.
+  //    5. Decode the leaf value (a serialized Account) and return the
+  //       balance.
+  //
+  //  On non-inclusion (the account doesn't exist at the version),
+  //  returns a VerifiedBalance with balance 0 and is_empty true.
+  std::optional<VerifiedBalance> fetchVerifiedBalance(
+      RpcClient &primary,
+      RpcClient *peer,
+      const std::string &address_bech32m,
+      Network network,
+      std::string *error_out = nullptr);
 } // namespace Wallet

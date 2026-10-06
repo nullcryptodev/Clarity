@@ -5,6 +5,13 @@
 
 #pragma once
 
+#include "Common/Json.h"
+
+namespace Node
+{
+  class Node;
+}
+
 namespace Rpc
 {
   class JsonRpcDispatcher;

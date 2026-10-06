@@ -66,6 +66,7 @@ namespace Wallet
   void cmd_open(WalletSession &session, const std::vector<std::string> &args);
   void cmd_close(WalletSession &session, const std::vector<std::string> &args);
   void cmd_connect(WalletSession &session, const std::vector<std::string> &args);
+  void cmd_connect_peer(WalletSession &session, const std::vector<std::string> &args);
   void cmd_help(WalletSession &session, const std::vector<std::string> &args);
   void cmd_exit(WalletSession &session, const std::vector<std::string> &args);
 

@@ -11,6 +11,8 @@
 
 #include "Node/Node.h"
 
+#include "State/ProofKeys.h"
+
 namespace Rpc
 {
   namespace
@@ -941,6 +943,170 @@ namespace Rpc
       return out;
     }
 
+    // ---- clrty_getProof ----
+    //
+    // Params:
+    //   key_type    (required, integer 0..4)
+    //   key_bytes   (required, 0x-prefixed hex; layout per key_type)
+    //   version     (optional, hex or "current"; default "current")
+    //
+    // Returns:
+    //   {
+    //     "status":      "ok" | "key_not_found" | "version_unavailable" | "malformed",
+    //     "state_root":  "0x...",
+    //     "version":     "0x...",
+    //     "proof":       "0x..."        // present only when status == "ok"
+    //   }
+    //
+    //  The proof is the serialized SmtProof, hex-encoded. A client
+    //  verifies it with State::verifyProof(state_root, proof) after
+    //  deserializing.
+    //
+    //  This is a *trusting* query from the server's perspective: the
+    //  server returns whatever proof it can produce, and the client
+    //  decides whether to believe it by verifying against a root it
+    //  trusts. A client that doesn't trust the server's root should
+    //  obtain the root from an independent source and verify the
+    //  proof itself.
+    //
+    //  The P2P GetProof message provides the same functionality over
+    //  the peer-to-peer layer. This method is the RPC-facing
+    //  counterpart, intended for tooling that already trusts its RPC
+    //  endpoint (or verifies the proof against a separately-obtained
+    //  root).
+
+    Common::Json method_getProof(Node::Node &node, const RpcConfig & /*config*/,
+                                 const JsonRpcRequest &req)
+    {
+      //  key_type: required integer 0..4.
+      auto key_type_u64 = optionalU64(req.params, "key_type");
+      if (!key_type_u64.has_value())
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "field 'key_type' is required",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"field", "key_type"}}));
+      }
+      if (*key_type_u64 > 4)
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "field 'key_type' must be 0..4",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"field", "key_type"},
+                           {"value", encodeU64Hex(*key_type_u64)}}));
+      }
+      const auto key_type = static_cast<State::ProofKeyType>(*key_type_u64);
+
+      //  key_bytes: required hex.
+      const std::string key_hex = requireString(req.params, "key_bytes");
+      std::vector<uint8_t> key_bytes;
+      if (!parseBytesHex(key_hex, key_bytes))
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "field 'key_bytes' must be 0x-prefixed even-length hex",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"field", "key_bytes"}}));
+      }
+
+      //  Resolve the key. A malformed descriptor is a client bug and
+      //  the client should not retry it — we report it as InvalidParams
+      //  rather than a status field, since the message shape is wrong
+      //  before the server can even ask the tree.
+      auto key = State::resolveProofKey(key_type, key_bytes);
+      if (!key.has_value())
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "key_bytes does not match the layout for key_type",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"key_type", encodeU64Hex(*key_type_u64)}}));
+      }
+
+      //  version: optional. "current" or the sentinel means "the head
+      //  height". A 0x-prefixed hex integer means that exact version.
+      uint64_t version = State::PROOF_VERSION_CURRENT;
+      if (req.params.contains("version") && !req.params["version"].is_null())
+      {
+        const auto &v = req.params["version"];
+        if (!v.is_string())
+        {
+          throw RpcMethodError(
+              ErrorCode::InvalidParams,
+              "field 'version' must be a string",
+              makeErrorData(ErrorCode::InvalidParams,
+                            {{"field", "version"}}));
+        }
+
+        const std::string s = v.get<std::string>();
+        if (s == "current")
+        {
+          version = State::PROOF_VERSION_CURRENT;
+        }
+        else
+        {
+          //  parseHexU64 in RPC/Encoding.h takes an out-parameter and
+          //  returns bool. It requires the 0x prefix.
+          uint64_t parsed = 0;
+          if (!parseHexU64(s, parsed))
+          {
+            throw RpcMethodError(
+                ErrorCode::InvalidParams,
+                "field 'version' must be 0x-prefixed hex or the "
+                "string 'current'",
+                makeErrorData(ErrorCode::InvalidParams,
+                              {{"field", "version"}}));
+          }
+          version = parsed;
+        }
+      }
+
+      const uint64_t resolved_version =
+          (version == State::PROOF_VERSION_CURRENT)
+              ? node.chain().height()
+              : version;
+
+      //  Look up the version's root. If there is none, we can't
+      //  produce a proof against it.
+      State::StateAccess state(node.stateDB(), resolved_version);
+
+      auto root = state.smtRootAtVersion(resolved_version);
+      if (!root.has_value())
+      {
+        throw RpcMethodError(
+            ErrorCode::ProofVersionUnavailable,
+            "no committed state root at version " +
+                encodeU64Hex(resolved_version),
+            makeErrorData(ErrorCode::ProofVersionUnavailable,
+                          {{"version", encodeU64Hex(resolved_version)}}));
+      }
+
+      //  Produce the proof. The StateAccess was constructed at
+      //  resolved_version, so its tree's nodes match — see the
+      //  contract comment on StateAccess::proveAtVersion.
+      auto proof = state.proveAtVersion(*key, resolved_version);
+      if (!proof.has_value())
+      {
+        throw RpcMethodError(
+            ErrorCode::ProofNotAvailable,
+            "could not produce a proof for this key at this version",
+            makeErrorData(ErrorCode::ProofNotAvailable,
+                          {{"version", encodeU64Hex(resolved_version)},
+                           {"key_type", encodeU64Hex(*key_type_u64)}}));
+      }
+
+      const auto proof_bytes = proof->serialize();
+
+      Common::Json out = Common::Json::object();
+      out["status"] = "ok";
+      putHash(out, "state_root", *root);
+      putU64(out, "version", resolved_version);
+      out["proof"] = encodeBytesHex(proof_bytes);
+      return out;
+    }
+
     // ---- clrty_getAccount ----
     //
     // Params:
@@ -1348,6 +1514,7 @@ namespace Rpc
     d.registerMethod("getNonce", method_getNonce);
     d.registerMethod("getTokenInfo", method_getTokenInfo);
     d.registerMethod("getTokenSupply", method_getTokenSupply);
+    d.registerMethod("getProof", method_getProof);
   }
 
   void registerTxMethods(JsonRpcDispatcher &d)
