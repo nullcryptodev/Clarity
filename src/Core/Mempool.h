@@ -206,6 +206,32 @@ namespace Core
 
     Stats stats() const;
 
+    // ---- Introspection ----
+
+    // Snapshot of the pool for external consumers (RPC, diagnostics).
+    //
+    // Returns a copy of every entry, taken under the pool's mutex. Safe
+    // to iterate after the call returns. The pool is bounded
+    // (MAX_MEMPOOL_TXS), so the copy is cheap; a 50k-entry pool at a
+    // few hundred bytes each is a few MB, which is fine for an RPC
+    // that's called at human rates.
+    //
+    // The `txid` is the key the entry is stored under, which equals
+    // `entry.tx.txid()`. It's duplicated into the snapshot so callers
+    // don't have to recompute it.
+    struct Snapshot
+    {
+      Crypto::Hash txid;
+      Transaction tx;
+      FeeTier tier{FeeTier::Standard};
+      uint64_t fee_rate{0};
+      uint64_t sequence{0};
+      uint64_t added_at_ms{0};
+      uint32_t tx_size{0};
+    };
+
+    std::vector<Snapshot> snapshot() const;
+
   private:
     // ---- Internal data ----
 

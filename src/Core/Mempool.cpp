@@ -940,4 +940,26 @@ namespace Core
     return s;
   }
 
+  std::vector<Mempool::Snapshot> Mempool::snapshot() const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    std::vector<Snapshot> out;
+    out.reserve(entries_.size());
+
+    for (const auto &[txid, entry] : entries_)
+    {
+      Snapshot s;
+      s.txid = txid;
+      s.tx = entry.tx;
+      s.tier = entry.tier;
+      s.fee_rate = entry.fee_rate;
+      s.sequence = entry.sequence;
+      s.added_at_ms = entry.added_at_ms;
+      s.tx_size = entry.tx_size;
+      out.push_back(std::move(s));
+    }
+
+    return out;
+  }
 } // namespace Core

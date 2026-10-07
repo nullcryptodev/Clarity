@@ -896,3 +896,255 @@ TEST_F(Node_EndToEndFixture, TempSplitKeySmoke)
   ASSERT_GE(NodeTestAccess::chain(*nodes_[0]).height(), 1u);
   stopNodes();
 }
+
+// ============================================================================
+//  Emergency rotation, end to end, with the derivation pinned
+//
+//  ChainRecoversFromLostQuorum asserts that the network recovers — someone
+//  commits, the online nodes agree. What it does not assert is *which* set
+//  the network derived: which validators it dropped, which candidates it
+//  promoted, and whether that derived set matches what
+//  Core::resolveActiveSet computes for the same inputs.
+//
+//  This test pins both halves. It computes the expected emergency set by
+//  calling Core::resolveActiveSet against validator 0's real StateDB
+//  before the stall, then asserts that the emergency block the network
+//  actually committed agrees with that set on every observable field:
+//  participant count, validator_set_root, and the post-commit active_set
+//  in state.
+//
+//  If the network and the unit-tested derivation ever disagree, this test
+//  fails with a specific mismatch rather than a generic "did not commit".
+// ============================================================================
+
+TEST_F(Node_EndToEndFixture, EmergencyRotationDerivationMatchesNetwork)
+{
+  //  6 validators configured, 4 committed (active), 2 pool candidates
+  //  (5 and 6). With 4 in the active set and bftQuorum(4) = 3, taking
+  //  2 offline drops the reachable count to 2, below quorum.
+  setValidatorCount(6);
+  setActiveCount(4);
+  startNodes();
+
+  //  Two of the four committed validators go offline.
+  setOffline(2, true);
+  setOffline(3, true);
+
+  //  Seed pool candidates with uptime scores so the derivation has a
+  //  deterministic ordering to work with. Higher uptime wins the tie-break
+  //  for promotion. Validators 5 and 6 are already registered by genesis
+  //  (setActiveCount(4) leaves them in state but not active); we only need
+  //  to nudge their uptime so the expected set is unambiguous.
+  {
+    auto &db = NodeTestAccess::stateDb(*nodes_[0]);
+    auto txn = db.beginWrite();
+    State::StateAccess state(db, txn, 0);
+
+    for (Id id : {Id{5}, Id{6}})
+    {
+      Core::ValidatorInfo v;
+      ASSERT_TRUE(state.getValidator(id, v))
+          << "pool candidate " << id << " missing from genesis";
+      v.uptime_score = (id == 5) ? 9'900 : 9'500;
+      state.putValidator(v);
+    }
+
+    txn.commit();
+  }
+
+  //  Compute the expected emergency set at the pre-stall height. This is
+  //  the source of truth the network's derived set must match.
+  std::vector<Id> expected_set;
+  {
+    auto &db = NodeTestAccess::stateDb(*nodes_[0]);
+    State::StateAccess state(db, 0);
+
+    //  Load the committed set exactly as BlockProcessor does.
+    std::vector<Id> committed;
+    std::vector<uint8_t> set_bytes;
+    ASSERT_TRUE(state.getGlobal("active_set", set_bytes));
+    const size_t count = set_bytes.size() / 8;
+    committed.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+      uint64_t id = 0;
+      for (int j = 0; j < 8; ++j)
+        id |= uint64_t(set_bytes[i * 8 + j]) << (j * 8);
+      committed.push_back(id);
+    }
+
+    const Height pre_stall_height = NodeTestAccess::chain(*nodes_[0]).height();
+    expected_set = Core::resolveActiveSet(
+        state, committed, pre_stall_height, /*force_rotation=*/true);
+  }
+
+  //  Sanity: the expected set must have dropped the two offline validators
+  //  and promoted exactly two pool candidates, keeping the set size at 4.
+  ASSERT_EQ(expected_set.size(), 4u)
+      << "expected set size should match the pre-stall committed size";
+  EXPECT_EQ(std::find(expected_set.begin(), expected_set.end(), Id{2}),
+            expected_set.end())
+      << "offline validator 2 should not be in the expected set";
+  EXPECT_EQ(std::find(expected_set.begin(), expected_set.end(), Id{3}),
+            expected_set.end())
+      << "offline validator 3 should not be in the expected set";
+  EXPECT_NE(std::find(expected_set.begin(), expected_set.end(), Id{1}),
+            expected_set.end())
+      << "online validator 1 should survive";
+  EXPECT_NE(std::find(expected_set.begin(), expected_set.end(), Id{4}),
+            expected_set.end())
+      << "online validator 4 should survive";
+
+  //  Now drive the stall. Same loop shape as ChainRecoversFromLostQuorum:
+  //  200 passes is well past EMERGENCY_ROTATION_ROUNDS (30) plus the
+  //  round trips needed to accumulate a certificate and propose.
+  startAllConsensus(1);
+  for (int i = 0;
+       i < 200 && NodeTestAccess::chain(*nodes_[0]).height() < 1;
+       ++i)
+  {
+    deliverAll();
+    advanceTimers();
+  }
+
+  ASSERT_GE(NodeTestAccess::chain(*nodes_[0]).height(), 1u)
+      << "network did not recover from the stall";
+
+  //  Find the emergency block in node 0's chain.
+  const Height head = NodeTestAccess::chain(*nodes_[0]).height();
+  std::optional<Core::Block> emergency_block;
+  Height emergency_height = 0;
+
+  for (Height h = 1; h <= head; ++h)
+  {
+    auto b = NodeTestAccess::chainDb(*nodes_[0]).getBlockByHeight(h);
+    if (!b.has_value())
+      break;
+    if (b->header.emergency_rotation > 0)
+    {
+      emergency_block = *b;
+      emergency_height = h;
+      break;
+    }
+  }
+
+  ASSERT_TRUE(emergency_block.has_value())
+      << "no emergency block found in the chain";
+
+  //  --- Assertion 1: the block carries a non-empty certificate ---
+
+  EXPECT_FALSE(emergency_block->header.timeout_certificate.votes.empty())
+      << "emergency block carries an empty certificate";
+
+  //  --- Assertion 2: the certificate's signers are all in the *committed*
+  //      set, not the derived set. The certificate is evidence that the
+  //      committed set stalled, so its signers are drawn from the set that
+  //      was trying to run when the stall began.
+
+  std::vector<Id> committed_ids;
+  {
+    //  Read the committed set from a peer that never participated in the
+    //  emergency. Node 1 is offline-set? No — we want a node that still
+    //  has the pre-stall set in its state, so read from node 0's chain
+    //  at emergency_height - 1.
+    auto prev = NodeTestAccess::chainDb(*nodes_[0])
+                    .getBlockByHeight(emergency_height - 1);
+    if (prev.has_value())
+      committed_ids = prev->participants;
+  }
+
+  if (!committed_ids.empty())
+  {
+    for (const auto &tv : emergency_block->header.timeout_certificate.votes)
+    {
+      EXPECT_NE(std::find(committed_ids.begin(), committed_ids.end(),
+                          tv.signer_id),
+                committed_ids.end())
+          << "certificate signer " << tv.signer_id
+          << " is not in the committed set that stalled";
+    }
+  }
+
+  //  --- Assertion 3: the block's declared active_validator_count matches
+  //      the expected set size ---
+
+  EXPECT_EQ(emergency_block->header.active_validator_count,
+            static_cast<uint32_t>(expected_set.size()))
+      << "block's active_validator_count disagrees with the derivation";
+
+  //  --- Assertion 4: the block's validator_set_root matches the expected
+  //      set's root ---
+
+  const Crypto::Hash expected_root = Core::computeValidatorSetRoot(expected_set);
+  EXPECT_EQ(emergency_block->header.validator_set_root, expected_root)
+      << "block's validator_set_root disagrees with the derivation";
+
+  //  --- Assertion 5: the emergency block's participants match the expected
+  //      set ---
+
+  std::vector<Id> block_participants = emergency_block->participants;
+  std::sort(block_participants.begin(), block_participants.end());
+  std::vector<Id> expected_sorted = expected_set;
+  std::sort(expected_sorted.begin(), expected_sorted.end());
+
+  EXPECT_EQ(block_participants, expected_sorted)
+      << "emergency block's participants disagree with the derivation";
+
+  //  --- Assertion 6: after the emergency block commits, the persisted
+  //      active_set in state equals the expected set ---
+
+  {
+    auto &db = NodeTestAccess::stateDb(*nodes_[0]);
+    State::StateAccess state(db, 0);
+
+    std::vector<uint8_t> set_bytes;
+    ASSERT_TRUE(state.getGlobal("active_set", set_bytes));
+
+    std::vector<Id> persisted;
+    const size_t count = set_bytes.size() / 8;
+    persisted.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+      uint64_t id = 0;
+      for (int j = 0; j < 8; ++j)
+        id |= uint64_t(set_bytes[i * 8 + j]) << (j * 8);
+      persisted.push_back(id);
+    }
+
+    std::sort(persisted.begin(), persisted.end());
+    EXPECT_EQ(persisted, expected_sorted)
+        << "persisted active_set disagrees with the derivation";
+  }
+
+  //  --- Assertion 7: the next block after the emergency one is a normal
+  //      block (emergency_rotation == 0) and uses the new set ---
+
+  const Height next_height = emergency_height + 1;
+  for (int i = 0;
+       i < 100 && NodeTestAccess::chain(*nodes_[0]).height() < next_height;
+       ++i)
+  {
+    deliverAll();
+    advanceTimers();
+  }
+
+  ASSERT_GE(NodeTestAccess::chain(*nodes_[0]).height(), next_height)
+      << "network did not produce a block after the emergency block";
+
+  auto next_block =
+      NodeTestAccess::chainDb(*nodes_[0]).getBlockByHeight(next_height);
+  ASSERT_TRUE(next_block.has_value());
+
+  EXPECT_EQ(next_block->header.emergency_rotation, 0u)
+      << "post-recovery block should not be an emergency block";
+
+  EXPECT_EQ(next_block->header.active_validator_count,
+            static_cast<uint32_t>(expected_set.size()))
+      << "post-recovery block did not adopt the new active set";
+
+  EXPECT_EQ(next_block->header.validator_set_root, expected_root)
+      << "post-recovery block's validator_set_root disagrees with the "
+         "derived set";
+
+  stopNodes();
+}

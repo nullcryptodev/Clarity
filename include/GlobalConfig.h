@@ -77,9 +77,9 @@ namespace GlobalConfig
   // these checks fail at node startup with a clear "genesis mismatch"
   // error, instead of silently diverging from other nodes on the same
   // network.
-  inline constexpr const char *MAINNET_GENESIS_HASH = "59e96f5bf3b530eae2a6132fea4a38c1d849d2d94fcca799d6484f7c34567df6";
-  inline constexpr const char *TESTNET_GENESIS_HASH = "205ae2774a2f8e70e4185ae9ef7687674e260d9ae9eb39413ffa94e16665266c";
-  inline constexpr const char *REGTEST_GENESIS_HASH = "6c92fef5ceef88529c7f2ca473427e82de2d5ec3ca47527cb09778525057555b";
+  inline constexpr const char *MAINNET_GENESIS_HASH = "92b083df282f1bc6ca0bd9311fa0facee430ba79bda767d3bc0578341046b8bb";
+  inline constexpr const char *TESTNET_GENESIS_HASH = "c0ba640301b056cf1b5eb0834ad45ad1a95870e85fd1a344fd38dd31e5e500b0";
+  inline constexpr const char *REGTEST_GENESIS_HASH = "285ef00240dca3a9ba620cd0603ee4336406db660ccc7ca08a02ce042e0a57f0";
 
   // Seed validators.
   //
@@ -111,8 +111,8 @@ namespace GlobalConfig
   inline constexpr Amount SEED_FUND_AMOUNT_TWO = ATOMIC_UNITS_PER_COIN * 1'000;                                                 // just fund the seed as to be a validator
 
   // Consensus keys are identical across all three networks
-  inline constexpr const char *SEED_NODE = "2cb94cfe327a1345790f2191f50a0da7f9d811a32cd17621db3b004a4253d422";     // consensus pubkey
-  inline constexpr const char *SEED_NODE_TWO = "3c16edfc44816af8401d0eb38ad2e547d4f71d07a2490fd6318064517bfe5bbf"; // consensus pubkey
+  inline constexpr const char *SEED_NODE = "5cab747984018f73c3dac5979254b35591477fd06e15707fed28f67dfcd9b02e";     // consensus pubkey
+  inline constexpr const char *SEED_NODE_TWO = "bcd90de479cabb39f01475775fb03289128c46d1966d056d64c637659fef31c9"; // consensus pubkey
   inline constexpr uint32_t INITIAL_SET_SIZE = 2;
 
   // Validator set

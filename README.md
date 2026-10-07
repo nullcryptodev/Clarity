@@ -1,8 +1,8 @@
 <img src='https://github.com/nullcryptodev/docs/blob/main/clarity/clarity-wide.png?raw=true'>
 
-# Clarity
+# Clarity - Authority rotates, the chain doesn't.
 
-![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C796-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue)
+![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C797-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
 
 #### Table of Contents
 

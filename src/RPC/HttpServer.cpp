@@ -243,8 +243,10 @@ namespace Rpc
             "Content-Length: 16\r\n"
             "Connection: close\r\n"
             "Retry-After: 1\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
             "\r\n"
-            "rate limit hit\r\n\r\n";
+            "rate limit hit\r\n"
+            "\r\n";
 
         ::send(client_fd, response, sizeof(response) - 1, MSG_NOSIGNAL);
         ::close(client_fd);
@@ -274,8 +276,10 @@ namespace Rpc
             "Content-Type: text/plain\r\n"
             "Content-Length: 21\r\n"
             "Connection: close\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
             "\r\n"
-            "server overloaded\r\n\r\n";
+            "server overloaded\r\n"
+            "\r\n";
 
         // Best-effort write; ignore failures.
         ::send(client_fd, response, sizeof(response) - 1, MSG_NOSIGNAL);

@@ -101,6 +101,20 @@ namespace Rpc
     static constexpr size_t MAX_RATE_LIMIT_ENTRIES = 10'000;
     std::mutex rate_limit_mutex_;
     std::unordered_map<std::string, Common::RateLimiter> rate_limiters_;
+
+    // ---- CORS ----
+
+    // Allowed origins for cross-origin requests. Empty means CORS is
+    // disabled (browser clients will be blocked by the same-origin
+    // policy). "*" allows any origin — appropriate for local dev and
+    // public read-only RPC endpoints. An explicit list is appropriate
+    // when the endpoint is also a control plane.
+    //
+    // A browser sends a preflight OPTIONS request for any non-simple
+    // request (POST with content-type: application/json qualifies),
+    // so the server must answer OPTIONS with the CORS headers and no
+    // body. See HttpConnection.
+    std::vector<std::string> cors_origins{};
   };
 
 } // namespace Rpc

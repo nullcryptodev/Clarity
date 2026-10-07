@@ -303,6 +303,15 @@ namespace Daemon
         args.rpc.verbose_errors = true;
         continue;
       }
+      if (arg == "--rpc-cors")
+      {
+        // Comma-separated list of allowed origins, or "*" for any.
+        args.rpc.cors_origins.clear();
+        auto list = splitComma(next());
+        for (auto &s : list)
+          args.rpc.cors_origins.push_back(s);
+        continue;
+      }
 
       // ---- Diagnostics ----
       if (arg == "--print-config")
@@ -357,6 +366,8 @@ namespace Daemon
         << "  --rpc-workers <n>          Worker threads; 0 = auto (default: 4)\n"
         << "  --rpc-admin-token <hex>    Admin bearer token (>=16 chars)\n"
         << "  --rpc-verbose-errors       Include internal error text in responses\n"
+        << "  --rpc-cors <list>          CORS origins (comma-separated) or <*> \n"
+        << "                             (default : disabled)\n"
         << "\n"
         << "Logging:\n"
         << "  --log-level <level>        trace|debug|info|warn|error (default: info)\n"
@@ -419,6 +430,13 @@ namespace Daemon
                 << (r.admin_token.empty() ? "(none)" : "(set)") << "\n";
       std::cout << "  rpc_verbose_errors:   "
                 << (r.verbose_errors ? "yes" : "no") << "\n";
+      std::cout << "  rpc_cors_origins:     ";
+      if (r.cors_origins.empty())
+        std::cout << "(disabled)";
+      else
+        for (size_t i = 0; i < r.cors_origins.size(); ++i)
+          std::cout << (i ? ", " : "") << r.cors_origins[i];
+      std::cout << "\n";
     }
 
     std::cout << "  log_level:            " << args.log_level << "\n";

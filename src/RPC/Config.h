@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace Rpc
 {
@@ -60,6 +61,26 @@ namespace Rpc
     // Token bucket per source IP. Both zero = disabled.
     uint32_t rate_limit_burst{200};
     uint32_t rate_limit_per_second{50};
+
+    // ---- CORS ----
+    //
+    // Allowed origins for cross-origin browser requests.
+    //
+    //   empty     — CORS disabled. Browsers on a different origin
+    //               cannot call this RPC endpoint. This is the
+    //               default, and the safe default.
+    //   ["*"]     — allow any origin. Appropriate for local dev and
+    //               for public read-only endpoints. Non-credentialed
+    //               requests only.
+    //   ["a","b"] — explicit allowlist. A request from any other
+    //               origin gets no CORS headers, so the browser
+    //               blocks it.
+    //
+    // The server answers preflight OPTIONS with the appropriate
+    // headers, and adds Access-Control-Allow-Origin to every
+    // response (success, error, and rate-limit) so the browser can
+    // read the status.
+    std::vector<std::string> cors_origins{};
 
     // ---- Admin ----
 

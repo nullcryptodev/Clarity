@@ -63,6 +63,7 @@ namespace Rpc
       std::string content_type;
       std::string authorization;
       std::string connection;
+      std::string origin;
       size_t content_length{0};
       bool has_content_length{false};
       std::string body;
@@ -97,10 +98,15 @@ namespace Rpc
     bool writeAll(const void *buf, size_t len);
     ssize_t readSome(void *buf, size_t len);
 
+    // Append CORS headers to `out` if the request's Origin is allowed
+    // by config_.cors_origins. Returns true if any header was added.
+    bool appendCorsHeaders(std::string &out, const std::string &origin) const;
+
     int fd_;
     const RpcConfig &config_;
     JsonRpcDispatcher &dispatcher_;
     std::string remote_ip_;
+    std::string current_origin_;
   };
 
 } // namespace Rpc

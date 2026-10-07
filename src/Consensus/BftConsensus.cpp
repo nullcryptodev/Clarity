@@ -690,7 +690,7 @@ namespace Consensus
 
     if (!validateProposal(p, block))
     {
-      log_(Logging::WARNING) << "Invalid proposal";
+      log_(Logging::DEBUGGING) << "Invalid proposal";
       return;
     }
 
@@ -1246,15 +1246,15 @@ namespace Consensus
   {
     auto quorum_block = quorumValue(/*is_precommit=*/true);
 
-    log_(Logging::WARNING) << "onPrecommitTimeout: h=" << height_
-                           << " r=" << round_
-                           << " precommits=" << precommits_.size()
-                           << " quorum=" << (quorum_block ? "yes" : "no")
-                           << " prop_known="
-                           << (quorum_block &&
-                                       proposals_by_hash_.count(*quorum_block) > 0
-                                   ? "yes"
-                                   : "no");
+    log_(Logging::DEBUGGING) << "onPrecommitTimeout: h=" << height_
+                             << " r=" << round_
+                             << " precommits=" << precommits_.size()
+                             << " quorum=" << (quorum_block ? "yes" : "no")
+                             << " prop_known="
+                             << (quorum_block &&
+                                         proposals_by_hash_.count(*quorum_block) > 0
+                                     ? "yes"
+                                     : "no");
 
     broadcastTimeoutVote(round_);
 
@@ -1807,7 +1807,7 @@ namespace Consensus
         proposalSigningHash(p.height, p.round, block_hash);
     if (!Crypto::verify(signing_hash, *pk, p.signature))
     {
-      log_(Logging::WARNING) << "validateProposal: signature verification failed";
+      log_(Logging::DEBUGGING) << "validateProposal: signature verification failed";
       return false;
     }
 

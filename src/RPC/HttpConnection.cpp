@@ -303,6 +303,8 @@ namespace Rpc
         out.authorization = value;
       else if (name == "connection")
         out.connection = value;
+      else if (name == "origin")
+        out.origin = value;
       else if (name == "content-length")
       {
         size_t n = 0;
@@ -323,6 +325,48 @@ namespace Rpc
   }
 
   //  Request handling
+
+  bool HttpConnection::appendCorsHeaders(std::string &out,
+                                         const std::string &origin) const
+  {
+    if (config_.cors_origins.empty())
+      return false;
+
+    const bool allow_any =
+        std::find(config_.cors_origins.begin(),
+                  config_.cors_origins.end(), "*") !=
+        config_.cors_origins.end();
+
+    std::string allowed;
+    if (allow_any)
+    {
+      // Echo the request's Origin if present, otherwise "*". This
+      // matters if credentials are ever enabled — a wildcard is
+      // illegal with credentials, but echoing is fine.
+      allowed = origin.empty() ? "*" : origin;
+    }
+    else
+    {
+      if (origin.empty())
+        return false; // no Origin, not a CORS request
+      if (std::find(config_.cors_origins.begin(),
+                    config_.cors_origins.end(), origin) ==
+          config_.cors_origins.end())
+      {
+        return false; // not allowed
+      }
+      allowed = origin;
+    }
+
+    out += "Access-Control-Allow-Origin: ";
+    out += allowed;
+    out += "\r\n";
+    out += "Access-Control-Allow-Methods: POST, OPTIONS\r\n";
+    out += "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+    out += "Access-Control-Max-Age: 86400\r\n";
+
+    return true;
+  }
 
   void HttpConnection::run()
   {
@@ -351,22 +395,18 @@ namespace Rpc
     // OPTIONS *    -> 204 with CORS headers
     // anything else -> 404 or 405
 
+    current_origin_ = req.origin;
+
     if (req.method == "OPTIONS")
     {
-      // CORS preflight. We don't actually enforce origin, but
-      // responding to preflight lets browser-based clients proceed.
-      // A production deployment should add explicit CORS config;
-      // for v1 loopback-only, this is enough.
-      std::string body;
-      std::string headers =
-          "HTTP/1.1 204 No Content\r\n"
-          "Access-Control-Allow-Origin: *\r\n"
-          "Access-Control-Allow-Methods: POST, OPTIONS\r\n"
-          "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
-          "Content-Length: 0\r\n"
-          "Connection: close\r\n\r\n";
+      std::string headers;
+      headers.reserve(256);
+      headers += "HTTP/1.1 204 No Content\r\n";
+      appendCorsHeaders(headers, req.origin);
+      headers += "Content-Length: 0\r\n";
+      headers += "Connection: close\r\n";
+      headers += "\r\n";
       writeAll(headers.data(), headers.size());
-      (void)body;
       return;
     }
 
@@ -437,13 +477,13 @@ namespace Rpc
 
     if (result.is_empty)
     {
-      // All notifications. Per JSON-RPC 2.0, no response is sent.
-      // We still close the connection cleanly. A 204 is the most
-      // honest HTTP-level representation of "nothing to say".
-      std::string headers =
-          "HTTP/1.1 204 No Content\r\n"
-          "Content-Length: 0\r\n"
-          "Connection: close\r\n\r\n";
+      std::string headers;
+      headers.reserve(128);
+      headers += "HTTP/1.1 204 No Content\r\n";
+      appendCorsHeaders(headers, req.origin);
+      headers += "Content-Length: 0\r\n";
+      headers += "Connection: close\r\n";
+      headers += "\r\n";
       writeAll(headers.data(), headers.size());
       return;
     }
@@ -473,6 +513,12 @@ namespace Rpc
     head += std::to_string(body.size());
     head += "\r\n";
     head += "Connection: close\r\n";
+
+    // CORS headers, if the request's Origin is allowed. The Request
+    // isn't available here, so we stash the origin on the connection
+    // before calling writeResponse. See handleRequest.
+    appendCorsHeaders(head, current_origin_);
+
     head += "\r\n";
 
     if (!writeAll(head.data(), head.size()))

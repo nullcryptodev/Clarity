@@ -1444,7 +1444,261 @@ namespace Rpc
       putU64(out, "height", height);
       return out;
     }
-    
+
+    // ---- clrty_getRecentBlocks ----
+    //
+    // Params:
+    //   limit  (optional, hex or decimal; default 10; max 100)
+    //
+    // Returns:
+    //   { "blocks": [ <header>, <header>, ... ], "count": <number> }
+    //
+    // Headers are newest first: blocks[0] is the tip. If the chain is
+    // shorter than `limit`, returns what exists without error.
+
+    Common::Json method_getRecentBlocks(Node::Node &node,
+                                        const RpcConfig & /*config*/,
+                                        const JsonRpcRequest &req)
+    {
+      uint64_t limit = 10;
+      if (auto v = optionalU64(req.params, "limit"); v.has_value())
+        limit = *v;
+
+      if (limit == 0 || limit > 100)
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "field 'limit' must be 1..100",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"field", "limit"},
+                           {"value", encodeU64Hex(limit)}}));
+      }
+
+      const uint64_t tip = node.chain().height();
+      const std::string hrp = hrpForNode(node);
+
+      Common::Json arr = Common::Json::array();
+
+      // Tip is height 0 at genesis; walk back to 0, then stop.
+      uint64_t h = tip;
+      uint64_t taken = 0;
+      while (taken < limit)
+      {
+        auto header = node.chainDB().getHeaderByHeight(h);
+        if (!header.has_value())
+        {
+          // A gap in the chain. This shouldn't happen — heights are
+          // contiguous from genesis — but if it does, stop rather
+          // than throwing. Returning fewer rows is more useful to a
+          // client than an error.
+          break;
+        }
+
+        arr.push_back(encodeBlockHeader(*header, hrp));
+        ++taken;
+
+        if (h == 0)
+          break; // reached genesis
+        --h;
+      }
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "count", taken);
+      out["blocks"] = std::move(arr);
+      return out;
+    }
+
+    // ---- clrty_getRecentTransactions ----
+    //
+    // Params:
+    //   limit  (optional, hex or decimal; default 10; max 100)
+    //
+    // Returns:
+    //   {
+    //     "count": <number>,
+    //     "transactions": [
+    //       {
+    //         "tx":           <transaction object>,
+    //         "block_hash":   "0x...",
+    //         "block_height": "0x...",
+    //         "index":        <number>,
+    //       },
+    //       ...
+    //     ]
+    //   }
+    //
+    // Newest first: transactions[0] is the most recent confirmation.
+    //
+    // Implementation: walk headers back from the tip, collect the
+    // heights whose tx_count > 0, then load those blocks in full
+    // and pull transactions. We stop once we have `limit` txs.
+    //
+    // Worst case: a chain with many empty blocks. We bound the scan
+    // to a configurable maximum (MAX_HEADER_SCAN) so a pathological
+    // chain can't make a single RPC call walk thousands of headers.
+
+    Common::Json method_getRecentTransactions(Node::Node &node,
+                                              const RpcConfig & /*config*/,
+                                              const JsonRpcRequest &req)
+    {
+      constexpr uint64_t MAX_HEADER_SCAN = 200;
+
+      uint64_t limit = 10;
+      if (auto v = optionalU64(req.params, "limit"); v.has_value())
+        limit = *v;
+
+      if (limit == 0 || limit > 100)
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "field 'limit' must be 1..100",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"field", "limit"},
+                           {"value", encodeU64Hex(limit)}}));
+      }
+
+      const uint64_t tip = node.chain().height();
+      const std::string hrp = hrpForNode(node);
+
+      Common::Json arr = Common::Json::array();
+      uint64_t collected = 0;
+
+      uint64_t h = tip;
+      uint64_t scanned = 0;
+      while (collected < limit && scanned < MAX_HEADER_SCAN)
+      {
+        auto header = node.chainDB().getHeaderByHeight(h);
+        if (!header.has_value())
+          break;
+
+        ++scanned;
+
+        if (header->tx_count > 0)
+        {
+          auto block = node.chain().getBlockByHeight(h);
+          if (block.has_value())
+          {
+            // Walk within the block newest-index-first. Within a
+            // block, transactions have an implicit order; we emit
+            // them in the order the block stores them (ascending
+            // index), which matches how they were applied.
+            for (size_t i = 0; i < block->transactions.size(); ++i)
+            {
+              if (collected >= limit)
+                break;
+
+              Common::Json entry = Common::Json::object();
+              entry["tx"] = encodeTransaction(block->transactions[i], hrp);
+              putHash(entry, "block_hash", block->header.hash());
+              putU64(entry, "block_height", block->header.height);
+              entry["index"] = i;
+
+              arr.push_back(std::move(entry));
+              ++collected;
+            }
+          }
+        }
+
+        if (h == 0)
+          break;
+        --h;
+      }
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "count", collected);
+      out["transactions"] = std::move(arr);
+      return out;
+    }
+
+    // ---- clrty_getMempoolList ----
+    //
+    // Params:
+    //   limit  (optional, hex or decimal; default 50; max 500)
+    //
+    // Returns the current mempool contents, sorted by fee rate
+    // descending, then by insertion time ascending. This is the
+    // order the block builder will prefer.
+    //
+    // Response:
+    //   {
+    //     "count":  <hex>,   // number of entries in this response
+    //     "total":  <hex>,   // total entries in the pool
+    //     "transactions": [
+    //       {
+    //         "tx":        <transaction object>,
+    //         "fee_rate":  <hex>,  // atomic units per byte
+    //         "added_ms":  <hex>,  // wall-clock ms when it entered
+    //         "tier":      "priority" | "standard",
+    //         "size":      <hex>   // serialized byte size
+    //       },
+    //       ...
+    //     ]
+    //   }
+
+    Common::Json method_getMempoolList(Node::Node &node,
+                                       const RpcConfig & /*config*/,
+                                       const JsonRpcRequest &req)
+    {
+      uint64_t limit = 50;
+      if (auto v = optionalU64(req.params, "limit"); v.has_value())
+        limit = *v;
+
+      if (limit == 0 || limit > 500)
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "field 'limit' must be 1..500",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"field", "limit"},
+                           {"value", encodeU64Hex(limit)}}));
+      }
+
+      auto entries = node.mempool().snapshot();
+
+      // Sort: fee rate desc, then added_ms asc (older first on ties).
+      //
+      // Rationale: the next proposer will pick the highest-fee-rate
+      // txs first. Ties broken by "who got there first", which is
+      // both fairer and matches the mempool's own eviction order
+      // (FIFO within a fee tier).
+      std::sort(entries.begin(), entries.end(),
+                [](const Core::Mempool::Snapshot &a,
+                   const Core::Mempool::Snapshot &b)
+                {
+                  if (a.fee_rate != b.fee_rate)
+                    return a.fee_rate > b.fee_rate;
+                  return a.added_at_ms < b.added_at_ms;
+                });
+
+      const std::string hrp = hrpForNode(node);
+      const uint64_t total = static_cast<uint64_t>(entries.size());
+
+      Common::Json arr = Common::Json::array();
+      uint64_t count = 0;
+
+      for (const auto &e : entries)
+      {
+        if (count >= limit)
+          break;
+
+        Common::Json entry = Common::Json::object();
+        entry["tx"] = encodeTransaction(e.tx, hrp);
+        putU64(entry, "fee_rate", e.fee_rate);
+        putU64(entry, "added_ms", e.added_at_ms);
+        putU64(entry, "size", static_cast<uint64_t>(e.tx_size));
+        entry["tier"] =
+            (e.tier == Core::FeeTier::Priority) ? "priority" : "standard";
+
+        arr.push_back(std::move(entry));
+        ++count;
+      }
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "count", count);
+      putU64(out, "total", total);
+      out["transactions"] = std::move(arr);
+      return out;
+    }
   } // anon namespace
 
   void registerAdminMethods(JsonRpcDispatcher &d)
@@ -1467,6 +1721,7 @@ namespace Rpc
     d.registerMethod("getBlockByNumber", method_getBlockByNumber);
     d.registerMethod("getBlockByHash", method_getBlockByHash);
     d.registerMethod("getBlockHeaderByNumber", method_getBlockHeaderByNumber);
+    d.registerMethod("getRecentBlocks", method_getRecentBlocks);
     d.registerMethod("getStateRoot", method_getStateRoot);
   }
 
@@ -1483,6 +1738,7 @@ namespace Rpc
   {
     d.registerMethod("getMempoolStats", method_getMempoolStats);
     d.registerMethod("getMempoolTx", method_getMempoolTx);
+    d.registerMethod("getMempoolList", method_getMempoolList);
   }
 
   void registerNodeMethods(JsonRpcDispatcher &d)
@@ -1523,5 +1779,6 @@ namespace Rpc
     d.registerMethod("getTransactionByHash", method_getTransactionByHash);
     d.registerMethod("getTransactionReceipt", method_getTransactionReceipt);
     d.registerMethod("simulateTransaction", method_simulateTransaction);
+    d.registerMethod("getRecentTransactions", method_getRecentTransactions);
   }
 }
