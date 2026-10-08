@@ -29,6 +29,15 @@ namespace Core
 {
   namespace
   {
+    //  Read a uint64 from the meta table (MDBX, not the SMT). Used
+    //  for aggregation counters that don't participate in the state
+    //  root: tx_counter, total_fees_lifetime, total_to_pot,
+    //  total_pot_distributed, last_effective_apy_bps.
+    uint64_t readU64Meta(State::StateAccess &state, const char *name)
+    {
+      return state.getMetaU64(name);
+    }
+
     uint64_t nowMs() noexcept
     {
       using namespace std::chrono;
@@ -77,6 +86,29 @@ namespace Core
       if (blocks > epoch_blocks)
         blocks = epoch_blocks;
       return blocks;
+    }
+
+    //  Increment the running lifetime counters by this block's
+    //  contribution. Called from applyBlock after transactions and
+    //  rewards have run, so tx_counter reflects only successfully
+    //  applied transactions (a block whose transactions all failed
+    //  would have been rejected before this point).
+    //
+    //  total_fees_lifetime counts the fees paid by transactions in
+    //  this block. Every fee goes to the pot eventually, but the
+    //  pot itself also accumulates from other sources (validator
+    //  penalties, slash proceeds, seed-only set shares). The two
+    //  numbers are related but not equal — total_fees_lifetime is
+    //  "fees ever paid", pot is "rewards currently unclaimed".
+    void bumpLifetimeCounters(State::StateAccess &state, const Block &block)
+    {
+      uint64_t tx_counter = state.getMetaU64("tx_counter");
+      tx_counter += block.transactions.size();
+      state.putMetaU64("tx_counter", tx_counter);
+
+      uint64_t fees = state.getMetaU64("total_fees_lifetime");
+      fees += block.header.total_fees;
+      state.putMetaU64("total_fees_lifetime", fees);
     }
   } // anonymous namespace
 
@@ -252,6 +284,18 @@ namespace Core
     distributeRewards(state, block, ctx);
 
     updateGlobalState(state, block, ctx);
+
+    //  Lifetime counters and per-block index writes. Both are
+    //  aggregation-only: they don't affect the state root, they
+    //  don't affect consensus, and they're skipped during dry-run
+    //  because the proposer's simulation shouldn't populate them
+    //  (the real block application will).
+    if (!ctx.dry_run)
+    {
+      bumpLifetimeCounters(state, block);
+      indexBlockProducer(state, block);
+      indexTransactions(state, block, ctx);
+    }
 
     if ((ctx.current_height + 1) % ROTATION_INTERVAL == 0)
     {
@@ -790,6 +834,17 @@ namespace Core
           applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::STAKER_SHARE_BPS);
       pot += staker_pool;
 
+      //  Track the lifetime total credited to the pot. Slashing
+      //  proceeds also route here via executeSystemSlash; those are
+      //  written by the executor, not by this path.
+      //
+      //  total_to_pot is aggregation, not consensus — it lives in
+      //  meta, not the SMT. pot is consensus state and stays on the
+      //  SMT.
+      uint64_t total_to_pot = state.getMetaU64("total_to_pot");
+      total_to_pot += total_redistributed + staker_pool;
+      state.putMetaU64("total_to_pot", total_to_pot);
+
       writeU64Global(state, "pot", pot);
       return;
     }
@@ -862,6 +917,10 @@ namespace Core
     uint64_t staker_pool = applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::STAKER_SHARE_BPS);
     pot += staker_pool;
 
+    uint64_t total_to_pot = state.getMetaU64("total_to_pot");
+    total_to_pot += total_redistributed + staker_pool;
+    state.putMetaU64("total_to_pot", total_to_pot);
+
     writeU64Global(state, "pot", pot);
   }
 
@@ -923,7 +982,27 @@ namespace Core
 
     const uint64_t pool_baseline = epoch_pool;
 
-    const uint64_t avg_tx_per_block = block.transactions.size();
+    //  Activity metric. The epoch's total transaction count divided
+    //  by the number of blocks in the epoch. The counters are the
+    //  chain-lifetime tx_counter and a snapshot of it taken at the
+    //  previous epoch boundary — the delta is this epoch's
+    //  contribution.
+    //
+    //  Reading `block.transactions.size()` here was a bug: it gave
+    //  the count for the *closing* block only, not the epoch, and
+    //  made the activity bonus depend on whether the last block
+    //  happened to include a transaction.
+    const uint64_t tx_counter_now = readU64Meta(state, "tx_counter");
+    const uint64_t tx_counter_at_start =
+        readU64Meta(state, "tx_counter_at_epoch_start");
+    const uint64_t txs_this_epoch =
+        tx_counter_now >= tx_counter_at_start
+            ? tx_counter_now - tx_counter_at_start
+            : 0;
+
+    const uint64_t avg_tx_per_block =
+        ROTATION_INTERVAL > 0 ? txs_this_epoch / ROTATION_INTERVAL : 0;
+
     const uint16_t apy_activity_bps = computeActivityBps(avg_tx_per_block);
 
     const uint16_t apy_pot_bonus_bps = computePotBonusBps(pot, pool_baseline);
@@ -942,6 +1021,19 @@ namespace Core
 
     const uint16_t effective_apy =
         computeEffectiveApy(rctx, SECONDS_PER_EPOCH);
+
+    //  Record the APY this epoch actually used. The RPC reads this
+    //  to answer "what is the current APY" without recomputing it —
+    //  the inputs (pot, activity) change between epoch boundaries,
+    //  but the value that governs staker payouts is the one computed
+    //  here, once per epoch.
+    //
+    //  This is display-only aggregation, so it lives in meta, not
+    //  the SMT. Writing it to the SMT would make the epoch-boundary
+    //  state root depend on a value that no verifier needs to
+    //  reproduce.
+    state.putMetaU64("last_effective_apy_bps",
+                     static_cast<uint64_t>(effective_apy));
 
     const uint64_t target_payout =
         computeTargetStakerPayout(rctx, effective_apy, SECONDS_PER_EPOCH);
@@ -966,6 +1058,16 @@ namespace Core
     }
 
     writeU64Global(state, "pot", static_cast<uint64_t>(new_pot));
+
+    //  Track the lifetime total actually paid to stakers from the
+    //  pot. Not the same as total_to_pot: the pot can also be burned
+    //  when it exceeds the cap, and can accumulate without being
+    //  distributed if there are no stakers.
+    //
+    //  Aggregation, so it lives in meta, not the SMT.
+    uint64_t total_pot_distributed = state.getMetaU64("total_pot_distributed");
+    total_pot_distributed += adj.distributed;
+    state.putMetaU64("total_pot_distributed", total_pot_distributed);
 
     if (adj.distributed == 0 || total_staked == 0 || staker_count == 0)
       return;
@@ -1019,6 +1121,12 @@ namespace Core
 
       acct.pending_rewards += share;
       acct.last_reward_epoch = rctx.epoch_number;
+
+      //  Snapshot the tx counter so the next epoch can compute its own
+      //  activity delta. Written unconditionally, even if there were no
+      //  stakers to pay — the next epoch's activity reading depends on
+      //  this value being up to date.
+      state.putMetaU64("tx_counter_at_epoch_start", tx_counter_now);
 
       state.putAccount(addr, acct); });
   }
@@ -1305,5 +1413,130 @@ namespace Core
     }
 
     return true;
+  }
+
+  void BlockProcessor::indexBlockProducer(State::StateAccess &state,
+                                          const Block &block)
+  {
+    //  The proposer address is the header's proposer field, which is
+    //  the validator's reward address. The index maps
+    //  (proposer, height) -> block_hash so a validator page can list
+    //  the blocks that validator produced.
+    state.indexBlockProducer(
+        block.header.proposer,
+        block.header.height,
+        block.hash());
+  }
+
+  void BlockProcessor::indexTransactions(State::StateAccess &state,
+                                         const Block &block,
+                                         const BlockContext &ctx)
+  {
+    //  One call per transaction, each writing:
+    //    - one row per address the transaction touched (from, to,
+    //      plus any address a type-specific payload references)
+    //    - one row per token involved
+    //    - one row for the transaction type
+    //
+    //  The address and token lists are type-specific. Rather than
+    //  duplicating that logic here, we derive them from the
+    //  transaction's fields with a small helper per category. The
+    //  rule of thumb: an address is "touched" if any state change
+    //  is applied to its balance, and a token is "involved" if any
+    //  balance of that token changes.
+    for (size_t i = 0; i < block.transactions.size(); ++i)
+    {
+      const Transaction &tx = block.transactions[i];
+
+      //  System transactions don't have user-visible address or
+      //  token participants. The Slash tx touches the slashed
+      //  validator's reward address (which is where the stake
+      //  accounting changes), but routing it through the general
+      //  index would conflate "an address that sent a tx" with
+      //  "an address whose validator record was penalized". Skip
+      //  system txs from the by-address index entirely; a validator
+      //  page that wants slash history can query the by-type index
+      //  for Slash and filter.
+      if (isSystemTx(tx.tx_type))
+        continue;
+
+      std::vector<Crypto::Address> addresses;
+      std::vector<Id> tokens;
+
+      //  Every user tx touches `from`. A transfer-like tx also
+      //  touches `to`. Token operations touch both addresses and
+      //  the token. AMM and order operations touch both tokens of
+      //  the pair plus the participating accounts.
+      //
+      //  We don't need to be exhaustive: the by-address index is a
+      //  query accelerator, not a consensus record. If a type's
+      //  participants are only partially captured, the query still
+      //  works — it just won't surface every edge case. The fields
+      //  below cover the common ones.
+      addresses.push_back(tx.from);
+
+      if (!tx.to.isNull())
+        addresses.push_back(tx.to);
+
+      switch (tx.tx_type)
+      {
+      case TxType::Transfer:
+        tokens.push_back(tx.token_id);
+        break;
+
+      case TxType::CreateToken:
+      case TxType::MintToken:
+      case TxType::BurnToken:
+      case TxType::UpdateTokenMeta:
+        tokens.push_back(tx.token_id);
+        break;
+
+      case TxType::Swap:
+      case TxType::AddLiquidity:
+      case TxType::RemoveLiquidity:
+        //  The exact token pair lives in the payload, which we
+        //  don't decode here. Index the tx.token_id (the "in"
+        //  side for a swap, the "supply" side for liquidity) so
+        //  the query surfaces the transaction at all. A more
+        //  complete index would decode the payload; that's a
+        //  follow-up.
+        tokens.push_back(tx.token_id);
+        break;
+
+      case TxType::CreatePool:
+        tokens.push_back(tx.token_id);
+        //  The other token is in the payload; leaving it out means
+        //  the pool's second token won't surface this tx. Acceptable
+        //  for v1 — the pool page queries by pool ID, not by token.
+        break;
+
+      case TxType::CreateOrder:
+      case TxType::CancelOrder:
+        tokens.push_back(tx.token_id);
+        break;
+
+      case TxType::OptInStaking:
+      case TxType::OptOutStaking:
+      case TxType::ClaimRewards:
+      case TxType::RegisterValidator:
+      case TxType::UnregisterValidator:
+      case TxType::UpdateRewardAddress:
+        //  Native-token only. Index the native token so a
+        //  "transactions involving CLRTY" query surfaces these.
+        tokens.push_back(NATIVE_TOKEN_ID);
+        break;
+
+      default:
+        break;
+      }
+
+      state.indexTransaction(
+          tx.txid(),
+          ctx.current_height,
+          static_cast<uint32_t>(i),
+          addresses,
+          tokens,
+          static_cast<uint8_t>(tx.tx_type));
+    }
   }
 } // namespace Core

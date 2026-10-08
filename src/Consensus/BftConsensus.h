@@ -38,6 +38,37 @@ namespace Consensus
   // evidence.
   inline constexpr size_t MAX_EQUIVOCATION_EVIDENCE = 256;
 
+  //  Minimum wall-clock interval between blocks, in milliseconds.
+  //
+  //  The consensus engine waits this long after a commit before
+  //  entering the next height, unless the node has pending work (a
+  //  non-empty mempool), in which case the next block is proposed
+  //  immediately.
+  //
+  //  The result:
+  //
+  //    - Idle chain: one empty heartbeat block per interval.
+  //    - Active chain: blocks as fast as transactions arrive.
+  //    - Transition: the next block fires the moment a tx lands
+  //      in the mempool, even if the idle timer is still counting.
+  //
+  //  This is a protocol constant, not a node config. Making it
+  //  configurable would let a single validator set its interval to
+  //  zero and produce a flood of empty blocks, and the other
+  //  validators would have to accept them — the pacing rule isn't
+  //  enforced at consensus, so a fast-proposing validator isn't
+  //  rejected by its peers. Keeping the value internal ensures every
+  //  honest node paces itself the same way.
+  //
+  //  A validator that patches its binary to disable pacing would
+  //  still be producing blocks the rest of the network accepts.
+  //  That's a property of the design, not a limitation: the pacing
+  //  rule is a well-behaved-node norm, and the network's protection
+  //  against a node that ignores it is that everyone else is
+  //  producing blocks at the same rate, so a burst from one node
+  //  can't dominate the chain.
+  inline constexpr uint64_t MIN_BLOCK_INTERVAL_MS = 60'000;
+
   // Key for the (height, round) -> block_hash map used to answer
   // "which block did this round propose?". Hashable because it's
   // used as a key in an unordered_map.
@@ -182,6 +213,17 @@ namespace Consensus
     // evidence and lets on-chain verification sort it out.
     std::function<bool(const std::vector<uint8_t> &payload)>
         verify_slash_proof;
+
+    //  Return true if the node has pending work (a non-empty
+    //  mempool). Called by pollTimers when a pacing delay is in
+    //  effect: if the chain is idle and a transaction has arrived,
+    //  the delay is cancelled and the next block is proposed
+    //  immediately.
+    //
+    //  Optional. When unset, the engine behaves as if the mempool
+    //  is always non-empty — that is, pacing never delays a block.
+    //  Non-validator nodes and tests can leave it unset.
+    std::function<bool()> has_pending_work;
 
     // The WAL exists to prevent self-slashing on restart. A
     // validator that crashes mid-round and comes back without its
@@ -671,6 +713,11 @@ namespace Consensus
     // makes stop() mean "inert": a stopped instance cannot advance
     // even if it had a commit in flight when it was stopped.
     std::optional<Height> pending_height_;
+
+    //  Wall-clock timestamp at which the next proposal is allowed.
+    //  Zero means "no delay in effect". Set by enterCommit; checked
+    //  and cleared by pollTimers.
+    uint64_t next_propose_not_before_ms_{0};
 
     // Votes received for rounds ahead of the local round, keyed by
     // round and then by signer id.

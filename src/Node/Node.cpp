@@ -717,6 +717,16 @@ namespace Node
       return result.has_value();
     };
 
+    // ---- has_pending_work ----
+    //  True when the mempool is non-empty. Called by pollTimers
+    //  during a pacing delay: if a transaction has arrived while
+    //  the chain was idle, the delay is cancelled and the next
+    //  block is proposed immediately.
+    deps.has_pending_work = [this]() -> bool
+    {
+      return mempool_ && mempool_->size() > 0;
+    };
+
     // ---- WAL ----
     //
     //  Every vote we sign is written to TBL_CONSENSUS_WAL before it

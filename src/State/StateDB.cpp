@@ -61,6 +61,28 @@ namespace State
       return "smt_nodes_by_ver";
     case TBL_SMT_LEAVES_BY_VER:
       return "smt_leaves_by_ver";
+    case TBL_AMM_POOLS:
+      return "amm_pools";
+    case TBL_AMM_POSITIONS:
+      return "amm_positions";
+    case TBL_INDEX_POSITIONS_BY_OWNER:
+      return "index_positions_by_owner";
+    case TBL_INDEX_ORDERS_BY_OWNER:
+      return "index_orders_by_owner";
+    case TBL_INDEX_BALANCES_BY_TOKEN:
+      return "index_balances_by_token";
+    case TBL_INDEX_POOLS_BY_TOKEN:
+      return "index_pools_by_token";
+    case TBL_INDEX_TX_BY_ADDRESS:
+      return "index_tx_by_address";
+    case TBL_INDEX_TX_BY_TOKEN:
+      return "index_tx_by_token";
+    case TBL_INDEX_TX_BY_TYPE:
+      return "index_tx_by_type";
+    case TBL_INDEX_BLOCKS_BY_PRODUCER:
+      return "index_blocks_by_producer";
+    case TBL_INDEX_ORDERS_BY_PAIR:
+      return "index_orders_by_pair";
     default:
       return "<unknown>";
     }
@@ -309,6 +331,276 @@ namespace State
     }
 
     mdbx_cursor_close(cursor);
+  }
+
+  void StateDB::Txn::forEachWithPrefix(
+      uint32_t tableId,
+      const std::vector<uint8_t> &prefix,
+      const EntryVisitor &visitor) const
+  {
+    if (!open_)
+      throw StateDBError("Txn::forEachWithPrefix on closed txn");
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(txn_, owner_->tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    MDBX_val mkey, mval;
+    mkey.iov_base = const_cast<void *>(static_cast<const void *>(prefix.data()));
+    mkey.iov_len = prefix.size();
+    rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_SET_RANGE);
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+
+      if (key.size() < prefix.size() ||
+          std::memcmp(key.data(), prefix.data(), prefix.size()) != 0)
+      {
+        break;
+      }
+
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_NEXT);
+    }
+
+    mdbx_cursor_close(cursor);
+  }
+
+  void StateDB::Txn::forEachReverse(
+      uint32_t tableId,
+      const EntryVisitor &visitor) const
+  {
+    if (!open_)
+      throw StateDBError("Txn::forEachReverse on closed txn");
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(txn_, owner_->tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    MDBX_val mkey, mval;
+    rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+    }
+
+    mdbx_cursor_close(cursor);
+  }
+
+  void StateDB::Txn::forEachWithPrefixReverse(
+      uint32_t tableId,
+      const std::vector<uint8_t> &prefix,
+      const EntryVisitor &visitor) const
+  {
+    if (!open_)
+      throw StateDBError("Txn::forEachWithPrefixReverse on closed txn");
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(txn_, owner_->tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    //  Position the cursor at the first key strictly greater than
+    //  everything in the prefix range, then step back one. That lands
+    //  on the last key whose prefix matches, if any.
+    //
+    //  Constructing the exclusive upper bound: the prefix's last byte
+    //  incremented by one, with trailing bytes dropped. If the last
+    //  byte is 0xFF, we'd have to carry; that requires walking the
+    //  prefix from the end. In practice our prefixes never end in
+    //  0xFF (they end in addresses, token IDs, or type bytes, none of
+    //  which use 0xFF as a terminator), so a simple increment is fine
+    //  and we handle the carry case defensively.
+
+    std::vector<uint8_t> upper = prefix;
+    while (!upper.empty() && upper.back() == 0xFF)
+      upper.pop_back();
+    if (!upper.empty())
+      ++upper.back();
+    // If upper became empty, the prefix was all 0xFF and there's no
+    // exclusive bound; use MDBX_LAST directly.
+
+    MDBX_val mkey, mval;
+    if (upper.empty())
+    {
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+    }
+    else
+    {
+      mkey.iov_base = const_cast<void *>(static_cast<const void *>(upper.data()));
+      mkey.iov_len = upper.size();
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_SET_RANGE);
+      if (rc == MDBX_SUCCESS)
+      {
+        // We're at the first key >= upper. Step back one.
+        rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+      }
+      else if (rc == MDBX_NOTFOUND)
+      {
+        // No key >= upper. The last key in the table is our starting
+        // point.
+        rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+      }
+    }
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+
+      if (key.size() < prefix.size() ||
+          std::memcmp(key.data(), prefix.data(), prefix.size()) != 0)
+      {
+        // Walked off the front of the prefix range. Done.
+        break;
+      }
+
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+    }
+
+    mdbx_cursor_close(cursor);
+  }
+
+  void StateDB::forEachEntryReverse(uint32_t tableId,
+                                    const EntryVisitor &visitor) const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    MDBX_txn *txn = nullptr;
+    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    MDBX_cursor *cursor = nullptr;
+    rc = mdbx_cursor_open(txn, tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+    {
+      mdbx_txn_abort(txn);
+      return;
+    }
+
+    MDBX_val mkey, mval;
+    rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+    }
+
+    mdbx_cursor_close(cursor);
+    mdbx_txn_abort(txn);
+  }
+
+  void StateDB::forEachEntryWithPrefixReverse(
+      uint32_t tableId,
+      const std::vector<uint8_t> &prefix,
+      const EntryVisitor &visitor) const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    MDBX_txn *txn = nullptr;
+    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    MDBX_cursor *cursor = nullptr;
+    rc = mdbx_cursor_open(txn, tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+    {
+      mdbx_txn_abort(txn);
+      return;
+    }
+
+    std::vector<uint8_t> upper = prefix;
+    while (!upper.empty() && upper.back() == 0xFF)
+      upper.pop_back();
+    if (!upper.empty())
+      ++upper.back();
+
+    MDBX_val mkey, mval;
+    if (upper.empty())
+    {
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+    }
+    else
+    {
+      mkey.iov_base = const_cast<void *>(static_cast<const void *>(upper.data()));
+      mkey.iov_len = upper.size();
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_SET_RANGE);
+      if (rc == MDBX_SUCCESS)
+      {
+        rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+      }
+      else if (rc == MDBX_NOTFOUND)
+      {
+        rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+      }
+    }
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+
+      if (key.size() < prefix.size() ||
+          std::memcmp(key.data(), prefix.data(), prefix.size()) != 0)
+      {
+        break;
+      }
+
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+    }
+
+    mdbx_cursor_close(cursor);
+    mdbx_txn_abort(txn);
   }
 
   void StateDB::Txn::commit()

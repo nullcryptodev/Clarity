@@ -174,6 +174,27 @@ namespace Core
                                         const std::vector<Id> &committed_set,
                                         uint64_t current_height,
                                         std::string &error);
+
+    //  Write the block's per-block index rows: the producer index
+    //  (one row per block) and the transaction indexes (one row per
+    //  address, token, and type per transaction).
+    //
+    //  Called from applyBlock after every state mutation has
+    //  succeeded, so the indexes only record blocks that actually
+    //  applied. Skipped during dry-run.
+    //
+    //  These are pure index writes — they don't affect the state
+    //  root, and a node that never wrote them would still agree
+    //  with a node that did. They exist so the RPC layer can answer
+    //  queries like "which blocks did this validator produce" and
+    //  "what's the transaction history for this address" without
+    //  walking the chain.
+    static void indexBlockProducer(State::StateAccess &state,
+                                   const Block &block);
+
+    static void indexTransactions(State::StateAccess &state,
+                                  const Block &block,
+                                  const BlockContext &ctx);
   };
 
 } // namespace Core

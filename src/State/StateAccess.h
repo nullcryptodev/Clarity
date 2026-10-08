@@ -10,7 +10,6 @@
 #include <optional>
 #include <string>
 #include <vector>
-#include <optional>
 
 #include "Core/Account.h"
 #include "Core/AmmPool.h"
@@ -36,7 +35,9 @@ namespace State
     // The txn is NOT owned by StateAccess. Caller commits or aborts.
     StateAccess(StateDB &db, StateDB::Txn &txn, uint64_t version);
 
-    // ---- Accounts ----
+    // =================================================================
+    //  Accounts
+    // =================================================================
 
     Core::Account getAccount(const Crypto::Address &address) const;
     bool accountExists(const Crypto::Address &address) const;
@@ -44,42 +45,78 @@ namespace State
                     const Core::Account &account);
     void deleteAccount(const Crypto::Address &address);
 
-    // ---- Token balances ----
+    // Enumerate every account. Order is by address (byte-lexicographic).
+    // The Account passed to the callback is a full deserialized record,
+    // not just the key. Reads through the txn-aware path so in txn-bound
+    // mode it sees the txn's own writes.
+    //
+    // Iteration cost is O(entries). The MDBX table only stores a
+    // sentinel value per address (the authoritative record lives in
+    // the SMT); each callback invocation therefore does one SMT read
+    // per account. For a large account set this is expensive — use
+    // for pagination, not for full scans on every poll.
+    void forEachAccount(
+        const std::function<void(const Crypto::Address &, const Core::Account &)> &fn) const;
+
+    // =================================================================
+    //  Token balances
+    // =================================================================
 
     uint64_t getTokenBalance(const Crypto::Address &address, Id token_id) const;
     void putTokenBalance(const Crypto::Address &address, Id token_id, uint64_t balance);
     void deleteTokenBalance(const Crypto::Address &address, Id token_id);
 
-    // ---- Token metadata ----
+    // Every (token_id, balance) pair held by an address. Order is by
+    // token_id ascending. Uses TBL_TOKEN_BALANCES with an address
+    // prefix scan; each entry's balance is read directly from the
+    // table, not the SMT.
+    void forEachTokenBalanceForOwner(
+        const Crypto::Address &owner,
+        const std::function<void(Id token_id, uint64_t balance)> &fn) const;
+
+    // Every (address, balance) pair for a token. Order is by address.
+    // Uses TBL_INDEX_BALANCES_BY_TOKEN.
+    //
+    // This is the query behind "top holders of a token". Callers that
+    // want the top N by balance should collect all pairs and sort,
+    // because MDBX has no native ordering by value.
+    void forEachHolderOfToken(
+        Id token_id,
+        const std::function<void(const Crypto::Address &, uint64_t balance)> &fn) const;
+
+    // =================================================================
+    //  Token metadata
+    // =================================================================
 
     bool getToken(Id token_id, Core::TokenInfo &out) const;
     void putToken(const Core::TokenInfo &token);
 
-    // ---- Token supply ----
-    //
-    // The cumulative minted supply per token, tracked separately from
-    // the token's metadata. Used to enforce maxSupply on mint without
-    // relying on any single account's balance, and decremented on burn.
-    //
-    // The native token's supply is tracked in global state under
-    // "total_supply", not here — the native token has no mint/burn
-    // path.
+    // Enumerate every registered token, ordered by token_id.
+    void forEachToken(
+        const std::function<void(const Core::TokenInfo &)> &fn) const;
+
+    // =================================================================
+    //  Token supply
+    // =================================================================
 
     uint64_t getTokenSupply(Id token_id) const;
     void putTokenSupply(Id token_id, uint64_t supply);
 
-    // ---- Validators ----
+    // =================================================================
+    //  Validators
+    // =================================================================
 
     bool getValidator(uint64_t validator_id, Core::ValidatorInfo &out) const;
     void putValidator(const Core::ValidatorInfo &validator);
     void deleteValidator(uint64_t validator_id);
 
-    // ---- Validator lookup by reward address ----
-    //
-    // Maps a validator's reward_address to its validator_id. Written
-    // when a validator is registered or seeded at genesis. Read by the
-    // reward distributor to identify the block proposer, and by any
-    // caller that has only an address.
+    // Already present — iterates TBL_INDEX_VALIDATORS.
+    void forEachValidator(
+        const std::function<void(const Core::ValidatorInfo &)> &fn) const;
+
+    // =================================================================
+    //  Validator lookup by reward address
+    // =================================================================
 
     bool getValidatorByAddress(const Crypto::Address &address,
                                uint64_t &validator_id_out) const;
@@ -87,52 +124,78 @@ namespace State
                                uint64_t validator_id);
     void deleteValidatorByAddress(const Crypto::Address &address);
 
-    // ---- Orders ----
+    // =================================================================
+    //  Orders
+    // =================================================================
 
     bool getOrder(Id order_id, Core::Order &out) const;
     void putOrder(const Core::Order &order);
     void deleteOrder(Id order_id);
 
-    // ---- Order expiry index ----
-    //
-    // One SMT entry per expiry height. The value is a length-prefixed
-    // list of 8-byte LE order IDs. Adding or removing an order is a
-    // read-modify-write of the list. Used by BlockProcessor's order
-    // expiry pass to find all orders due at the current height without
-    // scanning the whole order ID space.
+    // Enumerate every order, ordered by order_id.
+    void forEachOrder(
+        const std::function<void(const Core::Order &)> &fn) const;
+
+    // Every order owned by a given address, ordered by order_id.
+    // Uses TBL_INDEX_ORDERS_BY_OWNER.
+    void forEachOrderForOwner(
+        const Crypto::Address &owner,
+        const std::function<void(const Core::Order &)> &fn) const;
+
+    // Every order for a specific (sell_token, buy_token) pair, ordered
+    // by order_id. Uses TBL_INDEX_ORDERS_BY_PAIR.
+    void forEachOrderForPair(
+        Id sell_token, Id buy_token,
+        const std::function<void(const Core::Order &)> &fn) const;
+
+    // =================================================================
+    //  Order expiry index
+    // =================================================================
 
     std::vector<uint64_t> getOrdersExpiringAt(uint64_t height) const;
     void addOrderExpiry(uint64_t height, uint64_t order_id);
     void removeOrderExpiry(uint64_t height, uint64_t order_id);
+    void clearOrderExpiry(uint64_t height);
 
-    // ---- AMM Pools ----
+    // =================================================================
+    //  AMM Pools
+    // =================================================================
 
     bool getAmmPool(Id pool_id, Core::AmmPool &out) const;
     void putAmmPool(const Core::AmmPool &pool);
-
-    // Delete an AMM pool record. Called by TransactionExecutor when
-    // the last LP withdraws and the pool's reserves and liquidity
-    // reach zero — a pool in that state is functionally inert and is
-    // removed rather than left as a zombie record.
-    //
-    // Historical reads are unaffected: getAtVersion on the pool's
-    // SMT key returns the pool at any version where it existed,
-    // because the historical rows are written independently of the
-    // current-record deletion.
     void deleteAmmPool(Id pool_id);
 
-    // ---- AMM Positions ----
+    // Enumerate every pool, ordered by pool_id.
+    void forEachAmmPool(
+        const std::function<void(const Core::AmmPool &)> &fn) const;
+
+    // Every pool containing a given token (as either token_a or
+    // token_b), ordered by pool_id. Uses TBL_INDEX_POOLS_BY_TOKEN.
+    void forEachPoolForToken(
+        Id token_id,
+        const std::function<void(const Core::AmmPool &)> &fn) const;
+
+    // =================================================================
+    //  AMM Positions
+    // =================================================================
 
     bool getAmmPosition(Id pos_id, Core::AmmPosition &out) const;
     void putAmmPosition(const Core::AmmPosition &pos);
     void deleteAmmPosition(Id pos_id);
 
-    // ---- LP position index ----
-    //
-    // Maps (owner, pool_id) to a position_id. Enforces the invariant
-    // that a given owner has at most one LP position per pool, so
-    // AddLiquidity can merge into an existing position rather than
-    // creating a new one on every call.
+    // Enumerate every position, ordered by position_id.
+    void forEachAmmPosition(
+        const std::function<void(const Core::AmmPosition &)> &fn) const;
+
+    // Every position owned by a given address, ordered by position_id.
+    // Uses TBL_INDEX_POSITIONS_BY_OWNER.
+    void forEachPositionForOwner(
+        const Crypto::Address &owner,
+        const std::function<void(const Core::AmmPosition &)> &fn) const;
+
+    // =================================================================
+    //  LP position index
+    // =================================================================
 
     bool getPositionIndex(const Crypto::Address &owner,
                           uint64_t pool_id,
@@ -143,85 +206,144 @@ namespace State
     void deletePositionIndex(const Crypto::Address &owner,
                              uint64_t pool_id);
 
-    // ---- Receipts ----
+    // =================================================================
+    //  Transaction history indexes
+    // =================================================================
+
+    // Record a transaction's participation in a block. Called once per
+    // transaction from BlockProcessor after the block's transactions
+    // have been applied.
+    //
+    // `addresses` is the set of addresses the transaction touched (from,
+    // to, and any others the type implies). Each is indexed separately.
+    //
+    // `token_ids` is the set of tokens the transaction involved. For a
+    // native transfer, this is {NATIVE_TOKEN_ID}. For a swap, it's both
+    // tokens of the pair. For a CreatePool, both tokens.
+    //
+    // The `tx_type` is the transaction's type as it appears on the wire
+    // (TxType enum value). Used by TBL_INDEX_TX_BY_TYPE.
+    //
+    // All four indexes (by-address, by-token, by-type, and the
+    // optional multi-address expansion) are written in the same call,
+    // so a single failure mode covers all of them.
+    void indexTransaction(const Crypto::Hash &txid,
+                          uint64_t block_height,
+                          uint32_t tx_index_in_block,
+                          const std::vector<Crypto::Address> &addresses,
+                          const std::vector<Id> &token_ids,
+                          uint8_t tx_type);
+
+    // Recent transactions touching a given address, newest first.
+    // Walks TBL_INDEX_TX_BY_ADDRESS in reverse with the address prefix,
+    // resolving each txid to the full transaction by looking it up in
+    // its block. Stops after `max_results` or when the scan is
+    // exhausted, whichever comes first.
+    //
+    // The `txid` in the callback is the transaction's hash; the block
+    // height and index are passed alongside so the caller can locate
+    // the transaction without a second index lookup.
+    void forEachRecentTxForAddress(
+        const Crypto::Address &address,
+        size_t max_results,
+        const std::function<void(const Crypto::Hash &txid,
+                                 uint64_t block_height,
+                                 uint32_t tx_index)> &fn) const;
+
+    // Recent transactions touching a given token, newest first.
+    void forEachRecentTxForToken(
+        Id token_id,
+        size_t max_results,
+        const std::function<void(const Crypto::Hash &txid,
+                                 uint64_t block_height,
+                                 uint32_t tx_index)> &fn) const;
+
+    // Recent transactions of a given type, newest first.
+    void forEachRecentTxOfType(
+        uint8_t tx_type,
+        size_t max_results,
+        const std::function<void(const Crypto::Hash &txid,
+                                 uint64_t block_height,
+                                 uint32_t tx_index)> &fn) const;
+
+    // =================================================================
+    //  Block-by-producer index
+    // =================================================================
+
+    // Record that a validator produced a block. Called once per block
+    // from BlockProcessor after the block's header has been finalized
+    // and its proposer is known.
+    void indexBlockProducer(const Crypto::Address &proposer,
+                            uint64_t block_height,
+                            const Crypto::Hash &block_hash);
+
+    // Recent blocks produced by a given proposer address, newest first.
+    void forEachBlockByProducer(
+        const Crypto::Address &proposer,
+        size_t max_results,
+        const std::function<void(uint64_t block_height,
+                                 const Crypto::Hash &block_hash)> &fn) const;
+
+    // =================================================================
+    //  Receipts
+    // =================================================================
 
     bool getReceipt(const Crypto::Hash &tx_hash, Core::Receipt &out) const;
     void putReceipt(const Crypto::Hash &tx_hash, const Core::Receipt &receipt);
 
-    // ---- Global state ----
+    // =================================================================
+    //  Global state
+    // =================================================================
 
     bool getGlobal(const std::string &name, std::vector<uint8_t> &out) const;
     void putGlobal(const std::string &name, const std::vector<uint8_t> &value);
 
-    // ---- Raw SMT access ----
+    //  Convenience for reading and writing a uint64 in the meta
+    //  table. Txn-aware: in txn-bound mode these route through the
+    //  bound txn, so writes are atomic with the block-apply commit.
+    uint64_t getMetaU64(const std::string &key) const;
+    void putMetaU64(const std::string &key, uint64_t value);
+
+    // Convenience for reading and writing a uint64 global as a
+    // little-endian 8-byte value. Both write 0 as an 8-byte zero
+    // vector, not a missing entry — this keeps the "has this global
+    // been initialized" check as a presence check rather than a
+    // value check.
+    uint64_t getGlobalU64(const std::string &name) const;
+    void putGlobalU64(const std::string &name, uint64_t value);
+
+    // =================================================================
+    //  Raw SMT access
+    // =================================================================
 
     std::optional<std::vector<uint8_t>> getRaw(const Crypto::Hash &smt_key) const;
     void putRaw(const Crypto::Hash &smt_key, const std::vector<uint8_t> &value);
     void deleteRaw(const Crypto::Hash &smt_key);
 
-    // ---- Commit ----
+    // =================================================================
+    //  Commit
+    // =================================================================
 
     void commit(uint64_t version);
     Crypto::Hash stateRoot() const { return smt_.root(); }
 
-    // ---- Indexes (node-local) ----
-    //
-    // The staker index is txn-aware: if this StateAccess is bound to a
-    // txn, indexStaker / unindexStaker / forEachStaker all route through
-    // that txn, so writes made earlier in the same txn are visible to
-    // a subsequent forEachStaker call.
-    //
-    // In autocommit mode, each call opens its own read/write txn.
+    // =================================================================
+    //  Indexes (node-local)
+    // =================================================================
 
     void indexStaker(const Crypto::Address &address);
     void unindexStaker(const Crypto::Address &address);
     void forEachStaker(const std::function<void(const Crypto::Address &)> &fn) const;
 
-    // Clear the entire bucket for a height in one operation. Used by
-    // BlockProcessor's expiry pass after processing every order in
-    // the bucket, avoiding N read-modify-writes.
-    void clearOrderExpiry(uint64_t height);
+    // =================================================================
+    //  Versioned reads
+    // =================================================================
 
-    // Expose the SMT's historical root lookup. Returns the root
-    // committed at `version`, or nullopt if no root was saved for
-    // that version. Historical key reads are available via
-    // getRawAtVersion and its typed wrappers, below.
     std::optional<Crypto::Hash> smtRootAtVersion(uint64_t version) const;
 
-    // Iterate all validator records. The visitor is called for each
-    // validator in no particular order. The value passed is the full
-    // deserialized ValidatorInfo, not the raw bytes.
-    //
-    // Reads through a read-only path, so it does not require an
-    // active txn. In txn-bound mode, reads see the txn's own writes.
-    //
-    // The visitor should not modify state. In practice we only use
-    // this from RPC and diagnostic code where modification isn't
-    // possible.
-    void forEachValidator(const std::function<void(const Core::ValidatorInfo &)> &fn) const;
-
-    // ---- Versioned reads ----
-    //
-    // Read a key's raw value as it existed at `version`. Returns
-    // nullopt if the version's root is not available (pruned, or
-    // never written), or if the key did not exist at that version.
-    //
-    // The key is an SMT key as produced by the Keys::* functions.
-    // Callers that want a typed read compose:
-    //
-    //   auto bytes = state.getRawAtVersion(Keys::account(addr), v);
-    //   if (bytes) { Account a; Account::deserializeState(...); }
-    //
-    // For the three types that RPC methods ask about most often,
-    // typed wrappers are provided below to avoid the composition.
     std::optional<std::vector<uint8_t>> getRawAtVersion(
         const Crypto::Hash &smt_key, uint64_t version) const;
 
-    // ---- Typed historical reads ----
-    //
-    // Convenience wrappers over getRawAtVersion. Each returns false /
-    // default-constructs on missing or malformed data, matching the
-    // current-version getters.
     Core::Account getAccountAtVersion(const Crypto::Address &address,
                                       uint64_t version) const;
 
@@ -233,23 +355,16 @@ namespace State
                             uint64_t version,
                             std::vector<uint8_t> &out) const;
 
-    // ---- Proof generation at a specific version ----
-    //
-    //  Produces an SMT proof for `key` at `version`. The proof is
-    //  against the version's root, not the current root; the caller
-    //  receives the root separately (via smtRootAtVersion) so the
-    //  client can verify independently.
-    //
-    //  Returns nullopt if `version` has no saved root, or if the SMT
-    //  walk fails (corrupt DB).
-    //
-    //  The `key` is an SMT key as produced by the Keys::* functions —
-    //  the same key the current-version getters use, and the same key
-    //  resolveProofKey produces from a (key_type, key_bytes) pair.
-    //
-    //  Used by Node::handleGetProof. Not used by any consensus path.
     std::optional<State::SmtProof> proveAtVersion(
         const Crypto::Hash &key, uint64_t version) const;
+
+    // =================================================================
+    //  Table stats (for RPC diagnostics and chain aggregates)
+    // =================================================================
+
+    // Number of entries in a table. O(1) via MDBX's dbi stat.
+    // Used by getChainStats for unique-count fields.
+    size_t tableEntryCount(uint32_t table_id) const;
 
   private:
     // Txn-aware storage helpers.
@@ -257,6 +372,44 @@ namespace State
                      const std::vector<uint8_t> &value);
     bool getMetaImpl(const std::string &key,
                      std::vector<uint8_t> &out) const;
+
+    // =================================================================
+    //  Index write helpers. Each is a small wrapper that picks the
+    //  right table and key layout for one index row. They are called
+    //  from the corresponding putX/deleteX method and share its txn
+    //  context (txn_ if bound, autocommit otherwise).
+    // =================================================================
+
+    void indexAccountRow(const Crypto::Address &address);
+    void unindexAccountRow(const Crypto::Address &address);
+
+    void indexTokenRow(Id token_id);
+    void unindexTokenRow(Id token_id);
+
+    void indexTokenBalanceRow(const Crypto::Address &address, Id token_id, uint64_t balance);
+    void unindexTokenBalanceRow(const Crypto::Address &address, Id token_id);
+
+    void indexAmmPoolRow(Id pool_id, Id token_a, Id token_b);
+    void unindexAmmPoolRow(Id pool_id, Id token_a, Id token_b);
+
+    void indexAmmPositionRow(Id position_id, const Crypto::Address &owner);
+    void unindexAmmPositionRow(Id position_id, const Crypto::Address &owner);
+
+    void indexOrderRow(Id order_id, const Crypto::Address &owner, Id sell_token, Id buy_token);
+    void unindexOrderRow(Id order_id, const Crypto::Address &owner, Id sell_token, Id buy_token);
+
+    // Low-level: put a row with a sentinel value.
+    void putSentinel(uint32_t table_id, const void *key, size_t key_len);
+
+    // Low-level: put a row with an 8-byte LE uint64 value.
+    void putU64Row(uint32_t table_id, const void *key, size_t key_len, uint64_t value);
+
+    // Low-level: put a row with a byte-blob value.
+    void putBlobRow(uint32_t table_id, const void *key, size_t key_len,
+                    const void *value, size_t value_len);
+
+    // Low-level: delete a row.
+    void deleteRow(uint32_t table_id, const void *key, size_t key_len);
 
     StateDB &db_;
     StateDB::Txn *txn_{nullptr};

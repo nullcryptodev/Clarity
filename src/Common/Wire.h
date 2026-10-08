@@ -88,6 +88,74 @@ namespace Common
       out.push_back(uint8_t(v >> (i * 8)));
   }
 
+  //  Raw-buffer writers.
+  //
+  //  The put* functions above append to a vector. These write to a
+  //  caller-supplied buffer at a fixed offset, for cases where the
+  //  key or value being built isn't a std::vector. Both variants
+  //  write the same little-endian layout.
+  //
+  //  The buffer must have room for the full width. Callers are
+  //  responsible for the size; these do not bounds-check.
+
+  inline void writeU16(uint8_t *p, uint16_t v) noexcept
+  {
+    p[0] = uint8_t(v);
+    p[1] = uint8_t(v >> 8);
+  }
+
+  inline void writeU32(uint8_t *p, uint32_t v) noexcept
+  {
+    p[0] = uint8_t(v);
+    p[1] = uint8_t(v >> 8);
+    p[2] = uint8_t(v >> 16);
+    p[3] = uint8_t(v >> 24);
+  }
+
+  inline void writeU64(uint8_t *p, uint64_t v) noexcept
+  {
+    for (int i = 0; i < 8; ++i)
+      p[i] = uint8_t(v >> (i * 8));
+  }
+
+  //  Big-endian variants.
+  //
+  //  Used for index keys that embed a block height so that a reverse
+  //  cursor scan visits newest-first (MDBX orders keys lexicographically,
+  //  so encoding the height big-endian makes its natural order match its
+  //  numeric order).
+  //
+  //  These are the only BE code in the codebase. Everything else uses
+  //  the LE primitives above.
+
+  inline void writeU32BE(uint8_t *p, uint32_t v) noexcept
+  {
+    p[0] = uint8_t(v >> 24);
+    p[1] = uint8_t(v >> 16);
+    p[2] = uint8_t(v >> 8);
+    p[3] = uint8_t(v);
+  }
+
+  inline void writeU64BE(uint8_t *p, uint64_t v) noexcept
+  {
+    for (int i = 0; i < 8; ++i)
+      p[i] = uint8_t(v >> ((7 - i) * 8));
+  }
+
+  inline uint32_t readU32BE(const uint8_t *p) noexcept
+  {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
+           (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+  }
+
+  inline uint64_t readU64BE(const uint8_t *p) noexcept
+  {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i)
+      v = (v << 8) | uint64_t(p[i]);
+    return v;
+  }
+
   inline void putBytes(std::vector<uint8_t> &out, const uint8_t *p, size_t n)
   {
     out.insert(out.end(), p, p + n);

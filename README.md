@@ -109,8 +109,7 @@ address             keystore utility: create, import, inspect
                       (derives both the reward key and the consensus key
                       from one mnemonic, prints any network's encoding)
 genesis_hash        computes and verifies the pinned genesis hash per network
-transaction_signer  offline wallet transaction signer and submit if rpc
-                      is connected
+transaction_signer  offline wallet transaction signer
 ```
 
 ## Build

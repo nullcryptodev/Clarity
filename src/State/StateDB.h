@@ -71,7 +71,76 @@ namespace State
       TBL_SMT_NODES_BY_VER = 19,
       TBL_SMT_LEAVES_BY_VER = 20,
 
-      TBL_COUNT = 21,
+      // ---- Application index tables ----
+      //
+      // These mirror data that lives authoritatively in the SMT, but
+      // keyed for enumeration and scoped queries. The SMT is the
+      // commitment; these tables are the query layer.
+      //
+      // Every write that touches the SMT also updates the
+      // corresponding index rows in the same txn, so the two can
+      // never drift.
+      //
+      // Key layouts (all integers little-endian unless noted):
+      //
+      //   TBL_AMM_POOLS
+      //     pool_id(8) -> serialized AmmPool
+      //
+      //   TBL_AMM_POSITIONS
+      //     position_id(8) -> serialized AmmPosition
+      //
+      //   TBL_INDEX_POSITIONS_BY_OWNER
+      //     owner(32) || position_id(8) -> pool_id(8)
+      //     Prefix-scan on owner enumerates that owner's positions.
+      //
+      //   TBL_INDEX_ORDERS_BY_OWNER
+      //     owner(32) || order_id(8) -> empty
+      //     Prefix-scan on owner enumerates that owner's orders.
+      //
+      //   TBL_INDEX_BALANCES_BY_TOKEN
+      //     token_id(4) || owner(32) -> balance(8)
+      //     Prefix-scan on token_id enumerates that token's holders.
+      //     Balance is duplicated here (also in the SMT) so a holder
+      //     listing is one range scan, not N SMT lookups.
+      //
+      //   TBL_INDEX_POOLS_BY_TOKEN
+      //     token_id(4) || pool_id(8) -> empty
+      //     Prefix-scan on token_id enumerates pools containing it.
+      //
+      //   TBL_INDEX_TX_BY_ADDRESS
+      //     address(32) || height(8 BE) || tx_index(4 BE) -> txid(32)
+      //     Big-endian height so a reverse cursor scan visits newest
+      //     first — the natural order for "recent transactions for
+      //     an address".
+      //
+      //   TBL_INDEX_TX_BY_TOKEN
+      //     token_id(4) || height(8 BE) || tx_index(4 BE) -> txid(32)
+      //     Same idea, keyed by the token the transaction touched.
+      //
+      //   TBL_INDEX_TX_BY_TYPE
+      //     type(1) || height(8 BE) || tx_index(4 BE) -> txid(32)
+      //     Type is the TxType enum value, one byte.
+      //
+      //   TBL_INDEX_BLOCKS_BY_PRODUCER
+      //     proposer(32) || height(8 BE) -> block_hash(32)
+      //     Enumerates the blocks a validator produced.
+      //
+      //   TBL_INDEX_ORDERS_BY_PAIR
+      //     sell_token(4) || buy_token(4) || order_id(8) -> empty
+      //     Enumerates the order book for a specific pair.
+      TBL_AMM_POOLS = 21,
+      TBL_AMM_POSITIONS = 22,
+      TBL_INDEX_POSITIONS_BY_OWNER = 23,
+      TBL_INDEX_ORDERS_BY_OWNER = 24,
+      TBL_INDEX_BALANCES_BY_TOKEN = 25,
+      TBL_INDEX_POOLS_BY_TOKEN = 26,
+      TBL_INDEX_TX_BY_ADDRESS = 27,
+      TBL_INDEX_TX_BY_TOKEN = 28,
+      TBL_INDEX_TX_BY_TYPE = 29,
+      TBL_INDEX_BLOCKS_BY_PRODUCER = 30,
+      TBL_INDEX_ORDERS_BY_PAIR = 31,
+
+      TBL_COUNT = 32,
     };
 
     using EntryVisitor = std::function<bool(const std::vector<uint8_t> &key,
@@ -112,6 +181,26 @@ namespace State
       // own cursor, so it *does* see uncommitted writes made via this
       // same txn.
       void forEach(uint32_t tableId, const EntryVisitor &visitor) const;
+
+      // Iterate entries whose key begins with `prefix`. Same semantics
+      // as StateDB::forEachEntryWithPrefix, but through the txn's own
+      // view (sees uncommitted writes).
+      void forEachWithPrefix(uint32_t tableId,
+                             const std::vector<uint8_t> &prefix,
+                             const EntryVisitor &visitor) const;
+
+      // Reverse iteration: visits entries in descending key order.
+      // The first call positions the cursor at the last entry in the
+      // table (or, with a prefix, at the last entry whose key begins
+      // with that prefix). Useful for "newest first" scans on indexes
+      // whose keys embed a big-endian height.
+      //
+      // The visitor returns false to stop early, matching forEach.
+      void forEachReverse(uint32_t tableId, const EntryVisitor &visitor) const;
+
+      void forEachWithPrefixReverse(uint32_t tableId,
+                                    const std::vector<uint8_t> &prefix,
+                                    const EntryVisitor &visitor) const;
 
       void commit();
       void abort();
@@ -184,6 +273,14 @@ namespace State
                                 const std::vector<uint8_t> &prefix,
                                 const EntryVisitor &visitor) const;
 
+    // Reverse variants. See Txn::forEachReverse for semantics.
+    void forEachEntryReverse(uint32_t tableId,
+                             const EntryVisitor &visitor) const;
+
+    void forEachEntryWithPrefixReverse(uint32_t tableId,
+                                       const std::vector<uint8_t> &prefix,
+                                       const EntryVisitor &visitor) const;
+
     // =================================================================
     //  Meta helpers
     // =================================================================
@@ -216,15 +313,6 @@ namespace State
     std::optional<std::vector<uint8_t>> getLeafData(const Crypto::Hash &leaf_hash) const;
 
     // ---- Historical SMT access ----
-    //
-    // Reads and writes the (hash, version)-keyed historical tables.
-    // A historical write also writes the by-version index entry, so
-    // that pruneHistory can find rows to delete without a full scan.
-    //
-    // Callers that write both a current and a historical row (the
-    // SMT update path) use these alongside putNode/putLeafData; they
-    // are not replacements.
-
     void putNodeAtVersion(const Crypto::Hash &hash,
                           uint64_t version,
                           const std::vector<uint8_t> &children);
@@ -242,27 +330,6 @@ namespace State
                               std::vector<uint8_t> &out) const;
 
     // ---- Historical pruning ----
-    //
-    // Delete every historical row whose version is strictly less than
-    // keepFrom, from both the historical table and the by-version
-    // index. The index is keyed by (version, hash), so a single cursor
-    // scan finds every row to delete, in version order, and stops at
-    // the first version >= keepFrom.
-    //
-    // Two entry points:
-    //
-    //   pruneHistoryBefore(keepFrom)
-    //     Opens its own write txn. Used by callers that don't already
-    //     hold one (e.g. a startup maintenance pass).
-    //
-    //   pruneHistoryBeforeTxn(txn, keepFrom)
-    //     Uses the caller's write txn. Required when the rows to be
-    //     pruned were written in that same txn — for example when a
-    //     SparseMerkleTree is bound to a txn and its historical rows
-    //     are still uncommitted.
-    //
-    // Both are safe to call from any thread that can hold the DB
-    // mutex. Not called during block application.
     void pruneHistoryBefore(uint64_t keepFrom);
 
     void pruneHistoryBeforeTxn(Txn &txn, uint64_t keepFrom);

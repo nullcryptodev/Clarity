@@ -474,6 +474,19 @@ namespace Consensus
     //  Entering the next height is deferred. See pending_height_ in
     //  the header for why.
     pending_height_ = height + 1;
+
+    //  Pacing. Record the wall-clock time at which the next proposal
+    //  is allowed. pollTimers will honour this unless the node has
+    //  pending work, in which case the delay is cancelled.
+    //
+    //  The time is set here (at commit) rather than at enterPropose
+    //  because the pacing rule is "wait after the parent block was
+    //  produced", and the parent's production time is now.
+    if (deps_.now_ms)
+    {
+      next_propose_not_before_ms_ =
+          deps_.now_ms() + MIN_BLOCK_INTERVAL_MS;
+    }
   }
 
   //  Inbound message handlers.
@@ -1192,8 +1205,40 @@ namespace Consensus
 
     if (pending_height_.has_value())
     {
+      //  Pacing check. If a delay is in effect and we haven't
+      //  reached the target time, decide whether to keep waiting.
+      //
+      //  The wait is cancelled the moment the node has pending
+      //  work (a non-empty mempool). The whole point of the pacing
+      //  rule is to avoid empty blocks, not to delay real
+      //  transactions.
+      //
+      //  When has_pending_work is unset (as in tests and on
+      //  non-validator nodes), the engine behaves as if there is
+      //  always work — so pacing is a no-op and blocks commit as
+      //  fast as they can, matching the pre-pacing behaviour.
+      if (next_propose_not_before_ms_ != 0)
+      {
+        const uint64_t now = deps_.now_ms ? deps_.now_ms() : 0;
+
+        if (now < next_propose_not_before_ms_)
+        {
+          const bool pending =
+              !deps_.has_pending_work || deps_.has_pending_work();
+          if (!pending)
+          {
+            //  Idle and still inside the delay window. Wait.
+            return;
+          }
+          //  Otherwise fall through: pending work cancels the wait.
+        }
+
+        next_propose_not_before_ms_ = 0;
+      }
+
       Height next = *pending_height_;
       pending_height_.reset();
+      next_propose_not_before_ms_ = 0;
       enterNewHeight(next);
       return;
     }
@@ -2173,6 +2218,8 @@ namespace Consensus
     proposal_for_round_.clear();
 
     timeout_votes_.clear();
+
+    next_propose_not_before_ms_ = 0;
 
     //  equivocations_ is deliberately NOT cleared here.
   }
