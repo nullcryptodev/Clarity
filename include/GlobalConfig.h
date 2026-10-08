@@ -25,6 +25,7 @@ namespace GlobalConfig
   inline constexpr const char *PROJECT_NAME = "Clarity";
   inline constexpr const char *PROJECT_SYMBOL = "CLRTY";
   inline constexpr const char *PROJECT_AGENT_STRING = "/Clarity:1.0.0/";
+  inline constexpr const char *CLIENT_VERSION = "clrty/v1.0.0";
 
   inline constexpr Id CHAIN_ID = 0x434C5254;         // 'CLRT'
   inline constexpr Id TESTNET_CHAIN_ID = 0x434C5454; // 'CLTT'
@@ -62,15 +63,16 @@ namespace GlobalConfig
 
   // The genesis supply gets split multiple addresses
   // Current config splits 100k into 3 addresses, 60k to "treasury", 20k into "community"
-  // and 20k to the first seed. The seed can go without this reward, but funds could be
-  // used to bootstrap the network
+  // and 20k to the first seed.
+  // The seed can go without this reward, but funds are used to bootstrap the network
+  // and ensure both seeds "afford" to be network validators
   inline constexpr Amount GENESIS_SUPPLY = ATOMIC_UNITS_PER_COIN * 100'000; // 100k
 
   inline constexpr const char *COMMUNITY_FUND_ADDRESS = "0000000000000000000000000000000000000000000000000000000000000001"; // address
   inline constexpr const char *TREASURY_FUND_ADDRESS = "0000000000000000000000000000000000000000000000000000000000000001";  // address
 
   inline constexpr Amount COMMUNITY_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 40'000;
-  inline constexpr Amount TREASURY_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 58'000; // pay for seed validator
+  inline constexpr Amount TREASURY_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 58'000; // pay seed validators
 
   // Genesis block hashes, one per network. Computed once and pinned.
   // If a change to genesis construction produces a different hash,
@@ -113,13 +115,14 @@ namespace GlobalConfig
   // Consensus keys are identical across all three networks
   inline constexpr const char *SEED_NODE = "5cab747984018f73c3dac5979254b35591477fd06e15707fed28f67dfcd9b02e";     // consensus pubkey
   inline constexpr const char *SEED_NODE_TWO = "bcd90de479cabb39f01475775fb03289128c46d1966d056d64c637659fef31c9"; // consensus pubkey
-  inline constexpr uint32_t INITIAL_SET_SIZE = 2;
+
+  inline constexpr uint32_t INITIAL_SET_SIZE = 2; // should match seed node count
+  inline constexpr uint64_t SEED_NODES_COUNT = 2; // active seeds amount
 
   // Validator set
 
-  inline constexpr uint64_t VALIDATOR_MIN_STAKE = 1000ULL * ATOMIC_UNITS_PER_COIN; // 1000 CLRTY
+  inline constexpr Amount VALIDATOR_MIN_STAKE = 1000ULL * ATOMIC_UNITS_PER_COIN; // 1000 CLRTY
 
-  inline constexpr uint64_t SEED_NODES_COUNT = 2;              // always active
   inline constexpr uint64_t ACTIVE_SET_MIN = SEED_NODES_COUNT; // BFT minimum (2 of 2)
   inline constexpr uint64_t ACTIVE_SET_MAX = 100;              // BFT ceiling
   inline constexpr uint64_t ACTIVE_SET_DEFAULT = 11;
@@ -131,12 +134,12 @@ namespace GlobalConfig
 
   // Staking
 
-  inline constexpr uint64_t AUTO_STAKE_THRESHOLD = 100ULL * ATOMIC_UNITS_PER_COIN; // 100 CLRTY
-  inline constexpr uint16_t APY_BASE_BPS = 500;                                    // 5.00% (gov)
-  inline constexpr uint16_t APY_ACTIVITY_MAX_BPS = 500;                            // +5.00% max
-  inline constexpr uint16_t APY_POT_BONUS_MAX_BPS = 300;                           // +3.00% max
+  inline constexpr Amount AUTO_STAKE_THRESHOLD = 100ULL * ATOMIC_UNITS_PER_COIN;  // 100 CLRTY
+  inline constexpr Bps APY_BASE_BPS = 500;                                        // 5.00% (gov)
+  inline constexpr Bps APY_ACTIVITY_MAX_BPS = 500;                                // +5.00% max
+  inline constexpr Bps APY_POT_BONUS_MAX_BPS = 300;                               // +3.00% max
 
   // Balance bonus: stakers holding >= threshold get +3% weight
-  inline constexpr uint16_t BALANCE_BONUS_BPS = 300;                                   // 3.00%
-  inline constexpr uint64_t BALANCE_BONUS_THRESHOLD = 1000ULL * ATOMIC_UNITS_PER_COIN; // 1000 CLRTY
+  inline constexpr Bps BALANCE_BONUS_BPS = 300;                                      // 3.00%
+  inline constexpr Amount BALANCE_BONUS_THRESHOLD = 1000ULL * ATOMIC_UNITS_PER_COIN; // 1000 CLRTY
 }

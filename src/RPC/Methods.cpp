@@ -20,8 +20,6 @@ namespace Rpc
 {
   namespace
   {
-    constexpr const char *CLIENT_VERSION = "clrty/v1.0.0";
-
     //  Default page size for list endpoints. Every list handler uses
     //  this unless it passes an explicit cap.
     constexpr uint64_t DEFAULT_LIST_LIMIT = 50;
@@ -2961,7 +2959,7 @@ namespace Rpc
     Common::Json method_web3_clientVersion(Node::Node &, const RpcConfig &,
                                            const JsonRpcRequest &)
     {
-      return Common::Json(CLIENT_VERSION);
+      return Common::Json(GlobalConfig::CLIENT_VERSION);
     }
 
     Common::Json method_net_version(Node::Node &node, const RpcConfig &,

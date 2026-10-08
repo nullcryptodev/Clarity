@@ -727,6 +727,21 @@ namespace Node
       return mempool_ && mempool_->size() > 0;
     };
 
+    // ---- now_ms ----
+    //  Wall-clock milliseconds. Used to stamp a proposal's timestamp
+    //  and to compute the pacing deadline after a commit.
+    //
+    //  This was previously unset, and the pacing code checks
+    //  `if (deps_.now_ms)` before computing the deadline, so an
+    //  unset callback silently disabled pacing.
+    deps.now_ms = []() -> uint64_t
+    {
+      return static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count());
+    };
+
     // ---- WAL ----
     //
     //  Every vote we sign is written to TBL_CONSENSUS_WAL before it
