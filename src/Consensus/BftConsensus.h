@@ -67,7 +67,7 @@ namespace Consensus
   //  against a node that ignores it is that everyone else is
   //  producing blocks at the same rate, so a burst from one node
   //  can't dominate the chain.
-  inline constexpr uint64_t MIN_BLOCK_INTERVAL_MS = 60'000;
+  inline constexpr uint64_t MIN_BLOCK_INTERVAL_MS = 10'000;
 
   // Key for the (height, round) -> block_hash map used to answer
   // "which block did this round propose?". Hashable because it's

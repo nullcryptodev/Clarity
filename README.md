@@ -4,6 +4,11 @@
 
 ![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C797-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
 
+#### Documents
+
+- [Economics of Clarity](https://github.com/nullcryptodev/Clarity/blob/main/ECONOMICS.md)
+- [Setup Clarity REGTEST](https://github.com/nullcryptodev/Clarity/blob/main/SETUP-REGTEST.md)
+
 #### Table of Contents
 
 - [What it is](#what-it-is)

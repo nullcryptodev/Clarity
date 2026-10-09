@@ -353,8 +353,8 @@ namespace Consensus
 
     step_ = Step::Commit;
 
-    log_(Logging::INFO) << "Entering commit: h=" << height
-                        << " r=" << round;
+    log_(Logging::DEBUGGING) << "Entering commit: h=" << height
+                             << " r=" << round;
 
     auto quorum_block = quorumValue(/*is_precommit=*/true);
 
@@ -452,7 +452,7 @@ namespace Consensus
           equivocations_.end());
     }
 
-    log_(Logging::INFO)
+    log_(Logging::DEBUGGING)
         << "Committing block: h=" << height
         << " hash=" << block.hash().toString().substr(0, 16)
         << " quorum_sigs=" << block.quorum_signatures.size()
@@ -1539,12 +1539,12 @@ namespace Consensus
     proposals_by_hash_[block_hash] = block;
     proposal_for_round_[{height_, round_}] = block_hash;
 
-    log_(Logging::INFO) << (re_proposing ? "Re-proposed" : "Proposed")
-                        << " block for h=" << height_
-                        << " r=" << round_
-                        << " em=" << (useEmergencySet() ? "yes" : "no")
-                        << " txs=" << block.transactions.size()
-                        << " hash=" << block_hash.toString().substr(0, 16);
+    log_(Logging::DEBUGGING) << (re_proposing ? "Re-proposed" : "Proposed")
+                             << " block for h=" << height_
+                             << " r=" << round_
+                             << " em=" << (useEmergencySet() ? "yes" : "no")
+                             << " txs=" << block.transactions.size()
+                             << " hash=" << block_hash.toString().substr(0, 16);
 
     if (step_ == Step::Propose &&
         height_ == propose_height &&

@@ -950,9 +950,6 @@ namespace Core
                                             const Block &block,
                                             const BlockContext &ctx)
   {
-    // ========================================================================
-    //  Epoch boundary
-    //
     //  Runs at the last block of each epoch. Reads the pot, computes the
     //  target staker payout, credits each staker their proportional
     //  share, and adjusts the pot.
@@ -964,7 +961,6 @@ namespace Core
     //  Stakers who joined mid-epoch receive a partial share proportional
     //  to the number of blocks in the epoch for which they were staked
     //  (tracked via Account::staker_since_height).
-    // ========================================================================
 
     const uint64_t pot = readU64Global(state, "pot");
     const uint64_t total_staked = readU64Global(state, "total_staked");
@@ -987,14 +983,8 @@ namespace Core
     //  chain-lifetime tx_counter and a snapshot of it taken at the
     //  previous epoch boundary — the delta is this epoch's
     //  contribution.
-    //
-    //  Reading `block.transactions.size()` here was a bug: it gave
-    //  the count for the *closing* block only, not the epoch, and
-    //  made the activity bonus depend on whether the last block
-    //  happened to include a transaction.
     const uint64_t tx_counter_now = readU64Meta(state, "tx_counter");
-    const uint64_t tx_counter_at_start =
-        readU64Meta(state, "tx_counter_at_epoch_start");
+    const uint64_t tx_counter_at_start = readU64Meta(state, "tx_counter_at_epoch_start");
     const uint64_t txs_this_epoch =
         tx_counter_now >= tx_counter_at_start
             ? tx_counter_now - tx_counter_at_start
@@ -1019,8 +1009,7 @@ namespace Core
     rctx.apy_activity_bps = apy_activity_bps;
     rctx.apy_pot_bonus_bps = apy_pot_bonus_bps;
 
-    const uint16_t effective_apy =
-        computeEffectiveApy(rctx, SECONDS_PER_EPOCH);
+    const uint16_t effective_apy = computeEffectiveApy(rctx, SECONDS_PER_EPOCH);
 
     //  Record the APY this epoch actually used. The RPC reads this
     //  to answer "what is the current APY" without recomputing it —
@@ -1034,6 +1023,13 @@ namespace Core
     //  reproduce.
     state.putMetaU64("last_effective_apy_bps",
                      static_cast<uint64_t>(effective_apy));
+
+    //  Snapshot the tx counter so the next epoch can compute its own
+    //  activity delta. Written unconditionally, before any of the
+    //  early-return paths below, so the next epoch's reading is
+    //  always correct regardless of whether this epoch distributed
+    //  any rewards.
+    state.putMetaU64("tx_counter_at_epoch_start", tx_counter_now);
 
     const uint64_t target_payout =
         computeTargetStakerPayout(rctx, effective_apy, SECONDS_PER_EPOCH);
@@ -1121,12 +1117,6 @@ namespace Core
 
       acct.pending_rewards += share;
       acct.last_reward_epoch = rctx.epoch_number;
-
-      //  Snapshot the tx counter so the next epoch can compute its own
-      //  activity delta. Written unconditionally, even if there were no
-      //  stakers to pay — the next epoch's activity reading depends on
-      //  this value being up to date.
-      state.putMetaU64("tx_counter_at_epoch_start", tx_counter_now);
 
       state.putAccount(addr, acct); });
   }
