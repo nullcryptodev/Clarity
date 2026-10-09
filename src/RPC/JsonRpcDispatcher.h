@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "Common/Json.h"
+#include "IHttpHandler.h"
 #include "JsonRpcError.h"
 #include "JsonRpcRequest.h"
 #include "JsonRpcResponse.h"
@@ -94,86 +95,61 @@ namespace Rpc
   //  handlers, and assembles responses. Handles both single requests
   //  and batches.
   //
+  //  Implements IHttpHandler: `handle()` takes an HttpRequest,
+  //  validates that it targets one of the paths the RPC endpoint
+  //  serves, parses the JSON-RPC body, dispatches, and returns an
+  //  HttpResponse. The dispatcher still exposes `dispatch()` and
+  //  `dispatchJson()` for tests and for any caller that wants to
+  //  bypass the HTTP framing.
+  //
   //  Thread safety: the dispatch methods are const and thread-safe
   //  after construction. The internal map is immutable post-init.
 
-  class JsonRpcDispatcher
+  class JsonRpcDispatcher : public IHttpHandler
   {
   public:
-    // Construct with a node reference. The node must outlive the
-    // dispatcher. Registers all known methods (see registerMethods).
     JsonRpcDispatcher(Node::Node &node, const RpcConfig &config);
 
-    ~JsonRpcDispatcher() = default;
+    ~JsonRpcDispatcher() override = default;
 
     JsonRpcDispatcher(const JsonRpcDispatcher &) = delete;
     JsonRpcDispatcher &operator=(const JsonRpcDispatcher &) = delete;
 
-    // ---- Method registration ----
+    // ---- IHttpHandler ----
 
-    // Register a handler under `name`. If the name is already
-    // registered, the previous handler is replaced. Registering the
-    // same name twice is usually a bug; the dispatcher does not
-    // detect it, but tests do.
+    // Serves the RPC endpoint. Paths accepted: "/" and "/rpc".
+    // Methods accepted: POST (with a JSON-RPC body). A GET on "/"
+    // returns a friendly banner, matching the previous behavior.
+    //
+    // Never throws (IHttpHandler contract). Any exception that
+    // escapes from a handler is caught at the JSON-RPC layer and
+    // turned into a JSON-RPC InternalError response, which is
+    // returned with HTTP 200 (JSON-RPC errors do not use HTTP
+    // status codes to convey their nature). If the exception
+    // escapes from the JSON parsing itself, that's a different
+    // path — see the try/catch in `handle`.
+    HttpResponse handle(const HttpRequest &request) override;
+
+    // ---- Method registration ----  (unchanged)
     void registerMethod(const std::string &name, Handler handler);
-
-    // Register all built-in clrty_* methods. Called once by the
-    // constructor. Split into a separate function so tests can
-    // construct a dispatcher without the full method set if needed.
     void registerBuiltinMethods();
-
-    // Whether a method is registered.
     bool hasMethod(const std::string &name) const;
-
-    // The number of registered methods. Useful for tests and for the
-    // clrty_methods introspection method.
     size_t methodCount() const noexcept { return handlers_.size(); }
-
-    // The sorted list of registered method names. Used by
-    // clrty_methods and by tests that assert on the API surface.
     std::vector<std::string> methodNames() const;
 
-    // ---- Dispatch ----
-
-    // Dispatch a single pre-parsed request. Never throws.
-    //
-    // On success, returns a success response with the handler's
-    // result and the request's id.
-    //
-    // On failure, returns an error response with the appropriate
-    // error code and the request's id.
-    //
-    // If the request is a notification, the caller should check
-    // `request.is_notification` and skip calling this method — or
-    // call it and discard the result. The dispatcher always produces
-    // a response; whether it's sent is the caller's decision.
+    // ---- Dispatch ----  (unchanged)
     JsonRpcResponse dispatch(const JsonRpcRequest &request);
 
-    // Dispatch an arbitrary JSON value: could be a single request
-    // object, a batch (array of requests), or malformed input.
-    //
-    // Returns:
-    //   - a single JsonRpcResponse, if the input was a single request
-    //   - a JSON array (from serializeBatch), if the input was a batch
-    //   - a single error response, if the input was neither
-    //
-    // The return is `Common::Json` rather than a variant because the
-    // three cases serialize differently and the HTTP layer just writes
-    // the bytes. The `is_batch` out-parameter tells the caller which
-    // case was hit, if it cares.
     struct DispatchResult
     {
       Common::Json response;
       bool is_batch{false};
-      bool is_empty{false}; // true if all entries were notifications
+      bool is_empty{false};
     };
 
     DispatchResult dispatchJson(const Common::Json &input);
 
   private:
-    // Dispatch a single request that was extracted from a batch or
-    // arrived as a top-level object. Same as `dispatch` but returns
-    // an optional — nullopt if the request was a notification.
     std::optional<JsonRpcResponse> dispatchOne(const JsonRpcRequest &request);
 
     Node::Node &node_;

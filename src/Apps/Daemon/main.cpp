@@ -80,12 +80,14 @@ int main(int argc, char **argv)
     return 0;
   }
 
-  // Validate both configs before doing anything expensive. A bad
-  // --rpc-port should fail here, not on the first request.
+  // Validate all three configs before doing anything expensive. A
+  // bad --rpc-port or --metrics-port should fail here, not on the
+  // first request or the first scrape.
   try
   {
     Node::validateConfig(args.node);
     Rpc::validateConfig(args.rpc);
+    Rpc::validateMetricsConfig(args.metrics);
   }
   catch (const std::exception &e)
   {
@@ -125,6 +127,8 @@ int main(int argc, char **argv)
   log(Logging::INFO) << "  data dir: " << Logging::BRIGHT_GREEN << args.node.data_dir;
   log(Logging::INFO) << "  rpc:      "
                      << Logging::BRIGHT_GREEN << (args.rpc.enabled ? "enabled" : "disabled");
+  log(Logging::INFO) << "  metrics:  "
+                     << Logging::BRIGHT_GREEN << (args.metrics.enabled ? "enabled" : "disabled");
 
   // Disable nonvital logs from mdbx.
   setenv("MDBX_LOG", "ERROR", 1);
@@ -161,19 +165,32 @@ int main(int argc, char **argv)
     // Once Node::run() blocks on the P2P event loop, RPC continues
     // serving on its workers.
     //
-    // If RPC is disabled, we skip construction entirely — the
-    // dispatcher is never built, and no RPC header is ever touched
-    // again.
+    // RpcServer owns both the RPC endpoint and the metrics endpoint.
+    // Each is independently enabled via its own config; the object
+    // is only constructed if at least one of them is enabled. If
+    // both are disabled, no RPC header is ever touched again.
     std::unique_ptr<Rpc::RpcServer> rpc;
-    if (args.rpc.enabled)
+    const bool any_rpc_enabled = args.rpc.enabled || args.metrics.enabled;
+
+    if (any_rpc_enabled)
     {
-      rpc = std::make_unique<Rpc::RpcServer>(node, args.rpc, *logger);
+      rpc = std::make_unique<Rpc::RpcServer>(node, args.rpc, args.metrics, *logger);
       rpc->start();
       g_rpc = rpc.get();
 
-      log(Logging::INFO) << "RPC listening on " << Logging::BRIGHT_GREEN
-                         << args.rpc.bind_address << ":"
-                         << rpc->listeningPort();
+      if (args.rpc.enabled)
+      {
+        log(Logging::INFO) << "RPC listening on " << Logging::BRIGHT_GREEN
+                           << args.rpc.bind_address << ":"
+                           << rpc->listeningPort();
+      }
+
+      if (args.metrics.enabled)
+      {
+        log(Logging::INFO) << "Metrics listening on " << Logging::BRIGHT_GREEN
+                           << args.metrics.bind_address << ":"
+                           << rpc->metricsListeningPort();
+      }
     }
 
     log(Logging::INFO) << "Node is running. Press Ctrl+C to stop.";

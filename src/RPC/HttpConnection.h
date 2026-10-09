@@ -9,11 +9,11 @@
 #include <string>
 
 #include "Config.h"
+#include "IHttpHandler.h"
+#include "HttpServerConfig.h"
 
 namespace Rpc
 {
-  class JsonRpcDispatcher;
-
   //  HttpConnection
   //
   //  Handles one HTTP request on one socket. Constructed by
@@ -28,22 +28,36 @@ namespace Rpc
   //  and easy to change later if the wallet ends up making enough
   //  requests to care.
   //
-  //  Status codes:
-  //    200  — every JSON-RPC response (success or error) rides on 200
-  //    400  — malformed HTTP, or a JSON body that isn't a valid request
-  //    404  — path is not / or /rpc
-  //    405  — method is not POST (and path is /rpc)
+  //  HttpConnection does not know what a "JSON-RPC request" or a
+  //  "metrics request" is. It parses HTTP, applies the transport-
+  //  level checks that apply to every handler (Content-Length
+  //  present, Content-Type allowed), builds an HttpRequest, and
+  //  hands it to the IHttpHandler. Every routing decision below
+  //  that point is the handler's.
+  //
+  //  Status codes owned by this layer:
+  //    400  — malformed HTTP, or request body framing errors
+  //    404  — reserved (handlers currently don't route by path, but
+  //           the connection still refuses non-"/" and non-"/rpc"
+  //           paths so a future handler can't accidentally accept
+  //           them; see handleRequest for the exact check)
+  //    405  — method is not POST or GET
   //    413  — body larger than max_request_bytes
   //    415  — Content-Type is not JSON
-  //    500  — internal error
+  //    500  — internal error (handler threw)
   //    503  — server shutting down or overloaded
+  //
+  //  Status codes owned by handlers:
+  //    200  — normal response
+  //    204  — no content
+  //    and anything else a specific handler chooses to return.
 
   class HttpConnection
   {
   public:
     HttpConnection(int client_fd,
-                   const RpcConfig &config,
-                   JsonRpcDispatcher &dispatcher,
+                   const HttpServerConfig &config,
+                   IHttpHandler &handler,
                    std::string remote_ip);
 
     ~HttpConnection();
@@ -55,23 +69,9 @@ namespace Rpc
     void run();
 
   private:
-    struct Request
-    {
-      std::string method;
-      std::string path;
-      std::string version;
-      std::string content_type;
-      std::string authorization;
-      std::string connection;
-      std::string origin;
-      size_t content_length{0};
-      bool has_content_length{false};
-      std::string body;
-    };
-
     // Read and parse the request head + body. Returns true on success.
     // On failure, fills error_status and error_message.
-    bool readRequest(Request &out, int &error_status, std::string &error_message);
+    bool readRequest(HttpRequest &out, int &error_status, std::string &error_message);
 
     // Parse the request line + headers. `raw` must contain at least
     // one full header block (terminated by CRLF CRLF). On success,
@@ -79,18 +79,24 @@ namespace Rpc
     // is populated with whatever headers we recognize. `raw`'s tail
     // (from `header_end` on) is the beginning of the body.
     bool parseHead(const std::string &raw,
-                   Request &out,
+                   HttpRequest &out,
                    size_t &header_end,
                    int &error_status,
                    std::string &error_message);
 
-    void handleRequest(const Request &req);
+    // Validate the parsed request and hand it to the handler. The
+    // handler returns an HttpResponse; this method writes it.
+    void handleRequest(const HttpRequest &req);
 
-    void writeResponse(int status,
-                       const std::string &reason,
-                       const std::string &body,
-                       const std::string &content_type = "application/json");
+    // Write a response using the connection's HTTP framing. Used by
+    // both the success path (handler-returned response) and the
+    // error path (transport-level rejection).
+    void writeResponse(const HttpResponse &resp);
 
+    // Convenience for transport-level errors: a plain-text body,
+    // the given status, and no CORS on the failure path (a browser
+    // that gets a 400 on a preflight doesn't need CORS headers,
+    // because the browser will block the request regardless).
     void writeTextError(int status,
                         const std::string &reason,
                         const std::string &message);
@@ -103,8 +109,8 @@ namespace Rpc
     bool appendCorsHeaders(std::string &out, const std::string &origin) const;
 
     int fd_;
-    const RpcConfig &config_;
-    JsonRpcDispatcher &dispatcher_;
+    const HttpServerConfig &config_;
+    IHttpHandler &handler_;
     std::string remote_ip_;
     std::string current_origin_;
   };

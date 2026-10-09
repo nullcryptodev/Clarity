@@ -21,6 +21,7 @@
 #include "PeerTable.h"
 #include "WorkerPool.h"
 #include "AuthMessage.h"
+#include "AggregateLimiter.h"
 
 #include "Crypto/Types.h"
 
@@ -53,6 +54,21 @@ namespace P2P
   //    - All other public methods must run on the event loop thread, OR be
   //      posted via `post()` from another thread.
   //    - `stop()` is the only exception: safe from any thread.
+  //
+  //  Snapshot vs. peerList:
+  //    `snapshot()` returns aggregate counters that are safe to read
+  //    from any thread. It does not iterate the peer table — the
+  //    table is only mutated on the event loop, so a direct read
+  //    from a worker thread would be a data race. The counters are
+  //    mirrored into std::atomic<size_t> members that are updated
+  //    at the three points where the table changes (peer added,
+  //    peer removed, peer reached Established).
+  //
+  //    `peerList()` posts to the event loop and waits, so it sees a
+  //    consistent view of the table. It is the right call for
+  //    anything that needs per-peer fields (RPC `getPeers`), and
+  //    the wrong call for a metrics scrape (it can block for up to
+  //    2 seconds if the event loop is busy).
 
   class P2PManager
   {
@@ -101,10 +117,15 @@ namespace P2P
     // If `exclude` is set, skip that peer (useful to avoid echoes).
     void broadcast(const Message &msg, PeerId exclude = INVALID_PEER_ID);
 
-    // Current peer count.
-    size_t peerCount() const noexcept { return peers_.size(); }
+    // Current peer count. Reads an atomic counter — safe from any
+    // thread, does not touch the peer table.
+    size_t peerCount() const noexcept
+    {
+      return peers_total_.load(std::memory_order_relaxed);
+    }
 
     // Look up a peer by id. Returns nullptr if not found.
+    // Event loop thread only — the peer table is not thread-safe.
     Peer *findPeer(PeerId id) const { return peers_.find(id); }
 
     // ------------------------------------------------------------------
@@ -150,9 +171,22 @@ namespace P2P
     std::function<void(PeerId, const std::string &)> onPeerDisconnected;
 
     // ------------------------------------------------------------------
-    //  Introspection (event loop thread only)
+    //  Introspection
     // ------------------------------------------------------------------
 
+    //  Snapshot
+    //
+    //  Aggregate counters, safe to read from any thread. Every field
+    //  is either an atomic read (the peer counters) or a mutex-guarded
+    //  read of a small collection (address book, ban list). None of
+    //  them iterate the peer table, so this method is safe to call
+    //  concurrently with the event loop.
+    //
+    //  Values are approximate by at most one peer transition: a
+    //  peer added to the table but not yet reflected in the atomic
+    //  is not counted. For a metrics scrape or an RPC status call,
+    //  that approximation is what a gauge wants anyway — the
+    //  alternative is a snapshot that blocks on the event loop.
     struct Snapshot
     {
       size_t inbound = 0;
@@ -162,6 +196,9 @@ namespace P2P
       size_t knownAddresses = 0;
       size_t banned = 0;
       size_t workerQueue = 0;
+      uint32_t aggregateBurst = 0;
+      uint32_t aggregatePerSecond = 0;
+      bool aggregateEnabled = false;
     };
 
     Snapshot snapshot() const;
@@ -215,6 +252,16 @@ namespace P2P
     // authenticated but not a validator. Called on the event loop thread.
     std::function<bool(Peer &, const AuthMessage &, uint64_t &outValidatorId)>
         verifyAuth;
+
+    // Returns the node's Ed25519 identity public key — the one carried
+    // in the Auth message. Called by each Peer once, during session
+    // key derivation. If unset, session key derivation fails and the
+    // peer is force-closed with "encryption: key derivation failed".
+    //
+    // The manager doesn't own this key; it's the same key the node
+    // already uses to build the Auth message. The callback exists so
+    // the Peer can obtain it without a second source of truth.
+    std::function<Crypto::PublicKey(Peer &)> getOurIdentityPubkey;
 
     // Fired when a peer completes the full handshake — TCP, Version,
     // Verack, and Auth. At this point the peer has a verified identity
@@ -321,6 +368,40 @@ namespace P2P
 
     boost::asio::steady_timer maintenanceTimer_;
     std::atomic<bool> stopping_{false};
+
+    //  Peer-count atomics.
+    //
+    //  These mirror the state of peers_ but are readable from any
+    //  thread without synchronization. The peer table itself is only
+    //  mutated on the event loop; snapshot() is called from RPC worker
+    //  threads (via Node::status()), so a direct read of the table
+    //  from snapshot() would be a data race. The atomics close that
+    //  race with negligible cost: each is incremented or decremented
+    //  once per peer add/remove/establish.
+    //
+    //  A read is approximate by at most one peer transition — the
+    //  window between a peer being added to the table and the
+    //  corresponding atomic update. That's exactly what a gauge
+    //  wants; a metrics scrape does not need an atomic view of the
+    //  peer set.
+    //
+    //  relaxed ordering is correct: these counters don't guard any
+    //  other memory. A reader that sees the count never relies on
+    //  seeing writes to other data after it.
+    std::atomic<size_t> peers_total_{0};
+    std::atomic<size_t> peers_inbound_{0};
+    std::atomic<size_t> peers_outbound_{0};
+    std::atomic<size_t> peers_established_{0};
+
+    // Node-wide inbound work budget. Shared by every Peer; the
+    // lifetime rule is the reverse of the address book's — this must
+    // be constructed before any Peer and must outlive every Peer.
+    // It lives as a direct member, constructed in the initializer
+    // list, so its destruction order relative to peers_ is
+    // guaranteed: members are destroyed in reverse declaration
+    // order, and peers_ is declared above this, so peers_ is
+    // destroyed first. That's the right order.
+    AggregateLimiter aggregateLimiter_;
   };
 
 } // namespace P2P

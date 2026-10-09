@@ -69,9 +69,9 @@ namespace P2P
   P2PManager::P2PManager(const P2PConfig &config,
                          Logging::ILogger &logger,
                          std::string dataDir)
-      : config_(config), logger_(logger), log_(std::make_unique<Logging::LoggerRef>(logger, "P2P")), io_(), banList_(dataDir + "/p2p_bans.txt",
-                                                                                                                     config.banThreshold,
-                                                                                                                     config.banDurationSec),
+      : config_(config), logger_(logger), log_(std::make_unique<Logging::LoggerRef>(logger, "P2P")), io_(), aggregateLimiter_(config.aggregateRateLimitBurst, config.aggregateRateLimitPerSecond), banList_(dataDir + "/p2p_bans.txt",
+                                                                                                                                                                                                            config.banThreshold,
+                                                                                                                                                                                                            config.banDurationSec),
         addressBook_(dataDir + "/p2p_addresses.txt"), workers_(config.workerThreads), maintenanceTimer_(io_)
   {
     networkNonce_ = generateNetworkNonce();
@@ -83,7 +83,8 @@ namespace P2P
         << "P2P initialized: nonce=0x" << std::hex << networkNonce_ << std::dec
         << " workers=" << workers_.threadCount()
         << " knownAddresses=" << addressBook_.size()
-        << " banned=" << banList_.size();
+        << " banned=" << banList_.size()
+        << " aggregateRateLimit=" << aggregateLimiter_.refillPerSecond() << "/s";
   }
 
   P2PManager::~P2PManager()
@@ -303,7 +304,7 @@ namespace P2P
     // LoggerRef is not copyable; construct a fresh one per peer.
     Logging::LoggerRef log(logger_, "P2P:" + std::to_string(id));
 
-    auto peer = std::make_shared<Peer>(id, std::move(socket), dir, config_, log);
+    auto peer = std::make_shared<Peer>(id, std::move(socket), dir, config_, log, &aggregateLimiter_);
 
     peer->onConnected = [this](Peer &p)
     { handlePeerConnected(p); };
@@ -365,11 +366,25 @@ namespace P2P
       return verifyAuth(*p, a, outValidatorId);
     };
 
+    peer->getOurIdentityPubkey = [this, p = peer.get()]()
+    {
+      if (!getOurIdentityPubkey)
+        return Crypto::PublicKey{};
+      return getOurIdentityPubkey(*p);
+    };
+
     // The peer tells us when it's fully established. We translate
     // that into a PeerEstablishedInfo and forward it to the node.
     // The node uses this to instantiate a SyncManager for the peer.
     peer->onEstablished = [this](Peer &established_peer)
     {
+      //  The peer has transitioned to Established. Increment the
+      //  atomic counter here — this is the one point in the lifecycle
+      //  where the transition is observed by the manager. The
+      //  decrement is in removePeer; if the peer is closed without
+      //  ever reaching Established, neither fires, which is correct.
+      peers_established_.fetch_add(1, std::memory_order_relaxed);
+
       //  Peer deduplication. If we already have an Established peer
       //  with the same authenticated pubkey, one of the two must go.
       //  deduplicatePeer() decides which and closes the other; it
@@ -391,12 +406,42 @@ namespace P2P
     };
 
     peers_.add(peer);
+
+    //  Update the atomic counters. This runs immediately after the
+    //  peer table gains the entry, so the counters never lag more
+    //  than the duration of this function for a newly-created peer.
+    peers_total_.fetch_add(1, std::memory_order_relaxed);
+    if (dir == PeerDirection::Inbound)
+      peers_inbound_.fetch_add(1, std::memory_order_relaxed);
+    else
+      peers_outbound_.fetch_add(1, std::memory_order_relaxed);
+
     return peer;
   }
 
   void P2PManager::removePeer(PeerId id)
   {
+    //  Read the peer's direction and established-ness before removing
+    //  it from the table, because the peer pointer becomes invalid
+    //  after the removal.
+    Peer *p = peers_.find(id);
+    if (!p)
+      return;
+
+    const PeerDirection dir = p->direction();
+    const bool was_established = p->isOperational();
+
     peers_.remove(id);
+
+    //  Update the atomic counters to match the removal.
+    peers_total_.fetch_sub(1, std::memory_order_relaxed);
+    if (dir == PeerDirection::Inbound)
+      peers_inbound_.fetch_sub(1, std::memory_order_relaxed);
+    else
+      peers_outbound_.fetch_sub(1, std::memory_order_relaxed);
+
+    if (was_established)
+      peers_established_.fetch_sub(1, std::memory_order_relaxed);
   }
 
   //  Peer callbacks
@@ -568,7 +613,8 @@ namespace P2P
         << " total=" << snap.total
         << " addr=" << snap.knownAddresses
         << " banned=" << snap.banned
-        << " workerQueue=" << snap.workerQueue;
+        << " workerQueue=" << snap.workerQueue
+        << " aggregateBudget=" << snap.aggregatePerSecond << "/s";
   }
 
   //  Send
@@ -597,14 +643,37 @@ namespace P2P
 
   P2PManager::Snapshot P2PManager::snapshot() const
   {
+    //  Every field is read from a source that is safe to touch from
+    //  a worker thread:
+    //
+    //    * The four peer counters read std::atomic<size_t> members
+    //      that are updated on the event loop at each peer
+    //      add/remove/establish. Reading them is lock-free and
+    //      never races against the peer table itself.
+    //
+    //    * knownAddresses and banned read mutex-guarded size()
+    //      accessors on AddressBook and BanList. Both classes lock
+    //      internally; the reads are safe from any thread and are
+    //      briefly serialized against the event loop's writes.
+    //
+    //    * workerQueue reads WorkerPool::pendingJobs(), which is
+    //      designed for cross-thread access.
+    //
+    //    * The three aggregate limiter fields are config values
+    //      that never change after construction. They could be read
+    //      without synchronization at all; reading them here is
+    //      just for convenience.
     Snapshot s;
-    s.inbound = peers_.countInbound();
-    s.outbound = peers_.countOutbound();
-    s.established = peers_.countByState(PeerState::Established);
-    s.total = peers_.size();
+    s.inbound = peers_inbound_.load(std::memory_order_relaxed);
+    s.outbound = peers_outbound_.load(std::memory_order_relaxed);
+    s.established = peers_established_.load(std::memory_order_relaxed);
+    s.total = peers_total_.load(std::memory_order_relaxed);
     s.knownAddresses = addressBook_.size();
     s.banned = banList_.size();
     s.workerQueue = workers_.pendingJobs();
+    s.aggregateBurst = aggregateLimiter_.burst();
+    s.aggregatePerSecond = aggregateLimiter_.refillPerSecond();
+    s.aggregateEnabled = aggregateLimiter_.enabled();
     return s;
   }
 

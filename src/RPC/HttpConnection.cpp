@@ -5,8 +5,6 @@
 
 #include "HttpConnection.h"
 
-#include "JsonRpcDispatcher.h"
-
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -42,18 +40,6 @@ namespace Rpc
       return std::string(s.substr(start, end - start));
     }
 
-    bool contentTypeIsJson(const std::string &ct)
-    {
-      std::string lower = toLower(ct);
-      auto semi = lower.find(';');
-      std::string base = semi == std::string::npos ? lower : lower.substr(0, semi);
-      base = trim(base);
-      return base == "application/json" ||
-             base == "application/json-rpc" ||
-             base == "application/jsonrequest" ||
-             base == "text/plain";
-    }
-
     // Parse a decimal content-length. Returns false on invalid.
     bool parseContentLength(const std::string &s, size_t &out)
     {
@@ -72,17 +58,51 @@ namespace Rpc
       out = v;
       return true;
     }
+
+    // Canonical reason phrase for a status code. Handlers that
+    // want a different phrase override it via
+    // HttpResponse::reason_override. The map covers the codes we
+    // produce ourselves plus a few standard ones a handler might
+    // return.
+    const char *reasonFor(int status)
+    {
+      switch (status)
+      {
+      case 200:
+        return "OK";
+      case 204:
+        return "No Content";
+      case 400:
+        return "Bad Request";
+      case 404:
+        return "Not Found";
+      case 405:
+        return "Method Not Allowed";
+      case 413:
+        return "Payload Too Large";
+      case 415:
+        return "Unsupported Media Type";
+      case 429:
+        return "Too Many Requests";
+      case 500:
+        return "Internal Server Error";
+      case 503:
+        return "Service Unavailable";
+      default:
+        return "Unknown";
+      }
+    }
   } // anonymous namespace
 
   //  Construction
 
   HttpConnection::HttpConnection(int client_fd,
-                                 const RpcConfig &config,
-                                 JsonRpcDispatcher &dispatcher,
+                                 const HttpServerConfig &config,
+                                 IHttpHandler &handler,
                                  std::string remote_ip)
       : fd_(client_fd),
         config_(config),
-        dispatcher_(dispatcher),
+        handler_(handler),
         remote_ip_(std::move(remote_ip))
   {
     // Socket-level timeout on recv and send. A stalled client
@@ -140,7 +160,7 @@ namespace Rpc
 
   //  Request reading
 
-  bool HttpConnection::readRequest(Request &out,
+  bool HttpConnection::readRequest(HttpRequest &out,
                                    int &error_status,
                                    std::string &error_message)
   {
@@ -233,7 +253,7 @@ namespace Rpc
   }
 
   bool HttpConnection::parseHead(const std::string &raw,
-                                 Request &out,
+                                 HttpRequest &out,
                                  size_t &header_end,
                                  int &error_status,
                                  std::string &error_message)
@@ -370,7 +390,7 @@ namespace Rpc
 
   void HttpConnection::run()
   {
-    Request req;
+    HttpRequest req;
     int status = 0;
     std::string message;
 
@@ -378,24 +398,24 @@ namespace Rpc
     {
       if (status == 0)
         return; // no response possible
-      writeTextError(status, "Bad Request", message);
+      writeTextError(status, reasonFor(status), message);
       return;
     }
 
     handleRequest(req);
   }
 
-  void HttpConnection::handleRequest(const Request &req)
+  void HttpConnection::handleRequest(const HttpRequest &req)
   {
-    // ---- Route ----
-    //
-    // GET  /       -> tiny info page (helps debugging)
-    // POST /rpc    -> the RPC endpoint
-    // POST /       -> same as /rpc
-    // OPTIONS *    -> 204 with CORS headers
-    // anything else -> 404 or 405
-
     current_origin_ = req.origin;
+
+    // ---- OPTIONS: CORS preflight, answered by the transport layer ----
+    //
+    // A browser's preflight for a cross-origin request never reaches
+    // a handler: the browser is asking "will you accept this?" and
+    // the answer depends only on the server's CORS config, not on
+    // which handler is behind the port. Answering here avoids a
+    // wasted round trip through the handler.
 
     if (req.method == "OPTIONS")
     {
@@ -410,130 +430,102 @@ namespace Rpc
       return;
     }
 
-    if (req.method == "GET" && (req.path == "/" || req.path == "/rpc"))
-    {
-      // Friendly banner so `curl localhost:9633` isn't silence.
-      std::string body =
-          "Clarity RPC. Send POST /rpc with a JSON-RPC 2.0 request.\n";
-      writeResponse(200, "OK", body, "text/plain");
-      return;
-    }
-
-    if (req.path != "/rpc" && req.path != "/")
-    {
-      writeTextError(404, "Not Found", "path must be / or /rpc");
-      return;
-    }
-
-    if (req.method != "POST")
-    {
-      writeTextError(405, "Method Not Allowed", "use POST for RPC");
-      return;
-    }
-
-    if (!req.content_type.empty() && !contentTypeIsJson(req.content_type))
-    {
-      writeTextError(415, "Unsupported Media Type",
-                     "Content-Type must be application/json");
-      return;
-    }
-
-    if (!req.has_content_length)
-    {
-      writeTextError(400, "Bad Request",
-                     "Content-Length is required");
-      return;
-    }
-
-    // ---- Parse JSON ----
+    // ---- Method validation: transport-level ----
     //
-    // On parse failure, emit a JSON-RPC ParseError response. The
-    // HTTP status is 200 — the JSON-RPC layer owns the error.
-    Common::Json input;
+    // The server speaks GET and POST. A request with any other
+    // method is not something any current handler can act on, so
+    // the transport refuses it before dispatch. A future handler
+    // that wants to serve DELETE or PUT will need to move this
+    // check into the handler — the same pattern this commit is
+    // applying to the POST framing checks below.
+
+    if (req.method != "POST" && req.method != "GET")
+    {
+      writeTextError(405, "Method Not Allowed",
+                     "use POST for application requests, GET for the banner");
+      return;
+    }
+
+    // ---- Handler dispatch ----
+    //
+    // The method-specific framing checks (POST requires a
+    // Content-Length and an acceptable Content-Type) have moved
+    // into the handler. That's the correct place for them because
+    // which framing is required depends on which handler is
+    // running. Concretely: POST /metrics should return 405 "use
+    // GET for metrics" from the metrics handler, not 400 "Content-
+    // Length is required" from the transport, because the request
+    // is doing two things wrong at once and the more specific
+    // error is the more useful one.
+
+    HttpResponse resp;
     try
     {
-      input = Common::Json::parse(req.body);
+      resp = handler_.handle(req);
     }
-    catch (const std::exception &)
+    catch (const std::exception &e)
     {
-      Common::Json err = Common::Json::object();
-      err["jsonrpc"] = "2.0";
-      err["error"] = makeError(ErrorCode::ParseError);
-      err["id"] = nullptr;
-
-      writeResponse(200, "OK", err.dump());
+      // A handler that throws is a bug. Log the message and
+      // return a generic 500 — never leak internal exception
+      // text to the client.
+      (void)e;
+      writeTextError(500, "Internal Server Error", "internal error");
+      return;
+    }
+    catch (...)
+    {
+      writeTextError(500, "Internal Server Error", "internal error");
       return;
     }
 
-    // ---- Dispatch ----
-    //
-    // The dispatcher handles single requests, batches, and shape
-    // errors. It never throws.
-
-    // Set the auth context so admin methods can read the header.
-    Rpc::setCurrentAuthorization(req.authorization);
-    auto result = dispatcher_.dispatchJson(input);
-    Rpc::setCurrentAuthorization({});
-
-    if (result.is_empty)
-    {
-      std::string headers;
-      headers.reserve(128);
-      headers += "HTTP/1.1 204 No Content\r\n";
-      appendCorsHeaders(headers, req.origin);
-      headers += "Content-Length: 0\r\n";
-      headers += "Connection: close\r\n";
-      headers += "\r\n";
-      writeAll(headers.data(), headers.size());
-      return;
-    }
-
-    writeResponse(200, "OK", result.response.dump());
+    writeResponse(resp);
   }
 
   //  Response writing
 
-  void HttpConnection::writeResponse(int status,
-                                     const std::string &reason,
-                                     const std::string &body,
-                                     const std::string &content_type)
+  void HttpConnection::writeResponse(const HttpResponse &resp)
   {
+    const std::string reason = resp.reason_override.empty()
+                                   ? reasonFor(resp.status)
+                                   : resp.reason_override;
+
     std::string head;
-    head.reserve(256 + body.size());
+    head.reserve(256);
 
     head += "HTTP/1.1 ";
-    head += std::to_string(status);
+    head += std::to_string(resp.status);
     head += " ";
     head += reason;
     head += "\r\n";
     head += "Content-Type: ";
-    head += content_type;
+    head += resp.content_type;
     head += "\r\n";
     head += "Content-Length: ";
-    head += std::to_string(body.size());
+    head += std::to_string(resp.body.size());
     head += "\r\n";
     head += "Connection: close\r\n";
 
-    // CORS headers, if the request's Origin is allowed. The Request
-    // isn't available here, so we stash the origin on the connection
-    // before calling writeResponse. See handleRequest.
     appendCorsHeaders(head, current_origin_);
 
     head += "\r\n";
 
     if (!writeAll(head.data(), head.size()))
       return;
-    if (!body.empty())
-      writeAll(body.data(), body.size());
+    if (!resp.body.empty())
+      writeAll(resp.body.data(), resp.body.size());
   }
 
   void HttpConnection::writeTextError(int status,
                                       const std::string &reason,
                                       const std::string &message)
   {
-    std::string body = message;
-    body += "\n";
-    writeResponse(status, reason, body, "text/plain");
+    HttpResponse resp;
+    resp.status = status;
+    resp.content_type = "text/plain";
+    resp.body = message;
+    resp.body += "\n";
+    resp.reason_override = reason;
+    writeResponse(resp);
   }
 
 } // namespace Rpc

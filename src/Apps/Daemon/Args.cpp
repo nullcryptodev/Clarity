@@ -313,6 +313,45 @@ namespace Daemon
         continue;
       }
 
+      // ---- Metrics ----
+      //
+      //  The metrics endpoint is enabled by default and binds to
+      //  loopback on port 9100. On a host running more than one
+      //  daemon (the regtest devnet is the common case), each
+      //  daemon needs its own port — pass --metrics-port to the
+      //  second and subsequent daemons, or --no-metrics to disable
+      //  the endpoint on a daemon that doesn't need it.
+      //
+      //  The four flags mirror the RPC block above: a master
+      //  switch, a bind address, a port, and one optional-group
+      //  toggle. There is no --metrics-workers because the default
+      //  of one worker is always enough for a Prometheus scraper.
+      if (arg == "--metrics")
+      {
+        args.metrics.enabled = true;
+        continue;
+      }
+      if (arg == "--no-metrics")
+      {
+        args.metrics.enabled = false;
+        continue;
+      }
+      if (arg == "--metrics-bind")
+      {
+        args.metrics.bind_address = next();
+        continue;
+      }
+      if (arg == "--metrics-port")
+      {
+        args.metrics.port = static_cast<uint16_t>(parseU64(next()));
+        continue;
+      }
+      if (arg == "--metrics-include-validators")
+      {
+        args.metrics.include_validator_metrics = true;
+        continue;
+      }
+
       // ---- Diagnostics ----
       if (arg == "--print-config")
       {
@@ -369,6 +408,14 @@ namespace Daemon
         << "  --rpc-cors <list>          CORS origins (comma-separated) or <*> \n"
         << "                             (default : disabled)\n"
         << "\n"
+        << "Metrics:\n"
+        << "  --metrics                  Enable the metrics endpoint (default: on)\n"
+        << "  --no-metrics               Disable the metrics endpoint entirely\n"
+        << "  --metrics-bind <addr>      Bind address (default: 127.0.0.1)\n"
+        << "  --metrics-port <port>      Listen port (default: 9100)\n"
+        << "  --metrics-include-validators\n"
+        << "                             Include per-validator metrics (default: off)\n"
+        << "\n"
         << "Logging:\n"
         << "  --log-level <level>        trace|debug|info|warn|error (default: info)\n"
         << "  --log-file <path>          Write logs to file (default: stderr)\n"
@@ -392,6 +439,7 @@ namespace Daemon
   {
     const auto &n = args.node;
     const auto &r = args.rpc;
+    const auto &m = args.metrics;
 
     std::cout << "Resolved configuration:\n";
     std::cout << "  network:              " << Node::networkName(n.network) << "\n";
@@ -437,6 +485,16 @@ namespace Daemon
         for (size_t i = 0; i < r.cors_origins.size(); ++i)
           std::cout << (i ? ", " : "") << r.cors_origins[i];
       std::cout << "\n";
+    }
+
+    std::cout << "  metrics_enabled:      "
+              << (m.enabled ? "yes" : "no") << "\n";
+    if (m.enabled)
+    {
+      std::cout << "  metrics_bind:         " << m.bind_address << "\n";
+      std::cout << "  metrics_port:         " << m.port << "\n";
+      std::cout << "  metrics_include_validators: "
+                << (m.include_validator_metrics ? "yes" : "no") << "\n";
     }
 
     std::cout << "  log_level:            " << args.log_level << "\n";

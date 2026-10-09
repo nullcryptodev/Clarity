@@ -44,6 +44,7 @@ TEST(P2P_MessageCost, ControlMessagesAreCheap)
   EXPECT_EQ(messageCost(MessageType::GetPeers), 1u);
   EXPECT_EQ(messageCost(MessageType::Peers), 1u);
   EXPECT_EQ(messageCost(MessageType::Auth), 1u);
+  EXPECT_EQ(messageCost(MessageType::AuthReady), 1u);
   EXPECT_EQ(messageCost(MessageType::Inv), 1u);
   EXPECT_EQ(messageCost(MessageType::GetData), 1u);
   EXPECT_EQ(messageCost(MessageType::Disconnect), 1u);

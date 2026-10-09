@@ -6,7 +6,6 @@
 #include "HttpServer.h"
 
 #include "HttpConnection.h"
-#include "JsonRpcDispatcher.h"
 
 #include "Logging/ILogger.h"
 #include "Logging/LoggerRef.h"
@@ -52,11 +51,11 @@ namespace Rpc
 
   //  Construction
 
-  HttpServer::HttpServer(const RpcConfig &config,
-                         JsonRpcDispatcher &dispatcher,
+  HttpServer::HttpServer(const HttpServerConfig &config,
+                         IHttpHandler &handler,
                          Logging::ILogger &logger)
       : config_(config),
-        dispatcher_(dispatcher),
+        handler_(handler),
         logger_(logger),
         log_(std::make_unique<Logging::LoggerRef>(logger, "RPC")),
         pool_(config.worker_threads, config.max_queued_connections)
@@ -165,7 +164,7 @@ namespace Rpc
     }
 
     (*log_)(Logging::DEBUGGING)
-        << "RPC listening on " << config_.bind_address << ":"
+        << "HTTP listening on " << config_.bind_address << ":"
         << listening_port_ << " (" << pool_.threadCount() << " workers)";
 
     stopping_.store(false);
@@ -198,7 +197,7 @@ namespace Rpc
     // the queue is destroyed.
     pool_.stop();
 
-    (*log_)(Logging::INFO) << "RPC stopped";
+    (*log_)(Logging::INFO) << "HTTP stopped";
   }
 
   //  Accept loop
@@ -298,7 +297,7 @@ namespace Rpc
 
     try
     {
-      HttpConnection conn(client_fd, config_, dispatcher_, std::move(remote_ip));
+      HttpConnection conn(client_fd, config_, handler_, std::move(remote_ip));
       // HttpConnection's destructor closes client_fd, so we don't
       // double-close here.
       conn.run();

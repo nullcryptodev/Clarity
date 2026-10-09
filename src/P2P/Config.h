@@ -68,6 +68,34 @@ namespace P2P
     uint32_t consensusRateLimitBurst = 50;
     uint32_t consensusRateLimitPerSecond = 10;
 
+    // Node-wide aggregate token bucket. Bounds the total inbound work
+    // across all peers, so a crowd of individually-polite peers cannot
+    // collectively saturate the io_context thread. Charged in
+    // Peer::handleReadHeader, at the same point as the per-peer
+    // general bucket, using the separate aggregate cost table in
+    // AggregateLimiter.cpp.
+    //
+    // Same disable convention: both zero = disabled. The aggregate
+    // budget should be larger than any single peer's (it covers the
+    // whole peer set); a reasonable default is roughly
+    // maxInbound * rateLimitPerSecond / 4, rounded to taste.
+    //
+    // A trip here closes the offending connection but does NOT report
+    // misbehavior and does NOT ban. A shared-NAT peer can trip the
+    // aggregate budget through no fault of its own; per-peer trips
+    // still ban, this one only sheds.
+    uint32_t aggregateRateLimitBurst = 2500;
+    uint32_t aggregateRateLimitPerSecond = 800;
+
+    // ---- Session encryption ----
+    //
+    // Upper bound on the inbound per-direction nonce counter. A peer
+    // that sends more than this many messages on a single session is
+    // either broken or attacking; the connection is torn down before
+    // the counter can wrap. 2^32 is far beyond any legitimate session
+    // length (at 1M messages/sec, ~71 minutes of continuous traffic).
+    uint64_t maxInboundNonce = 1ULL << 32;
+
     // ---- Worker pool ----
     size_t workerThreads = 1; // 0 = hardware_concurrency - 1 (aka max threads)
 

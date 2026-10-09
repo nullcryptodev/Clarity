@@ -32,6 +32,7 @@ namespace P2P
     GetPeers = 0x0005,
     Peers = 0x0006,
     Auth = 0x0007,
+    AuthReady = 0x0008, // session-key confirmation, first encrypted message
 
     // Chain sync
     GetHeaders = 0x0010,

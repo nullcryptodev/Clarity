@@ -67,7 +67,7 @@ namespace Tests
 
       // ---- Auth wiring ----
       //
-      // Without these two callbacks, every peer's Auth exchange fails
+      // Without these callbacks, every peer's Auth exchange fails
       // (buildAuthMessage returns a null message, verifyAuth returns
       // false), and no handshake ever reaches Established. The
       // ManagerHarness tests exist to exercise the P2PManager's peer
@@ -75,15 +75,37 @@ namespace Tests
       // which sit downstream of a successful handshake. So the
       // harness has to speak the auth protocol.
       //
+      // Since step 3, the Auth message carries an ephemeral X25519
+      // public key and the signature covers it. Since step 6, the
+      // handshake completes only after an encrypted AuthReady, which
+      // requires our own identity pubkey for session-key derivation.
+      // All three of those must be supplied here.
+      //
       // The protocol is the same as Node::buildAuthMessageForPeer /
-      // Node::verifyPeerAuth, minus the validator lookup. The
-      // orderNonces / computeAuthChallenge helpers are shared with
-      // Node, so the wire format can't drift between the two.
+      // Node::verifyPeerAuth, minus the validator lookup.
+
+      // Our identity pubkey, exposed to each Peer so it can derive
+      // session keys. The harness has a single keypair used by every
+      // peer it owns; a real node has the same (one identity key,
+      // reused across peers).
+      mgr_->getOurIdentityPubkey = [this](P2P::Peer &) -> Crypto::PublicKey
+      {
+        return keypair_.publicKey;
+      };
 
       mgr_->buildAuthMessage = [this](P2P::Peer &peer) -> P2P::AuthMessage
       {
         P2P::AuthMessage a;
         a.pubkey = keypair_.publicKey;
+
+        // Our ephemeral key is owned by the Peer (generated in its
+        // constructor). We read it here rather than generating a
+        // separate one, so that the ephemeral key we sign is the same
+        // one the Peer will use to derive session keys on its side.
+        a.ephemeralPubkey = Crypto::PublicKey{};
+        std::memcpy(a.ephemeralPubkey.data.data(),
+                    peer.ephemeralKeypair().publicKey.data(),
+                    32);
 
         const uint64_t my_nonce = peer.localNonce();
         const uint64_t their_nonce = peer.peerNonce();
@@ -91,7 +113,10 @@ namespace Tests
         P2P::AuthNonces nonces = P2P::orderNonces(
             peer.direction(), my_nonce, their_nonce);
 
-        Crypto::Hash challenge = P2P::computeAuthChallenge(nonces, a.pubkey);
+        // Challenge now covers the ephemeral pubkey as well as the
+        // identity pubkey. See AuthMessage.h.
+        Crypto::Hash challenge = P2P::computeAuthChallenge(
+            nonces, a.pubkey, a.ephemeralPubkey);
         a.signature = Crypto::sign(challenge, keypair_.secretKey);
         return a;
       };
@@ -114,8 +139,17 @@ namespace Tests
         P2P::AuthNonces nonces = P2P::orderNonces(
             peer.direction(), my_nonce, their_nonce);
 
-        Crypto::Hash challenge = P2P::computeAuthChallenge(nonces, a.pubkey);
+        // The challenge uses the keys from the *message* — the
+        // remote side's identity and ephemeral pubkeys — because
+        // that's what the sender signed over.
+        Crypto::Hash challenge = P2P::computeAuthChallenge(
+            nonces, a.pubkey, a.ephemeralPubkey);
         return Crypto::verify(challenge, a.pubkey, a.signature);
+      };
+
+      mgr_->getOurIdentityPubkey = [this](P2P::Peer &) -> Crypto::PublicKey
+      {
+        return keypair_.publicKey;
       };
 
       mgr_->start({});

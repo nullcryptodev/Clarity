@@ -423,6 +423,12 @@ namespace Node
     {
       return verifyPeerAuth(peer, a, outValidatorId);
     };
+    p2p_->getOurIdentityPubkey = [this](P2P::Peer &) -> Crypto::PublicKey
+    {
+      if (node_key_.isNull())
+        return Crypto::PublicKey{};
+      return Crypto::derivePublicKey(node_key_);
+    };
     p2p_->onPeerEstablished = [this](
                                   const P2P::P2PManager::PeerEstablishedInfo &info)
     {
@@ -445,9 +451,6 @@ namespace Node
 
     if (node_key_.isNull())
     {
-      // Should not happen — initP2P calls loadOrCreateNodeKey()
-      // before any peer is created. Log and return null; the peer
-      // will fail auth and close.
       (*log_)(Logging::ERROR)
           << "buildAuthMessageForPeer: node key is null";
       return a;
@@ -455,13 +458,28 @@ namespace Node
 
     a.pubkey = Crypto::derivePublicKey(node_key_);
 
+    // The ephemeral key is owned by the Peer. We sign the same key
+    // the Peer will use to derive session keys — if we signed a
+    // different one, the two sides would derive divergent session
+    // keys and AuthReady would fail.
+    const Crypto::X25519KeyPair &eph = peer.ephemeralKeypair();
+    std::memcpy(a.ephemeralPubkey.data.data(),
+                eph.publicKey.data(),
+                a.ephemeralPubkey.data.size());
+
     const uint64_t my_nonce = peer.localNonce();
     const uint64_t their_nonce = peer.peerNonce();
 
     P2P::AuthNonces nonces = P2P::orderNonces(
         peer.direction(), my_nonce, their_nonce);
 
-    Crypto::Hash challenge = P2P::computeAuthChallenge(nonces, a.pubkey);
+    // The challenge covers both pubkeys: the identity key binds the
+    // signature to the peer's claimed identity, the ephemeral key
+    // binds it to the specific X25519 key that will derive the
+    // session. A MITM cannot substitute the ephemeral key without
+    // invalidating the signature.
+    Crypto::Hash challenge = P2P::computeAuthChallenge(
+        nonces, a.pubkey, a.ephemeralPubkey);
 
     a.signature = Crypto::sign(challenge, node_key_);
     return a;
@@ -473,10 +491,10 @@ namespace Node
   {
     outValidatorId = 0;
 
-    // Reject null keys/sigs outright. A null sig would verify against
-    // a null pubkey on some Ed25519 implementations, so guard
-    // explicitly.
     if (a.pubkey.isNull() || a.signature.isNull())
+      return false;
+
+    if (a.ephemeralPubkey.isNull())
       return false;
 
     const uint64_t my_nonce = peer.localNonce();
@@ -485,14 +503,14 @@ namespace Node
     P2P::AuthNonces nonces = P2P::orderNonces(
         peer.direction(), my_nonce, their_nonce);
 
-    Crypto::Hash challenge = P2P::computeAuthChallenge(nonces, a.pubkey);
+    // Reconstruct the same four-field challenge the sender signed
+    // over, using the keys from the message (the remote side's).
+    Crypto::Hash challenge = P2P::computeAuthChallenge(
+        nonces, a.pubkey, a.ephemeralPubkey);
 
     if (!Crypto::verify(challenge, a.pubkey, a.signature))
       return false;
 
-    // Signature is valid. Now decide whether this pubkey is a
-    // validator. A non-validator is still authenticated; it just
-    // gets validator_id = 0.
     outValidatorId = validatorIdForAddress(a.pubkey);
     return true;
   }
@@ -588,7 +606,22 @@ namespace Node
     }
     if (p2p_)
     {
+      //  peerCount() reads an atomic counter, safe from this thread.
       s.peer_count = p2p_->peerCount();
+
+      //  snapshot() reads only atomics and mutex-guarded
+      //  size() accessors — see its own comment for the audit.
+      //  No post to the event loop, no blocking.
+      const auto snap = p2p_->snapshot();
+      s.peers_total = snap.total;
+      s.peers_inbound = snap.inbound;
+      s.peers_outbound = snap.outbound;
+      s.peers_established = snap.established;
+      s.peers_banned = snap.banned;
+      s.addresses_known = snap.knownAddresses;
+      s.aggregate_rate_limit_burst = snap.aggregateBurst;
+      s.aggregate_rate_limit_per_second = snap.aggregatePerSecond;
+      s.aggregate_rate_limit_enabled = snap.aggregateEnabled;
     }
     if (consensus_)
     {
@@ -596,6 +629,19 @@ namespace Node
       s.consensus_height = cs.height;
       s.consensus_round = cs.round;
       s.consensus_step = Consensus::stepName(cs.step);
+      s.consensus_step_ordinal = cs.step;
+      s.consensus_prevotes = cs.prevote_count;
+      s.consensus_precommits = cs.precommit_count;
+      s.consensus_is_proposer = cs.is_proposer;
+
+      //  consecutiveTimeouts() and emergencyRotationActive() take
+      //  the consensus engine's mutex internally and return value
+      //  copies. Both are cheap — no callback into the node, no
+      //  state read.
+      s.consensus_consecutive_timeouts =
+          static_cast<uint32_t>(consensus_->consecutiveTimeouts());
+      s.consensus_emergency_rotation =
+          consensus_->emergencyRotationActive();
     }
 
     return s;

@@ -16,6 +16,7 @@ namespace P2P
     Handshaking,
     VerackPending,
     AuthPending,
+    AuthReadyPending, // Auth exchanged, awaiting session-key confirmation
     Established,
     Disconnecting,
     Closed,

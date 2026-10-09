@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -89,6 +91,13 @@ namespace Core
     Rejected_PoolFull,
   };
 
+  //  Pin the counter array size to the enum. If a new variant is
+  //  added to MempoolAddResult, this fires and the array size must
+  //  be bumped to match.
+  static_assert(
+      static_cast<size_t>(MempoolAddResult::Rejected_PoolFull) + 1 == 12,
+      "MempoolAddResult grew; update Mempool::ADD_RESULT_COUNT");
+
   const char *mempoolAddResultName(MempoolAddResult r) noexcept;
 
   // ---- Fee tier ----
@@ -141,9 +150,27 @@ namespace Core
     // The `tier` indicates whether the sender paid the priority surcharge.
     // This is enforced by the caller (wallet sets the fee accordingly,
     // node verifies the surcharge was included in tx.fee).
+    //
+    // Every call updates the per-result counters exposed by
+    // addResultCounts(). The update happens inside add(), after the
+    // underlying implementation returns, so the counter array is
+    // always consistent with the value returned to the caller.
     MempoolAddResult add(const Transaction &tx,
                          const StateView &state,
                          FeeTier tier);
+
+    // Counters for add() results, indexed by MempoolAddResult. The
+    // i-th element is the count of add() calls that returned result i
+    // since process start.
+    //
+    // Per-process, not persisted: a counter that resets on restart is
+    // what Prometheus expects from a _total series, and nobody wants
+    // a "rejected since genesis" number.
+    //
+    // The array has one slot per MempoolAddResult variant. The size
+    // is pinned to the enum by a static_assert above.
+    static constexpr size_t ADD_RESULT_COUNT = 12;
+    std::array<uint64_t, ADD_RESULT_COUNT> addResultCounts() const;
 
     // Remove a single transaction by txid. Returns true if it was present.
     bool remove(const Crypto::Hash &txid);
@@ -206,8 +233,6 @@ namespace Core
 
     Stats stats() const;
 
-    // ---- Introspection ----
-
     // Snapshot of the pool for external consumers (RPC, diagnostics).
     //
     // Returns a copy of every entry, taken under the pool's mutex. Safe
@@ -233,6 +258,13 @@ namespace Core
     std::vector<Snapshot> snapshot() const;
 
   private:
+    // The body of add(), separated so add() can count the result
+    // exactly once at a single site. Callers must use add(), not
+    // addImpl directly — addImpl does not update the counters.
+    MempoolAddResult addImpl(const Transaction &tx,
+                             const StateView &state,
+                             FeeTier tier);
+
     // ---- Internal data ----
 
     struct Entry
@@ -314,6 +346,16 @@ namespace Core
     static bool deserializeEntry(const uint8_t *data, size_t len, Entry &out);
 
     // ---- Members ----
+
+    //  Per-result counters for add(). Updated by add() after addImpl
+    //  returns; read by addResultCounts(). Indexed by
+    //  static_cast<size_t>(MempoolAddResult).
+    //
+    //  The atomics are relaxed because they are pure counters with no
+    //  ordering requirements: a reader either sees an update or it
+    //  doesn't, and every observation is a valid sample. There is no
+    //  memory guarded by these values.
+    std::array<std::atomic<uint64_t>, ADD_RESULT_COUNT> add_result_counts_{};
 
     mutable std::mutex mutex_;
 

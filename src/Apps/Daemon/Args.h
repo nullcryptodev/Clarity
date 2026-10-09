@@ -9,6 +9,7 @@
 
 #include "Node/NodeConfig.h"
 #include "RPC/Config.h"
+#include "RPC/MetricsConfig.h"
 
 namespace Daemon
 {
@@ -24,6 +25,7 @@ namespace Daemon
 
     // RPC configuration (built from flags).
     Rpc::RpcConfig rpc;
+    Rpc::MetricsConfig metrics;
 
     // Daemon-only options.
     std::string log_level{"info"}; // trace|debug|info|warn|error

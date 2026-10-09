@@ -184,15 +184,6 @@ namespace Rpc
       return p;
     }
 
-    //  Read a uint64 from the meta table (MDBX, not the SMT). Used
-    //  for aggregation counters that don't participate in the state
-    //  root: tx_counter, total_fees_lifetime, total_to_pot,
-    //  total_pot_distributed, last_effective_apy_bps.
-    uint64_t readU64Meta(State::StateAccess &state, const char *name)
-    {
-      return state.getMetaU64(name);
-    }
-
     uint64_t readU64Global(State::StateAccess &state, const char *name)
     {
       std::vector<uint8_t> bytes;

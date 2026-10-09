@@ -364,6 +364,25 @@ namespace Core
                                 const StateView &state,
                                 FeeTier tier)
   {
+    //  addImpl does the work and returns the result exactly once at
+    //  a single exit point (its own return statement). This wrapper
+    //  is the only place the result is counted, so the counter array
+    //  is always consistent with the return value the caller sees.
+    const MempoolAddResult result = addImpl(tx, state, tier);
+
+    const size_t idx = static_cast<size_t>(result);
+    if (idx < add_result_counts_.size())
+    {
+      add_result_counts_[idx].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    return result;
+  }
+
+  MempoolAddResult Mempool::addImpl(const Transaction &tx,
+                                    const StateView &state,
+                                    FeeTier tier)
+  {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // ---- Validate first ----
@@ -938,6 +957,21 @@ namespace Core
     s.avg_fee_rate = sum_rate / entries_.size();
 
     return s;
+  }
+
+  //  Add-result counters
+
+  std::array<uint64_t, Mempool::ADD_RESULT_COUNT>
+  Mempool::addResultCounts() const
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    std::array<uint64_t, ADD_RESULT_COUNT> out{};
+    for (size_t i = 0; i < add_result_counts_.size(); ++i)
+    {
+      out[i] = add_result_counts_[i].load(std::memory_order_relaxed);
+    }
+    return out;
   }
 
   std::vector<Mempool::Snapshot> Mempool::snapshot() const

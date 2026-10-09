@@ -25,6 +25,8 @@ namespace P2P
       return "peers";
     case MessageType::Auth:
       return "Auth";
+    case MessageType::AuthReady:
+      return "authready";
     case MessageType::GetHeaders:
       return "getheaders";
     case MessageType::Headers:
@@ -109,6 +111,7 @@ namespace P2P
     case MessageType::GetPeers:
     case MessageType::Peers:
     case MessageType::Auth:
+    case MessageType::AuthReady:
     case MessageType::Inv:
     case MessageType::GetData:
     case MessageType::Disconnect:

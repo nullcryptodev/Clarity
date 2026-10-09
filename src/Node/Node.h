@@ -71,12 +71,49 @@ namespace Node
       size_t mempool_bytes{0};
       bool is_validator{false};
       uint64_t validator_id{0};
+
       uint64_t consensus_height{0};
       uint32_t consensus_round{0};
       const char *consensus_step{"unknown"};
+      Consensus::Step consensus_step_ordinal{Consensus::Step::NewHeight}; // ordinal
+
+      // ---- Consensus detail ----
+      //
+      //  Read from BftConsensus::state() and
+      //  BftConsensus::consecutiveTimeouts() when consensus is
+      //  running, or zero on a non-validator node. All fields are
+      //  lock-free reads of consensus-engine state; the engine
+      //  holds its own mutex internally and returns value copies.
+      size_t consensus_prevotes{0};
+      size_t consensus_precommits{0};
+      uint32_t consensus_consecutive_timeouts{0};
+      bool consensus_emergency_rotation{false};
+      bool consensus_is_proposer{false};
+
       Network network{Network::Regtest};
       uint64_t chain_id{0};
       bool running{false};
+
+      // ---- P2P counters ----
+      //
+      //  Read from P2PManager::snapshot() when P2P is enabled, or
+      //  zero when it isn't. Every field is a lock-free atomic read
+      //  or a mutex-guarded size() call — safe to invoke from any
+      //  thread, including RPC worker threads that call status().
+      //
+      //  peer_count above is retained for backward compatibility
+      //  and equals peers_total.
+      size_t peers_total{0};
+      size_t peers_inbound{0};
+      size_t peers_outbound{0};
+      size_t peers_established{0};
+      size_t peers_banned{0};
+      size_t addresses_known{0};
+
+      // ---- Aggregate rate limiter (config) ----
+      uint32_t aggregate_rate_limit_burst{0};
+      uint32_t aggregate_rate_limit_per_second{0};
+      bool aggregate_rate_limit_enabled{false};
     };
 
     Status status() const;
@@ -103,6 +140,12 @@ namespace Node
     const Core::Mempool &mempool() const { return *mempool_; }
     State::StateDB &stateDB() const { return *state_db_; }
     Core::ChainDB &chainDB() const { return *chain_db_; }
+
+    // Data directory path. Read by the metrics handler to compute
+    // the on-disk size of the state and chain databases. Returns
+    // config_.data_dir verbatim — the caller appends "/state" or
+    // "/chain" as needed.
+    const std::string &dataDir() const noexcept { return config_.data_dir; }
 
     // Forwarding method for RPC. Returns an empty vector if P2P is
     // disabled or not initialized. Thread-safe: P2PManager::peerList

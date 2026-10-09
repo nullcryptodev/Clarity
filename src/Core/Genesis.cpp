@@ -114,10 +114,6 @@ namespace Core
 
     constexpr Wallet::Network net = Wallet::Network::Mainnet;
 
-    cfg.accounts.push_back({addressFromConfig(GlobalConfig::COMMUNITY_FUND_ADDRESS, net, "community fund"),
-                            GlobalConfig::COMMUNITY_FUND_AMOUNT,
-                            "community fund"});
-
     cfg.accounts.push_back({addressFromConfig(GlobalConfig::TREASURY_FUND_ADDRESS, net, "treasury"),
                             GlobalConfig::TREASURY_FUND_AMOUNT,
                             "treasury"});
@@ -167,10 +163,6 @@ namespace Core
 
     constexpr Wallet::Network net = Wallet::Network::Testnet;
 
-    cfg.accounts.push_back({addressFromConfig(GlobalConfig::COMMUNITY_FUND_ADDRESS, net, "community fund"),
-                            GlobalConfig::COMMUNITY_FUND_AMOUNT,
-                            "community fund"});
-
     cfg.accounts.push_back({addressFromConfig(GlobalConfig::TREASURY_FUND_ADDRESS, net, "treasury"),
                             GlobalConfig::TREASURY_FUND_AMOUNT,
                             "treasury"});
@@ -208,10 +200,6 @@ namespace Core
     cfg.timestamp_ms = GlobalConfig::GENESIS_TIMESTAMP_MS;
 
     constexpr Wallet::Network net = Wallet::Network::Regtest;
-
-    cfg.accounts.push_back({addressFromConfig(GlobalConfig::COMMUNITY_FUND_ADDRESS, net, "community fund"),
-                            GlobalConfig::COMMUNITY_FUND_AMOUNT,
-                            "community fund"});
 
     cfg.accounts.push_back({addressFromConfig(GlobalConfig::TREASURY_FUND_ADDRESS, net, "treasury"),
                             GlobalConfig::TREASURY_FUND_AMOUNT,
@@ -260,7 +248,85 @@ namespace Core
 
   void applyGenesis(State::StateAccess &state, const GenesisConfig &config)
   {
+    //  Ordering matters here.
+    //
+    //  Global state is written FIRST, before any per-entity state.
+    //  The reason is that some per-entity writes — specifically,
+    //  putAccount — read and increment the globals "total_staked"
+    //  and "staker_count". If those globals are zeroed *after* the
+    //  accounts are created, the increments are lost and the globals
+    //  become inconsistent with the state they describe.
+    //
+    //  The invariant this establishes: at every point during genesis,
+    //  the accumulated globals are consistent with the per-entity
+    //  records written so far.
+    //
+    //  Bootstrapping the globals first has a second effect: it makes
+    //  the function idempotent. Running applyGenesis twice on the
+    //  same state produces the same result, because the second run's
+    //  global writes reset the accumulators before the accounts loop
+    //  re-adds them. Without this ordering, a second run would double
+    //  the accumulated values.
+
+    // ---- Global state ----
+
+    uint64_t max_seed_id = 0;
+    for (const auto &v : config.validators)
+    {
+      if (v.is_seed && v.id > max_seed_id)
+        max_seed_id = v.id;
+    }
+
+    state.putGlobal("chain_id", u64Bytes(config.chain_id));
+    state.putGlobal("total_supply", u64Bytes(config.initial_total_supply));
+    state.putGlobal("total_staked", u64Bytes(0));
+    state.putGlobal("pot", u64Bytes(0));
+    state.putGlobal("epoch_number", u64Bytes(0));
+    state.putGlobal("staker_count", u64Bytes(0));
+    state.putGlobal("next_validator_id", u64Bytes(max_seed_id + 1));
+    state.putGlobal("next_token_id", u64Bytes(1));
+    state.putGlobal("next_order_id", u64Bytes(1));
+    state.putGlobal("next_pool_id", u64Bytes(1));
+    state.putGlobal("next_position_id", u64Bytes(1));
+    state.putGlobal("last_rotation_height", u64Bytes(0));
+    state.putGlobal("apy_activity_bps", u64Bytes(0));
+    state.putGlobal("apy_pot_bps", u64Bytes(0));
+
+    state.putGlobal("active_set_size",
+                    u64Bytes(config.initial_active_set_size));
+
+    // ---- Native token metadata ----
+    //
+    //  Created before any user tokens so that token_id 0 exists in
+    //  the token table from genesis onward. Every balance check
+    //  that treats NATIVE_TOKEN_ID specially still works, but the
+    //  token record being present means forEachToken and the token
+    //  count metric both include it — matching what a reader would
+    //  expect from "the chain has a native currency".
+
+    {
+      TokenInfo native;
+      native.id = INVALID_ID;
+      native.name = GlobalConfig::PROJECT_NAME;
+      native.symbol = GlobalConfig::PROJECT_SYMBOL;
+      native.decimals = GlobalConfig::DECIMALS;
+      native.creator = Crypto::Address{};
+      native.backing = BackingModel::Unbacked;
+      native.maxSupply = 0;
+      native.royaltyBps = 0;
+      state.putToken(native);
+    }
+
     // ---- Initial accounts ----
+    //
+    //  putAccount reads the globals "total_staked" and "staker_count"
+    //  and increments them as accounts are added. Those globals were
+    //  just initialized to zero above, so the increments accumulate
+    //  correctly. At the end of this loop, total_staked equals the
+    //  sum of the genesis accounts' staked balances, and staker_count
+    //  equals the number of genesis accounts above the auto-stake
+    //  threshold that were not opted out.
+
     for (const auto &acc : config.accounts)
     {
       Account a;
@@ -274,10 +340,19 @@ namespace Core
 
     // ---- Seed validators ----
     //
-    // For each seed, write the validator record and the index entry
-    // that maps its reward_address back to its id. The index is what
-    // the reward distributor uses to identify the block proposer, and
-    // what any caller with only an address uses to find the validator.
+    //  For each seed, write the validator record and the index entry
+    //  that maps its reward_address back to its id. The index is what
+    //  the reward distributor uses to identify the block proposer, and
+    //  what any caller with only an address uses to find the validator.
+    //
+    //  Validator records do NOT touch the staker globals: a validator
+    //  and a staker are different concepts (a validator's stake is
+    //  tracked in ValidatorInfo::stake, a staker's is tracked in
+    //  Account::staked). The reward addresses of the seed validators
+    //  happen to also be stakers because their accounts have nonzero
+    //  balances — that's already accounted for in the accounts loop
+    //  above.
+
     for (const auto &v : config.validators)
     {
       ValidatorInfo vi;
@@ -305,7 +380,7 @@ namespace Core
       vi.infraction_count = 0;
       vi.last_infraction_height = 0;
 
-      // ---- Stats (all default to 0, but explicit here for clarity) ----
+      // ---- Stats ----
       vi.pings_responded_this_epoch = 0;
       vi.pings_sent_this_epoch = 0;
       vi.total_blocks_produced = 0;
@@ -317,7 +392,13 @@ namespace Core
       state.putValidatorByAddress(v.reward_address, v.id);
     }
 
-    // ---- Active set as global state ----
+    // ---- Active set ----
+    //
+    //  Written last, after the validator records it references exist.
+    //  Nothing downstream reads the active set during genesis, so this
+    //  is mostly a convention — but it keeps the write order
+    //  "dependencies first" as a rule.
+
     {
       std::vector<uint8_t> set_bytes;
       for (const auto &v : config.validators)
@@ -328,46 +409,6 @@ namespace Core
         set_bytes.insert(set_bytes.end(), b.begin(), b.end());
       }
       state.putGlobal("active_set", set_bytes);
-    }
-
-    uint64_t max_seed_id = 0;
-    for (const auto &v : config.validators)
-    {
-      if (v.is_seed && v.id > max_seed_id)
-        max_seed_id = v.id;
-    }
-
-    // ---- Global state ----
-    state.putGlobal("chain_id", u64Bytes(config.chain_id));
-    state.putGlobal("total_supply", u64Bytes(config.initial_total_supply));
-    state.putGlobal("total_staked", u64Bytes(0));
-    state.putGlobal("pot", u64Bytes(0));
-    state.putGlobal("epoch_number", u64Bytes(0));
-    state.putGlobal("staker_count", u64Bytes(0));
-    state.putGlobal("next_validator_id", u64Bytes(max_seed_id + 1));
-    state.putGlobal("next_token_id", u64Bytes(1));
-    state.putGlobal("next_order_id", u64Bytes(1));
-    state.putGlobal("next_pool_id", u64Bytes(1));
-    state.putGlobal("next_position_id", u64Bytes(1));
-    state.putGlobal("last_rotation_height", u64Bytes(0));
-    state.putGlobal("apy_activity_bps", u64Bytes(0));
-    state.putGlobal("apy_pot_bps", u64Bytes(0));
-
-    state.putGlobal("active_set_size",
-                    u64Bytes(config.initial_active_set_size));
-
-    // ---- Native token metadata ----
-    {
-      TokenInfo native;
-      native.id = INVALID_ID;
-      native.name = GlobalConfig::PROJECT_NAME;
-      native.symbol = GlobalConfig::PROJECT_SYMBOL;
-      native.decimals = GlobalConfig::DECIMALS;
-      native.creator = Crypto::Address{};
-      native.backing = BackingModel::Unbacked;
-      native.maxSupply = 0;
-      native.royaltyBps = 0;
-      state.putToken(native);
     }
   }
 

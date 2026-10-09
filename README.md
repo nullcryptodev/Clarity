@@ -2,12 +2,13 @@
 
 # Clarity - Authority rotates, the chain doesn't.
 
-![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C797-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
+![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C853-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
 
 #### Documents
 
 - [Economics of Clarity](https://github.com/nullcryptodev/Clarity/blob/main/ECONOMICS.md)
 - [Setup Clarity REGTEST](https://github.com/nullcryptodev/Clarity/blob/main/SETUP-REGTEST.md)
+- [Clarity Metrics Reference](https://github.com/nullcryptodev/Clarity/blob/main/METRICS.md)
 
 #### Table of Contents
 
@@ -23,7 +24,6 @@
   - [Finality](#finality)
   - [Validator Set](#validator-set)
   - [Seed Validators](#seed-validators)
-  - [Emergency Rotation](#emergency-rotation)
   - [Dry-run vs. finalized validation](#dry-run-vs-finalized-validation)
 - [**State**: how the chain is stored](#state-how-the-chain-is-stored)
   - [Storage](#storage)
@@ -44,23 +44,11 @@
   - [Consensus Key](#consensus-key)
   - [Reward Address](#reward-address)
   - [Tooling](#tooling)
-- [**Economics**: how value flows](#economics-how-value-flows)
-  - [Block Reward](#block-reward)
-  - [Validator Pool](#validator-pool)
-  - [Validator Rewards](#validator-rewards)
-  - [Seed-only reward policy](#seed-only-reward-policy)
-  - [Staker Rewards](#staker-rewards)
-  - [APY Mechanism](#apy-mechanism)
-  - [Pot Mechanics](#pot-mechanics)
-  - [Total Supply](#total-supply)
-  - [Uptime and Penalties](#uptime-and-penalties)
-  - [Stake slashing for equivocation](#stake-slashing-for-equivocation)
-  - [How equivocation is detected and slashed](#how-equivocation-is-detected-and-slashed)
-  - [Timeout certificate](#timeout-certificate)
 - [**Network**: how nodes talk](#network-how-nodes-talk)
   - [Message Framing](#message-framing)
   - [Handshake](#handshake)
   - [Authentication](#authentication)
+  - [Session encryption](#session-encryption)
   - [Sync](#sync)
   - [Idle Refresh](#idle-refresh)
   - [Block Relay](#block-relay)
@@ -69,6 +57,7 @@
   - [Rate Limiting](#rate-limiting)
   - [Peer Management](#peer-management)
   - [Self-connection prevention](#self-connection-prevention)
+- [**Metrics**: how operators watch the node](#metrics-how-operators-watch-the-node)
 - [**RPC**: how clients talk](#rpc-how-clients-talk)
 - [**Wallet**: how keys are managed](#wallet-how-keys-are-managed)
   - [Signing](#signing)
@@ -84,24 +73,25 @@
 
 Clarity is a **single-chain, Byzantine-fault-tolerant proof-of-stake network** with a native currency ($CLRTY), a general-purpose token system, an automated market maker, a limit-order book, validator rewards with a pot mechanism, and a growing feature set around staking, validator rotation, and on-chain governance of validator sets.
 
-It's not a direct fork of anything. The block format, consensus protocol, state model, and reward math are original. It uses well-known primitives (Ed25519, Blake2b, SHA-512, ChaCha20-Poly1305) from Monocypher, the Argon2 reference implementation for keystore KDF, the BLAKE2 reference code, and a project-internal Keccak implementation verified against the official Keccak test vectors.
+It's not a direct fork of anything. The block format, consensus protocol, state model, and reward math are original. It uses well-known primitives (Ed25519, X25519, Blake2b, SHA-512, XChaCha20-Poly1305) from Monocypher, the Argon2 reference implementation for keystore KDF, the BLAKE2 reference code, and a project-internal Keccak implementation verified against the official Keccak test vectors.
 
-The project is at the code-complete, pre-launch stage. The daemon builds, the full test suite passes, and the end-to-end path (from transaction submission through consensus through block application through state persistence through restart) has been exercised on a live two-validator regtest network. The RPC surface is complete and tested. The wallet layer (keystores, HD derivation, signing, address encoding) is complete and tested, and there is an interactive CLI wallet client. The P2P layer has authentication, sync, block relay, transaction relay, proof serving, per-peer rate limiting, and periodic refresh. It has not been deployed to a public network.
+The project is at the code-complete, pre-launch stage. The daemon builds, the full test suite passes, and the end-to-end path (from transaction submission through consensus through block application through state persistence through restart) has been exercised on a live two-validator regtest network. The RPC surface is complete and tested. The wallet layer (keystores, HD derivation, signing, address encoding) is complete and tested, and there is an interactive CLI wallet client. The P2P layer has authentication, session encryption, sync, block relay, transaction relay, proof serving, per-peer and node-wide rate limiting, and periodic refresh. A Prometheus-compatible metrics endpoint exposes node, P2P, mempool, storage, reward, and consensus state. It has not been deployed to a public network.
 
 ## The architecture
 
 Ten main modules, from bottom to top:
 
 ```
-Crypto           hashes, signatures, AEAD, key types
+Crypto           hashes, signatures, AEAD, key exchange, key types
 Common           encodings (Base58, Base64, hex), CRC32, JSON, varint, rate limiter, wire codec
 Serialization    binary, KV-binary, JSON serializers
 State            MDBX storage, sparse Merkle tree, state access, proofs, historical reads
 Core             blocks, transactions, execution, block processing, rewards, equivocation proofs
 Consensus        BFT state machine, proposer selection, message encoding
-P2P              TCP transport, peer management, message framing, auth, sync, relay, proof serving
+P2P              TCP transport, peer management, message framing, auth, session encryption,
+                 sync, relay, proof serving, rate limiting
 Node             assembles everything into a running daemon
-RPC              JSON-RPC 2.0 server, dispatcher, method handlers, encoders
+RPC              JSON-RPC 2.0 server, dispatcher, method handlers, encoders, metrics endpoint
 Wallet           keystores, HD derivation (BIP39/SLIP10), signing, addresses
 ```
 
@@ -212,11 +202,6 @@ The two keys are independent. Rotating one does not affect the other. Both are r
 
 Seeds are never removed from the active set by normal rotation, offline removal, or unhealthy-culling. This is the trust anchor for bootstrap -- the seeds are expected to be operated by the project itself. The mainnet and testnet genesis configs are defined and pinned but the networks are not live.
 
-#### Emergency rotation
-If the committed set can no longer form quorum, `BftConsensus` counts consecutive round timeouts. At `EMERGENCY_ROTATION_ROUNDS` (30) the proposer assembles a **timeout certificate** -- f+1 signed `TimeoutVote` attestations at rounds >= 30 from the committed set -- and stamps `block.header.emergency_rotation` (set to the round at which the emergency was declared) plus the certificate into the block header. Every verifier reads the flag from the block, verifies the certificate against the committed set, and derives the same emergency set from `(committed_set, registry, height)`. The certificate is what makes the flag non-arbitrary: without f+1 validators attesting to the same stall, the block is rejected by every honest node. Seeds are droppable here, unlike the normal paths. When the emergency block commits, the derived set becomes the committed set. `emergency_rotation` is part of the block hash. The timeout certificate is transmitted in the header but is deliberately **excluded** from the hash, the same treatment `commit_round` and `quorum_signatures` receive -- the certificate is evidence attached to the block, not part of its identity.
-
-**The active set is a function of the block, not the local counter.** `handleProposal`, `recordVote`, `quorumThreshold`, and `mySignerIndex` all resolve the emergency flag from the block being voted on. For a vote that references a block, the flag is read from that block's header; for nil votes, from the current round's proposal; for the proposer's own proposal attempt, from the local counter, which is the only case where it's consulted. This prevents two nodes whose counters differ by one from computing different proposers. A vote's `signer_index` resolves through `active_set[signer_index]` -> validator record -> signing key, matching `checkQuorum`. Votes for unknown blocks buffer until the block arrives; a second vote from a known signer is routed to `recordVote` regardless, so a conflict is detectable without the block.
-
 #### Dry-run vs. finalized validation
 The block processor distinguishes between *simulating* a block (the proposer needs to know what state root a candidate block would produce, but the block's state root and quorum signatures aren't populated yet) and *applying* a finalized block. `BlockContext::dry_run` skips structural header checks, quorum verification, and the state-root comparison; the non-dry path runs them all. This split is load-bearing -- the consensus proposer relies on it, and the test suite exercises both paths.
 
@@ -224,6 +209,8 @@ The block processor distinguishes between *simulating* a block (the proposer nee
 
 #### Storage
 MDBX, a memory-mapped key-value store. Twenty-one tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, three index tables (stakers, validators, order expiry), receipts, tx index, blocks by hash, blocks by height, the persistent mempool, the consensus WAL, and four historical SMT tables (nodes-history, leaves-history, nodes-by-version, leaves-by-version).
+
+For v1, all of these live in a single MDBX database file at `<data_dir>/state`. Chain data — block indices, block bodies, receipts, the transaction index — shares the same file as state data. There is no separate chain DB directory. This is a storage-layout decision, not a consensus-relevant one: the atomic commit discipline that writes state, block index, and head together in one transaction relies on the two being in the same MDBX instance.
 
 #### State commitment
 A **sparse Merkle tree** of depth 256. Each key is a 32-byte hash (derived from an account address, token balance key, validator ID, or global state name). Each leaf commits to a value. The tree root is the state root, which is written into every block header. Any two nodes with the same state produce the same root.
@@ -296,68 +283,31 @@ A single `address` binary handles all key management for validators and users:
 - `address --show --show-secret` additionally prints the raw hex secrets. This is the command to run when you need the consensus secret for the daemon's `--consensus-key` flag.
 - `address --from-mnemonic "<words>"` derives and prints keys without writing a keystore.
 
-## Economics: how value flows
-
-#### Block reward
-Each block issues a fixed reward in CLRTY. The reward splits into a validator pool (60%) and a staker pool (40%).
-
-#### Validator pool
-The validator pool splits into a producer bonus (20% of the pool, paid to the block's proposer) and a set share (80% of the pool, split across the active set).
-
-#### Validator rewards
-Under the normal path, the producer bonus goes to the proposer and the set share is split evenly across active validators, weighted by their `reward_multiplier`. A validator that has been penalized for infractions has a reduced multiplier, and the difference is routed to the pot. Any validator ID in the active set with no corresponding validator record has its share routed to the pot. Rewards are paid to each validator's `reward_address`, not its consensus key -- moving the reward address redirects future rewards without affecting the validator's ability to sign.
-
-#### Seed-only reward policy
-When every validator in the active set is a seed, the normal split is replaced. The producer bonus is distributed evenly across all seeds -- the producing seed earns no more than any other seed, because seeds are operated as a single entity and the distinction between producing and signing is bookkeeping noise. The entire set share (80% of the validator pool) is routed to the pot, along with the staker pool.
-
-This is deliberate: paying seeds the full validator pool on a chain with no other validators would concentrate wealth and provide no incentive for new validators to register. The policy fires only when *every* active validator is a seed -- a single non-seed in the set resumes normal distribution, so a validator that joins a seed-heavy chain starts earning its share immediately.
-
-The degenerate case is one seed: the seed earns the full producer bonus, and the set share plus staker pool go to the pot. The invariant `validator_earnings + pot_earnings == block_reward` holds in every case.
-
-#### Staker rewards
-The staker pool accumulates in a "pot" on a per-block basis. At each epoch boundary (every 60 blocks), the pot is drained to pay stakers a target APY. Stakers are weighted by their staked balance, with a bonus for large balances (`BALANCE_BONUS_THRESHOLD`, `BALANCE_BONUS_BPS`), and time-weighted by how long they've been staked during the epoch.
-
-#### APY mechanism
-The target APY is `base + activity + pot_bonus`. Base is a fixed 5% (`APY_BASE_BPS = 500`). Activity scales with transaction throughput, up to a cap of +5% (`APY_ACTIVITY_MAX_BPS = 500`). Pot bonus scales with how full the pot is, up to a cap of +3% (`APY_POT_BONUS_MAX_BPS = 300`). The effective APY is capped at 13%. The payout is computed deterministically from the state at the epoch boundary, so the exact number a staker receives is knowable in advance. The *target* is a policy parameter, not a promise; if the pot is low the actual distribution is lower.
-
-#### Pot mechanics
-The pot accumulates 40% of each block reward as it's issued, plus the set share during seed-only blocks, plus the difference from any validator's reward multiplier penalty, plus any slash proceeds. At the epoch boundary, the protocol tries to pay stakers the target APY. If the pot doesn't have enough, it pays what it has and drains. If the pool (this epoch's 40% contribution) doesn't cover the target, the pot fills in the gap. If the pot exceeds a maximum, the excess is burned.
-
-#### Total supply
-Increases by the block reward each block. Genesis has an initial supply of 100k CLRTY on mainnet (38k to treasury, 60k to community, 1k per seed). Total supply grows without a cap, but the growth rate is bounded by the block reward.
-
-#### Uptime and penalties
-Each validator has an uptime score, an EMA updated based on how many pings they respond to. Below a threshold, they're removed from the active set. Infractions reduce the validator's `reward_multiplier`, with a floor of 20%. No automatic recovery from a multiplier penalty.
-
-#### Stake slashing for equivocation
-A validator that signs two conflicting votes at the same `(height, round)` loses 5% of its stake (`SLASH_AMOUNT_BPS = 500`). The slashed stake is credited to the staker pot. The validator's reward multiplier is also reduced by the standard penalty (`REWARD_MULTIPLIER_PENALTY`), so the economic cost is both a one-time loss of principal and a persistent reduction in future earnings. Seed validators are exempt (`SEED_SLASH_EXEMPT`).
-
-A validator whose post-slash stake falls below `VALIDATOR_MIN_STAKE` becomes ineligible for the active set via the existing `canBeActive` check, and rotation removes it on the next epoch boundary. A validator that has requested unregistration is *not* immediately immune: its record, address index, and stake persist for the full `UNBONDING_PERIOD`, and remain slashable throughout. A proof that lands during the window is applied as normal, and the stake return at expiry is the *post-slash* amount.
-
-#### How equivocation is detected and slashed
-Nodes detect conflicting votes during the prevote phase. Both votes' signatures are verified before the conflict is recorded as evidence. A forged conflict -- a second vote from a known signer with a garbage signature -- is rejected rather than stored, because an unverifiable conflict would otherwise poison the proposer's evidence buffer and prevent it from proposing. A conflict whose block is not yet known is dropped and re-delivered when the block arrives. Evidence survives round and height transitions, bounded by `MAX_EQUIVOCATION_EVIDENCE` (256 entries), and the proposer includes a `TxType::Slash` transaction carrying the proof in the next block it builds. Every node independently verifies the proof during block application. Verification checks framing, `(height, round, signer)` agreement, value disagreement, signer range, validator registration, and both Ed25519 signatures over the domain-separated vote hash. A block containing an invalid Slash proof is rejected. Once a Slash tx commits, every node erases matching evidence by scanning the committed block.
-
-Signatures are verified against `ValidatorInfo::effectiveConsensusKey()`, so a validator that has split its reward address from its consensus key remains slashable for any vote signed under its consensus key.
-
-A Slash tx whose target is ineligible -- a seed, an unregistered validator, or a validator with nothing left to slash -- is a no-op at the executor level: `executeSystemSlash` returns `Success` with a zero receipt, and the block is accepted. Ineligibility is a *policy* outcome, not evidence of a malformed block. Returning `Failure` here would let a proposer halt the chain by including a Slash tx against a seed in every block it produces, because `BlockProcessor` treats a failed Slash as a block-level error. The proof's *validity* is enforced upstream: `verifyEquivocationProof` rejects an invalid proof, and the block is rejected on that basis. The distinction matters: **policy rejection must not be a block-level error.**
-
-#### Timeout certificate
-Each round that times out is attested by a broadcast `TimeoutVote` -- a signature over `(height, round)` with the attesting validator's index in the committed set. A node that has timed out 30 or more consecutive rounds and holds f+1 valid attestations at a round >= 30 can include them in an emergency block header. A node that has not yet accumulated f+1 attestations refuses to propose an emergency block; the round stalls rather than emitting a block every verifier will reject. The certificate is verified by every node's `validateProposal` and re-verified on-chain by `BlockProcessor::applyBlock` before the emergency set is honoured. The certificate's signers are drawn from the **committed** set, since that's the set that was trying to run when the stall began; the emergency set only exists once a certificate is honoured.
-
 ## Network: how nodes talk
 
-**TCP transport** over IPv4 and IPv6. Each peer connection goes through a handshake: exchange version messages, verify protocol compatibility, exchange a signed challenge, exchange addresses. Once established, peers route messages by type -- proposals, votes, transactions, block announcements, sync requests, proof requests, and peer address requests.
+**TCP transport** over IPv4 and IPv6. Each peer connection goes through a handshake: exchange version messages, verify protocol compatibility, exchange a signed challenge-response, complete a session-key confirmation, exchange addresses. Once established, peers route messages by type -- proposals, votes, transactions, block announcements, sync requests, proof requests, and peer address requests -- over an encrypted channel.
 
 #### Message framing
-10-byte header (4-byte magic, 2-byte type, 4-byte length) followed by an opaque payload. Magic is chain-ID-based, so peers on different networks don't connect. Max message size is 16 MiB.
+10-byte header (4-byte magic, 2-byte type, 4-byte length) followed by an opaque payload. Magic is chain-ID-based, so peers on different networks don't connect. Max message size is 16 MiB. The header is always plaintext; the payload is encrypted once the session is established (see [Session encryption](#session-encryption)).
 
 #### Handshake
-After TCP connect, the two peers exchange `Version` messages (protocol version, network nonce, agent string, best chain height, listen port). They then exchange `Verack` acknowledgements. Finally, they exchange `Auth` messages -- a signed challenge-response that proves possession of the public key declared in the message.
+After TCP connect, the two peers exchange `Version` messages (protocol version, network nonce, agent string, best chain height, listen port). They then exchange `Verack` acknowledgements. Then they exchange `Auth` messages -- a signed challenge-response carrying both the peer's identity public key and an X25519 ephemeral public key. Finally they exchange `AuthReady` messages, which confirm that both sides derived the same session key. Only after `AuthReady` is a peer considered `Established`.
 
 #### Authentication
-Every peer must complete the `Auth` exchange before reaching `Established`. The challenge is `Blake2b(initiator_nonce || responder_nonce || pubkey)`, so a signature captured from one session can't be replayed in another. The pubkey is bound to the peer's validator ID by looking up the validator whose consensus key matches -- a non-validator peer is still authenticated but claims `validator_id = 0`. Failed auth is an immediate ban. Peers are not encrypted; a MITM can drop or substitute messages but cannot forge signatures.
+Every peer must complete the `Auth` exchange before reaching `Established`. The challenge is `Blake2b(initiator_nonce || responder_nonce || identity_pubkey || ephemeral_pubkey)`, so a signature captured from one session can't be replayed in another, and a MITM cannot substitute the ephemeral key without invalidating the signature. The identity pubkey is bound to the peer's validator ID by looking up the validator whose consensus key matches -- a non-validator peer is still authenticated but claims `validator_id = 0`. Failed auth is an immediate ban.
+
+The `Auth` message also carries an X25519 ephemeral public key, which the signature covers. This key is the input to the session-key agreement (see [Session encryption](#session-encryption)). It is generated fresh per peer connection and never persisted.
 
 On a validator node, the daemon uses the validator's consensus key as its node identity. On a non-validator, it loads or generates a per-node key at `<data_dir>/node_key`.
+
+#### Session encryption
+After `Auth` completes, the two peers exchange an `AuthReady` message. This is the synchronization point for the encrypted session: each side sends `AuthReady` only after it has both sent and verified the peer's `Auth`, so neither side ever encrypts before the other can decrypt.
+
+The session key is derived from `X25519(our_ephemeral_secret, their_ephemeral_public)` combined with both ephemeral public keys, both identity public keys, and both network nonces, all hashed through Blake2b with a domain separator. The result is split into two directional keys via labelled Blake2b calls -- the lower-nonce side sends under one key and receives under the other, and the roles flip on the higher-nonce side. The AAD on every AEAD frame binds the message type and the direction, so a frame cannot be replayed in the reverse direction or reframed as a different type.
+
+`AuthReady` itself is the first encrypted message; its AEAD tag is the key-confirmation. If the two sides derive different keys (a bug, a version mismatch, or an active attacker), the tag fails to verify, and the peer is closed without a ban -- a session-key disagreement is not evidence of misbehavior.
+
+Every message after `AuthReady` is encrypted with XChaCha20-Poly1305. Each direction has its own 8-byte counter, zero-padded to the 24-byte extended nonce, and no nonce is ever reused. The identity keys are not used for key agreement -- an ephemeral X25519 keypair per session gives forward secrecy, which a static-static exchange on the identity key would not.
 
 #### Sync
 A peer that falls behind catches up via `GetHeaders` / `Headers` / `GetBlocks` / `Blocks`. The `SyncManager` per peer drives a small state machine -- request headers, receive them, request blocks, apply them, repeat -- bounded by `MAX_HEADERS_PER_REQUEST = 2000` and a computed `MAX_BLOCKS_PER_REQUEST` that fits in one message. Blocks are applied through `Node::applyCommittedBlock`, the same path consensus uses, so sync and consensus stay consistent. Requests time out (30 s for headers, 60 s for blocks); timeouts score the peer but don't disconnect.
@@ -381,13 +331,60 @@ Proofs can be requested against the current head (a sentinel version) or against
 Serving a proof is expensive -- a 256-level tree walk plus a ~9 KB response -- so `GetProof` carries a higher rate-limit cost than a header request, and `Proof` carries a non-trivial cost because the receiving peer still has to deserialize and re-verify the proof.
 
 #### Rate limiting
-Each peer has a token bucket for its message stream, plus a stricter separate bucket for consensus messages. The cost per message reflects the asymmetry of work -- `GetHeaders` and `GetBlocks` cost 20 tokens, `GetProof` costs 50, `Tx` costs 5, `Proof` costs 5, control messages cost 1, consensus messages use the separate bucket. A peer that floods expensive-to-serve messages is cut off and disconnected. The RPC layer has its own per-source-IP token bucket with the same `Common::RateLimiter`.
+Each peer has a token bucket for its message stream, plus a stricter separate bucket for consensus messages. The cost per message reflects the asymmetry of work -- `GetHeaders` and `GetBlocks` cost 20 tokens, `GetProof` costs 50, `Tx` costs 5, `Proof` costs 5, control messages cost 1, consensus messages use the separate bucket. A peer that floods expensive-to-serve messages is cut off and disconnected.
+
+Above the per-peer buckets is a **node-wide aggregate bucket**. The per-peer bucket bounds what any one peer can do; it does not bound the sum: many peers each staying under their own cap can still saturate the io_context thread's serving capacity. The aggregate bucket is charged by message type at the same point the per-peer bucket is, using a separate and deliberately compressed cost table -- `GetProof` costs 10 at the aggregate level, not 50, because a single legitimate proof request should not consume an eighth of the budget. Consensus types are charged at the aggregate level even though they bypass the per-peer general bucket; a crowd of non-validators sending junk proposals is a real flood vector. A trip on the aggregate bucket closes the offending connection **without** reporting misbehavior or banning -- a peer behind a shared NAT can trip the aggregate budget through no fault of its own. Both buckets use `Common::RateLimiter`; both are disabled by setting their burst and refill to zero.
+
+The RPC layer has its own per-source-IP token bucket with the same `Common::RateLimiter`.
 
 #### Peer management
 An address book stores known peers, persisted to disk. A ban list records misbehaving peers, with a threshold at which they're banned. Outbound connection maintenance dials enough peers to maintain a target. The manager also handles inbound connections up to a maximum.
 
 #### Self-connection prevention
-Each node generates a random 64-bit network nonce at startup. The nonce is exchanged during handshake. If a node receives a version message with its own nonce, it closes the connection -- it has dialed itself.
+Each node generates a random 64-bit network nonce at startup. The nonce is exchanged during the Version handshake. If a node receives a Version message with its own nonce, it closes the connection -- it has dialed itself. The check is done after the Version exchange and before `Verack`, so both sides observe the nonce before either transitions to the auth phase.
+
+## Metrics: how operators watch the node
+
+Clarity exposes a **Prometheus-compatible metrics endpoint** on a separate port from the RPC endpoint. It is enabled by default, bound to `127.0.0.1:9100`, and speaks the Prometheus text exposition format (`text/plain; version=0.0.4`).
+
+The endpoint lives on its own HTTP server, independent of the RPC server: a separate port, a separate worker pool, a separate rate limiter, and a separate handler. This is deliberate. RPC endpoints are frequently exposed to the public internet, and metrics endpoints frequently are not — the operator should be able to make that choice for each independently. The two also have different audiences: RPC is for application clients, metrics is for scrapers, and combining them would force both to share a policy.
+
+**Defaults.**
+
+```
+--metrics               enable the endpoint (default: on)
+--no-metrics            disable the endpoint entirely
+--metrics-bind <addr>   bind address (default: 127.0.0.1)
+--metrics-port <port>   listen port (default: 9100)
+--metrics-include-validators
+                        include per-validator metrics (default: off)
+```
+
+The per-validator block adds six time series per active validator. On a 100-validator chain that's 600 series per node, fine for a monitoring stack but wasteful for an operator who just wants to watch their own node. Off by default.
+
+**Scraping.**
+
+```
+curl -s http://127.0.0.1:9100/metrics
+```
+
+On a two-validator regtest network with the defaults, the endpoint returns roughly 50 fixed series plus the per-validator block if it's enabled. The metric families are:
+
+| Group | What it reports |
+|---|---|
+| `clrty_height`, `clrty_running`, `clrty_chain_id`, `clrty_uptime_seconds` | Node identity and liveness |
+| `clrty_p2p_*` | Peer counts by direction and state, ban list size, address book size, aggregate rate-limiter config |
+| `clrty_mempool_*` | Pending transaction count, byte size, fee-tier split, fee-rate min/max/avg, and cumulative accept/reject counters with a `reason` label |
+| `clrty_storage_*` | On-disk database size, block count, SMT node and leaf counts |
+| `clrty_pot`, `clrty_total_supply`, `clrty_total_staked`, `clrty_staker_count`, `clrty_last_effective_apy_bps`, `clrty_current_epoch`, `clrty_blocks_until_epoch` | Reward pool and staking state |
+| `clrty_consensus_*`, `clrty_active_set_size` | Consensus height, round, step ordinal, proposer flag, vote counts, consecutive timeouts, emergency rotation state, active set size and quorum threshold |
+| `clrty_validator_*` (opt-in) | Per-validator stake, uptime EMA, reward multiplier, cumulative rewards and blocks produced, pending unbond height |
+
+**Failure modes.** A path other than `/metrics` returns `404`. A method other than `GET` returns `405`. If a subsystem accessor throws during rendering, the whole scrape returns `500` rather than emitting a partial body — a partial scrape would leave some metrics at their last values while others errored, and Prometheus would silently carry the stale values forward. A clean failure is the honest signal.
+
+**Concurrency.** The scrape runs on the metrics server's worker thread, never on the P2P event loop. Every value comes from one of four sources: `Node::Status` (a value struct returned by `Node::status()`), the memory-mapped database through `StateAccess`, lock-free atomic counters on `P2PManager` (read via `snapshot()`), or value-returning accessors on `Mempool` and `BftConsensus` that take their own short-lived mutexes. None of them requires posting a request to the event loop and waiting for a reply. A scrape never blocks on the event loop, and the event loop never blocks on a scrape.
+
+**Port collisions.** Running two daemons on one host requires each to have a distinct metrics port. The second daemon binds `9101`, the third `9102`, and so on — the same as with any other network service. The [Setup Clarity REGTEST](https://github.com/nullcryptodev/Clarity/blob/main/SETUP-REGTEST.md) guide shows this pattern for the two-validator devnet.
 
 ## RPC: how clients talk
 
@@ -463,17 +460,9 @@ The wallet layer supports the operations you'd need for an address book -- multi
 
 **No order matching engine.** Orders are stored, indexed by expiry, and can be cancelled -- but nothing *fills* them. There is no code that matches buys against sells, no partial-fill logic, no price-time priority queue. The order book exists in the state model but not in the execution model. This is the single largest feature gap.
 
-**No P2P encryption.** Authentication is done -- every peer proves possession of its key. But the channel itself is plaintext. A MITM can drop messages or substitute them; they can't forge signatures, but they can cause liveness failures. An authenticated-encryption layer (Noise, or a simple ECDH + ChaCha20-Poly1305 wrap) would close this.
-
-**No aggregate rate limiting at the P2P layer.** Each peer is limited individually, but 100 peers each at their per-peer cap can collectively saturate the io_context thread's serving capacity. An aggregate cap ("no more than N headers served per second across all peers") would close this.
-
-**No RPC authentication beyond the admin token.** Read methods are unauthenticated. If the RPC endpoint is exposed to the public internet, anyone can query balances, blocks, and state roots. That's usually fine for a public node; it becomes a problem if the RPC endpoint is also used as a control plane.
-
-**No metrics endpoint.** There's no Prometheus exporter, no `/metrics`, no structured healthcheck. Operators get logs.
+**No RPC authentication beyond the admin token.** Read methods are unauthenticated. If the RPC endpoint is exposed to the public internet, anyone can query balances, blocks, and state roots. That's usually fine for a public node; it becomes a problem if the RPC endpoint is also used as a control plane. The metrics endpoint is bound to loopback by default for the same reason, but has no authentication at all -- the design assumes that a scrape endpoint on a private interface is not a secret.
 
 **No consensus key rotation.** A validator's consensus key is set at registration and immutable. Rotating it means unregistering and re-registering, which forfeits uptime history. This is a deliberate choice -- mutable consensus keys would invalidate every prior signature by the same validator and complicate equivocation proofs -- but it means a validator with a compromised consensus key has no recovery path short of full re-registration.
-
-**Emergency rotation is tested in isolation but not end to end.** The derivation, the block path, the timeout counter, the certificate verifier, vote verification, and evidence lifetime all have unit tests. What is *not* tested is a live network driving through 30 rounds of genuine stall and asserting recovery -- the `ConsensusNetwork` fixture does not model offline validators or pool promotion candidates. A randomized multi-node simulator with partition and offline-node injection would close this.
 
 **No wallet CLI for address-book operations.** The `clarity-wallet` client covers balance, transfer, staking, and validator operations, but not multi-account management, address labels, or key rotation from the CLI. Integrators still drive those through the library.
 
@@ -534,3 +523,17 @@ Proofs can be requested against historical versions because the SMT keeps histor
 **Persistent mempool.** The mempool writes through to a dedicated MDBX table (`TBL_MEMPOOL`) on every mutation -- add, remove, removeIncluded, purgeExpired, clear. On startup, `Node::initMempool` rebuilds the pool by re-adding each persisted entry through the normal validation path; entries that fail (nonce too low, insufficient funds, expired, already on chain) are dropped and their rows deleted. This means a transaction submitted before a restart is still in the pool after the node comes back -- important for the case where a user submits a tx and the operator restarts their validator before the next block commits it. The persisted entry carries the full `Entry` (tx, tier, fee rate, sequence, add time), not just the transaction, so priority status and eviction ordering survive a restart.
 
 **Command-line consensus key.** The daemon reads the validator's consensus key from `--consensus-key <hex>`. This is a development convenience for the regtest devnet, where spinning up a two-validator network from a shell script should take a few commands and no persistent state. For a production validator, a file-based flag (`--consensus-key-file`) with restrictive permissions is the recommended path and will be added before launch. The command-line form is documented in `--help` as dev-only.
+
+**`AuthReady` is the synchronization point for encryption.** The two `Auth` messages cross on the wire, so a peer that finishes processing `Auth` may not yet have received the peer's `Auth` -- meaning it may not yet know the peer's ephemeral key, and therefore cannot yet derive the session key. The fix is a fourth handshake message, `AuthReady`, sent only after both `Auth` messages have been sent and verified. Neither side encrypts anything before sending `AuthReady`, and neither accepts anything encrypted before receiving the peer's. The message itself is empty; its AEAD tag is the confirmation that the two sides derived the same key from the same inputs. A wrong key produces a failing AEAD, not a false acceptance, so key disagreement is detected at the earliest possible point and before any application data flows.
+
+**Directional session keys, not a shared one.** The session key agreement produces two keys, not one. The lower-nonce side sends under one and receives under the other; the higher-nonce side does the reverse. This is not strictly necessary for confidentiality -- a single shared key with a per-direction nonce counter is also safe -- but it removes the class of bug where the two directions accidentally share a nonce space. The AAD additionally binds a direction tag, so a frame reflected back to its sender fails authentication even if the nonce and key happened to collide. The cost is one extra Blake2b call per session, which is free in any accounting that matters.
+
+**The aggregate rate-limiter cost table is deliberately not `messageCost`.** The per-peer bucket assigns `GetProof` a cost of 50 because serving one proof is roughly 50× a control message. At the aggregate level that ratio is wrong: a single legitimate proof request would consume 20% of a modest aggregate budget and starve header sync. The aggregate table compresses the ratio -- `GetProof` is 10, `GetHeaders`/`GetBlocks` are 5, relay and consensus types are 3, control is 1 -- so expensive work is shed first without letting one legitimate request dominate. The two tables are in separate translation units (`MessageTypes.cpp` and `AggregateLimiter.cpp`) so a future edit to one cannot silently change the other.
+
+**Metrics is a pull, not a push.** The node never sends metrics anywhere. A Prometheus-compatible scraper asks for them, and the node answers. That means the metrics endpoint is bounded by what a scraper can request, not by what the node chooses to send — an unreachable monitoring system causes zero work at the node. The alternative, push-based metrics, adds failure modes (what happens when the push target is down? buffer? drop? back off?) that a scrape-driven endpoint simply doesn't have. This is not a novel design; it's the same reason Prometheus exists, and Bitcoin Core, geth, and Erigon all follow it.
+
+**The scrape path reads through `Node::status()`, not from the event loop.** Every metric the handler emits comes from one of four sources: `Node::Status` (a value struct), the memory-mapped database (through `StateAccess`), lock-free atomics on `P2PManager`, or value-returning accessors on `Mempool` and `BftConsensus` that take their own short-lived mutexes. None of them requires posting a request to the P2P event loop and waiting for a reply. That's the property that keeps a metrics scrape from ever blocking on message handling, and it's why `P2PManager::snapshot()` exists — it reads atomic counters rather than iterating the peer table, which is only safe from the event loop. `P2PManager::peerList()`, which does post to the event loop, is deliberately **not** called by the metrics handler.
+
+**Each handler owns its own method contract.** The HTTP transport layer (`HttpConnection`) validates only what's universal: the HTTP version, the method is one the server speaks at all (`GET` or `POST`), and the request size is under the global limit. Everything else — which method is valid for which path, whether a body is required, what content type is acceptable — is the handler's job. This split is what makes `POST /metrics` return `405 use GET for metrics` from the metrics handler rather than `400 Content-Length is required` from the transport. The first is the correct diagnosis; the second is a true statement about a request whose real problem is that it targeted the wrong handler. `JsonRpcDispatcher` and `MetricsHandler` both implement `IHttpHandler`, both check their own method contract, and both return their own error responses for violations.
+
+**`clrty_` is a namespace, not decoration.** Every metric name carries the `clrty_` prefix. Prometheus treats metric names as a flat global namespace across every exporter the server scrapes — `node_`, `postgres_`, `nginx_`, `ethereum_`, and so on all live in the same bag. A metric named `height` would collide with `height` from any of a dozen other exporters, and the operator would have to disambiguate every query with `{job="clarity"}`. The prefix costs a few bytes per scrape (compressed on the wire by Prometheus's default gzip) and saves the operator from writing longer queries forever. This is the same reason every well-behaved Prometheus exporter in existence prefixes its metrics.

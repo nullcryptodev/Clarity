@@ -21,6 +21,7 @@
 #include "Node/Node.h"
 #include "RPC/Config.h"
 #include "RPC/HttpServer.h"
+#include "RPC/HttpServerConfig.h"
 #include "RPC/JsonRpcDispatcher.h"
 
 using namespace Tests;
@@ -89,7 +90,7 @@ TEST(RPC_RpcRateLimit, DisabledByDefaultNoLimit)
   cfg.rate_limit_per_second = 0;
 
   Rpc::JsonRpcDispatcher dispatcher(node, cfg);
-  Rpc::HttpServer server(cfg, dispatcher, logger);
+  Rpc::HttpServer server(Rpc::httpServerConfigFrom(cfg), dispatcher, logger);
   server.start();
 
   // Twenty requests in a row should all succeed.
@@ -115,7 +116,7 @@ TEST(RPC_RpcRateLimit, ExhaustedBurstReturns429)
   cfg.rate_limit_per_second = 1;
 
   Rpc::JsonRpcDispatcher dispatcher(node, cfg);
-  Rpc::HttpServer server(cfg, dispatcher, logger);
+  Rpc::HttpServer server(Rpc::httpServerConfigFrom(cfg), dispatcher, logger);
   server.start();
 
   int got_429 = 0;

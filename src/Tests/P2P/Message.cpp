@@ -221,3 +221,9 @@ TEST(P2P_P2PMessage, FactoryMethods)
   EXPECT_TRUE(Message::ping().payload.empty());
   EXPECT_TRUE(Message::pong().payload.empty());
 }
+
+TEST(P2P_MessageType, AuthReadyHasNameAndCost)
+{
+  EXPECT_EQ(messageTypeName(MessageType::AuthReady), "authready");
+  EXPECT_EQ(messageCost(MessageType::AuthReady), 1u);
+}

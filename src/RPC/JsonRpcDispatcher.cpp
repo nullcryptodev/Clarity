@@ -10,6 +10,40 @@
 
 namespace Rpc
 {
+  namespace
+  {
+    std::string toLower(std::string_view s)
+    {
+      std::string out;
+      out.reserve(s.size());
+      for (char c : s)
+        out.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+      return out;
+    }
+
+    std::string trim(std::string_view s)
+    {
+      size_t start = 0;
+      while (start < s.size() && (s[start] == ' ' || s[start] == '\t'))
+        ++start;
+      size_t end = s.size();
+      while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t'))
+        --end;
+      return std::string(s.substr(start, end - start));
+    }
+
+    bool contentTypeIsJson(const std::string &ct)
+    {
+      std::string lower = toLower(ct);
+      auto semi = lower.find(';');
+      std::string base = semi == std::string::npos ? lower : lower.substr(0, semi);
+      base = trim(base);
+      return base == "application/json" ||
+             base == "application/json-rpc" ||
+             base == "application/jsonrequest" ||
+             base == "text/plain";
+    }
+  }
 
   //  Construction
 
@@ -270,6 +304,119 @@ namespace Rpc
                        makeError(ErrorCode::InvalidRequest,
                                  "request must be an object or an array"))
                        .toJson();
+    return out;
+  }
+
+  //  IHttpHandler implementation
+
+  HttpResponse JsonRpcDispatcher::handle(const HttpRequest &request)
+  {
+    HttpResponse out;
+
+    // ---- Path routing ----
+
+    if (request.path != "/" && request.path != "/rpc")
+    {
+      out.status = 404;
+      out.content_type = "text/plain";
+      out.body = "path must be / or /rpc\n";
+      return out;
+    }
+
+    // ---- GET: friendly banner ----
+
+    if (request.method == "GET")
+    {
+      out.status = 200;
+      out.content_type = "text/plain";
+      out.body = "Clarity RPC. Send POST /rpc with a JSON-RPC 2.0 request.\n";
+      return out;
+    }
+
+    // ---- POST framing checks ----
+    //
+    //  These checks used to live in HttpConnection::handleRequest,
+    //  where they applied to every POST that reached the transport
+    //  layer. That was wrong when the metrics handler was added:
+    //  POST /metrics is a request that targets the wrong handler,
+    //  and the right response is 405 "use GET for metrics" from
+    //  that handler, not 400 "Content-Length is required" from
+    //  the transport. Moving the checks here lets each handler
+    //  own its own method and framing contract.
+    //
+    //  For the RPC handler specifically: a POST is required to
+    //  carry a body (Content-Length), and the body is required to
+    //  be JSON (or a content-type the client library uses to mean
+    //  JSON-RPC). If either is missing, reject with the specific
+    //  error before attempting to parse.
+
+    if (!request.content_type.empty() &&
+        !contentTypeIsJson(request.content_type))
+    {
+      out.status = 415;
+      out.content_type = "text/plain";
+      out.body = "Content-Type must be application/json\n";
+      return out;
+    }
+
+    if (!request.has_content_length)
+    {
+      out.status = 400;
+      out.content_type = "text/plain";
+      out.body = "Content-Length is required\n";
+      return out;
+    }
+
+    // ---- POST: parse body as JSON, then dispatch ----
+    //
+    // Content-Type and Content-Length were validated above; by the
+    // time we're here, the body is present and non-empty for any
+    // request that had a Content-Length.
+
+    Common::Json input;
+    try
+    {
+      input = Common::Json::parse(request.body);
+    }
+    catch (const std::exception &)
+    {
+      // JSON parse failure: emit a JSON-RPC ParseError response
+      // with HTTP 200. JSON-RPC errors do not use HTTP status
+      // codes to convey their nature.
+      Common::Json err = Common::Json::object();
+      err["jsonrpc"] = "2.0";
+      err["error"] = makeError(ErrorCode::ParseError);
+      err["id"] = nullptr;
+
+      out.status = 200;
+      out.content_type = "application/json";
+      out.body = err.dump();
+      return out;
+    }
+
+    // ---- Dispatch ----
+
+    // Set the auth context so admin methods can read the header.
+    // The thread-local is set here because the dispatcher's method
+    // handlers don't take the request headers — they only take the
+    // JsonRpcRequest. Clearing it after dispatch keeps the
+    // thread-local scoped to this call.
+    Rpc::setCurrentAuthorization(request.authorization);
+    auto result = dispatchJson(input);
+    Rpc::setCurrentAuthorization({});
+
+    if (result.is_empty)
+    {
+      // Notification-only request or batch. 204 with no body.
+      out.status = 204;
+      out.content_type = "text/plain";
+      out.body.clear();
+      return out;
+    }
+
+    out.status = 200;
+    out.content_type = "application/json";
+    out.body = result.response.dump();
     return out;
   }
 

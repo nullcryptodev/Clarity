@@ -120,12 +120,22 @@ cd Clarity/build/src/Apps/Daemon
   --rpc \
   --rpc-bind 127.0.0.1 \
   --rpc-port 9634 \
-  --rpc-cors '*'
+  --rpc-cors '*' \
+  --metrics-port 9101
 ```
 
 Replace `<wallet-N-consensus-secret>` with the actual secret from Step 2. The `--rpc-cors '*'` flag allows browser-based clients (like a block explorer) to reach the RPC; omit it if you only need shell access.
 
-Start validator 1 first. Its RPC binds to port 9633. Start validator 2 second — it connects to validator 1 at `127.0.0.1:22001` and binds its own RPC to 9634.
+**On `--metrics-port 9101` for validator 2.** The metrics endpoint is enabled by default on every daemon, bound to `127.0.0.1:9100`. Running two daemons on one host means the second one can't bind 9100 — the first already has it. The `--metrics-port 9101` flag moves validator 2's metrics endpoint to a different port. Validator 1 keeps the default (9100). If you don't want metrics at all on the second daemon, pass `--no-metrics` instead; the effect on the rest of the setup is the same.
+
+To scrape either node's metrics:
+
+```
+curl -s http://127.0.0.1:9100/metrics   # validator 1
+curl -s http://127.0.0.1:9101/metrics   # validator 2
+```
+
+Start validator 1 first. Its RPC binds to port 9633 and its metrics to 9100. Start validator 2 second — it connects to validator 1 at `127.0.0.1:22001`, binds its own RPC to 9634, and its metrics to 9101.
 
 ## Step 6 — Verify the network is producing blocks
 
