@@ -375,6 +375,12 @@ namespace State
     bool getMetaImpl(const std::string &key,
                      std::vector<uint8_t> &out) const;
 
+    // Release the autocommit read txn if one is held. Called at the
+    // top of every write method. MDBX refuses to open a write txn on
+    // a thread that already has a read txn open; the next read after
+    // this method returns will transparently acquire a fresh one.
+    void releaseReadTxnIfHeld();
+
     // =================================================================
     //  Index write helpers. Each is a small wrapper that picks the
     //  right table and key layout for one index row. They are called
@@ -436,8 +442,6 @@ namespace State
                                       const EntryVisitor &visitor) const;
 
     size_t readTableCount(uint32_t table_id) const;
-
-    void releaseReadTxnIfHeld();
 
     StateDB &db_;
     StateDB::Txn *txn_{nullptr};

@@ -1350,6 +1350,26 @@ namespace Node
       head.height = block.header.height;
       chain_db_->setHeadTxn(txn, head);
 
+      //  Persist the receipts. Written inside the same MDBX txn as
+      //  the block and head, so a crash cannot leave a committed
+      //  block whose receipts are missing. This is the write side
+      //  of ChainDB::getReceipt, which the RPC reads.
+      //
+      //  result.receipts is populated by BlockProcessor::applyBlock
+      //  in the same order as block.transactions, so the index i
+      //  here matches the tx_index we write into the receipt row.
+      for (size_t i = 0; i < result.receipts.size(); ++i)
+      {
+        const Core::Transaction &tx = block.transactions[i];
+        const Core::Receipt &r = result.receipts[i];
+
+        chain_db_->storeReceiptTxn(txn,
+                                   tx.txid(),
+                                   block.header.height,
+                                   static_cast<uint32_t>(i),
+                                   r.serializeState());
+      }
+
       txn.commit();
     }
     catch (const std::exception &e)

@@ -1381,6 +1381,17 @@ namespace Consensus
           config_.max_block_txs);
     }
 
+    //  Sum the fees of every transaction in the block. This field is
+    //  part of the header and is read by the block-apply path
+    //  (bumpLifetimeCounters, sumFeesInWindow, getBlockStats). If it
+    //  is left at its default of zero, the lifetime fee counter
+    //  never advances and getFeeStats reports zeros on a chain that
+    //  is collecting fees.
+    uint64_t total_fees = 0;
+    for (const auto &tx : block.transactions)
+      total_fees += tx.fee;
+    block.header.total_fees = total_fees;
+
     block.header.tx_root = Core::computeTxRoot(block.transactions);
     block.header.tx_count = static_cast<uint32_t>(block.transactions.size());
     block.header.validator_set_root = Core::computeValidatorSetRoot(active);

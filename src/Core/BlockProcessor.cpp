@@ -102,6 +102,18 @@ namespace Core
     //  "fees ever paid", pot is "rewards currently unclaimed".
     void bumpLifetimeCounters(State::StateAccess &state, const Block &block)
     {
+      //  tx_counter and total_fees_lifetime are aggregation counters:
+      //  they are read by the RPC to display explorer statistics, and
+      //  nothing in the block-apply path branches on them. Keeping
+      //  them in the SMT would make the state root depend on values
+      //  that no verifier needs to reproduce, and it would invalidate
+      //  every previously-committed block whose state_root was
+      //  computed before these counters existed.
+      //
+      //  They belong in the meta table alongside total_to_pot,
+      //  total_pot_distributed, and last_effective_apy_bps, which are
+      //  the same category of value.
+
       uint64_t tx_counter = state.getMetaU64("tx_counter");
       tx_counter += block.transactions.size();
       state.putMetaU64("tx_counter", tx_counter);

@@ -183,6 +183,32 @@ namespace Core
     return true;
   }
 
+  void ChainDB::storeReceiptTxn(State::StateDB::Txn &txn,
+                                const Crypto::Hash &tx_hash,
+                                uint64_t block_height,
+                                uint32_t tx_index,
+                                const std::vector<uint8_t> &serialized_receipt)
+  {
+    // Same value layout as storeReceipt: block_height (8 LE) ||
+    // tx_index (4 LE) || receipt bytes. The txn-aware variant exists
+    // so the write is part of the block-commit txn instead of a
+    // separate MDBX commit that could fail after the block committed.
+    std::vector<uint8_t> value;
+    value.reserve(12 + serialized_receipt.size());
+
+    for (int i = 0; i < 8; ++i)
+      value.push_back(uint8_t(block_height >> (i * 8)));
+    for (int i = 0; i < 4; ++i)
+      value.push_back(uint8_t(tx_index >> (i * 8)));
+    value.insert(value.end(),
+                 serialized_receipt.begin(),
+                 serialized_receipt.end());
+
+    txn.put(TBL_RECEIPTS,
+            tx_hash.data.data(), tx_hash.data.size(),
+            value.data(), value.size());
+  }
+
   //  Chain head
 
   ChainDB::ChainHead ChainDB::getHead() const

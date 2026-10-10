@@ -25,7 +25,7 @@ namespace Core
   //  Tables used (added to StateDB):
   //    - blocks_by_hash:   block_hash (32B) → serialized Block
   //    - blocks_by_height: height (8B LE)   → block_hash (32B)
-  //    - receipts:         tx_hash (32B)    → serialized Receipt (already exists)
+  //    - receipts:         tx_hash (32B)    → height(8) || tx_index(4) || receipt
   //    - meta:             "chain_head"     → 32B hash + 8B height
   //
   //  All methods are safe to call from multiple threads. The underlying
@@ -45,20 +45,11 @@ namespace Core
 
     // ---- Block storage ----
 
-    // Store a block. The block's hash is computed from its header.
-    // Idempotent: re-storing the same block is a no-op.
     void storeBlock(const Block &block);
-
-    // Store a block with a pre-computed hash. Used for genesis where the
-    // hash is derived from the block itself, and for testing.
     void storeBlock(const Block &block, const Crypto::Hash &hash);
 
     // Txn-aware variants. Writes go through the given txn so the caller
     // can commit block index writes atomically with state writes.
-    //
-    // Use this from Node::applyCommittedBlock: without it, the state is
-    // committed in one txn and the block index in another, and a crash
-    // between the two leaves state ahead of the chain head.
     void storeBlockTxn(State::StateDB::Txn &txn,
                        const Block &block,
                        const Crypto::Hash &hash);
@@ -83,11 +74,28 @@ namespace Core
     bool hasBlockAtHeight(uint64_t height) const;
 
     // ---- Receipts ----
+    //
+    // The receipt write path is txn-aware. Node::applyCommittedBlock
+    // writes every receipt inside the same MDBX txn as the block and
+    // head it belongs to, so a crash cannot leave a confirmed tx
+    // whose receipt is missing. Layout:
+    //
+    //   key   = tx_hash (32 bytes)
+    //   value = block_height (8 LE) || tx_index (4 LE) || receipt bytes
+    //
+    // The RPC reads via getReceipt(), which strips the 12-byte prefix
+    // and returns just the receipt payload.
 
     void storeReceipt(const Crypto::Hash &tx_hash,
                       uint64_t block_height,
                       uint32_t tx_index,
                       const std::vector<uint8_t> &serialized_receipt);
+
+    void storeReceiptTxn(State::StateDB::Txn &txn,
+                         const Crypto::Hash &tx_hash,
+                         uint64_t block_height,
+                         uint32_t tx_index,
+                         const std::vector<uint8_t> &serialized_receipt);
 
     bool getReceipt(const Crypto::Hash &tx_hash,
                     std::vector<uint8_t> &out) const;
@@ -103,8 +111,6 @@ namespace Core
     ChainHead getHead() const;
     void setHead(const ChainHead &head);
 
-    // Txn-aware head update. Same rationale as storeBlockTxn: the head
-    // must advance in the same atomic unit as the block it points to.
     void setHeadTxn(State::StateDB::Txn &txn, const ChainHead &head);
 
     uint64_t getBestPeerHeight() const;
@@ -124,16 +130,6 @@ namespace Core
     void pruneBelowHeight(uint64_t height);
 
     // ---- Transaction index ----
-    //
-    // Maps a confirmed tx's hash to its position in a block. Written
-    // atomically with the block during storeBlockTxn. Read by RPC's
-    // getTransactionByHash and getTransactionReceipt.
-    //
-    // The index is keyed by txid. If two txs in different blocks had
-    // the same txid (impossible in practice, since nonces are
-    // per-sender and monotonic), the later write would overwrite the
-    // earlier — the index is a convenience lookup, not a source of
-    // truth. The source of truth is the block itself.
 
     struct TxLocation
     {

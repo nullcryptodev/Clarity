@@ -911,8 +911,13 @@ namespace Rpc
 
       State::StateAccess state(node.stateDB(), height);
 
-      const uint64_t tx_counter = readU64Global(state, "tx_counter");
-      const uint64_t total_fees = readU64Global(state, "total_fees_lifetime");
+      //  These two counters are aggregation, not consensus. They live
+      //  in the meta table (written by bumpLifetimeCounters) rather
+      //  than the SMT, so a node that upgrades the code does not
+      //  invalidate blocks it has already committed.
+      const uint64_t tx_counter = state.getMetaU64("tx_counter");
+      const uint64_t total_fees = state.getMetaU64("total_fees_lifetime");
+
       const uint64_t total_supply = readU64Global(state, "total_supply");
       const uint64_t total_staked = readU64Global(state, "total_staked");
       const uint64_t staker_count = readU64Global(state, "staker_count");
@@ -1580,7 +1585,7 @@ namespace Rpc
       //  The APY the last epoch boundary computed. Zero before the
       //  first epoch has closed (heights < ROTATION_INTERVAL).
       const uint64_t last_effective_apy_bps =
-          readU64Global(state, "last_effective_apy_bps");
+          state.getMetaU64("last_effective_apy_bps");
 
       //  Live activity input: transactions in the last
       //  ROTATION_INTERVAL blocks. This is what the activity
@@ -2231,11 +2236,15 @@ namespace Rpc
       return out;
     }
 
-    Common::Json method_getTransactionReceipt(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getTransactionReceipt(Node::Node &node,
+                                              const RpcConfig & /*config*/,
                                               const JsonRpcRequest &req)
     {
       const Crypto::Hash hash = requireHash(req.params, "hash");
 
+      //  Step 1: is this a confirmed tx? The tx index is written
+      //  atomically with the block, so if the index row exists, the
+      //  block is committed.
       auto loc = node.chainDB().getTxLocation(hash);
       if (!loc.has_value())
       {
@@ -2246,13 +2255,28 @@ namespace Rpc
                           {{"hash", encodeHash(hash)}}));
       }
 
-      State::StateAccess state(node.stateDB(), loc->block_height);
-      Core::Receipt receipt;
-      if (!state.getReceipt(hash, receipt))
+      //  Step 2: read the receipt from ChainDB. Receipts are stored
+      //  in TBL_RECEIPTS, not in the SMT. The SMT path
+      //  (StateAccess::getReceipt, Keys::receipt(txid)) is not
+      //  populated by the block processor.
+      std::vector<uint8_t> receipt_bytes;
+      if (!node.chainDB().getReceipt(hash, receipt_bytes))
       {
         throw RpcMethodError(
             ErrorCode::ReceiptNotFound,
             "tx index has the transaction but no receipt is stored",
+            makeErrorData(ErrorCode::ReceiptNotFound,
+                          {{"hash", encodeHash(hash)}}));
+      }
+
+      Core::Receipt receipt;
+      if (!Core::Receipt::deserializeState(receipt_bytes.data(),
+                                           receipt_bytes.size(),
+                                           receipt))
+      {
+        throw RpcMethodError(
+            ErrorCode::ReceiptNotFound,
+            "stored receipt failed to deserialize",
             makeErrorData(ErrorCode::ReceiptNotFound,
                           {{"hash", encodeHash(hash)}}));
       }
@@ -2472,7 +2496,7 @@ namespace Rpc
       const uint64_t height = node.chain().height();
 
       State::StateAccess state(node.stateDB(), height);
-      const uint64_t lifetime = readU64Global(state, "tx_counter");
+      const uint64_t lifetime = state.getMetaU64("tx_counter");
 
       const uint64_t epoch_txs =
           sumTxCountInWindow(node, height, Core::ROTATION_INTERVAL);
@@ -2636,9 +2660,9 @@ namespace Rpc
       State::StateAccess state(node.stateDB(), height);
 
       const uint64_t lifetime_fees =
-          readU64Global(state, "total_fees_lifetime");
+          state.getMetaU64("total_fees_lifetime");
       const uint64_t tx_counter =
-          readU64Global(state, "tx_counter");
+          state.getMetaU64("tx_counter");
 
       const uint64_t epoch_fees =
           sumFeesInWindow(node, height, Core::ROTATION_INTERVAL);
