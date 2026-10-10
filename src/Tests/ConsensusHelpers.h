@@ -218,7 +218,14 @@ namespace Tests
     std::function<void(const Consensus::TimeoutVote &)> on_timeout_vote;
     std::function<std::vector<Core::Transaction>(uint64_t, uint64_t)>
         select_transactions;
-    std::function<void(const Core::Block &)> on_block_committed;
+    std::function<bool(const Core::Block &)> on_block_committed;
+
+    // Fired when the consensus engine halts itself (a committed block
+    // could not be applied after all retries). Tests that care can
+    // install a handler to assert the halt; tests that don't can
+    // leave it unset.
+    std::function<void(const std::string &)> on_consensus_halt;
+
     std::function<void(Height)> on_height_advanced;
 
     //  ---- Builders ----
@@ -331,6 +338,7 @@ namespace Tests
       cb.select_transactions = select_transactions;
       cb.on_block_committed = on_block_committed;
       cb.on_height_advanced = on_height_advanced;
+      cb.on_consensus_halt = on_consensus_halt;
       return cb;
     }
 

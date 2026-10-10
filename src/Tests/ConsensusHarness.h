@@ -251,6 +251,23 @@ namespace Tests
       on_block_committed_ = std::move(f);
     }
 
+    // Fired when the consensus engine halts itself. The reason string
+    // is the one the engine passed to haltConsensus().
+    void setOnConsensusHalt(
+        std::function<void(size_t index, const std::string &)> f)
+    {
+      on_consensus_halt_ = std::move(f);
+    }
+
+    // Return false from the underlying callback to model an apply
+    // failure. When set, the harness's on_block_committed wrapper
+    // returns this value instead of always true; the committed block
+    // is still recorded in committed_[index] so tests can inspect it.
+    void setBlockCommitFails(std::function<bool(size_t)> f)
+    {
+      block_commit_fails_ = std::move(f);
+    }
+
     void setSelectTransactions(
         std::function<std::vector<Core::Transaction>(size_t index,
                                                      uint64_t max_bytes,
@@ -279,6 +296,32 @@ namespace Tests
     {
       return instances_[i]->state().height;
     }
+
+    //  Total blocks committed by every instance, across all heights.
+    //  Convenience for tests that want "how far has the network
+    //  gotten" without iterating instances themselves.
+    size_t totalCommitted() const
+    {
+      size_t n = 0;
+      for (const auto &v : committed_)
+        n += v.size();
+      return n;
+    }
+
+    //  The validator set the env built. Validators are identified by
+    //  the same ids the deps report, so a test can inspect key
+    //  material without reconstructing it.
+    const TestValidator &validator(size_t i) const
+    {
+      return env_.validator(i);
+    }
+
+    //  Direct access to the env. Used by tests that need to install a
+    //  node backend, override the emergency set, or otherwise
+    //  configure the environment after the harness has been
+    //  constructed.
+    const ConsensusTestEnv &env() const { return env_; }
+    ConsensusTestEnv &env() { return env_; }
 
     //  ---- Offline control ----
 
@@ -328,11 +371,30 @@ namespace Tests
     }
 
     //  ---- Proposal suppression ----
-
+    //
+    //  When enabled, proposals are dropped on the *receiving* side in
+    //  deliverAll, but proposers still generate them and the network
+    //  still carries them. Timeout-vote gossip is unaffected. This
+    //  models a fault where proposals are persistently rejected
+    //  (malformed, failing validation, censored by the network layer)
+    //  while the rest of the protocol keeps running, which is exactly
+    //  the condition that drives consecutive_timeouts_ up to
+    //  EMERGENCY_ROTATION_ROUNDS.
+    //
+    //  Emergency proposals are the recovery path and are NOT
+    //  suppressed: the whole point of the fault model is that the
+    //  ordinary path is broken but the emergency path still works.
+    //
+    //  Note: restartValidator re-delivers a peer's proposal via a
+    //  direct onProposal call, bypassing deliverAll. A test that
+    //  enables suppression and then restarts a validator will see
+    //  that one proposal get through. Don't mix the two unless you
+    //  mean to.
     void setProposalSuppressed(bool suppressed)
     {
       proposal_suppressed_ = suppressed;
     }
+
     bool isProposalSuppressed() const { return proposal_suppressed_; }
 
     //  ---- Partition control ----
@@ -413,11 +475,26 @@ namespace Tests
       };
 
       cb.on_block_committed =
-          [this, index](const Core::Block &b)
+          [this, index](const Core::Block &b) -> bool
       {
+        // Record even on failure: the block has a quorum, the engine
+        // decided it, and the test wants to inspect it either way.
         committed_[index].push_back(b);
+
         if (on_block_committed_)
           on_block_committed_(index, b);
+
+        if (block_commit_fails_ && block_commit_fails_(index))
+          return false;
+
+        return true;
+      };
+
+      cb.on_consensus_halt =
+          [this, index](const std::string &reason)
+      {
+        if (on_consensus_halt_)
+          on_consensus_halt_(index, reason);
       };
 
       cb.on_height_advanced =
@@ -457,6 +534,8 @@ namespace Tests
     std::function<std::vector<Core::Transaction>(size_t, uint64_t, uint64_t)>
         select_transactions_;
     std::function<void(size_t, const Core::Block &)> on_block_committed_;
+    std::function<void(size_t, const std::string &)> on_consensus_halt_;
+    std::function<bool(size_t)> block_commit_fails_;
 
     bool proposal_suppressed_{false};
     uint64_t random_seed_{0};

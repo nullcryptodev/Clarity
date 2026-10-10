@@ -2,7 +2,7 @@
 
 # Clarity - Authority rotates, the chain doesn't.
 
-![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C853-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
+![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C861-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
 
 #### Documents
 
@@ -186,7 +186,9 @@ A variant of BFT with three phases per round -- propose, prevote, precommit. Whe
 If a round fails to reach quorum (proposer offline, network partition, timed-out proposal), the round number increments and a new proposer takes over. Timeouts scale exponentially with the round number, capped at a maximum. A proposal for a future round is queued and delivered when the local round advances, so a validator that's briefly behind doesn't drop the round's only proposal.
 
 #### Locking
-A validator locks on a block when it **precommits to that block after seeing a prevote quorum (polka) for it**. The lock is set at precommit time, not prevote time, so a validator that prevoted X but never saw a polka for X is not committed to X and will prevote Y in the next round if Y is proposed. This is a **variant** of the standard Tendermint locking rule (which locks at prevote). The variant is safe -- a validator that precommits X and later precommits Y requires a higher-round polka for Y, and the safety proof holds -- but its liveness properties differ: a validator that saw a polka for X after entering precommit does *not* record it, and so doesn't prevote X in the next round. That's a rare case that delays round-crossing recovery but does not break safety.
+A validator locks on a block when it **precommits to that block after seeing a prevote quorum (polka) for it**. The lock is set at precommit time, not prevote time, so a validator that prevoted X but never saw a polka for X is not committed to X and will prevote Y in the next round if Y is proposed.
+
+A validator that saw a polka for X after entering precommit does *not* record it, and so does not prevote X in the next round. That is a rare case that delays round-crossing recovery but does not break safety: precommitting X and later precommitting Y would require a higher-round polka for Y.
 
 Once locked, at prevote time the validator prevotes the locked block unless a *newer* polka (from a round strictly greater than the lock round) supersedes the lock. At precommit time it precommits the block with a polka this round, or the locked block if no new polka has formed. The lock survives round transitions within a height and is cleared only on a height change.
 
@@ -212,7 +214,13 @@ The block processor distinguishes between *simulating* a block (the proposer nee
 A subtle invariant: **every state change that touches the SMT must happen on both paths.** Only writes to the meta table (`TBL_META`) and to the non-SMT index tables may be gated on `!ctx.dry_run`. The dry-run path aborts its transaction, so the change is discarded; the apply path commits it. If a change is gated, the two paths produce different state roots and the proposer's block is rejected on apply. This was a source of a hard-to-diagnose bug where blocks 1 and 2 were committed by consensus but rejected by every node that tried to apply them.
 
 #### Commit failure handling
-The `on_block_committed` callback returns a `bool`. `BftConsensus::enterCommit` checks the return value: if the apply failed, the engine advances the **round** (`enterPropose(height, round + 1)`) rather than the height. It does **not** fire `on_height_advanced`, does **not** truncate the WAL, and does **not** set `pending_height_`. The height is not considered committed until a block applies successfully.
+The `on_block_committed` callback returns a `bool`. `BftConsensus::tryApplyCommit` checks the return value, and on failure the engine retries the apply **in place**, with a linear backoff. Up to `max_commit_retries` retries are attempted. Each retry is driven by `pollTimers`, which compares `deps_.now_ms()` against `next_commit_attempt_ms_`.
+
+A failed apply does **not** advance the round. The block already has 2f+1 precommits; advancing the round would re-propose a block every honest validator is locked on, and would push a validator with a persistent apply failure toward emergency rotation. The engine retries the same block until it applies.
+
+If every retry fails, the engine calls `haltConsensus(reason)`: `running_` becomes false, `halted_` becomes true, the round timer is cancelled, and the `on_consensus_halt` callback fires once. `on_height_advanced` does not fire, the WAL is not truncated, and `pending_height_` is not set. The engine stays halted until the node calls `start()` again. `halted()` is a public accessor.
+
+The other way out is `noteChainHead(Height)`. If a relay or sync path applied the block while consensus was retrying, the node calls `noteChainHead` to tell the engine the chain has already moved; the next `pollTimers` abandons the retry and enters the reported height directly. `noteChainHead` is lock-free and safe to call from inside any callback, including `on_block_committed`.
 
 Before this change, the callback returned `void`, and a failed apply still fired `on_height_advanced` and set `pending_height_`. The engine would march forward to height N+1 while the chain head stayed at N, and every subsequent block would fail the same way. The height would appear to advance in the consensus engine's state while the on-chain height stayed stuck.
 
@@ -585,7 +593,7 @@ Proofs can be requested against historical versions because the SMT keeps histor
 
 **Only non-SMT writes may be gated on `dry_run`.** The block processor's dry-run path aborts its write transaction at the end, so any state change it makes is discarded. If a change is gated on `!ctx.dry_run`, the dry-run path doesn't make it and the two paths produce different state roots. The rule is: SMT writes happen unconditionally; meta-table and non-SMT index writes may be gated. This was the source of a hard-to-diagnose bug where a block's simulate and apply paths disagreed on the state root.
 
-**Commit failure advances the round, not the height.** The consensus engine treats a failed `on_block_committed` as a failed round: it advances to `round + 1` and tries a fresh proposal. It does not truncate the WAL, does not fire `on_height_advanced`, and does not set `pending_height_`. The height is not considered committed until a block applies. This makes the consensus engine's view of the chain consistent with the actual chain head even when a block is rejected — which is what the round-based retry mechanism is designed to handle.
+**Commit failure retries in place, then halts.** A failed `on_block_committed` is not treated as a failed round. The block already has 2f+1 precommits; re-proposing a different block would not help, and would push a validator with a persistent apply failure toward emergency rotation — the worst possible response to a local disk problem. Instead the engine retries the same block with a linear backoff, up to `max_commit_retries`, and if every retry fails it halts: `running_ = false`, `halted_ = true`, `on_consensus_halt` fired once. No height advance, no WAL truncation, no `pending_height_`. This makes the consensus engine's view of the chain consistent with the actual chain head — the engine stays parked on the block it cannot apply rather than silently marching forward — and gives operators a loud, observable signal (`halted()`, `on_consensus_halt`) that something is wrong with the node's storage rather than with consensus. A node whose storage is fixed, or whose chain head was moved by relay or sync, calls `noteChainHead` to unstick the engine without a restart.
 
 **The consensus WAL is wiped on fresh genesis.** A fresh DB is a fresh chain; any WAL rows from a previous life reference blocks whose height and hash no longer correspond to anything on the current chain. `Node::initGenesis` calls `state_db_->wipeConsensusWal()` after writing genesis on the fresh-DB path. Without it, the consensus engine replays its own votes for a chain that no longer exists and forces the validator to be loyal to a block that no other node recognises. On an existing DB, the WAL survives a restart — that's the crash-recovery case the WAL exists for.
 

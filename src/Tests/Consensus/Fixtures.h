@@ -1,8 +1,9 @@
 #pragma once
 
 #include <gtest/gtest.h>
-#include <random>
+#include <memory>
 
+#include "Tests/ConsensusHarness.h"
 #include "Tests/ConsensusHelpers.h"
 #include "Tests/Logger.h"
 
@@ -11,538 +12,21 @@
 namespace Tests
 {
 
-  //  ConsensusNetwork
+  //  =================================================================
+  //  Consensus_BftFixture
   //
-  //  Owns N BftConsensus instances and a shared message queue. Each
-  //  instance's broadcast callbacks push envelopes into the queue
-  //  instead of delivering directly. deliverAll() drains the queue
-  //  until it's empty, which settles a full round deterministically.
+  //  Single-instance fixture. Owns one BftConsensus plus its own
+  //  validator set, its own deps, its own callbacks, and a pile of
+  //  helpers for constructing blocks, proposals, votes, and timeout
+  //  certificates.
   //
-  //  The network never advances time on its own. Tests drive timers
-  //  explicitly via advanceAllTimers().
-  //
-  //  Two modes:
-  //    - Deterministic (default, random_seed_ == 0): FIFO delivery,
-  //      every message reaches every online peer, no partitions.
-  //      This is what every existing test relies on.
-  //    - Randomized (random_seed_ != 0): deliverAll() picks a random
-  //      subset of the queue to deliver each iteration, then
-  //      re-queues the rest. Used by adversarial tests to explore
-  //      message orderings.
-  //
-  //  Partitions are orthogonal to the mode. A partition drops any
-  //  message whose (from, to) pair crosses the partition. Cleared
-  //  partitions re-deliver held messages.
-  //
-  //  Validator set, Dependencies, and the various per-instance test
-  //  helpers come from a ConsensusTestEnv. The network owns the
-  //  network-specific state: the queue, the offline flags, the
-  //  partition table, and the RNG.
-  class ConsensusNetwork
-  {
-  public:
-    explicit ConsensusNetwork(size_t n, Logging::ILogger &logger)
-        : logger_(logger),
-          log_ref_(std::make_unique<Logging::LoggerRef>(logger, "net"))
-    {
-      env_.makeValidators(n);
-
-      instances_.reserve(n);
-      committed_.resize(n);
-      offline_.assign(n, false);
-      height_advances_.resize(n);
-
-      //  Partition state. side_[i] == 0 means "not in a partition".
-      //  Non-zero side ids partition the set into two groups;
-      //  messages from one group to the other are dropped.
-      partition_side_.assign(n, 0);
-
-      for (size_t i = 0; i < n; ++i)
-        instances_.push_back(makeInstance(i));
-    }
-
-    // ---- Lifecycle ----
-
-    void startAll(Height height)
-    {
-      for (size_t i = 0; i < instances_.size(); ++i)
-      {
-        if (!offline_[i])
-          instances_[i]->start(height);
-      }
-      //  Deliberately do NOT deliverAll() here. The network's initial
-      //  proposal and votes are queued and delivered by the first
-      //  advanceAllTimers() call. This keeps the contract
-      //  "startAll(h) puts every instance at height h with the round's
-      //  messages in flight" — it does not commit anything. Tests that
-      //  want a commit call advanceAllTimers() or advanceUntil().
-      //
-      //  Before the pending-height fix in BftConsensus, deliverAll()
-      //  here was harmless because enterCommit recursed through
-      //  heights; the recursion is now deferred, so a deliverAll()
-      //  here would commit exactly one height and skew every test's
-      //  commit count.
-    }
-
-    void stopAll()
-    {
-      for (auto &inst : instances_)
-        inst->stop();
-    }
-
-    // Deliver every queued message, including any messages those
-    // deliveries generate, until the queue is empty. Order of
-    // delivery depends on the current mode.
-    void deliverAll()
-    {
-      constexpr size_t MAX_ROUNDS = 10'000;
-      size_t iterations = 0;
-
-      while (!queue_.empty())
-      {
-        if (++iterations > MAX_ROUNDS)
-          throw std::runtime_error(
-              "ConsensusNetwork::deliverAll: message loop did not settle");
-
-        Envelope env;
-        if (random_seed_ == 0)
-        {
-          env = std::move(queue_.front());
-          queue_.erase(queue_.begin());
-        }
-        else
-        {
-          std::uniform_int_distribution<size_t> dist(0, queue_.size() - 1);
-          size_t idx = dist(random_engine_);
-          std::swap(queue_[idx], queue_[0]);
-          env = std::move(queue_.front());
-          queue_.erase(queue_.begin());
-        }
-
-        if (offline_[env.to])
-          continue;
-        if (env.from != env.to && crossesPartition(env.from, env.to))
-          continue;
-
-        switch (env.kind)
-        {
-        case Envelope::Proposal:
-          //  Suppression models a network that persistently rejects
-          //  ordinary proposals. Emergency proposals are the recovery
-          //  path and must get through, otherwise the test would be
-          //  modeling a permanent partition, not a proposal-suppression
-          //  fault.
-          if (proposal_suppressed_ && !env.is_emergency)
-            continue;
-          instances_[env.to]->onProposal(env.proposal);
-          break;
-        case Envelope::Prevote:
-          instances_[env.to]->onPrevote(env.vote);
-          break;
-        case Envelope::Precommit:
-          instances_[env.to]->onPrecommit(env.vote);
-          break;
-        case Envelope::TimeoutVote:
-          instances_[env.to]->onTimeoutVote(env.timeout_vote);
-          break;
-        case Envelope::Restart:
-          instances_[env.to]->start(env.restart_height);
-          break;
-        }
-      }
-    }
-
-    size_t totalCommitted() const
-    {
-      size_t n = 0;
-      for (const auto &v : committed_)
-        n += v.size();
-      return n;
-    }
-
-    void advanceAllTimers()
-    {
-      //  Snapshot heights before delivering, so we can tell whether
-      //  any validator advanced a height during (A).
-      std::vector<Height> heights_before(instances_.size());
-      for (size_t i = 0; i < instances_.size(); ++i)
-        heights_before[i] = offline_[i] ? 0 : heightOf(i);
-
-      deliverAll();
-
-      //  Only force-expire timers on validators that did NOT advance a
-      //  height during the delivery pass. A validator that just
-      //  entered a new height needs a real chance to receive that
-      //  height's proposal before its round timer fires; otherwise it
-      //  prevotes nil, advances a round, and — under randomized
-      //  delivery — drifts to a round where no live proposer exists.
-      for (size_t i = 0; i < instances_.size(); ++i)
-      {
-        if (offline_[i])
-          continue;
-        if (heightOf(i) != heights_before[i])
-          continue;
-        instances_[i]->forceTimerExpiryForTest();
-      }
-
-      for (size_t i = 0; i < instances_.size(); ++i)
-        if (!offline_[i])
-          instances_[i]->pollTimers();
-
-      deliverAll();
-    }
-
-    // advance until a specific condition is met, or fail.
-    bool advanceUntil(std::function<bool()> predicate, int max_passes = 16)
-    {
-      for (int i = 0; i < max_passes; ++i)
-      {
-        if (predicate())
-          return true;
-        advanceAllTimers();
-      }
-      return predicate();
-    }
-
-    // ---- Introspection ----
-
-    Consensus::BftConsensus &instance(size_t i) { return *instances_[i]; }
-
-    const std::vector<Core::Block> &committed(size_t i) const
-    {
-      return committed_[i];
-    }
-
-    const std::vector<Height> &heightAdvances(size_t i) const
-    {
-      return height_advances_[i];
-    }
-
-    const TestValidator &validator(size_t i) const
-    {
-      return env_.validator(i);
-    }
-
-    const ConsensusTestEnv &env() const { return env_; }
-    ConsensusTestEnv &env() { return env_; }
-
-    size_t size() const { return instances_.size(); }
-
-    // ---- Offline control ----
-
-    void setOffline(size_t i, bool offline)
-    {
-      offline_[i] = offline;
-    }
-
-    bool isOffline(size_t i) const { return offline_[i]; }
-
-    // ---- Crash / restart ----
-    //
-    //  stopValidator(i) marks i as offline AND stops its consensus
-    //  instance: it doesn't send, doesn't receive, doesn't fire
-    //  timers, and its run loop is halted. Any messages already
-    //  queued for it are dropped when delivered.
-    //
-    //  restartValidator(i) stops the instance (in case it was only
-    //  setOffline'd, not stopValidator'd), brings it back at the
-    //  current height, and backfills its committed chain from a live
-    //  peer. Tests that care about the restored node's committed
-    //  history should assert on future commits, not past ones.
-    //
-    //  setOffline(i, true) is a *network* control only: the instance
-    //  keeps running and keeps its state, but messages to and from it
-    //  are dropped. Use it to simulate a partition-like isolation
-    //  without a lifecycle change.
-
-    void stopValidator(size_t i)
-    {
-      if (i >= offline_.size())
-        return;
-      offline_[i] = true;
-      instances_[i]->stop();
-    }
-
-    void restartValidator(size_t i, Height /*at_height*/)
-    {
-      if (i >= offline_.size())
-        return;
-
-      //  A validator may have been taken offline either via
-      //  stopValidator (which calls stop()) or via setOffline (which
-      //  only flips the network flag). In the latter case the instance
-      //  is still running and start() would be a no-op, leaving it
-      //  stuck at its old height forever. Stop it unconditionally so
-      //  start() below actually takes effect.
-      instances_[i]->stop();
-
-      offline_[i] = false;
-
-      Height target = 0;
-      size_t peer = SIZE_MAX;
-      for (size_t p = 0; p < instances_.size(); ++p)
-      {
-        if (p == i || offline_[p])
-          continue;
-        if (!committed_[p].empty())
-        {
-          committed_[i] = committed_[p];
-          target = committed_[p].back().header.height + 1;
-          peer = p;
-          break;
-        }
-      }
-
-      instances_[i]->start(target);
-
-      //  Re-deliver the peer's current-round proposal to the restarted
-      //  validator. Without this, the restarted node can never commit:
-      //  it has no proposal for its entry height, and no other node
-      //  will re-propose for that height.
-      if (peer != SIZE_MAX)
-      {
-        auto proposal = instances_[peer]->currentProposalForTest();
-        if (proposal.has_value())
-          instances_[i]->onProposal(*proposal);
-      }
-    }
-
-    Height heightOf(size_t i) const
-    {
-      //  BftConsensus::state() is const-safe but locks the mutex; the
-      //  harness drives these serially so there's no contention.
-      return instances_[i]->state().height;
-    }
-
-    // ---- Proposal suppression ----
-    //
-    //  When enabled, proposals are dropped on the *receiving* side in
-    //  deliverAll, but proposers still generate them and the network
-    //  still carries them. Timeout-vote gossip is unaffected. This
-    //  models a fault where proposals are persistently rejected
-    //  (malformed, failing validation, censored by the network layer)
-    //  while the rest of the protocol keeps running, which is exactly
-    //  the condition that drives consecutive_timeouts_ up to
-    //  EMERGENCY_ROTATION_ROUNDS.
-    //
-    //  Note: restartValidator re-delivers a peer's proposal via a
-    //  direct onProposal call, bypassing deliverAll. A test that
-    //  enables suppression and then restarts a validator will see
-    //  that one proposal get through. Don't mix the two unless you
-    //  mean to.
-    void setProposalSuppressed(bool suppressed)
-    {
-      proposal_suppressed_ = suppressed;
-    }
-
-    bool isProposalSuppressed() const { return proposal_suppressed_; }
-
-    // ---- Partition control ----
-    //
-    //  setPartition({0, 1}, {2, 3}) puts validators 0 and 1 on side 1
-    //  and validators 2 and 3 on side 2. Messages from a validator on
-    //  side 1 to a validator on side 2 (or vice versa) are dropped
-    //  until clearPartition() is called.
-    //
-    //  Pass overlapping or incomplete groups at your own risk — the
-    //  fixture doesn't validate the partition, it just tags each
-    //  validator with a side and compares tags.
-
-    void setPartition(const std::vector<size_t> &side_a,
-                      const std::vector<size_t> &side_b)
-    {
-      partition_side_.assign(instances_.size(), 0);
-      for (size_t i : side_a)
-        if (i < partition_side_.size())
-          partition_side_[i] = 1;
-      for (size_t i : side_b)
-        if (i < partition_side_.size())
-          partition_side_[i] = 2;
-    }
-
-    void clearPartition()
-    {
-      partition_side_.assign(instances_.size(), 0);
-    }
-
-    // ---- Randomized delivery ----
-
-    //  0 (default): deterministic FIFO.
-    //  Non-zero: seed for the internal RNG. Same seed + same starting
-    //  conditions produces the same sequence of delivery decisions, so
-    //  a failing case is reproducible.
-    void setRandomSeed(uint64_t seed)
-    {
-      random_seed_ = seed;
-      random_engine_.seed(seed);
-    }
-
-  private:
-    bool crossesPartition(size_t from, size_t to) const
-    {
-      const uint8_t a = partition_side_[from];
-      const uint8_t b = partition_side_[to];
-      if (a == 0 || b == 0)
-        return false; // not in a partition
-      return a != b;
-    }
-
-    //  Per-instance callbacks. The env's makeCallbacks() returns a
-    //  single set of callbacks built from the env's slots; that's
-    //  fine for a fixture that owns a single BftConsensus, but the
-    //  network needs per-instance callbacks because the broadcast must
-    //  fan out to the sender's peers, not to a shared queue with no
-    //  sender tag.
-    //
-    //  The Dependencies come from the env (single source of truth for
-    //  what a consensus instance sees). The Callbacks are built here,
-    //  per instance, because they close over `index`.
-    Consensus::Callbacks makeCallbacks(size_t index)
-    {
-      Consensus::Callbacks cb;
-
-      cb.broadcast_proposal =
-          [this, index](const Consensus::Proposal &p)
-      {
-        if (offline_[index])
-          return;
-
-        //  Peek the emergency flag so deliverAll can let emergency
-        //  proposals through even when proposal suppression is on.
-        //  A full decode is fine here: the proposer already has the
-        //  block in memory, and the tests use empty blocks.
-        bool is_emergency = false;
-        Core::Block b;
-        if (Core::Block::deserialize(p.block_bytes.data(),
-                                     p.block_bytes.size(), b))
-          is_emergency = (b.header.emergency_rotation > 0);
-
-        for (size_t to = 0; to < instances_.size(); ++to)
-        {
-          if (to == index || offline_[to])
-            continue;
-          Envelope env;
-          env.kind = Envelope::Proposal;
-          env.to = to;
-          env.from = index;
-          env.proposal = p;
-          env.is_emergency = is_emergency;
-          queue_.push_back(std::move(env));
-        }
-      };
-
-      cb.broadcast_prevote =
-          [this, index](const Consensus::Vote &v)
-      {
-        if (offline_[index])
-          return;
-        for (size_t to = 0; to < instances_.size(); ++to)
-        {
-          if (to == index || offline_[to])
-            continue;
-          Envelope env;
-          env.kind = Envelope::Prevote;
-          env.to = to;
-          env.from = index;
-          env.vote = v;
-          queue_.push_back(std::move(env));
-        }
-      };
-
-      cb.broadcast_precommit =
-          [this, index](const Consensus::Vote &v)
-      {
-        if (offline_[index])
-          return;
-        for (size_t to = 0; to < instances_.size(); ++to)
-        {
-          if (to == index || offline_[to])
-            continue;
-          Envelope env;
-          env.kind = Envelope::Precommit;
-          env.to = to;
-          env.from = index;
-          env.vote = v;
-          queue_.push_back(std::move(env));
-        }
-      };
-
-      cb.broadcast_timeout_vote =
-          [this, index](const Consensus::TimeoutVote &tv)
-      {
-        if (offline_[index])
-          return;
-        for (size_t to = 0; to < instances_.size(); ++to)
-        {
-          if (to == index || offline_[to])
-            continue;
-          Envelope env;
-          env.kind = Envelope::TimeoutVote;
-          env.to = to;
-          env.from = index;
-          env.timeout_vote = tv;
-          queue_.push_back(std::move(env));
-        }
-      };
-
-      cb.select_transactions = [](uint64_t, uint64_t)
-      { return std::vector<Core::Transaction>{}; };
-
-      cb.on_block_committed =
-          [this, index](const Core::Block &b)
-      {
-        committed_[index].push_back(b);
-        //  No Restart envelope: enterCommit already calls
-        //  enterNewHeight() synchronously after this callback returns,
-        //  so start() would be a no-op. Queuing it only perturbs
-        //  randomized delivery order.
-      };
-
-      cb.on_height_advanced =
-          [this, index](Height h)
-      {
-        height_advances_[index].push_back(h);
-      };
-
-      return cb;
-    }
-
-    std::unique_ptr<Consensus::BftConsensus> makeInstance(size_t index)
-    {
-      return std::make_unique<Consensus::BftConsensus>(
-          env_.makeDeps(index),
-          makeCallbacks(index),
-          Consensus::Config{},
-          *log_ref_);
-    }
-
-    Logging::ILogger &logger_;
-    std::unique_ptr<Logging::LoggerRef> log_ref_;
-
-    //  Single source of truth for what a consensus instance sees.
-    //  Owns the validator set, the emergency set, and the network
-    //  identity. Not copyable or movable; the deps lambdas capture
-    //  `this`, so it must outlive every instance.
-    ConsensusTestEnv env_;
-
-    std::vector<std::unique_ptr<Consensus::BftConsensus>> instances_;
-    std::vector<std::vector<Core::Block>> committed_;
-    std::vector<std::vector<Height>> height_advances_;
-    std::vector<bool> offline_;
-    std::vector<Envelope> queue_;
-
-    //  Partition state: 0 = unpartitioned, 1 = side A, 2 = side B.
-    //  Messages between different non-zero sides are dropped.
-    std::vector<uint8_t> partition_side_;
-
-    //  When true, proposals are dropped on the receiving side in
-    //  deliverAll. See setProposalSuppressed.
-    bool proposal_suppressed_{false};
-
-    //  Randomized delivery. random_seed_ == 0 means deterministic.
-    uint64_t random_seed_{0};
-    std::mt19937_64 random_engine_;
-  };
+  //  This class does NOT use ConsensusHarness or ConsensusTestEnv —
+  //  it predates both and re-implements what ConsensusTestEnv
+  //  provides. That duplication is scheduled for removal in a
+  //  follow-up commit; for now the fixture is unchanged so that the
+  //  single-instance tests (BftConsensus.cpp, BftEdgeCases.cpp, etc.)
+  //  keep working without modification.
+  //  =================================================================
 
   class Consensus_BftFixture : public testing::Test
   {
@@ -611,8 +95,8 @@ namespace Tests
           return Crypto::Address{};
         return validators_[local_index].address;
       };
-      deps.now_ms = []() -> uint64_t
-      { return 1'700'000'000'000ULL; };
+      deps.now_ms = [this]() -> uint64_t
+      { return now_ms_; };
       deps.state_lookup_validator =
           [this](Id id, Core::ValidatorInfo &out) -> bool
       {
@@ -632,6 +116,91 @@ namespace Tests
         }
         return false;
       };
+      //  WAL plumbing. All six callbacks are optional in the real
+      //  engine; the fixture installs all of them so the restart
+      //  tests can exercise the full path.
+      deps.wal_append_vote =
+          [this](const Consensus::Vote &v, bool is_precommit)
+      {
+        TestWal::VoteKey k{v.height, v.round, is_precommit};
+        wal_.votes.emplace(k, v); // first write wins, matching the
+                                  // engine's "sign once" invariant
+      };
+
+      deps.wal_append_lock =
+          [this](Height h, Round r, const Crypto::Hash &hash)
+      {
+        auto it = wal_.locks.find(h);
+        if (it == wal_.locks.end() || r >= it->second.first)
+          wal_.locks[h] = {r, hash};
+      };
+
+      deps.wal_append_locked_block =
+          [this](Height h, const Core::Block &b)
+      {
+        wal_.locked_blocks[h] = b;
+      };
+
+      deps.wal_load_locked_block =
+          [this](Height h) -> std::optional<Core::Block>
+      {
+        auto it = wal_.locked_blocks.find(h);
+        if (it == wal_.locked_blocks.end())
+          return std::nullopt;
+        return it->second;
+      };
+
+      deps.wal_replay =
+          [this](Height for_height,
+                 std::function<void(const Consensus::Vote &, bool)> on_vote,
+                 std::function<void(Height, Round, const Crypto::Hash &)> on_lock)
+      {
+        //  On restart the engine expects to see what survived the
+        //  crash. The fixture's WAL is either the live one (no
+        //  restart) or the snapshot's (after a restart); the replay
+        //  callback reads whichever is current.
+        const TestWal &w = restarting_ ? restart_wal_ : wal_;
+
+        for (const auto &[k, v] : w.votes)
+        {
+          if (k.height != for_height)
+            continue;
+          if (on_vote)
+            on_vote(v, k.is_precommit);
+        }
+
+        auto it = w.locks.find(for_height);
+        if (it != w.locks.end() && on_lock)
+          on_lock(for_height, it->second.first, it->second.second);
+      };
+
+      deps.wal_truncate =
+          [this](Height up_to)
+      {
+        //  Entries at heights <= up_to are no longer needed.
+        for (auto it = wal_.votes.begin(); it != wal_.votes.end();)
+        {
+          if (it->first.height <= up_to)
+            it = wal_.votes.erase(it);
+          else
+            ++it;
+        }
+        for (auto it = wal_.locks.begin(); it != wal_.locks.end();)
+        {
+          if (it->first <= up_to)
+            it = wal_.locks.erase(it);
+          else
+            ++it;
+        }
+        for (auto it = wal_.locked_blocks.begin();
+             it != wal_.locked_blocks.end();)
+        {
+          if (it->first <= up_to)
+            it = wal_.locked_blocks.erase(it);
+          else
+            ++it;
+        }
+      };
       return deps;
     }
 
@@ -648,8 +217,22 @@ namespace Tests
       { broadcast_timeout_votes.push_back(tv); };
       cb.select_transactions = [](uint64_t, uint64_t)
       { return std::vector<Core::Transaction>{}; };
-      cb.on_block_committed = [this](const Core::Block &b)
-      { committed_blocks.push_back(b); };
+      cb.on_block_committed = [this](const Core::Block &b) -> bool
+      {
+        committed_blocks.push_back(b);
+
+        if (block_commit_fail_remaining_ > 0)
+        {
+          --block_commit_fail_remaining_;
+          return false;
+        }
+        return true;
+      };
+      cb.on_consensus_halt = [this](const std::string &reason)
+      {
+        last_halt_reason_ = reason;
+        halt_count_++;
+      };
       cb.on_height_advanced = [this](Height h)
       { height_advances.push_back(h); };
       return cb;
@@ -684,6 +267,14 @@ namespace Tests
 
     void makeConsensus(size_t local_index)
     {
+      local_index_ = local_index;
+      if (!restarting_)
+      {
+        //  Fresh instance: start with an empty WAL.
+        wal_ = TestWal{};
+      }
+      restarting_ = false;
+
       consensus_ = std::make_unique<Consensus::BftConsensus>(
           makeDeps(local_index),
           makeCallbacks(),
@@ -759,10 +350,6 @@ namespace Tests
     //  Timeout certificate helpers
     // ------------------------------------------------------------------
 
-    //  Sign `hash` with validator `signer_index`'s private key. The
-    //  index is a position in the committed set, matching the
-    //  convention used by makeSignedVote and by the consensus object
-    //  when it resolves a signer through active_set[signer_index].
     Crypto::Signature signForValidator(Index signer_index,
                                        const Crypto::Hash &hash)
     {
@@ -771,12 +358,6 @@ namespace Tests
       return validators_[signer_index].sign(hash);
     }
 
-    //  Build a TimeoutCertificate for (height, round) with one vote
-    //  per signer index in `signers`. Signatures are produced by
-    //  signForValidator, so a certificate built here verifies against
-    //  the fixture's key material and against the fixture's
-    //  state_lookup_validator, which exposes each validator's pubkey
-    //  as its reward_address.
     Consensus::TimeoutCertificate makeTimeoutCertificate(
         Height height, Round round, const std::vector<Index> &signers)
     {
@@ -801,9 +382,6 @@ namespace Tests
       return cert;
     }
 
-    //  Build a signed TimeoutVote for `signer_index` and deliver it to
-    //  the consensus object via onTimeoutVote — equivalent to what a
-    //  peer's P2P message would do.
     void deliverTimeoutVote(Index signer_index, Height height, Round round)
     {
       const Crypto::Hash signing_hash =
@@ -820,6 +398,128 @@ namespace Tests
       consensus_->onTimeoutVote(tv);
     }
 
+    // ------------------------------------------------------------------
+    //  Restart / WAL test support
+    // ------------------------------------------------------------------
+
+    //  Minimal in-memory write-ahead log. The real Node wires the
+    //  engine's WAL callbacks to MDBX; the fixture keeps them in
+    //  memory so a test can snapshot, destroy the instance, and
+    //  rebuild it — that is the crash/restart the WAL is designed to
+    //  survive.
+    struct TestWal
+    {
+      struct VoteKey
+      {
+        Height height{0};
+        Round round{0};
+        bool is_precommit{false};
+
+        bool operator<(const VoteKey &o) const noexcept
+        {
+          if (height != o.height)
+            return height < o.height;
+          if (round != o.round)
+            return round < o.round;
+          return is_precommit < o.is_precommit;
+        }
+      };
+
+      // Signed votes, keyed by (height, round, type). The engine
+      // writes one entry per vote it signs and never overwrites;
+      // replay restores them into the signed-vote registry.
+      std::map<VoteKey, Consensus::Vote> votes;
+
+      // Highest-round lock per height. The engine writes one entry
+      // per lock adoption; replay keeps the highest round.
+      std::map<Height, std::pair<Round, Crypto::Hash>> locks;
+
+      // Locked block per height, so a restarted validator can
+      // re-propose without fetching it from peers.
+      std::map<Height, Core::Block> locked_blocks;
+    };
+
+    //  What a restart preserves. Everything the instance learned
+    //  during its first life is captured here; the second life sees
+    //  exactly these and nothing else.
+    struct RestartSnapshot
+    {
+      Height height{0};
+      TestWal wal;
+    };
+
+    //  Force the next `attempts` apply attempts to fail, then
+    //  succeed. Zero means "never fail".
+    void setBlockCommitFailsFor(size_t attempts)
+    {
+      block_commit_fail_remaining_ = attempts;
+    }
+
+    //  Snapshot everything the fixture needs to rebuild the instance
+    //  after a simulated crash.
+    RestartSnapshot snapshotForRestart() const
+    {
+      RestartSnapshot s;
+      s.height = consensus_ ? consensus_->state().height : 0;
+      s.wal = wal_;
+      return s;
+    }
+
+    //  Destroy the current instance and build a fresh one at
+    //  `snap.height`, replaying the snapshot's WAL. The validator
+    //  key set and the fixture's other members are preserved; only
+    //  the BftConsensus instance's in-memory state is reset.
+    void restartFromSnapshot(const RestartSnapshot &snap)
+    {
+      consensus_.reset();
+
+      //  Clear anything that would leak state across the restart.
+      broadcast_proposals.clear();
+      broadcast_prevotes.clear();
+      broadcast_precommits.clear();
+      broadcast_timeout_votes.clear();
+      // committed_blocks and height_advances survive: they are the
+      // fixture's observations, not the engine's state.
+
+      restart_wal_ = snap.wal;
+      restart_at_height_ = snap.height;
+      restarting_ = true;
+
+      makeConsensus(local_index_);
+      consensus_->start(snap.height);
+    }
+
+    bool consensusHalted() const
+    {
+      return consensus_ && consensus_->halted();
+    }
+
+    const std::string &lastHaltReason() const
+    {
+      return last_halt_reason_;
+    }
+
+    //  Poll the engine `max_polls` times, advancing the clock by
+    //  `advance_ms` before each poll. Returns as soon as `predicate`
+    //  is true. Used by the retry / halt tests, where the engine's
+    //  retry gate compares deps_.now_ms() against next_commit_attempt_ms_.
+    bool pollWithTimeAdvance(std::function<bool()> predicate,
+                             uint64_t advance_ms = 5000,
+                             int max_polls = 200)
+    {
+      for (int i = 0; i < max_polls; ++i)
+      {
+        if (predicate())
+          return true;
+        advanceTimeMs(advance_ms);
+        consensus_->pollTimers();
+      }
+      return predicate();
+    }
+
+    void advanceTimeMs(uint64_t ms) { now_ms_ += ms; }
+    uint64_t nowMs() const { return now_ms_; }
+
     NoopLogger logger_;
     std::unique_ptr<Logging::LoggerRef> log_ref_;
     std::vector<TestValidator> validators_;
@@ -833,6 +533,23 @@ namespace Tests
     std::vector<Core::Block> committed_blocks;
     std::vector<Height> height_advances;
 
+    //  Restart / WAL test support.
+    TestWal wal_;
+    TestWal restart_wal_;
+    Height restart_at_height_{0};
+    bool restarting_{false};
+    size_t local_index_{SIZE_MAX};
+
+    size_t block_commit_fail_remaining_{0};
+    size_t halt_count_{0};
+    std::string last_halt_reason_;
+
+    uint64_t now_ms_{1'700'000'000'000ULL};
+
+    // When true, on_block_committed returns false. Used by tests that
+    // exercise the commit-retry / halt path.
+    bool block_commit_fails_{false};
+
     //  Optional distinct emergency set. When empty (default), the
     //  fixture returns activeIds() regardless of force_rotation, which
     //  preserves the behavior every existing test relies on. When
@@ -842,26 +559,114 @@ namespace Tests
     std::vector<Id> emergency_ids_;
   };
 
+  //  =================================================================
+  //  Consensus_NetworkFixture
+  //
+  //  Wraps ConsensusHarness. Owns the env and the harness, and wires
+  //  the harness's broadcast callbacks to fan out into the queue.
+  //
+  //  Replaces the retired ConsensusNetwork class. All existing network
+  //  tests keep their semantics unchanged: every broadcast from
+  //  instance i becomes one envelope per peer, offline and partition
+  //  filtering happen at delivery time, and proposal suppression is
+  //  honored at delivery time using the emergency flag peeked from
+  //  the serialized block.
+  //  =================================================================
+
   class Consensus_NetworkFixture : public testing::Test
   {
   protected:
     void TearDown() override
     {
-      if (network_)
+      if (harness_)
       {
-        network_->stopAll();
-        network_.reset();
+        harness_->stopAll();
+        harness_.reset();
       }
+      env_.reset();
     }
 
+    //  Build a fresh env and harness for N validators, and install
+    //  the fan-out callbacks. Any previous harness is destroyed
+    //  first, so calling makeNetwork(n) twice in a test is safe and
+    //  produces a genuinely fresh env (validator keys, emergency
+    //  set, backends, all reset).
     void makeNetwork(size_t n)
     {
-      network_ = std::make_unique<ConsensusNetwork>(n, logger_);
+      harness_.reset();
+      env_ = std::make_unique<ConsensusTestEnv>();
+      env_->makeValidators(n);
+      harness_ = std::make_unique<ConsensusHarness>(*env_, n, logger_);
+      wireFanOut();
     }
 
-    ConsensusNetwork &net() { return *network_; }
+    ConsensusHarness &net() { return *harness_; }
+
+    //  Install harness callbacks that reproduce the old
+    //  ConsensusNetwork fan-out: every broadcast from instance i is
+    //  enqueued as one envelope per peer.
+    //
+    //  Offline and partition filtering is NOT done here — the
+    //  harness's deliverAll() consults those at pop time, and the
+    //  enqueue helpers deliberately don't filter. This matches how
+    //  ConsensusNetwork behaved: it pushed envelopes for every peer
+    //  and let the delivery loop drop the ones that had gone offline
+    //  or were separated by a partition.
+    void wireFanOut()
+    {
+      auto &h = *harness_;
+      const size_t n = h.size();
+
+      //  Proposal fan-out. The emergency flag is read from the
+      //  serialized block so the harness can honor proposal
+      //  suppression correctly.
+      h.setOnProposal([&h, n](size_t from, const Consensus::Proposal &p)
+                      {
+        bool is_emergency = false;
+        Core::Block b;
+        if (Core::Block::deserialize(p.block_bytes.data(),
+                                     p.block_bytes.size(), b))
+          is_emergency = (b.header.emergency_rotation > 0);
+
+        for (size_t to = 0; to < n; ++to)
+        {
+          if (to == from)
+            continue;
+          h.enqueueProposal(from, to, p, is_emergency);
+        } });
+
+      h.setOnPrevote([&h, n](size_t from, const Consensus::Vote &v)
+                     {
+        for (size_t to = 0; to < n; ++to)
+        {
+          if (to == from)
+            continue;
+          h.enqueueVote(from, to, Envelope::Prevote, v);
+        } });
+
+      h.setOnPrecommit([&h, n](size_t from, const Consensus::Vote &v)
+                       {
+        for (size_t to = 0; to < n; ++to)
+        {
+          if (to == from)
+            continue;
+          h.enqueueVote(from, to, Envelope::Precommit, v);
+        } });
+
+      h.setOnTimeoutVote(
+          [&h, n](size_t from, const Consensus::TimeoutVote &tv)
+          {
+            for (size_t to = 0; to < n; ++to)
+            {
+              if (to == from)
+                continue;
+              h.enqueueTimeoutVote(from, to, tv);
+            }
+          });
+    }
 
     NoopLogger logger_;
-    std::unique_ptr<ConsensusNetwork> network_;
+    std::unique_ptr<ConsensusTestEnv> env_;
+    std::unique_ptr<ConsensusHarness> harness_;
   };
 }

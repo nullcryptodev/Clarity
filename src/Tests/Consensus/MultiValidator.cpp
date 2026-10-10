@@ -24,7 +24,7 @@ using namespace Tests;
 
 namespace
 {
-  bool allHaveAtLeast(const ConsensusNetwork &net, size_t n)
+  bool allHaveAtLeast(const ConsensusHarness &net, size_t n)
   {
     for (size_t i = 0; i < net.size(); ++i)
       if (net.committed(i).size() < n)
@@ -193,7 +193,6 @@ TEST_F(Consensus_NetworkFixture, SameRunProducesSameCommit)
     ASSERT_GE(net().committed(0).size(), 1u);
     first_run = net().committed(0)[0].hash();
     net().stopAll();
-    network_.reset();
   }
 
   {

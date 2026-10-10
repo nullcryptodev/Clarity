@@ -74,6 +74,7 @@ namespace GlobalConfig
   // these checks fail at node startup with a clear "genesis mismatch"
   // error, instead of silently diverging from other nodes on the same
   // network.
+  // When creating new hashes, rotate the addresses too.
   inline constexpr const char *MAINNET_GENESIS_HASH = "c70eab94aa0881c6487d1c991e44cfba91dab02caddabbdba821f297b53fcaec";
   inline constexpr const char *TESTNET_GENESIS_HASH = "eb2cf5a1d2c5be852e128f96ae78871f1759c2334e9d7d445b020b93ac9f2724";
   inline constexpr const char *REGTEST_GENESIS_HASH = "41be25faee454fdc624cba08ff590d0ccca95b878006fc9b797459acf22456ce";

@@ -553,7 +553,7 @@ TEST_F(Consensus_BftFixture, LockReleasedOnNewHeight)
       << "lock was not cleared on height transition";
 }
 
-TEST_F(Consensus_BftFixture, WrongSignerIndexOutOfRangeIsIgnored)
+TEST_F(Consensus_BftFixture, WrongSignerIndexIsIgnoredWhenSignerIdIsValid)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -562,11 +562,18 @@ TEST_F(Consensus_BftFixture, WrongSignerIndexOutOfRangeIsIgnored)
   consensus_->pollTimers();
   ASSERT_EQ(consensus_->state().step, Step::Prevote);
 
+  const size_t before = consensus_->state().prevote_count;
+
+  //  signer_id is authoritative for resolution; signer_index is
+  //  advisory. A vote with a valid signature and a valid signer_id
+  //  must be counted even if signer_index is nonsense, because a
+  //  re-proposal of a lock or a cross-set vote may have been signed
+  //  against a set the receiver does not hold.
   Vote v = makeSignedVote(0, 0, 0, true);
   v.signer_index = 99;
   consensus_->onPrevote(v);
 
-  EXPECT_EQ(consensus_->state().prevote_count, 1u);
+  EXPECT_EQ(consensus_->state().prevote_count, before + 1);
 }
 
 // ============================================================================
@@ -621,7 +628,7 @@ TEST_F(Consensus_BftFixture, PrevoteRejectedDuringPrecommitStep)
   EXPECT_EQ(consensus_->state().step, Step::Precommit);
 }
 
-TEST_F(Consensus_BftFixture, MixedVotesDoNotFormFalseQuorum)
+TEST_F(Consensus_BftFixture, MixedVotesAreRecordedButDoNotAdvanceStep)
 {
   makeValidators(4);
   makeConsensus(3);
@@ -635,12 +642,17 @@ TEST_F(Consensus_BftFixture, MixedVotesDoNotFormFalseQuorum)
 
   Crypto::Hash block_hash = block.hash();
 
+  //  Votes are recorded at any step. The step transitions they
+  //  trigger are what's step-gated: a prevote quorum fires
+  //  enterPrecommit only from Prevote; a precommit quorum fires
+  //  enterCommit from any step. So a single precommit for a known
+  //  block does not move us, but it IS recorded.
   deliverPrevote(0, 0, 0, false, block_hash);
   deliverPrecommit(1, 0, 0, false, block_hash);
 
   EXPECT_EQ(consensus_->state().step, Step::Prevote);
   EXPECT_EQ(consensus_->state().prevote_count, 2u);
-  EXPECT_EQ(consensus_->state().precommit_count, 0u);
+  EXPECT_EQ(consensus_->state().precommit_count, 1u);
 }
 
 TEST_F(Consensus_BftFixture, CorrectlyRoutedVotesFormQuorum)
@@ -1229,7 +1241,7 @@ TEST_F(Consensus_BftFixture, EmergencyBlockWithWrongRoundCertificateIsRejected)
   EXPECT_EQ(consensus_->state().step, Step::Propose);
 }
 
-TEST_F(Consensus_BftFixture, TimeoutVoteBroadcastOnRoundTimeout)
+TEST_F(Consensus_BftFixture, TimeoutVoteBroadcastOnlyAtEmergencyRound)
 {
   makeValidators(4);
   makeConsensus(1);
@@ -1237,24 +1249,40 @@ TEST_F(Consensus_BftFixture, TimeoutVoteBroadcastOnRoundTimeout)
 
   ASSERT_TRUE(broadcast_timeout_votes.empty());
 
-  consensus_->forceTimerExpiryForTest();
-  consensus_->pollTimers();
-  ASSERT_EQ(consensus_->state().step, Step::Prevote);
-  ASSERT_EQ(broadcast_timeout_votes.size(), 1u);
-  EXPECT_EQ(broadcast_timeout_votes[0].round, 0u);
-  EXPECT_EQ(broadcast_timeout_votes[0].height, 0u);
+  //  Time out enough rounds to reach the emergency threshold. Each
+  //  round times out at Propose, then Prevote, then Precommit, so
+  //  three polls per round.
+  const Round em = Core::EMERGENCY_ROTATION_ROUNDS;
 
-  consensus_->forceTimerExpiryForTest();
-  consensus_->pollTimers();
-  ASSERT_EQ(consensus_->state().step, Step::Precommit);
-  ASSERT_EQ(broadcast_timeout_votes.size(), 2u);
-  EXPECT_EQ(broadcast_timeout_votes[1].round, 0u);
+  for (Round r = 0; r < em; ++r)
+  {
+    consensus_->forceTimerExpiryForTest();
+    consensus_->pollTimers();
+    consensus_->forceTimerExpiryForTest();
+    consensus_->pollTimers();
+    consensus_->forceTimerExpiryForTest();
+    consensus_->pollTimers();
+  }
 
-  consensus_->forceTimerExpiryForTest();
-  consensus_->pollTimers();
-  ASSERT_EQ(consensus_->state().round, 1u);
-  ASSERT_EQ(broadcast_timeout_votes.size(), 3u);
-  EXPECT_EQ(broadcast_timeout_votes[2].round, 0u);
+  ASSERT_GE(consensus_->state().round, em);
+
+  //  Below the threshold, nothing was sent.
+  //  At the threshold, exactly one timeout vote per round should have
+  //  been broadcast.
+  ASSERT_FALSE(broadcast_timeout_votes.empty())
+      << "timeout vote was never broadcast at emergency round";
+
+  for (const auto &tv : broadcast_timeout_votes)
+  {
+    EXPECT_GE(tv.round, em)
+        << "timeout vote broadcast below the emergency threshold";
+  }
+
+  //  Every vote we broadcast is for a distinct round at this height.
+  std::set<Round> seen;
+  for (const auto &tv : broadcast_timeout_votes)
+    EXPECT_TRUE(seen.insert(tv.round).second)
+        << "duplicate timeout vote for round " << tv.round;
 }
 
 TEST_F(Consensus_BftFixture, TimeoutVoteReceivedFromPeerIsRetained)
