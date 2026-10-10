@@ -122,7 +122,21 @@ namespace Consensus
 
     // Called after a block is committed. The node applies it to
     // state, stores it, and advances the chain head.
-    std::function<void(const Core::Block &)> on_block_committed;
+    //
+    // Returns true if the block was applied successfully. Returns
+    // false on any failure (state root mismatch, disk error, storage
+    // rejection) — in which case the consensus engine must NOT treat
+    // the height as committed: no WAL truncation, no height advance,
+    // no pending transition. The round advances instead, and a fresh
+    // proposal is attempted.
+    //
+    // Before this returned void, a failed apply still fired
+    // on_height_advanced and set pending_height_, which made the
+    // engine believe a block had committed when the chain head had
+    // not moved. The next height's proposals were then built on a
+    // parent that didn't exist, and every subsequent block failed
+    // the same way.
+    std::function<bool(const Core::Block &)> on_block_committed;
 
     // Called after the commit callback. A separate hook so the
     // node can log or meter height advances independently of the

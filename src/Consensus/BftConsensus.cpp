@@ -458,8 +458,32 @@ namespace Consensus
         << " quorum_sigs=" << block.quorum_signatures.size()
         << " participants=" << block.participants.size();
 
-    if (callbacks_.on_block_committed)
-      callbacks_.on_block_committed(block);
+    //  Apply the block. If the callback returns false, the apply
+    //  failed and the chain head did not advance. In that case we
+    //  must not:
+    //
+    //    - fire on_height_advanced (the height didn't advance),
+    //    - truncate the WAL (the votes at this height may still be
+    //      needed if we recover this height in a later round),
+    //    - set pending_height_ (there's nothing to advance to),
+    //    - reset consecutive_timeouts_ (the round didn't succeed).
+    //
+    //  The only valid action is to advance the round and try again.
+    //  The next proposer will build on the current chain head, which
+    //  is where we actually are.
+    const bool committed =
+        callbacks_.on_block_committed
+            ? callbacks_.on_block_committed(block)
+            : true; // no callback means "no state to apply" — treat as success
+
+    if (!committed)
+    {
+      log_(Logging::WARNING)
+          << "Commit callback rejected block at h=" << height
+          << "; advancing round";
+      enterPropose(height, round + 1);
+      return;
+    }
 
     if (callbacks_.on_height_advanced)
       callbacks_.on_height_advanced(height + 1);

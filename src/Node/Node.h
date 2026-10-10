@@ -11,6 +11,7 @@
 #include <thread>
 #include <unordered_map>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/signal_set.hpp>
 
 #include "NodeConfig.h"
 #include "GlobalConfig.h"
@@ -71,38 +72,15 @@ namespace Node
       size_t mempool_bytes{0};
       bool is_validator{false};
       uint64_t validator_id{0};
-
       uint64_t consensus_height{0};
       uint32_t consensus_round{0};
       const char *consensus_step{"unknown"};
-      Consensus::Step consensus_step_ordinal{Consensus::Step::NewHeight}; // ordinal
-
-      // ---- Consensus detail ----
-      //
-      //  Read from BftConsensus::state() and
-      //  BftConsensus::consecutiveTimeouts() when consensus is
-      //  running, or zero on a non-validator node. All fields are
-      //  lock-free reads of consensus-engine state; the engine
-      //  holds its own mutex internally and returns value copies.
-      size_t consensus_prevotes{0};
-      size_t consensus_precommits{0};
-      uint32_t consensus_consecutive_timeouts{0};
-      bool consensus_emergency_rotation{false};
-      bool consensus_is_proposer{false};
-
+      Consensus::Step consensus_step_ordinal{Consensus::Step::NewHeight};
       Network network{Network::Regtest};
       uint64_t chain_id{0};
       bool running{false};
 
       // ---- P2P counters ----
-      //
-      //  Read from P2PManager::snapshot() when P2P is enabled, or
-      //  zero when it isn't. Every field is a lock-free atomic read
-      //  or a mutex-guarded size() call — safe to invoke from any
-      //  thread, including RPC worker threads that call status().
-      //
-      //  peer_count above is retained for backward compatibility
-      //  and equals peers_total.
       size_t peers_total{0};
       size_t peers_inbound{0};
       size_t peers_outbound{0};
@@ -114,6 +92,13 @@ namespace Node
       uint32_t aggregate_rate_limit_burst{0};
       uint32_t aggregate_rate_limit_per_second{0};
       bool aggregate_rate_limit_enabled{false};
+
+      // ---- Consensus detail ----
+      size_t consensus_prevotes{0};
+      size_t consensus_precommits{0};
+      uint32_t consensus_consecutive_timeouts{0};
+      bool consensus_emergency_rotation{false};
+      bool consensus_is_proposer{false};
     };
 
     Status status() const;
@@ -156,7 +141,7 @@ namespace Node
     // address matches it, or 0 if no active validator claims it.
     // Called from the P2P auth path on the event loop thread.
     uint64_t validatorIdForAddress(const Crypto::PublicKey &pk) const;
-    
+
   private:
     friend class Tests::NodeTestAccess;
 
@@ -206,7 +191,7 @@ namespace Node
     void onConsensusVote(const Consensus::Vote &v, bool is_precommit);
     std::vector<Core::Transaction> selectTransactionsForProposal(
         uint64_t max_bytes, uint64_t max_txs);
-    void onBlockCommitted(const Core::Block &block);
+    bool onBlockCommitted(const Core::Block &block);
     void onHeightAdvanced(Height height);
 
     void onConsensusPoll();
@@ -293,7 +278,8 @@ namespace Node
     std::atomic<bool> stopping_{false};
     std::atomic<bool> consensus_started_{false};
     uint64_t active_set_height_{0};
-    mutable std::mutex status_mutex_;
+
+    uint64_t last_prune_height_{0};
 
     FailPoint fail_point_for_test_{FailPoint::None};
 
@@ -318,6 +304,20 @@ namespace Node
     // happens between the work and the re-arm is honored.
     std::unique_ptr<boost::asio::steady_timer> consensus_timer_;
     std::unique_ptr<boost::asio::steady_timer> sync_timer_;
+
+    // Signal handling. Installed in run() on the P2P io_context's
+    // executor. asio's signal_set catches SIGINT and SIGTERM via a
+    // self-pipe and delivers the notification as an event on the
+    // io_context, so the callback runs on the event loop thread where
+    // it is safe to take locks and call stop().
+    //
+    // Previously this was handled by a std::signal handler in main.cpp
+    // that called node.stop() and rpc.stop() directly. That was
+    // undefined behavior: the signal could arrive while any thread
+    // held any of the daemon's mutexes, and the handler would try to
+    // acquire the same lock, deadlocking. The asio signal_set path
+    // avoids the problem entirely.
+    std::unique_ptr<boost::asio::signal_set> signals_;
 
     // Sync tick interval. Every tick, each peer's SyncManager::tick()
     // is called, which drives both timeout detection and Idle refresh.

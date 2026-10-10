@@ -88,6 +88,9 @@ namespace State
         size_t depth,
         uint64_t version) const;
 
+    void setReadTxn(StateDB::ReadTxn *read_txn) noexcept { read_txn_ = read_txn; }
+    StateDB::ReadTxn *readTxn() const noexcept { return read_txn_; }
+
   private:
     struct InternalNode
     {
@@ -145,6 +148,7 @@ namespace State
 
     StateDB &db_;
     StateDB::Txn *txn_{nullptr};
+    StateDB::ReadTxn *read_txn_{nullptr};
     Crypto::Hash root_;
   };
 

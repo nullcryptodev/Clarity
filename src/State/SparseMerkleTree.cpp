@@ -152,10 +152,13 @@ namespace State
                                      std::vector<uint8_t> &out) const
   {
     if (txn_)
-    {
       return txn_->get(StateDB::TBL_SMT_NODES,
                        hash.data.data(), hash.data.size(), out);
-    }
+
+    if (read_txn_)
+      return read_txn_->get(StateDB::TBL_SMT_NODES,
+                            hash.data.data(), hash.data.size(), out);
+
     return db_.getNode(hash, out);
   }
 

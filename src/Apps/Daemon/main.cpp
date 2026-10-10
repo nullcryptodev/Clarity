@@ -11,7 +11,6 @@
 #include "RPC/RpcServer.h"
 
 #include <atomic>
-#include <csignal>
 #include <cstdio>
 #include <exception>
 #include <memory>
@@ -19,27 +18,6 @@
 
 namespace
 {
-  std::atomic<bool> g_shutdown_requested{false};
-  Node::Node *g_node{nullptr};
-  Rpc::RpcServer *g_rpc{nullptr};
-
-  extern "C" void handleSignal(int /*sig*/)
-  {
-    g_shutdown_requested.store(true);
-
-    // Stop RPC first so no in-flight handler reads Node state while
-    // Node is being torn down. Both stop() calls are documented as
-    // safe from any thread and idempotent.
-    if (g_rpc)
-    {
-      g_rpc->stop();
-    }
-    if (g_node)
-    {
-      g_node->stop();
-    }
-  }
-
   Logging::Level parseLogLevel(const std::string &s)
   {
     if (s == "debug")
@@ -135,9 +113,20 @@ int main(int argc, char **argv)
   setenv("MDBX_DEBUG", "none", 1);
   mdbx_setup_debug(MDBX_LOG_ERROR, MDBX_DBG_NONE, nullptr);
 
-  // Install signal handlers
-  std::signal(SIGINT, handleSignal);
-  std::signal(SIGTERM, handleSignal);
+  //  No std::signal handler here. The daemon installs an asio
+  //  signal_set on the P2P io_context inside Node::run(). asio
+  //  catches SIGINT and SIGTERM via a self-pipe and delivers the
+  //  notification as an event on the io_context, so the shutdown
+  //  callback runs on the event loop thread where it is safe to
+  //  take locks, join threads, and call node methods.
+  //
+  //  Previously this file installed a std::signal handler that
+  //  called g_rpc->stop() and g_node->stop() directly. That was
+  //  undefined behavior: a signal can arrive while any thread holds
+  //  any of the daemon's mutexes, and the handler would try to
+  //  acquire the same lock, deadlocking. The asio path avoids the
+  //  problem entirely and also handles rapid repeated Ctrl+C
+  //  gracefully.
 
   // Construct and run the node
   int exit_code = 0;
@@ -145,18 +134,8 @@ int main(int argc, char **argv)
   try
   {
     Node::Node node(args.node, *logger);
-    g_node = &node;
 
     node.start();
-
-    // If a signal arrived during startup, don't bother running.
-    if (g_shutdown_requested.load())
-    {
-      log(Logging::WARNING) << "Shutdown requested during startup";
-      node.stop();
-      g_node = nullptr;
-      return 0;
-    }
 
     // Construct RPC after Node has started but before Node::run().
     //
@@ -176,7 +155,6 @@ int main(int argc, char **argv)
     {
       rpc = std::make_unique<Rpc::RpcServer>(node, args.rpc, args.metrics, *logger);
       rpc->start();
-      g_rpc = rpc.get();
 
       if (args.rpc.enabled)
       {
@@ -195,16 +173,19 @@ int main(int argc, char **argv)
 
     log(Logging::INFO) << "Node is running. Press Ctrl+C to stop.";
 
-    // Block until stopped. Node::run() returns when stop() is called.
+    // Block until stopped. Node::run() returns when stop() is called,
+    // whether by the asio signal handler or by the admin shutdown RPC.
     node.run();
 
     // Stop RPC before Node finishes tearing down. This ensures no
     // handler is running against Node-owned state while Node's
-    // destructor runs.
+    // destructor runs. Runs on the main thread, after the P2P event
+    // loop has stopped, which is the safe context for the stop()
+    // sequence (no signal handler involvement).
     if (rpc)
     {
       rpc->stop();
-      g_rpc = nullptr;
+      rpc.reset();
     }
 
     log(Logging::INFO) << "Node stopped cleanly.";
@@ -214,9 +195,6 @@ int main(int argc, char **argv)
     log(Logging::ERROR) << "Fatal error: " << e.what();
     exit_code = 1;
   }
-
-  g_rpc = nullptr;
-  g_node = nullptr;
 
   // Cleanup
   log(Logging::INFO) << "Daemon exiting with code " << exit_code;

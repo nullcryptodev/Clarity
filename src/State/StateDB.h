@@ -51,83 +51,11 @@ namespace State
       TBL_MEMPOOL = 15,
       TBL_CONSENSUS_WAL = 16,
 
-      // Historical SMT. Two index tables and two value tables.
-      //
-      //   TBL_SMT_NODES_HIST:      (hash || version_be) -> children
-      //   TBL_SMT_LEAVES_HIST:     (hash || version_be) -> leaf value
-      //   TBL_SMT_NODES_BY_VER:    (version_be || hash) -> empty
-      //   TBL_SMT_LEAVES_BY_VER:   (version_be || hash) -> empty
-      //
-      // The historical tables are keyed by (hash, version) for O(1)
-      // historical reads. The by-version tables are keyed by
-      // (version, hash) for O(entries-pruned) historical pruning.
-      //
-      // Version is big-endian in the by-version index so that
-      // lexicographic order matches numeric order, which lets
-      // pruneHistory stop at the first version >= keepFrom instead of
-      // scanning the whole index.
       TBL_SMT_NODES_HIST = 17,
       TBL_SMT_LEAVES_HIST = 18,
       TBL_SMT_NODES_BY_VER = 19,
       TBL_SMT_LEAVES_BY_VER = 20,
 
-      // ---- Application index tables ----
-      //
-      // These mirror data that lives authoritatively in the SMT, but
-      // keyed for enumeration and scoped queries. The SMT is the
-      // commitment; these tables are the query layer.
-      //
-      // Every write that touches the SMT also updates the
-      // corresponding index rows in the same txn, so the two can
-      // never drift.
-      //
-      // Key layouts (all integers little-endian unless noted):
-      //
-      //   TBL_AMM_POOLS
-      //     pool_id(8) -> serialized AmmPool
-      //
-      //   TBL_AMM_POSITIONS
-      //     position_id(8) -> serialized AmmPosition
-      //
-      //   TBL_INDEX_POSITIONS_BY_OWNER
-      //     owner(32) || position_id(8) -> pool_id(8)
-      //     Prefix-scan on owner enumerates that owner's positions.
-      //
-      //   TBL_INDEX_ORDERS_BY_OWNER
-      //     owner(32) || order_id(8) -> empty
-      //     Prefix-scan on owner enumerates that owner's orders.
-      //
-      //   TBL_INDEX_BALANCES_BY_TOKEN
-      //     token_id(4) || owner(32) -> balance(8)
-      //     Prefix-scan on token_id enumerates that token's holders.
-      //     Balance is duplicated here (also in the SMT) so a holder
-      //     listing is one range scan, not N SMT lookups.
-      //
-      //   TBL_INDEX_POOLS_BY_TOKEN
-      //     token_id(4) || pool_id(8) -> empty
-      //     Prefix-scan on token_id enumerates pools containing it.
-      //
-      //   TBL_INDEX_TX_BY_ADDRESS
-      //     address(32) || height(8 BE) || tx_index(4 BE) -> txid(32)
-      //     Big-endian height so a reverse cursor scan visits newest
-      //     first — the natural order for "recent transactions for
-      //     an address".
-      //
-      //   TBL_INDEX_TX_BY_TOKEN
-      //     token_id(4) || height(8 BE) || tx_index(4 BE) -> txid(32)
-      //     Same idea, keyed by the token the transaction touched.
-      //
-      //   TBL_INDEX_TX_BY_TYPE
-      //     type(1) || height(8 BE) || tx_index(4 BE) -> txid(32)
-      //     Type is the TxType enum value, one byte.
-      //
-      //   TBL_INDEX_BLOCKS_BY_PRODUCER
-      //     proposer(32) || height(8 BE) -> block_hash(32)
-      //     Enumerates the blocks a validator produced.
-      //
-      //   TBL_INDEX_ORDERS_BY_PAIR
-      //     sell_token(4) || buy_token(4) || order_id(8) -> empty
-      //     Enumerates the order book for a specific pair.
       TBL_AMM_POOLS = 21,
       TBL_AMM_POSITIONS = 22,
       TBL_INDEX_POSITIONS_BY_OWNER = 23,
@@ -173,29 +101,12 @@ namespace State
 
       bool has(uint32_t tableId, const void *key, size_t keyLen) const;
 
-      // Iterate all entries in the given table via the txn's view.
-      // The visitor is called for each (key, value) pair in key order.
-      // If the visitor returns false, iteration stops.
-      //
-      // NOTE: unlike StateDB::forEachEntry, this uses the write txn's
-      // own cursor, so it *does* see uncommitted writes made via this
-      // same txn.
       void forEach(uint32_t tableId, const EntryVisitor &visitor) const;
 
-      // Iterate entries whose key begins with `prefix`. Same semantics
-      // as StateDB::forEachEntryWithPrefix, but through the txn's own
-      // view (sees uncommitted writes).
       void forEachWithPrefix(uint32_t tableId,
                              const std::vector<uint8_t> &prefix,
                              const EntryVisitor &visitor) const;
 
-      // Reverse iteration: visits entries in descending key order.
-      // The first call positions the cursor at the last entry in the
-      // table (or, with a prefix, at the last entry whose key begins
-      // with that prefix). Useful for "newest first" scans on indexes
-      // whose keys embed a big-endian height.
-      //
-      // The visitor returns false to stop early, matching forEach.
       void forEachReverse(uint32_t tableId, const EntryVisitor &visitor) const;
 
       void forEachWithPrefixReverse(uint32_t tableId,
@@ -214,6 +125,68 @@ namespace State
       MDBX_txn *txn_{nullptr};
       StateDB *owner_{nullptr};
       bool open_{false};
+    };
+
+    // =================================================================
+    //  Read transaction
+    //
+    //  A holder of an MDBX read txn. Any number of read txns can be
+    //  open at once across threads (MDBX is MVCC), but at most one
+    //  per thread. StateDB tracks the per-thread handle in
+    //  tls_read_txn_ so that a nested beginRead() returns a
+    //  non-owning ReadTxn wrapping the outer one, and so that any
+    //  legacy rawGet / forEach* call reuses the outer txn rather
+    //  than trying (and failing) to open a second overlapping one.
+    //
+    //  MDBX also refuses to open a write txn on a thread that
+    //  already has a read txn open. StateDB handles this by exposing
+    //  releaseReadTxn(): any write path calls it first, which
+    //  destroys the current ReadTxn on this thread and reopens it
+    //  lazily on the next read. See the comment on releaseReadTxn.
+    // =================================================================
+
+    class ReadTxn
+    {
+    public:
+      ReadTxn() noexcept = default;
+      ReadTxn(ReadTxn &&other) noexcept;
+      ReadTxn &operator=(ReadTxn &&other) noexcept;
+      ~ReadTxn();
+
+      ReadTxn(const ReadTxn &) = delete;
+      ReadTxn &operator=(const ReadTxn &) = delete;
+
+      bool get(uint32_t tableId,
+               const void *key, size_t keyLen,
+               std::vector<uint8_t> &out) const;
+
+      void forEach(uint32_t tableId, const EntryVisitor &visitor) const;
+      void forEachWithPrefix(uint32_t tableId,
+                             const std::vector<uint8_t> &prefix,
+                             const EntryVisitor &visitor) const;
+      void forEachReverse(uint32_t tableId, const EntryVisitor &visitor) const;
+      void forEachWithPrefixReverse(uint32_t tableId,
+                                    const std::vector<uint8_t> &prefix,
+                                    const EntryVisitor &visitor) const;
+
+      size_t dbiStat(uint32_t tableId) const;
+
+      void abort();
+
+      bool isOpen() const noexcept;
+
+      MDBX_txn *raw() const noexcept { return txn_; }
+
+    private:
+      friend class StateDB;
+      explicit ReadTxn(MDBX_txn *txn, StateDB *owner,
+                       bool owns, MDBX_txn *prev_tls) noexcept;
+
+      MDBX_txn *txn_{nullptr};
+      StateDB *owner_{nullptr};
+      bool open_{false};
+      bool owns_txn_{false};
+      MDBX_txn *prev_tls_{nullptr};
     };
 
     // =================================================================
@@ -248,6 +221,22 @@ namespace State
 
     // =================================================================
     //  Raw access (autocommit)
+    //
+    //  Reads do NOT take write_mutex_. MDBX readers are MVCC and
+    //  concurrent-safe.
+    //
+    //  Reads reuse the per-thread read txn if one is open; see
+    //  beginRead / releaseReadTxn.
+    //
+    //  Writes DO take write_mutex_. MDBX allows only one write txn
+    //  at a time; a second concurrent mdbx_txn_begin(READWRITE)
+    //  returns MDBX_BUSY, which this code does not retry.
+    //
+    //  Before opening a write txn, every write method calls
+    //  releaseReadTxn() to close any open read txn on this thread.
+    //  MDBX refuses to open a write txn while a read txn is open
+    //  on the same thread (MDBX_TXN_OVERLAPPING), so this release
+    //  step is mandatory.
     // =================================================================
 
     void rawPut(uint32_t tableId,
@@ -264,7 +253,8 @@ namespace State
                 const void *key, size_t keyLen) const;
 
     // =================================================================
-    //  Iteration (autocommit — opens its own read-only txn)
+    //  Iteration (autocommit — opens its own read-only txn if none
+    //  is open on this thread)
     // =================================================================
 
     void forEachEntry(uint32_t tableId, const EntryVisitor &visitor) const;
@@ -273,13 +263,38 @@ namespace State
                                 const std::vector<uint8_t> &prefix,
                                 const EntryVisitor &visitor) const;
 
-    // Reverse variants. See Txn::forEachReverse for semantics.
     void forEachEntryReverse(uint32_t tableId,
                              const EntryVisitor &visitor) const;
 
     void forEachEntryWithPrefixReverse(uint32_t tableId,
                                        const std::vector<uint8_t> &prefix,
                                        const EntryVisitor &visitor) const;
+
+    // =================================================================
+    //  Read txn lifecycle
+    //
+    //  beginRead returns a ReadTxn for the current thread. If a
+    //  read txn is already open, it returns a non-owning ReadTxn
+    //  wrapping the outer one, so the caller can hold it in a
+    //  unique_ptr alongside the outer's owner without any
+    //  coordination.
+    //
+    //  releaseReadTxn closes the outermost read txn on this thread,
+    //  if any. Write paths call this before opening a write txn,
+    //  because MDBX refuses to overlap them. The next read (via
+    //  rawGet, rawHas, forEach*, or beginRead) will transparently
+    //  open a fresh read txn, so a caller that interleaves reads
+    //  and writes simply gets a new read txn after each write.
+    //
+    //  This is the mechanism that makes "hold a ReadTxn for the
+    //  lifetime of a StateAccess" compatible with "the same
+    //  StateAccess does a write halfway through": the write closes
+    //  the read txn, then the next read reopens it.
+    // =================================================================
+
+    ReadTxn beginRead();
+
+    void releaseReadTxn() noexcept;
 
     // =================================================================
     //  Meta helpers
@@ -312,7 +327,6 @@ namespace State
 
     std::optional<std::vector<uint8_t>> getLeafData(const Crypto::Hash &leaf_hash) const;
 
-    // ---- Historical SMT access ----
     void putNodeAtVersion(const Crypto::Hash &hash,
                           uint64_t version,
                           const std::vector<uint8_t> &children);
@@ -329,10 +343,15 @@ namespace State
                               uint64_t version,
                               std::vector<uint8_t> &out) const;
 
-    // ---- Historical pruning ----
     void pruneHistoryBefore(uint64_t keepFrom);
 
     void pruneHistoryBeforeTxn(Txn &txn, uint64_t keepFrom);
+
+    //  Delete every row in TBL_CONSENSUS_WAL. Called from
+    //  Node::initGenesis on a fresh DB, so that stale WAL entries
+    //  from a previous chain (whose votes reference blocks that no
+    //  longer exist) don't get replayed by the consensus engine.
+    void wipeConsensusWal();
 
     // =================================================================
     //  Diagnostics
@@ -358,11 +377,24 @@ namespace State
 
     static const char *tableName(uint32_t id) noexcept;
 
+    //  Per-thread handle to the outermost read txn on this thread,
+    //  if one is open. Set by beginRead when it opens a fresh txn,
+    //  cleared by releaseReadTxn and by the owning ReadTxn's
+    //  destructor.
+    //
+    //  MDBX requires this: a read txn already in progress on a given
+    //  thread must be reused by any nested read, because
+    //  mdbx_txn_begin returns MDBX_BUSY for a second overlapping
+    //  read txn on the same thread, and MDBX_TXN_OVERLAPPING for a
+    //  write txn that would overlap an existing read txn.
+    static thread_local MDBX_txn *tls_read_txn_;
+
     MDBX_env *env_{nullptr};
     MDBX_dbi tables_[TBL_COUNT]{};
     size_t mapSizeBytes_{0};
 
-    mutable std::mutex mutex_;
+    // Guards writes only. Reads are lock-free (MVCC).
+    mutable std::mutex write_mutex_;
     std::string path_;
   };
 

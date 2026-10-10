@@ -127,11 +127,25 @@ namespace Node
     // Kick off P2P listening and connection attempts.
     p2p_->start(config_.seeds);
 
-    // Consensus is started lazily by the consensus poll timer:
-    // onConsensusPoll checks whether enough peers are Established to
-    // form a quorum and starts consensus on the first poll where the
-    // condition holds. This avoids starting consensus before the first
-    // peer's handshake completes, which would drop the first proposal.
+    //  Install signal handling on the P2P io_context.
+    //
+    //  asio's signal_set catches SIGINT and SIGTERM via a self-pipe
+    //  and delivers the notification as an event on the io_context.
+    //  The callback below runs on the event loop thread — the same
+    //  thread that services P2P I/O and consensus ticks — so it is
+    //  safe to take locks, join threads, and call node methods.
+    signals_ = std::make_unique<boost::asio::signal_set>(
+        p2p_->executor(), SIGINT, SIGTERM);
+    signals_->async_wait(
+        [this](const boost::system::error_code &ec, int signum)
+        {
+          if (ec)
+            return;
+          (*log_)(Logging::INFO) << "Received signal " << signum
+                                 << ", shutting down";
+          stop();
+        });
+
     armConsensusPollTimer();
     armSyncTickTimer();
 
@@ -151,15 +165,13 @@ namespace Node
 
     (*log_)(Logging::INFO) << "Node stopping";
 
-    // Cancel the poll timers first. Handlers that are already queued
-    // see the operation_aborted error and return without re-arming.
-    // This matters because P2PManager::stop() below may take up to
-    // one interval's worth of time to drain; we don't want the timer
-    // firing more work into the middle of the shutdown.
     if (consensus_timer_)
       consensus_timer_->cancel();
     if (sync_timer_)
       sync_timer_->cancel();
+
+    if (signals_)
+      signals_->cancel();
 
     if (consensus_)
       consensus_->stop();
@@ -177,13 +189,8 @@ namespace Node
   void Node::maybeStartConsensus()
   {
     if (!consensus_)
-      return; // not a validator
+      return;
 
-    // Do not start (or restart) consensus while we're behind. A
-    // validator that's syncing doesn't know the current height, and
-    // a proposal made on a stale parent will be rejected by every
-    // up-to-date peer. Once sync catches up, the poll loop will call
-    // this again and consensus will start normally.
     if (chain_ && chain_->isSyncing())
     {
       (*log_)(Logging::DEBUGGING)
@@ -194,11 +201,8 @@ namespace Node
     }
 
     if (consensus_started_.exchange(true))
-      return; // already started
+      return;
 
-    // Count peers that have completed the handshake. peerCount()
-    // includes peers that are still handshaking; broadcast() filters
-    // those out, so they can't help us reach a quorum yet.
     size_t established = 0;
     if (p2p_)
     {
@@ -235,25 +239,14 @@ namespace Node
   {
     (*log_)(Logging::INFO) << "Initializing storage...";
 
-    // Create data directory if needed.
     std::filesystem::create_directories(config_.data_dir);
 
-    // Open the state DB.
     std::string state_path = config_.data_dir + "/state";
     state_db_ = std::make_unique<State::StateDB>(state_path,
                                                  config_.state_map_size);
 
-    // Open the chain DB (block + receipt storage).
-    std::string chain_path = config_.data_dir + "/chain";
-    // ChainDB uses the same StateDB infrastructure for its tables —
-    // for v1, we keep everything in one DB.
     chain_db_ = std::make_unique<Core::ChainDB>(*state_db_);
-
-    // Chain wrapper.
     chain_ = std::make_unique<Core::Chain>(*chain_db_);
-
-    // Mempool. Attached to the state DB so pending transactions
-    // survive a restart. See initMempool() for the load path.
     mempool_ = std::make_unique<Core::Mempool>(*state_db_);
 
     (*log_)(Logging::DEBUGGING)
@@ -266,9 +259,6 @@ namespace Node
     if (!mempool_)
       return;
 
-    // Build a state view at the current chain height. makeStateView()
-    // returns null only if state_db_ or chain_ is missing, both of
-    // which are guaranteed by initStorage having run first.
     auto view = makeStateView();
     if (!view)
     {
@@ -277,11 +267,6 @@ namespace Node
       return;
     }
 
-    // load() re-adds each persisted entry through the normal validation
-    // path. Entries that fail (nonce too low, insufficient funds,
-    // expired) are dropped and their persisted rows deleted. This is
-    // what filters out transactions that were mined while we were
-    // offline.
     mempool_->load(*view);
 
     (*log_)(Logging::INFO)
@@ -295,14 +280,16 @@ namespace Node
 
     Core::GenesisConfig cfg = genesisConfig();
 
-    // A StateAccess over the current committed state. Used by the
-    // fresh-DB path to apply genesis, and by nothing in the initialized
-    // path (which only inspects ChainDB meta).
-    State::StateAccess state(*state_db_, /*version=*/0);
-
-    auto head = chain_db_->getHead();
-    const bool db_initialized = (head.height > 0) || !head.hash.isNull() ||
-                                !chain_db_->getGenesisHash().isNull();
+    //  Inspect the existing DB state first. This is a read-only
+    //  check; use a short-lived autocommit StateAccess for it. The
+    //  ReadTxn it holds is released when the StateAccess goes out
+    //  of scope.
+    bool db_initialized = false;
+    {
+      auto head = chain_db_->getHead();
+      db_initialized = (head.height > 0) || !head.hash.isNull() ||
+                       !chain_db_->getGenesisHash().isNull();
+    }
 
     if (db_initialized)
     {
@@ -315,62 +302,86 @@ namespace Node
       return;
     }
 
-    // Fresh DB — apply genesis. `state` is in scope here.
     (*log_)(Logging::INFO)
         << "Empty state detected, applying genesis for "
         << networkName(config_.network);
 
-    Core::applyGenesis(state, cfg);
-    state.commit(0);
+    //  Genesis is one atomic write: the entire genesis state, the
+    //  genesis block, and the chain head all live in a single MDBX
+    //  write txn. Either all of it commits, or none of it does.
+    //
+    //  This also sidesteps the MDBX_TXN_OVERLAPPING problem that
+    //  arises when an autocommit StateAccess holds a read txn and
+    //  then tries to write through db_.rawPut(). Under a bound
+    //  write txn, every read and write goes through the write txn
+    //  and no read txn is ever opened.
+    Crypto::Hash genesis_hash;
 
-    Core::Block genesis = Core::makeGenesisBlock(state, cfg);
-    Crypto::Hash genesis_hash = genesis.hash();
-
-    // Pinned-hash check: refuse to start if genesis construction has
-    // drifted from the canonical value. Skipped when the caller supplied
-    // a genesis override — that's a test or a private chain, and the
-    // override is explicitly saying "use this genesis, not the network's."
-    if (!config_.test_genesis_override.has_value())
     {
-      Crypto::Hash expected = Core::expectedGenesisHash(cfg);
-      if (!expected.isNull() && genesis_hash != expected)
+      auto txn = state_db_->beginWrite();
+      State::StateAccess state(*state_db_, txn, /*version=*/0);
+
+      Core::applyGenesis(state, cfg);
+      state.commit(0);
+
+      Core::Block genesis = Core::makeGenesisBlock(state, cfg);
+      genesis_hash = genesis.hash();
+
+      // Pinned-hash check: refuse to start if genesis construction
+      // has drifted from the canonical value. Skipped when the
+      // caller supplied a genesis override — that's a test or a
+      // private chain, and the override is explicitly saying "use
+      // this genesis, not the network's."
+      if (!config_.test_genesis_override.has_value())
       {
-        throw std::runtime_error(
-            "node: genesis hash mismatch — genesis construction has "
-            "changed since this network was defined. "
-            "Expected " +
-            expected.toString() +
-            ", got " + genesis_hash.toString() +
-            ". This is a consensus-breaking change; do not proceed.");
+        Crypto::Hash expected = Core::expectedGenesisHash(cfg);
+        if (!expected.isNull() && genesis_hash != expected)
+        {
+          throw std::runtime_error(
+              "node: genesis hash mismatch — genesis construction has "
+              "changed since this network was defined. "
+              "Expected " +
+              expected.toString() +
+              ", got " + genesis_hash.toString() +
+              ". This is a consensus-breaking change; do not proceed.");
+        }
+
+        if (expected.isNull())
+        {
+          (*log_)(Logging::WARNING)
+              << "No pinned genesis hash for chain_id 0x"
+              << std::hex << cfg.chain_id << std::dec
+              << ". Computed hash: " << genesis_hash.toString()
+              << ". Consider pinning it in GlobalConfig to catch future "
+                 "genesis-construction drift.";
+        }
       }
 
-      if (expected.isNull())
-      {
-        (*log_)(Logging::WARNING)
-            << "No pinned genesis hash for chain_id 0x"
-            << std::hex << cfg.chain_id << std::dec
-            << ". Computed hash: " << genesis_hash.toString()
-            << ". Consider pinning it in GlobalConfig to catch future "
-               "genesis-construction drift.";
-      }
+      chain_db_->storeBlockTxn(txn, genesis, genesis_hash);
+
+      Core::ChainDB::ChainHead ghead;
+      ghead.hash = genesis_hash;
+      ghead.height = 0;
+      chain_db_->setHeadTxn(txn, ghead);
+
+      txn.commit();
     }
 
-    auto txn = state_db_->beginWrite();
-    chain_db_->storeBlockTxn(txn, genesis, genesis_hash);
-
-    Core::ChainDB::ChainHead ghead;
-    ghead.hash = genesis_hash;
-    ghead.height = 0;
-    chain_db_->setHeadTxn(txn, ghead);
-    txn.commit();
+    //  Wipe any stale consensus WAL. A fresh DB is a fresh chain;
+    //  any WAL rows from a previous life reference blocks whose
+    //  height and hash no longer correspond to anything on the
+    //  current chain. If they survived, the consensus engine would
+    //  replay them at start() and force this validator to vote for
+    //  a block that no other node recognises, deadlocking the
+    //  round.
+    state_db_->wipeConsensusWal();
 
     chain_db_->setChainId(config_.chain_id);
     chain_db_->setGenesisHash(genesis_hash);
 
     (*log_)(Logging::INFO)
         << "Genesis applied: block hash="
-        << ghead.hash.toString().substr(0, 16)
-        << " state root=" << state.stateRoot().toString().substr(0, 16);
+        << genesis_hash.toString().substr(0, 16);
   }
 
   void Node::initP2P()
@@ -387,18 +398,11 @@ namespace Node
 
     P2P::P2PConfig p2p_cfg;
 
-    // Network identity.
     p2p_cfg.magic = P2P::magicForNetwork(static_cast<int>(config_.network));
     p2p_cfg.agentString = GlobalConfig::PROJECT_AGENT_STRING;
     p2p_cfg.protocolVersion = GlobalConfig::CURRENT_PROTOCOL_VERSION;
-
-    // Listening.
     p2p_cfg.listenPort = config_.p2p_port;
-
-    // Bootstrap.
     p2p_cfg.dnsSeeds = config_.seeds;
-
-    // Leave the rest at defaults.
 
     p2p_ = std::make_unique<P2P::P2PManager>(p2p_cfg, logger_, config_.data_dir);
 
@@ -458,10 +462,6 @@ namespace Node
 
     a.pubkey = Crypto::derivePublicKey(node_key_);
 
-    // The ephemeral key is owned by the Peer. We sign the same key
-    // the Peer will use to derive session keys — if we signed a
-    // different one, the two sides would derive divergent session
-    // keys and AuthReady would fail.
     const Crypto::X25519KeyPair &eph = peer.ephemeralKeypair();
     std::memcpy(a.ephemeralPubkey.data.data(),
                 eph.publicKey.data(),
@@ -473,11 +473,6 @@ namespace Node
     P2P::AuthNonces nonces = P2P::orderNonces(
         peer.direction(), my_nonce, their_nonce);
 
-    // The challenge covers both pubkeys: the identity key binds the
-    // signature to the peer's claimed identity, the ephemeral key
-    // binds it to the specific X25519 key that will derive the
-    // session. A MITM cannot substitute the ephemeral key without
-    // invalidating the signature.
     Crypto::Hash challenge = P2P::computeAuthChallenge(
         nonces, a.pubkey, a.ephemeralPubkey);
 
@@ -503,8 +498,6 @@ namespace Node
     P2P::AuthNonces nonces = P2P::orderNonces(
         peer.direction(), my_nonce, their_nonce);
 
-    // Reconstruct the same four-field challenge the sender signed
-    // over, using the keys from the message (the remote side's).
     Crypto::Hash challenge = P2P::computeAuthChallenge(
         nonces, a.pubkey, a.ephemeralPubkey);
 
@@ -528,8 +521,6 @@ namespace Node
       Core::ValidatorInfo v;
       if (!state.getValidator(vid, v))
         continue;
-      // v1 convention: the validator's signing key IS its reward
-      // address. See getSignerPublicKey().
       if (v.effectiveConsensusKey() == pk)
         return vid;
     }
@@ -562,8 +553,6 @@ namespace Node
         Logging::LoggerRef(logger_, "Consensus"));
   }
 
-  //  Genesis config lookup
-
   Core::GenesisConfig Node::genesisConfig() const
   {
     if (config_.test_genesis_override)
@@ -581,12 +570,8 @@ namespace Node
     return Core::regtestGenesis();
   }
 
-  //  Status
-
   Node::Status Node::status() const
   {
-    std::lock_guard<std::mutex> lock(status_mutex_);
-
     Status s;
     s.network = config_.network;
     s.chain_id = config_.chain_id;
@@ -606,12 +591,8 @@ namespace Node
     }
     if (p2p_)
     {
-      //  peerCount() reads an atomic counter, safe from this thread.
       s.peer_count = p2p_->peerCount();
 
-      //  snapshot() reads only atomics and mutex-guarded
-      //  size() accessors — see its own comment for the audit.
-      //  No post to the event loop, no blocking.
       const auto snap = p2p_->snapshot();
       s.peers_total = snap.total;
       s.peers_inbound = snap.inbound;
@@ -634,10 +615,6 @@ namespace Node
       s.consensus_precommits = cs.precommit_count;
       s.consensus_is_proposer = cs.is_proposer;
 
-      //  consecutiveTimeouts() and emergencyRotationActive() take
-      //  the consensus engine's mutex internally and return value
-      //  copies. Both are cheap — no callback into the node, no
-      //  state read.
       s.consensus_consecutive_timeouts =
           static_cast<uint32_t>(consensus_->consecutiveTimeouts());
       s.consensus_emergency_rotation =
@@ -646,8 +623,6 @@ namespace Node
 
     return s;
   }
-
-  //  Consensus deps
 
   Consensus::Dependencies Node::buildConsensusDeps()
   {
@@ -682,43 +657,23 @@ namespace Node
       return found;
     };
 
-    // ---- chain_id ----
-    // Needed by propose() to stamp block.header.chain_id. Without this,
-    // deps_.chain_id() defaults to 0 and every proposed block carries
-    // chain_id = 0, which BlockProcessor::checkHeader rejects.
     deps.chain_id = [this]() -> uint64_t
     { return config_.chain_id; };
 
-    // ---- parent_hash ----
-    // The parent of the next block is the current chain head. Read fresh
-    // on each call so the proposer sees the head that was just committed.
     deps.parent_hash = [this]() -> Crypto::Hash
     {
       return chain_db_->getHead().hash;
     };
 
-    // ---- my_address ----
-    // The address that appears in the proposed block's header. For v1,
-    // this is the validator's reward_address, matching the convention
-    // used by getSignerPublicKey.
     deps.my_address = [this]() -> Crypto::Address
     {
       State::StateAccess state(*state_db_, /*version=*/0);
       Core::ValidatorInfo v;
       if (!state.getValidator(config_.validator_id, v))
         return Crypto::Address{};
-      return v.effectiveConsensusKey();
+      return v.reward_address;
     };
 
-    // ---- simulate_block ----
-    // Dry-run the block against committed state and return the resulting
-    // state root. Must not commit. The BlockProcessor is invoked with
-    // dry_run = true so it stops short of writing anything the caller
-    // could observe; the txn is aborted unconditionally.
-    //
-    // This is the callback that makes propose() and validateProposal()
-    // work. Without it, both return nullopt and no block is ever
-    // proposed or accepted.
     deps.simulate_block = [this](const Core::Block &b)
         -> std::optional<Crypto::Hash>
     {
@@ -732,28 +687,18 @@ namespace Node
         ctx.dry_run = true;
         Core::BlockResult r = Core::BlockProcessor::applyBlock(state, b, ctx);
         txn.abort();
+
         if (!r.valid)
           return std::nullopt;
         return r.new_state_root;
       }
-      catch (...)
+      catch (const std::exception &e)
       {
         txn.abort();
         return std::nullopt;
       }
     };
 
-    // ---- verify_slash_proof ----
-    //  Called by the proposer for each piece of local equivocation
-    //  evidence before including it in a Slash tx.
-    //
-    //  Pass an empty active set: the proposer's job is to filter
-    //  obviously-malformed proofs, not to be the final arbiter of set
-    //  membership. Core::verifyEquivocationProof treats an empty set
-    //  as "no membership check," and the on-chain verifier (via
-    //  BlockProcessor::applySlash, which has the correct set for the
-    //  block's height) is the authority on whether a proof is valid
-    //  in context.
     deps.verify_slash_proof =
         [this](const std::vector<uint8_t> &payload) -> bool
     {
@@ -763,23 +708,11 @@ namespace Node
       return result.has_value();
     };
 
-    // ---- has_pending_work ----
-    //  True when the mempool is non-empty. Called by pollTimers
-    //  during a pacing delay: if a transaction has arrived while
-    //  the chain was idle, the delay is cancelled and the next
-    //  block is proposed immediately.
     deps.has_pending_work = [this]() -> bool
     {
       return mempool_ && mempool_->size() > 0;
     };
 
-    // ---- now_ms ----
-    //  Wall-clock milliseconds. Used to stamp a proposal's timestamp
-    //  and to compute the pacing deadline after a commit.
-    //
-    //  This was previously unset, and the pacing code checks
-    //  `if (deps_.now_ms)` before computing the deadline, so an
-    //  unset callback silently disabled pacing.
     deps.now_ms = []() -> uint64_t
     {
       return static_cast<uint64_t>(
@@ -788,20 +721,6 @@ namespace Node
               .count());
     };
 
-    // ---- WAL ----
-    //
-    //  Every vote we sign is written to TBL_CONSENSUS_WAL before it
-    //  is broadcast. The write is durable (StateDB::rawPut commits
-    //  with MDBX's default sync behavior), so a crash after the
-    //  return but before the broadcast still leaves a durable
-    //  record that we signed this vote. On restart, wal_replay
-    //  reads it back, and the validator will not re-sign a
-    //  different vote for the same (height, round).
-    //
-    //  Only our own votes are WAL'd. Recording other validators'
-    //  votes would help recovery but isn't needed for the
-    //  self-slashing safety property, and it would grow the WAL by
-    //  a factor of the active set size.
     deps.wal_append_vote =
         [this](const Consensus::Vote &v, bool is_precommit)
     {
@@ -835,7 +754,7 @@ namespace Node
               return true;
             const uint64_t h = readU64BE(key.data());
             if (h != for_height)
-              return true; // only replay this height
+              return true;
 
             const uint32_t kind = readU32BE(key.data() + 8);
 
@@ -864,11 +783,6 @@ namespace Node
     deps.wal_truncate =
         [this](Height committed_height)
     {
-      //  Collect keys to delete, then delete them in a single txn.
-      //  The WAL is small in absolute terms but a truncate after a
-      //  long-active validator could touch a few hundred entries; one
-      //  MDBX commit is faster than N, and it keeps the truncation
-      //  atomic from the DB's point of view.
       std::vector<std::vector<uint8_t>> to_delete;
 
       auto collect_txn = state_db_->beginWrite();
@@ -924,7 +838,7 @@ namespace Node
     };
     cb.on_block_committed = [this](const Core::Block &b)
     {
-      onBlockCommitted(b);
+      return onBlockCommitted(b);
     };
     cb.on_height_advanced = [this](Height h)
     {
@@ -932,8 +846,6 @@ namespace Node
     };
     return cb;
   }
-
-  //  ConsensusDependencies implementations
 
   Id Node::getMyValidatorId() const
   {
@@ -956,8 +868,6 @@ namespace Node
 
   std::vector<Id> Node::getActiveSet() const
   {
-    // Open a read-only StateAccess. We could cache the active set, but
-    // it changes at rotation boundaries; for v1 we re-read on demand.
     State::StateAccess state(*state_db_, /*version=*/0);
     return loadActiveSetFromState(state);
   }
@@ -996,7 +906,6 @@ namespace Node
 
     Id vid = active[idx];
 
-    // Read the validator from state.
     State::StateAccess state(*state_db_, /*version=*/0);
     Core::ValidatorInfo v;
     if (!state.getValidator(vid, v))
@@ -1005,11 +914,8 @@ namespace Node
     return v.effectiveConsensusKey();
   }
 
-  //  ConsensusCallbacks implementations
-
   void Node::onConsensusProposal(const Consensus::Proposal &p)
   {
-    // Encode and broadcast via P2P.
     auto encoded = Consensus::encodeProposal(p);
 
     if (!p2p_)
@@ -1043,7 +949,6 @@ namespace Node
     if (!mempool_)
       return {};
 
-    // Build a StateView at the current height.
     auto state_view = makeStateView();
     if (!state_view)
       return {};
@@ -1053,9 +958,6 @@ namespace Node
 
   std::unique_ptr<Core::StateView> Node::makeStateView() const
   {
-    // Read at the current chain height. The StateView owns the
-    // StateAccess, so it remains valid for the caller's lifetime
-    // regardless of what else runs concurrently.
     uint64_t version = chain_->height();
     uint64_t chain_id = config_.chain_id;
 
@@ -1064,7 +966,7 @@ namespace Node
         std::move(state), version, chain_id);
   }
 
-  void Node::onBlockCommitted(const Core::Block &block)
+  bool Node::onBlockCommitted(const Core::Block &block)
   {
     std::string error;
     if (!applyCommittedBlock(block, error))
@@ -1072,9 +974,7 @@ namespace Node
       (*log_)(Logging::ERROR)
           << "Failed to apply committed block at height "
           << block.header.height << ": " << error;
-      // In a full implementation, we would enter a recovery mode or
-      // halt the node. For v1, we log and continue.
-      return;
+      return false;
     }
 
     (*log_)(Logging::DEBUGGING)
@@ -1082,11 +982,8 @@ namespace Node
         << " hash=" << block.hash().toString().substr(0, 16)
         << " txs=" << block.transactions.size();
 
-    // Announce to peers. This is the only path by which non-validator
-    // nodes learn about new blocks: they can't participate in consensus,
-    // so they never see a Proposal, and they need the post-commit
-    // Block message to advance.
     broadcastBlock(block);
+    return true;
   }
 
   void Node::onHeightAdvanced(Height height)
@@ -1097,10 +994,6 @@ namespace Node
 
   void Node::onConsensusPoll()
   {
-    // Try to start consensus if we haven't already. This runs on the
-    // io_context thread, so snapshot() is safe to call. It's the
-    // first thing we do so that consensus starts within one poll
-    // interval of the first peer reaching Established.
     if (!consensus_started_.load())
       maybeStartConsensus();
 
@@ -1120,8 +1013,6 @@ namespace Node
           << " precommits=" << s.precommit_count;
     }
   }
-
-  //  P2P event handlers
 
   void Node::onP2PMessage(const P2P::Message &msg, P2P::PeerId from)
   {
@@ -1168,27 +1059,16 @@ namespace Node
   void Node::onP2PPeerConnected(P2P::PeerId id)
   {
     (*log_)(Logging::INFO) << "Peer connected: " << id;
-
-    // Do not try to start consensus here. onPeerConnected fires at
-    // TCP-connect time, before the version handshake completes, so
-    // broadcast() would silently drop any proposal we sent. The
-    // poll loop (onConsensusPoll) retries the start every interval
-    // and uses the Established count, which is the correct
-    // condition.
     (void)id;
   }
 
   void Node::onP2PPeerDisconnected(P2P::PeerId id, const std::string &reason)
   {
     (*log_)(Logging::DEBUGGING) << "Peer disconnected: " << id << " (" << reason << ")";
-    // Drop the sync manager, if any. Any in-flight request dies with
-    // it; the next peer with a higher best_height will take over.
     sync_managers_.erase(id);
     peer_heights_.erase(id);
     updateBestPeerHeight();
   }
-
-  //  Consensus message handlers
 
   void Node::handleIncomingProposal(const P2P::Message &msg)
   {
@@ -1202,17 +1082,6 @@ namespace Node
       return;
     }
 
-    //  Emergency-set fork guard. Before accepting an emergency
-    //  proposal for the next height, check whether the consensus
-    //  layer holds a conflicting quorum-signed block at that
-    //  height. A quorum-signed block beats an emergency proposal:
-    //  the emergency proposal is a *claim* that the normal path is
-    //  stuck, and a block that already has quorum is evidence that
-    //  it isn't. Applying the held block advances the chain and
-    //  makes the emergency proposal stale.
-    //
-    //  The check is cheap: it only runs when the proposal is for
-    //  the next height and its block carries an emergency flag.
     if (chain_ &&
         p.height == chain_->height() + 1)
     {
@@ -1236,11 +1105,9 @@ namespace Node
           if (applyCommittedBlock(*held, error))
           {
             broadcastBlock(*held);
-            return; // drop the emergency proposal
+            return;
           }
 
-          //  If the held block doesn't apply, fall through. The
-          //  emergency proposal is the last chance at this height.
           (*log_)(Logging::WARNING)
               << "Held quorum block failed to apply: " << error
               << "; falling through to emergency proposal";
@@ -1263,18 +1130,11 @@ namespace Node
       return;
     }
 
-    // Route by message type, not by local step. A precommit received
-    // during the prevote step is still a precommit — it's just early,
-    // and the consensus engine will drop it. Conflating the two would
-    // let precommits satisfy the prevote quorum and vice versa, which
-    // breaks the safety argument.
     if (is_precommit)
       consensus_->onPrecommit(v);
     else
       consensus_->onPrevote(v);
   }
-
-  //  Transaction and block handlers
 
   void Node::handleIncomingTx(const P2P::Message &msg)
   {
@@ -1290,14 +1150,6 @@ namespace Node
       return;
     }
 
-    // Dedup before touching the mempool: if we already have this txid,
-    // drop it silently. Without this, a broadcast from every peer
-    // re-triggers a re-broadcast and the tx loops forever. The check
-    // and the subsequent add are not atomic, so a race is possible
-    // (two threads both see the tx as missing, both call add; add is
-    // mutex-guarded and one insert wins, the other hits the
-    // idempotent-accept path). The result is a duplicate broadcast,
-    // which is bounded and harmless.
     const Crypto::Hash txid = tx.txid();
     if (mempool_->contains(txid))
       return;
@@ -1314,9 +1166,6 @@ namespace Node
           << "Tx accepted to mempool: "
           << txid.toString().substr(0, 16);
 
-      // Propagate to peers so the tx reaches validators who can
-      // include it. Every node that accepts a tx does this exactly
-      // once; the `contains` check above is what breaks the loop.
       broadcastTransaction(tx);
     }
     else
@@ -1328,22 +1177,6 @@ namespace Node
 
   void Node::handleIncomingBlock(const P2P::Message &msg, P2P::PeerId from)
   {
-    // Relay path. A peer that has committed a block broadcasts the
-    // full block after applyCommittedBlock succeeds locally. We receive
-    // it here, apply it if it's the next one we need, and re-broadcast
-    // so it propagates through the network.
-    //
-    // Three cases:
-    //
-    //   Already have it       → drop silently, no re-broadcast.
-    //   Height == our + 1     → apply, then re-broadcast.
-    //   Height >  our + 1     → drop, rely on sync to fill the gap.
-    //                           The block will arrive again after we
-    //                           catch up.
-    //   Height <= our height  → fork. Ban the sender. This should not
-    //                           happen on a final chain; a peer that
-    //                           sends it is either buggy or malicious.
-
     if (!chain_ || !chain_db_)
       return;
 
@@ -1356,7 +1189,6 @@ namespace Node
 
     const Crypto::Hash block_hash = block.hash();
 
-    // Already have it.
     if (chain_db_->hasBlock(block_hash))
       return;
 
@@ -1380,7 +1212,6 @@ namespace Node
 
     if (block.header.height > our_height + 1)
     {
-      // Gap. Sync will fill it. Drop.
       (*log_)(Logging::DEBUGGING)
           << "Block at height " << block.header.height
           << " is ahead of our height " << our_height
@@ -1388,7 +1219,6 @@ namespace Node
       return;
     }
 
-    // Height == our_height + 1. Apply.
     std::string error;
     if (!applyCommittedBlock(block, error))
     {
@@ -1402,8 +1232,6 @@ namespace Node
         << "Applied relayed block: height=" << block.header.height
         << " hash=" << block_hash.toString().substr(0, 16);
 
-    // Re-broadcast so the block propagates one hop further. A node
-    // that's already seen it drops it silently.
     broadcastBlock(block);
   }
 
@@ -1420,8 +1248,6 @@ namespace Node
     if (!chain_ || !p2p_)
       return;
 
-    // Clamp the request. A peer asking for 1 million headers gets
-    // MAX_HEADERS_PER_REQUEST.
     const uint32_t limit = std::min(
         req.limit, P2P::MAX_HEADERS_PER_REQUEST);
 
@@ -1475,8 +1301,6 @@ namespace Node
       auto block = chain_db_->getBlock(hash);
       if (!block.has_value())
       {
-        // We don't have this block. The requester will re-request it
-        // from another peer, or from us later if we catch up.
         continue;
       }
       resp.blocks.push_back(std::move(*block));
@@ -1489,21 +1313,12 @@ namespace Node
     p2p_->sendTo(from, reply);
   }
 
-  //  Block application
-
   bool Node::applyCommittedBlock(const Core::Block &block, std::string &error)
   {
     State::StateDB::Txn txn = state_db_->beginWrite();
 
     try
     {
-      // Atomicity invariant: the state writes, the block index writes, and
-      // the chain head update all happen on the same MDBX txn. Either they
-      // all commit, or none of them do.
-      //
-      // Test injection: FailPoint::InsideTxn throws immediately after
-      // beginWrite to exercise the abort path. See
-      // NodeEndToEndFixture.InjectionInsideTxnLeavesNothingPersisted.
       if (fail_point_for_test_ == FailPoint::InsideTxn)
       {
         fail_point_for_test_ = FailPoint::None;
@@ -1516,8 +1331,7 @@ namespace Node
       ctx.chain_id = config_.chain_id;
       ctx.current_height = block.header.height;
 
-      Core::BlockResult result =
-          Core::BlockProcessor::applyBlock(state, block, ctx);
+      Core::BlockResult result = Core::BlockProcessor::applyBlock(state, block, ctx);
 
       if (!result.valid)
       {
@@ -1545,7 +1359,6 @@ namespace Node
       return false;
     }
 
-    // Post-commit bookkeeping 
     if (mempool_)
     {
       std::vector<Crypto::Hash> txids;
@@ -1556,11 +1369,51 @@ namespace Node
       mempool_->purgeExpired(block.header.height);
     }
 
+    {
+      State::StateAccess state(*state_db_, block.header.height);
+
+      const uint64_t window = config_.fee_window_blocks;
+      const uint64_t tip = block.header.height;
+
+      uint64_t sum = state.getMetaU64("fees_in_window");
+
+      if (tip >= window)
+      {
+        const uint64_t leaving_height = tip - window;
+        auto leaving_header = chain_db_->getHeaderByHeight(leaving_height);
+        if (leaving_header.has_value())
+        {
+          const uint64_t leaving_fees = leaving_header->total_fees;
+          sum = (sum >= leaving_fees) ? (sum - leaving_fees) : 0;
+        }
+      }
+
+      sum += block.header.total_fees;
+
+      state.putMetaU64("fees_in_window", sum);
+    }
+
+    if (config_.smt_history_blocks > 0 &&
+        block.header.height >= config_.smt_history_blocks &&
+        block.header.height - last_prune_height_ >= 100)
+    {
+      const uint64_t keep_from =
+          block.header.height - config_.smt_history_blocks;
+      try
+      {
+        state_db_->pruneHistoryBefore(keep_from);
+        last_prune_height_ = block.header.height;
+      }
+      catch (const std::exception &e)
+      {
+        (*log_)(Logging::WARNING)
+            << "SMT history prune failed: " << e.what();
+      }
+    }
+
     state_db_->flush();
     return true;
   }
-
-  //  External API
 
   Core::MempoolAddResult Node::submitTransaction(const Core::Transaction &tx,
                                                  std::string &error)
@@ -1582,10 +1435,6 @@ namespace Node
       return result;
     }
 
-    // Propagate to peers. The local mempool now has the tx; every
-    // other node will learn about it through this broadcast (or from
-    // one of the peers we broadcast to). If P2P is disabled, this is
-    // a no-op.
     broadcastTransaction(tx);
 
     return result;
@@ -1612,7 +1461,6 @@ namespace Node
       return;
     node_key_loaded_ = true;
 
-    // Explicit override wins — tests and tooling use this.
     if (!config_.node_secret_key.isNull())
     {
       node_key_ = config_.node_secret_key;
@@ -1621,13 +1469,6 @@ namespace Node
       return;
     }
 
-    // A validator's node identity IS its validator identity. This is
-    // what makes verifyPeerAuth() able to bind the peer to a validator
-    // ID: the pubkey we advertise in Auth derives to the validator's
-    // reward_address, which is what the active-set lookup matches on.
-    //
-    // Non-validator nodes fall through and get a fresh key, which
-    // authenticates them as "not a validator" (validator_id = 0).
     if (!config_.consensus_secret_key.isNull())
     {
       node_key_ = config_.consensus_secret_key;
@@ -1636,10 +1477,8 @@ namespace Node
       return;
     }
 
-    // Non-validator: load or create a persistent identity.
     const std::string path = config_.data_dir + "/node_key";
 
-    // Try to load an existing key.
     {
       std::ifstream in(path, std::ios::binary);
       if (in)
@@ -1659,7 +1498,6 @@ namespace Node
       }
     }
 
-    // Generate a fresh key and persist it.
     Crypto::KeyPair kp = Crypto::generateKeyPair();
     node_key_ = kp.secretKey;
 
@@ -1669,17 +1507,12 @@ namespace Node
       {
         (*log_)(Logging::ERROR)
             << "Failed to write node key to " << path;
-        // Fall back to the in-memory key. P2P will still work for
-        // this session, but the identity won't be stable across
-        // restarts. Log loudly.
         return;
       }
       out.write(reinterpret_cast<const char *>(node_key_.data.data()),
                 node_key_.data.size());
       out.close();
 
-      // Restrict permissions. Best-effort — some filesystems don't
-      // support this.
       std::error_code ec;
       std::filesystem::permissions(
           path,
@@ -1710,12 +1543,6 @@ namespace Node
         << " validator_id=" << info.validator_id
         << " agent=\"" << info.agent << "\"";
 
-    // Build the SyncManager. It has four callbacks into Node:
-    //   our_height    — reads chain height fresh on every use
-    //   send          — forwards to P2PManager::sendTo
-    //   apply_blocks  — hands blocks to applyCommittedBlock
-    //   on_misbehavior— scores the peer and, if the score crosses
-    //                   the ban threshold, disconnects.
     auto mgr = std::make_unique<P2P::SyncManager>(
         info.id, config_.max_block_bytes);
 
@@ -1726,9 +1553,6 @@ namespace Node
       return chain_ ? chain_->height() : 0;
     };
 
-    // Record the peer's advertised best height. Chain::setBestPeerHeight
-    // persists it; Chain::isSyncing reads it. This is what feeds the
-    // consensus gate above and the best_peer_height field in status().
     if (chain_)
     {
       uint64_t current = chain_->bestPeerHeight();
@@ -1756,9 +1580,6 @@ namespace Node
           (*log_)(Logging::WARNING)
               << "Sync block at height " << b.header.height
               << " failed to apply: " << error;
-          // Stop at the first failure. The count returned is
-          // "blocks before the failure" — the SyncManager treats
-          // any shortfall as a protocol violation and disconnects.
           return applied;
         }
         ++applied;
@@ -1775,25 +1596,13 @@ namespace Node
           << "Sync misbehavior from peer " << peer_id
           << " (+" << score << "): " << reason;
 
-      // Reach into the peer to record the score. reportMisbehavior
-      // already increments stats_.misbehaviors and invokes
-      // onMisbehaving (which P2PManager turns into a ban record).
-      //
-      // We deliberately do NOT forceClose from here — the score
-      // accumulates, and P2PManager::handlePeerDisconnected bans
-      // when the accumulated score crosses banThreshold. A peer
-      // that misses one request isn't banned; a peer that
-      // repeatedly lies about headers is.
       auto *peer = p2p_->findPeer(peer_id);
       if (peer)
         peer->reportMisbehavior(score, /*reason=*/0);
     };
 
-    // Record before starting so a racing message can find it.
     sync_managers_[peer_id] = std::move(mgr);
 
-    // Kick off the initial sync. If the peer is at or below our
-    // height, this is a no-op.
     sync_managers_[peer_id]->start();
   }
 
@@ -1801,7 +1610,7 @@ namespace Node
   {
     auto it = sync_managers_.find(from);
     if (it == sync_managers_.end())
-      return; // Headers from a peer we didn't set up sync for
+      return;
 
     P2P::HeadersMessage headers;
     if (!P2P::deserializeHeaders(msg.payload.data(), msg.payload.size(), headers))
@@ -1852,10 +1661,6 @@ namespace Node
 
     P2P::ProofMessage resp;
 
-    //  Step 1: resolve the (key_type, key_bytes) descriptor to an SMT
-    //  key. A Malformed reply means the client sent bytes that don't
-    //  match the layout its declared key_type requires — a client bug,
-    //  not a server error.
     auto key = P2P::resolveProofKey(req.key_type, req.key_bytes);
     if (!key.has_value())
     {
@@ -1867,10 +1672,6 @@ namespace Node
       return;
     }
 
-    //  Step 2: resolve the version. PROOF_VERSION_CURRENT means "the
-    //  current head", which we translate to a concrete height before
-    //  doing anything else, so the reply's version field is always a
-    //  real number.
     const uint64_t resolved_version =
         (req.version == P2P::PROOF_VERSION_CURRENT)
             ? chain_->height()
@@ -1878,9 +1679,6 @@ namespace Node
 
     resp.version = resolved_version;
 
-    //  Step 3: get the version's root. This is what the client will
-    //  verify against. If the version has no saved root — pruned, or
-    //  never existed — we report VersionUnavailable.
     auto state = std::make_unique<State::StateAccess>(
         *state_db_, resolved_version);
 
@@ -1897,9 +1695,6 @@ namespace Node
 
     resp.state_root = *root;
 
-    //  Step 4: produce the proof. The StateAccess is at the requested
-    //  version, so its tree and the version's nodes are consistent —
-    //  see the contract comment on proveAtVersion.
     auto proof = state->proveAtVersion(*key, resolved_version);
     if (!proof.has_value())
     {
@@ -1954,9 +1749,6 @@ namespace Node
     msg.type = P2P::MessageType::Block;
     msg.payload = block.serialize();
 
-    // broadcast() filters to Established peers only. A peer that's
-    // still handshaking or authenticating won't receive this; it will
-    // get the block from sync instead once it reaches Established.
     p2p_->broadcast(msg);
 
     (*log_)(Logging::DEBUGGING)
@@ -1974,7 +1766,6 @@ namespace Node
     msg.type = P2P::MessageType::Tx;
     msg.payload = tx.serialize();
 
-    // broadcast() filters to Established peers only.
     p2p_->broadcast(msg);
 
     (*log_)(Logging::DEBUGGING)
@@ -1984,12 +1775,6 @@ namespace Node
 
   void Node::onSyncTick()
   {
-    // Runs on the io_context thread. sync_managers_ is only touched
-    // there, and asio guarantees handlers don't run concurrently, so
-    // the iteration is safe. The map may be modified by a later
-    // handler (onP2PPeerEstablished/Disconnected), but not by anything
-    // tick() does synchronously — those callbacks post their
-    // modifications to the event loop.
     for (auto &[id, mgr] : sync_managers_)
     {
       if (mgr)
@@ -1999,15 +1784,11 @@ namespace Node
 
   void Node::armConsensusPollTimer()
   {
-    // No consensus instance means no poll timer. A non-validator
-    // node never needs to poll consensus.
     if (!consensus_ || !p2p_ || stopping_.load())
       return;
 
     if (!consensus_timer_)
     {
-      // Construct once. The timer's executor is the P2P io_context,
-      // so the handler runs on the event loop thread.
       consensus_timer_ = std::make_unique<boost::asio::steady_timer>(
           p2p_->executor());
     }
@@ -2024,11 +1805,10 @@ namespace Node
   void Node::onConsensusPollTimer(const boost::system::error_code &ec)
   {
     if (ec == boost::asio::error::operation_aborted || stopping_.load())
-      return; // cancelled by stop()
+      return;
 
     onConsensusPoll();
 
-    // Re-arm for the next tick.
     armConsensusPollTimer();
   }
 
@@ -2055,11 +1835,10 @@ namespace Node
   void Node::onSyncTickTimer(const boost::system::error_code &ec)
   {
     if (ec == boost::asio::error::operation_aborted || stopping_.load())
-      return; // cancelled by stop()
+      return;
 
     onSyncTick();
 
-    // Re-arm for the next tick.
     armSyncTickTimer();
   }
 
@@ -2086,20 +1865,12 @@ namespace Node
 
   std::vector<uint8_t> Node::walPrefixForHeightOrLower(Height max_height)
   {
-    //  We iterate-with-prefix and filter; the caller checks
-    //  height <= max_height. To keep the prefix small, we use the
-    //  empty prefix (scan everything) — the WAL is small.
     return {};
   }
 
   std::vector<uint8_t> Node::walEncodeVoteRecord(const Consensus::Vote &v,
                                                  bool is_precommit)
   {
-    //  We store the wire encoding produced by Consensus::encodeVote,
-    //  plus a 1-byte tag for prevote vs precommit. That keeps the
-    //  decoding on the way back simple, and means the WAL bytes and
-    //  the wire bytes are the same format — one less thing to keep
-    //  in sync.
     auto bytes = Consensus::encodeVote(v);
     std::vector<uint8_t> out;
     out.reserve(1 + bytes.size());

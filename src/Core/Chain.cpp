@@ -1,4 +1,7 @@
-// src/Core/Chain.cpp
+// Copyright (c) 2018-2026 Conceal Network & Conceal Devs
+//
+// Distributed under the MIT/X11 software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "Chain.h"
 
@@ -10,11 +13,64 @@ namespace Core
   {
   }
 
+  //  Reads — no lock.
+  //
+  //  Every method below reads from ChainDB / StateDB, both of which
+  //  use MDBX read transactions. MDBX readers are MVCC and require
+  //  no external synchronization. Holding Chain::mutex_ here would
+  //  only serialize reads against each other, and — more importantly
+  //  — would create a lock that callers into StateDB iteration
+  //  visitors would have to acquire while already inside a
+  //  StateDB-level operation. That was the shape of the earlier
+  //  self-deadlock. Do not re-add.
+
   ChainDB::ChainHead Chain::head() const
   {
-    std::lock_guard<std::mutex> lock(mutex_);
     return db_.getHead();
   }
+
+  uint64_t Chain::height() const
+  {
+    return db_.getHead().height;
+  }
+
+  Crypto::Hash Chain::headHash() const
+  {
+    return db_.getHead().hash;
+  }
+
+  std::optional<Block> Chain::getBlock(const Crypto::Hash &hash) const
+  {
+    return db_.getBlock(hash);
+  }
+
+  std::optional<Block> Chain::getBlockByHeight(uint64_t height) const
+  {
+    return db_.getBlockByHeight(height);
+  }
+
+  bool Chain::hasBlock(const Crypto::Hash &hash) const
+  {
+    return db_.hasBlock(hash);
+  }
+
+  uint64_t Chain::bestPeerHeight() const
+  {
+    return db_.getBestPeerHeight();
+  }
+
+  bool Chain::isSyncing() const
+  {
+    const uint64_t ours = db_.getHead().height;
+    const uint64_t theirs = db_.getBestPeerHeight();
+    return theirs > ours + 5;
+  }
+
+  //  Writes — mutex_ held.
+  //
+  //  setHead, setBestPeerHeight, and appendBlock each perform a
+  //  read-modify-write against persisted state. mutex_ makes those
+  //  atomic with respect to each other within this process.
 
   bool Chain::setHead(const Crypto::Hash &hash, uint64_t height)
   {
@@ -27,49 +83,17 @@ namespace Core
     return true;
   }
 
-  uint64_t Chain::height() const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return db_.getHead().height;
-  }
-
-  Crypto::Hash Chain::headHash() const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return db_.getHead().hash;
-  }
-
-  std::optional<Block> Chain::getBlock(const Crypto::Hash &hash) const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return db_.getBlock(hash);
-  }
-
-  std::optional<Block> Chain::getBlockByHeight(uint64_t height) const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return db_.getBlockByHeight(height);
-  }
-
-  bool Chain::hasBlock(const Crypto::Hash &hash) const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return db_.hasBlock(hash);
-  }
-
   Chain::AppendResult Chain::appendBlock(const Block &block)
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
     Crypto::Hash block_hash = block.hash();
 
-    // Already have it?
     if (db_.hasBlock(block_hash))
     {
       return AppendResult::AlreadyHave;
     }
 
-    // Genesis: height 0, no parent.
     if (block.header.height == 0)
     {
       try
@@ -88,30 +112,22 @@ namespace Core
       }
     }
 
-    // Regular block: must extend the current head.
     ChainDB::ChainHead current = db_.getHead();
 
     if (block.header.parent_hash != current.hash)
     {
-      // Parent doesn't match head. Could be a fork, or a block we haven't
-      // seen the parent of yet.
       if (db_.hasBlock(block.header.parent_hash))
       {
-        // Parent exists but isn't our head — we have a fork, which BFT
-        // shouldn't allow. Reject.
         return AppendResult::InvalidParent;
       }
-      // Parent unknown. Block arrives before its parent.
       return AppendResult::NotConnected;
     }
 
-    // Height must be current.height + 1.
     if (block.header.height != current.height + 1)
     {
       return AppendResult::InvalidParent;
     }
 
-    // Store.
     try
     {
       db_.storeBlock(block, block_hash);
@@ -121,7 +137,6 @@ namespace Core
       return AppendResult::StorageError;
     }
 
-    // Update head.
     ChainDB::ChainHead h;
     h.hash = block_hash;
     h.height = block.header.height;
@@ -130,24 +145,10 @@ namespace Core
     return AppendResult::Ok;
   }
 
-  uint64_t Chain::bestPeerHeight() const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return db_.getBestPeerHeight();
-  }
-
   void Chain::setBestPeerHeight(uint64_t height)
   {
     std::lock_guard<std::mutex> lock(mutex_);
     db_.setBestPeerHeight(height);
-  }
-
-  bool Chain::isSyncing() const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    uint64_t ours = db_.getHead().height;
-    uint64_t theirs = db_.getBestPeerHeight();
-    return theirs > ours + 5; // 5 blocks of tolerance
   }
 
 } // namespace Core

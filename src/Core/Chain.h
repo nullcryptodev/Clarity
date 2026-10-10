@@ -1,4 +1,7 @@
-// src/Core/Chain.h
+// Copyright (c) 2018-2026 Conceal Network & Conceal Devs
+//
+// Distributed under the MIT/X11 software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #pragma once
 
@@ -13,8 +16,18 @@ namespace Core
 {
   //  Chain
   //
-  //  High-level chain API. Wraps ChainDB with a mutex, tracks the head,
-  //  and provides methods for the node's main loop.
+  //  High-level chain API. Wraps ChainDB.
+  //
+  //  Threading: reads are lock-free (ChainDB / StateDB are MVCC).
+  //  mutex_ guards head updates and best_peer_height updates, so the
+  //  read-modify-write sequences on those two fields are atomic.
+  //
+  //  Do NOT re-add mutex_ to the read methods. The RPC layer calls
+  //  getBlockByHeight() from inside StateDB iteration visitors; if
+  //  that read took mutex_, it would still be safe (different lock),
+  //  but it would serialize all chain reads against each other for
+  //  no benefit and create a lock-order surface between Chain and
+  //  StateDB that produced the earlier self-deadlock.
 
   class Chain
   {
@@ -25,8 +38,6 @@ namespace Core
 
     ChainDB::ChainHead head() const;
 
-    // Set a new head after a block is confirmed. Validates that the
-    // block extends the current head.
     bool setHead(const Crypto::Hash &hash, uint64_t height);
 
     uint64_t height() const;
@@ -41,15 +52,6 @@ namespace Core
 
     // ---- Chain append ----
 
-    // Attempt to append a new block. Checks that it extends the current
-    // head. Stores the block and updates the head on success.
-    //
-    // Returns:
-    //   AppendResult::Ok                 — block stored, head updated
-    //   AppendResult::AlreadyHave        — block already stored
-    //   AppendResult::NotConnected       — parent not in our chain
-    //   AppendResult::InvalidParent      — parent hash doesn't match head
-    //   AppendResult::StorageError       — DB write failed
     enum class AppendResult
     {
       Ok,
@@ -66,7 +68,6 @@ namespace Core
     uint64_t bestPeerHeight() const;
     void setBestPeerHeight(uint64_t height);
 
-    // True if we're behind the best peer by more than a threshold.
     bool isSyncing() const;
 
   private:

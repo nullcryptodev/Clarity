@@ -76,14 +76,159 @@ namespace State
   StateAccess::StateAccess(StateDB &db, uint64_t version)
       : db_(db), txn_(nullptr), version_(version), smt_(db)
   {
+    //  Autocommit mode. Hold one read txn for the lifetime of this
+    //  StateAccess and bind it into the SMT. Reads below route
+    //  through it, so a 256-level SMT walk is one reader slot, not
+    //  256. This is what keeps maxreaders=126 from being exhausted
+    //  under load.
+    //
+    //  Writes below must release this read txn before opening their
+    //  own write txn, because MDBX refuses to overlap them on the
+    //  same thread. See the releaseReadTxnIfHeld() helper.
+    read_txn_ = std::make_unique<StateDB::ReadTxn>(db.beginRead());
+    smt_.setReadTxn(read_txn_.get());
     smt_.load();
   }
 
   StateAccess::StateAccess(StateDB &db, StateDB::Txn &txn, uint64_t version)
       : db_(db), txn_(&txn), version_(version), smt_(db)
   {
+    //  Txn-bound mode. No read txn is opened: the write txn serves
+    //  both roles, and mixing a read txn with a write txn on the
+    //  same thread would defeat the write txn's visibility into its
+    //  own uncommitted writes.
     smt_.setTxn(txn_);
     smt_.load();
+  }
+
+  // ===========================================================================
+  //  Read dispatch helpers
+  //
+  //  Three-layer fallback for reads:
+  //    1. bound write txn  (txn_)       — sees uncommitted writes
+  //    2. bound read txn   (read_txn_)  — the normal autocommit path
+  //    3. raw DB access    (db_)        — safety net; db_ internally
+  //                                        reuses tls_read_txn_ if
+  //                                        a read txn is open on
+  //                                        this thread
+  //
+  //  Layer 1 wins when present, because a write txn that has just
+  //  written a value must see that value on the next read, and a
+  //  fresh read txn would not.
+  // ===========================================================================
+
+  bool StateAccess::readRow(uint32_t table_id,
+                            const void *key, size_t key_len,
+                            std::vector<uint8_t> &out) const
+  {
+    if (txn_)
+      return txn_->get(table_id, key, key_len, out);
+    if (read_txn_)
+      return read_txn_->get(table_id, key, key_len, out);
+    return db_.rawGet(table_id, key, key_len, out);
+  }
+
+  void StateAccess::readForEach(uint32_t table_id,
+                                const StateDB::EntryVisitor &visitor) const
+  {
+    if (txn_)
+    {
+      txn_->forEach(table_id, visitor);
+      return;
+    }
+    if (read_txn_)
+    {
+      read_txn_->forEach(table_id, visitor);
+      return;
+    }
+    db_.forEachEntry(table_id, visitor);
+  }
+
+  void StateAccess::readForEachWithPrefix(
+      uint32_t table_id,
+      const std::vector<uint8_t> &prefix,
+      const StateDB::EntryVisitor &visitor) const
+  {
+    if (txn_)
+    {
+      txn_->forEachWithPrefix(table_id, prefix, visitor);
+      return;
+    }
+    if (read_txn_)
+    {
+      read_txn_->forEachWithPrefix(table_id, prefix, visitor);
+      return;
+    }
+    db_.forEachEntryWithPrefix(table_id, prefix, visitor);
+  }
+
+  void StateAccess::readForEachReverse(
+      uint32_t table_id,
+      const StateDB::EntryVisitor &visitor) const
+  {
+    if (txn_)
+    {
+      txn_->forEachReverse(table_id, visitor);
+      return;
+    }
+    if (read_txn_)
+    {
+      read_txn_->forEachReverse(table_id, visitor);
+      return;
+    }
+    db_.forEachEntryReverse(table_id, visitor);
+  }
+
+  void StateAccess::readForEachWithPrefixReverse(
+      uint32_t table_id,
+      const std::vector<uint8_t> &prefix,
+      const StateDB::EntryVisitor &visitor) const
+  {
+    if (txn_)
+    {
+      txn_->forEachWithPrefixReverse(table_id, prefix, visitor);
+      return;
+    }
+    if (read_txn_)
+    {
+      read_txn_->forEachWithPrefixReverse(table_id, prefix, visitor);
+      return;
+    }
+    db_.forEachEntryWithPrefixReverse(table_id, prefix, visitor);
+  }
+
+  size_t StateAccess::readTableCount(uint32_t table_id) const
+  {
+    if (txn_)
+      return 0; // write txns can't stat; callers don't use this path
+    if (read_txn_)
+      return read_txn_->dbiStat(table_id);
+    return db_.entryCount(table_id);
+  }
+
+  // ===========================================================================
+  //  Write-side read txn release
+  //
+  //  MDBX refuses to open a write txn on a thread that already has
+  //  a read txn open (MDBX_TXN_OVERLAPPING). Before any write, we
+  //  must release the read txn we're holding. After the write
+  //  finishes, the next read will transparently open a fresh one.
+  //
+  //  This helper is called at the top of every write method. It's a
+  //  no-op when the StateAccess is bound to a write txn (txn_ !=
+  //  nullptr), because in that case we never opened a read txn in
+  //  the first place.
+  // ===========================================================================
+
+  void StateAccess::releaseReadTxnIfHeld()
+  {
+    if (read_txn_)
+    {
+      //  Unbind from the SMT first, so the SMT doesn't hold a
+      //  dangling pointer while we destroy the ReadTxn.
+      smt_.setReadTxn(nullptr);
+      read_txn_.reset();
+    }
   }
 
   // ===========================================================================
@@ -100,6 +245,8 @@ namespace State
       txn_->put(table_id, key, key_len, SENTINEL, sizeof(SENTINEL));
       return;
     }
+
+    releaseReadTxnIfHeld();
     db_.rawPut(table_id, key, key_len, SENTINEL, sizeof(SENTINEL));
   }
 
@@ -115,6 +262,8 @@ namespace State
       txn_->put(table_id, key, key_len, buf, sizeof(buf));
       return;
     }
+
+    releaseReadTxnIfHeld();
     db_.rawPut(table_id, key, key_len, buf, sizeof(buf));
   }
 
@@ -127,6 +276,8 @@ namespace State
       txn_->put(table_id, key, key_len, value, value_len);
       return;
     }
+
+    releaseReadTxnIfHeld();
     db_.rawPut(table_id, key, key_len, value, value_len);
   }
 
@@ -138,6 +289,8 @@ namespace State
       txn_->del(table_id, key, key_len);
       return;
     }
+
+    releaseReadTxnIfHeld();
     db_.rawDel(table_id, key, key_len);
   }
 
@@ -475,6 +628,15 @@ namespace State
       copy.staker_since_height = 0;
     }
 
+    // ---- Release read txn before any writes ----
+    //
+    //  The SMT update below and the index writes further down both
+    //  need to open their own write txns. Releasing the read txn
+    //  here, once, means each of them can proceed without hitting
+    //  MDBX_TXN_OVERLAPPING. The next read call after this method
+    //  returns will transparently reacquire a fresh read txn.
+    releaseReadTxnIfHeld();
+
     // ---- Write the account record ----
 
     Crypto::Hash key = Keys::account(address);
@@ -482,15 +644,32 @@ namespace State
     smt_.update(key, value, version_);
 
     // ---- Write the index row ----
-    //
-    // The MDBX table holds a serialized copy for enumeration. Both
-    // writes happen in the same txn, so the two representations
-    // cannot drift.
+
     {
       auto bytes = copy.serializeState();
       putBlobRow(StateDB::TBL_ACCOUNTS,
                  address.data.data(), address.data.size(),
                  bytes.data(), bytes.size());
+    }
+
+    // ---- Native balance by-token index ----
+    //
+    //  The native token (id 0) lives in Account.balance, not in the
+    //  SMT as a tokenBalance entry. But getTokenHolders(0) and
+    //  getTokensForAddress(0) both route through
+    //  TBL_INDEX_BALANCES_BY_TOKEN, so without this block the native
+    //  token has no holders in the by-token index even though every
+    //  account carries a CLRTY balance.
+    //
+    //  Only write when the balance actually changed. When the
+    //  balance reaches zero, delete the row so the index stays
+    //  sparse.
+    if (copy.balance != old.balance)
+    {
+      if (copy.balance == 0)
+        unindexTokenBalanceRow(address, NATIVE_TOKEN_ID);
+      else
+        indexTokenBalanceRow(address, NATIVE_TOKEN_ID, copy.balance);
     }
 
     // Helper: read a uint64 from a global state entry via the SMT.
@@ -545,10 +724,15 @@ namespace State
     Core::Account old = getAccount(address);
     const bool was_staker = (old.staked > 0);
 
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::account(address);
     smt_.remove(key, version_);
 
     unindexAccountRow(address);
+
+    //  Drop the native-balance by-token row if one was written.
+    unindexTokenBalanceRow(address, NATIVE_TOKEN_ID);
 
     if (!was_staker)
       return;
@@ -586,8 +770,6 @@ namespace State
   void StateAccess::forEachAccount(
       const std::function<void(const Crypto::Address &, const Core::Account &)> &fn) const
   {
-    // The MDBX table holds the serialized Account inline, so no SMT
-    // read is required per entry.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -604,12 +786,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEach(StateDB::TBL_ACCOUNTS, visitor);
-      return;
-    }
-    db_.forEachEntry(StateDB::TBL_ACCOUNTS, visitor);
+    readForEach(StateDB::TBL_ACCOUNTS, visitor);
   }
 
   // ===========================================================================
@@ -630,6 +807,8 @@ namespace State
   {
     Crypto::Hash key = Keys::tokenBalance(address, token_id);
 
+    releaseReadTxnIfHeld();
+
     if (balance == 0)
     {
       smt_.remove(key, version_);
@@ -646,6 +825,8 @@ namespace State
 
   void StateAccess::deleteTokenBalance(const Crypto::Address &address, Id token_id)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::tokenBalance(address, token_id);
     smt_.remove(key, version_);
     unindexTokenBalanceRow(address, token_id);
@@ -655,7 +836,6 @@ namespace State
       const Crypto::Address &owner,
       const std::function<void(Id token_id, uint64_t balance)> &fn) const
   {
-    // Key layout: address(32) || token_id(4 LE). Value: balance(8 LE).
     std::vector<uint8_t> prefix(owner.data.begin(), owner.data.end());
 
     auto visitor = [&fn](const std::vector<uint8_t> &key,
@@ -669,19 +849,13 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEachWithPrefix(StateDB::TBL_TOKEN_BALANCES, prefix, visitor);
-      return;
-    }
-    db_.forEachEntryWithPrefix(StateDB::TBL_TOKEN_BALANCES, prefix, visitor);
+    readForEachWithPrefix(StateDB::TBL_TOKEN_BALANCES, prefix, visitor);
   }
 
   void StateAccess::forEachHolderOfToken(
       Id token_id,
       const std::function<void(const Crypto::Address &, uint64_t balance)> &fn) const
   {
-    // Key layout: token_id(4 LE) || address(32). Value: balance(8 LE).
     uint8_t prefix_bytes[4];
     Common::writeU32(prefix_bytes, static_cast<uint32_t>(token_id));
     std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 4);
@@ -698,12 +872,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEachWithPrefix(StateDB::TBL_INDEX_BALANCES_BY_TOKEN, prefix, visitor);
-      return;
-    }
-    db_.forEachEntryWithPrefix(StateDB::TBL_INDEX_BALANCES_BY_TOKEN, prefix, visitor);
+    readForEachWithPrefix(StateDB::TBL_INDEX_BALANCES_BY_TOKEN, prefix, visitor);
   }
 
   // ===========================================================================
@@ -721,6 +890,8 @@ namespace State
 
   void StateAccess::putToken(const Core::TokenInfo &token)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::token(token.id);
     auto value = token.serializeState();
     smt_.update(key, value, version_);
@@ -745,12 +916,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEach(StateDB::TBL_TOKENS, visitor);
-      return;
-    }
-    db_.forEachEntry(StateDB::TBL_TOKENS, visitor);
+    readForEach(StateDB::TBL_TOKENS, visitor);
   }
 
   // ===========================================================================
@@ -769,6 +935,8 @@ namespace State
 
   void StateAccess::putTokenSupply(Id token_id, uint64_t supply)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::tokenSupply(token_id);
 
     if (supply == 0)
@@ -797,13 +965,11 @@ namespace State
 
   void StateAccess::putValidator(const Core::ValidatorInfo &validator)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::validator(validator.id);
     auto value = validator.serializeState();
     smt_.update(key, value, version_);
-
-    // Write to two tables:
-    //   TBL_INDEX_VALIDATORS  key = id(8 LE) -> sentinel
-    //   TBL_VALIDATORS        key = id(8 LE) -> serialized record
 
     uint8_t id_key[8];
     Common::writeU64(id_key, validator.id);
@@ -815,6 +981,8 @@ namespace State
 
   void StateAccess::deleteValidator(uint64_t validator_id)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::validator(validator_id);
     smt_.remove(key, version_);
 
@@ -828,8 +996,6 @@ namespace State
   void StateAccess::forEachValidator(
       const std::function<void(const Core::ValidatorInfo &)> &fn) const
   {
-    // Read the full records from TBL_VALIDATORS, which holds the
-    // serialized ValidatorInfo inline.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -844,12 +1010,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEach(StateDB::TBL_VALIDATORS, visitor);
-      return;
-    }
-    db_.forEachEntry(StateDB::TBL_VALIDATORS, visitor);
+    readForEach(StateDB::TBL_VALIDATORS, visitor);
   }
 
   // ===========================================================================
@@ -871,6 +1032,8 @@ namespace State
   void StateAccess::putValidatorByAddress(const Crypto::Address &address,
                                           uint64_t validator_id)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::validatorByAddress(address);
     std::vector<uint8_t> value(8);
     Common::writeU64(value.data(), validator_id);
@@ -879,6 +1042,8 @@ namespace State
 
   void StateAccess::deleteValidatorByAddress(const Crypto::Address &address)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::validatorByAddress(address);
     smt_.remove(key, version_);
   }
@@ -898,6 +1063,8 @@ namespace State
 
   void StateAccess::putOrder(const Core::Order &order)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::order(order.id);
     auto value = order.serializeState();
     smt_.update(key, value, version_);
@@ -907,9 +1074,10 @@ namespace State
 
   void StateAccess::deleteOrder(Id order_id)
   {
-    // Fetch the order first so we know the owner and pair to unindex.
     Core::Order order;
     const bool have_order = getOrder(order_id, order);
+
+    releaseReadTxnIfHeld();
 
     Crypto::Hash key = Keys::order(order_id);
     smt_.remove(key, version_);
@@ -935,12 +1103,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEach(StateDB::TBL_ORDERS, visitor);
-      return;
-    }
-    db_.forEachEntry(StateDB::TBL_ORDERS, visitor);
+    readForEach(StateDB::TBL_ORDERS, visitor);
   }
 
   void StateAccess::forEachOrderForOwner(
@@ -961,12 +1124,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEachWithPrefix(StateDB::TBL_INDEX_ORDERS_BY_OWNER, prefix, visitor);
-      return;
-    }
-    db_.forEachEntryWithPrefix(StateDB::TBL_INDEX_ORDERS_BY_OWNER, prefix, visitor);
+    readForEachWithPrefix(StateDB::TBL_INDEX_ORDERS_BY_OWNER, prefix, visitor);
   }
 
   void StateAccess::forEachOrderForPair(
@@ -990,12 +1148,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEachWithPrefix(StateDB::TBL_INDEX_ORDERS_BY_PAIR, prefix, visitor);
-      return;
-    }
-    db_.forEachEntryWithPrefix(StateDB::TBL_INDEX_ORDERS_BY_PAIR, prefix, visitor);
+    readForEachWithPrefix(StateDB::TBL_INDEX_ORDERS_BY_PAIR, prefix, visitor);
   }
 
   // ===========================================================================
@@ -1024,6 +1177,8 @@ namespace State
 
     ids.push_back(order_id);
 
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::orderExpiry(height);
     auto value = encodeU64List(ids);
     smt_.update(key, value, version_);
@@ -1039,6 +1194,8 @@ namespace State
 
     ids.erase(it);
 
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::orderExpiry(height);
 
     if (ids.empty())
@@ -1053,6 +1210,8 @@ namespace State
 
   void StateAccess::clearOrderExpiry(uint64_t height)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::orderExpiry(height);
     smt_.remove(key, version_);
   }
@@ -1072,6 +1231,8 @@ namespace State
 
   void StateAccess::putAmmPool(const Core::AmmPool &pool)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::ammPool(pool.id);
     auto value = pool.serializeState();
     smt_.update(key, value, version_);
@@ -1081,9 +1242,10 @@ namespace State
 
   void StateAccess::deleteAmmPool(Id pool_id)
   {
-    // Fetch the pool first so we know its token pair for unindexing.
     Core::AmmPool pool;
     const bool have_pool = getAmmPool(pool_id, pool);
+
+    releaseReadTxnIfHeld();
 
     Crypto::Hash key = Keys::ammPool(pool_id);
     smt_.remove(key, version_);
@@ -1109,12 +1271,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEach(StateDB::TBL_AMM_POOLS, visitor);
-      return;
-    }
-    db_.forEachEntry(StateDB::TBL_AMM_POOLS, visitor);
+    readForEach(StateDB::TBL_AMM_POOLS, visitor);
   }
 
   void StateAccess::forEachPoolForToken(
@@ -1137,12 +1294,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEachWithPrefix(StateDB::TBL_INDEX_POOLS_BY_TOKEN, prefix, visitor);
-      return;
-    }
-    db_.forEachEntryWithPrefix(StateDB::TBL_INDEX_POOLS_BY_TOKEN, prefix, visitor);
+    readForEachWithPrefix(StateDB::TBL_INDEX_POOLS_BY_TOKEN, prefix, visitor);
   }
 
   // ===========================================================================
@@ -1160,6 +1312,8 @@ namespace State
 
   void StateAccess::putAmmPosition(const Core::AmmPosition &pos)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::ammPosition(pos.id);
     auto value = pos.serializeState();
     smt_.update(key, value, version_);
@@ -1171,6 +1325,8 @@ namespace State
   {
     Core::AmmPosition pos;
     const bool have_pos = getAmmPosition(pos_id, pos);
+
+    releaseReadTxnIfHeld();
 
     Crypto::Hash key = Keys::ammPosition(pos_id);
     smt_.remove(key, version_);
@@ -1196,12 +1352,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEach(StateDB::TBL_AMM_POSITIONS, visitor);
-      return;
-    }
-    db_.forEachEntry(StateDB::TBL_AMM_POSITIONS, visitor);
+    readForEach(StateDB::TBL_AMM_POSITIONS, visitor);
   }
 
   void StateAccess::forEachPositionForOwner(
@@ -1222,12 +1373,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEachWithPrefix(StateDB::TBL_INDEX_POSITIONS_BY_OWNER, prefix, visitor);
-      return;
-    }
-    db_.forEachEntryWithPrefix(StateDB::TBL_INDEX_POSITIONS_BY_OWNER, prefix, visitor);
+    readForEachWithPrefix(StateDB::TBL_INDEX_POSITIONS_BY_OWNER, prefix, visitor);
   }
 
   // ===========================================================================
@@ -1251,6 +1397,8 @@ namespace State
                                      uint64_t pool_id,
                                      uint64_t position_id)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::ammPositionIndex(owner, pool_id);
     std::vector<uint8_t> value(8);
     Common::writeU64(value.data(), position_id);
@@ -1260,6 +1408,8 @@ namespace State
   void StateAccess::deletePositionIndex(const Crypto::Address &owner,
                                         uint64_t pool_id)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::ammPositionIndex(owner, pool_id);
     smt_.remove(key, version_);
   }
@@ -1279,6 +1429,8 @@ namespace State
 
   void StateAccess::putReceipt(const Crypto::Hash &tx_hash, const Core::Receipt &receipt)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::receipt(tx_hash);
     auto value = receipt.serializeState();
     smt_.update(key, value, version_);
@@ -1301,6 +1453,8 @@ namespace State
   void StateAccess::putGlobal(const std::string &name,
                               const std::vector<uint8_t> &value)
   {
+    releaseReadTxnIfHeld();
+
     Crypto::Hash key = Keys::global(name);
     smt_.update(key, value, version_);
   }
@@ -1347,11 +1501,15 @@ namespace State
   void StateAccess::putRaw(const Crypto::Hash &smt_key,
                            const std::vector<uint8_t> &value)
   {
+    releaseReadTxnIfHeld();
+
     smt_.update(smt_key, value, version_);
   }
 
   void StateAccess::deleteRaw(const Crypto::Hash &smt_key)
   {
+    releaseReadTxnIfHeld();
+
     smt_.remove(smt_key, version_);
   }
 
@@ -1362,6 +1520,11 @@ namespace State
   void StateAccess::commit(uint64_t version)
   {
     version_ = version;
+
+    //  smt_.save writes to meta, which is a write. Release the read
+    //  txn so it can open its own write txn.
+    releaseReadTxnIfHeld();
+
     smt_.save(version);
 
     if (!txn_)
@@ -1398,12 +1561,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEach(StateDB::TBL_INDEX_STAKERS, visitor);
-      return;
-    }
-    db_.forEachEntry(StateDB::TBL_INDEX_STAKERS, visitor);
+    readForEach(StateDB::TBL_INDEX_STAKERS, visitor);
   }
 
   // ===========================================================================
@@ -1440,13 +1598,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEachWithPrefixReverse(
-          StateDB::TBL_INDEX_TX_BY_ADDRESS, prefix, visitor);
-      return;
-    }
-    db_.forEachEntryWithPrefixReverse(
+    readForEachWithPrefixReverse(
         StateDB::TBL_INDEX_TX_BY_ADDRESS, prefix, visitor);
   }
 
@@ -1482,13 +1634,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEachWithPrefixReverse(
-          StateDB::TBL_INDEX_TX_BY_TOKEN, prefix, visitor);
-      return;
-    }
-    db_.forEachEntryWithPrefixReverse(
+    readForEachWithPrefixReverse(
         StateDB::TBL_INDEX_TX_BY_TOKEN, prefix, visitor);
   }
 
@@ -1522,13 +1668,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEachWithPrefixReverse(
-          StateDB::TBL_INDEX_TX_BY_TYPE, prefix, visitor);
-      return;
-    }
-    db_.forEachEntryWithPrefixReverse(
+    readForEachWithPrefixReverse(
         StateDB::TBL_INDEX_TX_BY_TYPE, prefix, visitor);
   }
 
@@ -1560,13 +1700,7 @@ namespace State
       return true;
     };
 
-    if (txn_)
-    {
-      txn_->forEachWithPrefixReverse(
-          StateDB::TBL_INDEX_BLOCKS_BY_PRODUCER, prefix, visitor);
-      return;
-    }
-    db_.forEachEntryWithPrefixReverse(
+    readForEachWithPrefixReverse(
         StateDB::TBL_INDEX_BLOCKS_BY_PRODUCER, prefix, visitor);
   }
 
@@ -1584,18 +1718,16 @@ namespace State
                 value.data(), value.size());
       return;
     }
+
+    releaseReadTxnIfHeld();
     db_.putMeta(key, value);
   }
 
   bool StateAccess::getMetaImpl(const std::string &key,
                                 std::vector<uint8_t> &out) const
   {
-    if (txn_)
-    {
-      return txn_->get(StateDB::TBL_META,
-                       key.data(), key.size(), out);
-    }
-    return db_.getMeta(key, out);
+    return readRow(StateDB::TBL_META,
+                   key.data(), key.size(), out);
   }
 
   std::optional<Crypto::Hash> StateAccess::smtRootAtVersion(uint64_t version) const
@@ -1666,7 +1798,7 @@ namespace State
 
   size_t StateAccess::tableEntryCount(uint32_t table_id) const
   {
-    return db_.entryCount(table_id);
+    return readTableCount(table_id);
   }
 
 } // namespace State

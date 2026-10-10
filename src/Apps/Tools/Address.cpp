@@ -5,8 +5,9 @@
 //
 //  Address — keystore utility
 //
-//  Creates, imports, and inspects CLRTY keystores. A keystore carries
-//  a single BIP-39 mnemonic from which two keys are derived:
+//  Creates, imports, inspects, and converts CLRTY keystores. A
+//  keystore carries a single BIP-39 mnemonic from which two keys are
+//  derived:
 //
 //    - the reward address (receive path, m/44'/9000'/0'/0'/0')
 //    - the validator consensus key (validator path, m/44'/9000'/0'/2'/0')
@@ -17,6 +18,7 @@
 //    --new, -n           create a fresh keystore
 //    --import, -i        import an existing mnemonic
 //    --show, -s          display every key in an existing keystore
+//    --convert, -c       change the network label of an existing keystore
 //    --from-mnemonic     derive and print keys from a mnemonic, no
 //                        keystore written
 //
@@ -26,7 +28,7 @@
 //
 //  --new and --import always print the full key set for all three
 //  networks. --show-secret adds raw hex secrets to the output; it is
-//  accepted by all four subcommands.
+//  accepted by all subcommands.
 //
 //  --show-secret prints private key material in plaintext. It is
 //  documented as dangerous. Use it when you need to hand a key to the
@@ -205,6 +207,9 @@ namespace
         << "  --new, -n           -o <path> [options]  create a fresh keystore\n"
         << "  --import, -i        -o <path> [options]  import an existing mnemonic\n"
         << "  --show, -s          <path> [options]     display all keys in a keystore\n"
+        << "  --convert, -c       <path> --network <name> [--force]\n"
+        << "                                           change the network label of an\n"
+        << "                                           existing keystore\n"
         << "  --from-mnemonic     <words> [options]    derive keys from a mnemonic\n"
         << "\n"
         << "Options:\n"
@@ -216,6 +221,8 @@ namespace
         << "  --passphrase <text>  for --import/--from-mnemonic: BIP-39 passphrase\n"
         << "  --all-networks       for --show/--from-mnemonic: print mainnet, testnet,\n"
         << "                       and regtest reward addresses in one run\n"
+        << "  --force              for --convert: proceed with the conversion. Without\n"
+        << "                       it, --convert prints what it would do and exits.\n"
         << "  --show-secret        also print raw hex secrets. Accepted by all\n"
         << "                       subcommands. DANGEROUS. See below.\n"
         << "\n"
@@ -225,6 +232,12 @@ namespace
         << "--new and --import always print the full key set for all three\n"
         << "networks. --show and --from-mnemonic print one network by default;\n"
         << "pass --all-networks to see all three.\n"
+        << "\n"
+        << "--convert changes the network label of an existing keystore. It is\n"
+        << "useful when a keystore was created with the wrong --network and the\n"
+        << "keys themselves are correct. The mnemonic and derived keys do NOT\n"
+        << "change; only the network string, the chain ID, and the bech32m\n"
+        << "encoding of the default account's address are updated.\n"
         << "\n"
         << "--show-secret prints private key material in plaintext to stdout.\n"
         << "Anyone who sees the output can sign on your behalf. Do not run it\n"
@@ -352,13 +365,13 @@ namespace
 
     if (show_secrets)
     {
-      std::cout << "  secret        : " << keys.reward_secret_hex << "\n"; // use --consensus-key with clarityd
+      std::cout << "  secret        : " << keys.reward_secret_hex << "\n";
     }
 
     std::cout << "\n";
     std::cout << "  ---- validator consensus key ----\n";
     std::cout << "\n";
-    std::cout << "  pubkey        : " << keys.consensus_pubkey_hex << "\n"; // goes into global config if seed
+    std::cout << "  pubkey        : " << keys.consensus_pubkey_hex << "\n";
     std::cout << "  derivation    : " << keys.consensus_derivation << "\n";
 
     if (show_secrets)
@@ -454,6 +467,7 @@ namespace
     Network network = Network::Mainnet;
     uint32_t strength = 256;
     bool show_secrets = false;
+    bool network_was_set = false;
 
     for (int i = 0; i < argc; ++i)
     {
@@ -472,6 +486,7 @@ namespace
           return 1;
         }
         network = *n;
+        network_was_set = true;
       }
       else if (arg == "--strength" && i + 1 < argc)
       {
@@ -492,6 +507,15 @@ namespace
     {
       std::cerr << "error: -o <path> is required\n";
       return 1;
+    }
+
+    //  Warn when --network is omitted. The default is mainnet, which
+    //  is almost never what a developer wants when creating a test
+    //  keystore; making the choice visible costs nothing.
+    if (!network_was_set)
+    {
+      std::cerr << "note: --network not specified; defaulting to mainnet.\n"
+                << "      pass --network regtest for the devnet.\n";
     }
 
     out_path = withDefaultKeystoreExtension(out_path);
@@ -555,6 +579,7 @@ namespace
     Network network = Network::Mainnet;
     std::string passphrase;
     bool show_secrets = false;
+    bool network_was_set = false;
 
     for (int i = 0; i < argc; ++i)
     {
@@ -573,6 +598,7 @@ namespace
           return 1;
         }
         network = *n;
+        network_was_set = true;
       }
       else if (arg == "--passphrase" && i + 1 < argc)
       {
@@ -593,6 +619,12 @@ namespace
     {
       std::cerr << "error: -o <path> is required\n";
       return 1;
+    }
+
+    if (!network_was_set)
+    {
+      std::cerr << "note: --network not specified; defaulting to mainnet.\n"
+                << "      pass --network regtest for the devnet.\n";
     }
 
     out_path = withDefaultKeystoreExtension(out_path);
@@ -726,6 +758,96 @@ namespace
     return 0;
   }
 
+  int cmdConvert(int argc, char **argv)
+  {
+    if (argc < 1)
+    {
+      std::cerr << "error: --convert requires a keystore path\n";
+      return 1;
+    }
+
+    std::string path = argv[0];
+    std::optional<Network> target;
+    bool force = false;
+
+    for (int i = 1; i < argc; ++i)
+    {
+      std::string arg = argv[i];
+      if (arg == "--network" && i + 1 < argc)
+      {
+        target = parseNetwork(argv[++i]);
+        if (!target)
+        {
+          std::cerr << "error: unknown network '" << argv[i] << "'\n";
+          return 1;
+        }
+      }
+      else if (arg == "--force")
+      {
+        force = true;
+      }
+      else
+      {
+        std::cerr << "error: unknown argument '" << arg << "'\n";
+        return 1;
+      }
+    }
+
+    if (!target)
+    {
+      std::cerr << "error: --network <name> is required\n";
+      return 1;
+    }
+
+    Wallet::WalletStatus st;
+    auto ks = Wallet::EncryptedKeyStore::open(path, &st);
+    if (!ks.has_value())
+    {
+      reportError("cannot open keystore", st);
+      return 1;
+    }
+
+    //  Detect and print the current network before touching the file.
+    //  This is what the user sees before deciding whether to proceed.
+    const Network current = (*ks)->network();
+
+    std::cout << "Keystore: " << path << "\n";
+    std::cout << "  current network: " << networkLabel(current) << "\n";
+    std::cout << "  target network:  " << networkLabel(*target) << "\n";
+
+    if (current == *target)
+    {
+      std::cout << "\nKeystore is already on " << networkLabel(*target)
+                << ". Nothing to do.\n";
+      return 0;
+    }
+
+    //  Refuse to modify the file without --force. The keystore holds
+    //  key material; an accidental conversion could leave it in a
+    //  state the user doesn't expect.
+    if (!force)
+    {
+      std::cout << "\nThis will modify the keystore file in place.\n";
+      std::cout << "The mnemonic and derived keys do NOT change.\n";
+      std::cout << "Only the network string, chain ID, and address\n";
+      std::cout << "encoding are updated.\n";
+      std::cout << "\nRe-run with --force to proceed.\n";
+      return 1;
+    }
+
+    const Wallet::WalletError err = (*ks)->convertNetwork(*target);
+    if (err != Wallet::WalletError::Ok)
+    {
+      Wallet::WalletStatus cerr = Wallet::WalletStatus::fail(err, "");
+      reportError("cannot convert keystore", cerr);
+      return 1;
+    }
+
+    std::cout << "\nConverted.\n";
+    std::cout << "The mnemonic and derived keys are unchanged.\n";
+    return 0;
+  }
+
   int cmdFromMnemonic(int argc, char **argv)
   {
     if (argc < 1)
@@ -840,6 +962,8 @@ int main(int argc, char **argv)
     return cmdImport(remaining, rest);
   if (cmd == "--show" || cmd == "-s")
     return cmdShow(remaining, rest);
+  if (cmd == "--convert" || cmd == "-c")
+    return cmdConvert(remaining, rest);
   if (cmd == "--from-mnemonic")
     return cmdFromMnemonic(remaining, rest);
   if (cmd == "--help" || cmd == "-h")

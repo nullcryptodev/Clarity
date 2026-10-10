@@ -634,4 +634,48 @@ namespace Wallet
     return EncryptedKeyStore::open(path, error_out);
   }
 
+  WalletError EncryptedKeyStore::convertNetwork(Network new_network)
+  {
+    //  Validate the target network. There are only three, and
+    //  passing anything else is a caller bug.
+    const char *new_name = networkToString(new_network);
+    if (std::strcmp(new_name, "unknown") == 0)
+      return WalletError::BadArgument;
+
+    //  If we're already on this network, nothing to do.
+    if (network_ == new_network)
+      return WalletError::Ok;
+
+    //  Re-encode the existing pubkey with the new network's HRP.
+    //  The pubkey is stored as raw bytes in the file, so we don't
+    //  need the mnemonic or the password to do this — we just need
+    //  the bytes.
+    if (file_.pubkey.size() != 32)
+      return WalletError::KeyStoreCorrupt;
+
+    Crypto::PublicKey pk;
+    std::memcpy(pk.data.data(), file_.pubkey.data(), 32);
+
+    const std::string new_address = encodeAddress(pk, new_network);
+    if (new_address.empty())
+      return WalletError::Internal;
+
+    //  Update the three network-dependent fields.
+    file_.network = new_name;
+    file_.chain_id = chainIdForNetwork(new_network);
+    file_.address = new_address;
+
+    //  In-memory state.
+    network_ = new_network;
+
+    //  Persist. We can't use save() because it requires an unlocked
+    //  keystore, and unlocking requires the password. Writing
+    //  directly is correct here because the fields we changed are
+    //  not protected by the password.
+    WalletStatus status;
+    if (!writeKeyStoreFile(path_, file_, &status))
+      return status.code;
+
+    return WalletError::Ok;
+  }
 } // namespace Wallet

@@ -132,7 +132,7 @@ namespace Core
     result.block_hash = block.hash();
 
     std::string error;
-    if (!checkHeader(block, ctx, error)) // handles dry_run internally
+    if (!checkHeader(block, ctx, error))
     {
       result.error = error;
       return result;
@@ -144,29 +144,11 @@ namespace Core
       return result;
     }
 
-    //  Resolve the active set for this block.
-    //
-    //  committed_set is the pre-emergency set: the one the
-    //  certificate's signers are drawn from. active_set is the
-    //  post-emergency set: the one the block's quorum was actually
-    //  formed against. These are the same value for a normal block
-    //  and different values for an emergency block.
-    //
-    //  The derivation must be a pure function of state and height.
-    //  Both the proposer (via Node::buildConsensusDeps::active_set)
-    //  and every verifier (here) call resolveActiveSet, so they can't
-    //  drift.
     std::vector<Id> committed_set = loadActiveSet(state);
     const bool is_emergency = (block.header.emergency_rotation > 0);
 
     if (is_emergency)
     {
-      //  The certificate hash binding (H(certificate) matches the
-      //  header's timeout_certificate_hash) was verified in
-      //  checkHeader. Here we verify the certificate's signatures
-      //  against the committed set. Two separate checks: the hash
-      //  is a wire-integrity guarantee, the signature check is a
-      //  consensus guarantee. Both must pass.
       if (!checkTimeoutCertificate(state, block, committed_set,
                                    ctx.current_height, error))
       {
@@ -185,11 +167,6 @@ namespace Core
       return result;
     }
 
-    // Quorum signatures are added after the round's prevote quorum
-    // forms, so a block being simulated by the proposer has no
-    // signatures yet. The check is a validation of the finalized
-    // block, not part of the state transition it produces. Skip it
-    // during dry-run.
     if (!ctx.dry_run && !checkQuorum(state, block, active_set, error))
     {
       result.error = error;
@@ -212,15 +189,6 @@ namespace Core
       return result;
     }
 
-    //  Emergency rotation commit. If this block was proposed on the
-    //  emergency set, that set becomes the new committed set. The
-    //  is_active flags are flipped to match — the same bookkeeping
-    //  applyOfflineRemoval performs, but driven by the emergency
-    //  derivation instead of the height-based one.
-    //
-    //  Writing the emergency set back to state is what makes the
-    //  rotation durable. The next block reads the new committed set
-    //  from state and no longer needs the emergency flag.
     if (is_emergency && active_set != committed_set)
     {
       std::unordered_set<Id> was_active(
@@ -283,13 +251,34 @@ namespace Core
 
     distributeRewards(state, block, ctx);
 
+    //  Increment the producer's own counter. This is a state change:
+    //  total_blocks_produced lives in the validator record, which is
+    //  in the SMT, so it must happen on BOTH the simulate and the
+    //  apply path. If it were gated on !ctx.dry_run, the two paths
+    //  would produce different state roots — which is exactly the
+    //  bug that caused block 1 and block 2 to be rejected.
+    //
+    //  The simulate path aborts its txn, so the increment does not
+    //  persist there. The apply path commits it. Both compute the
+    //  same new state root.
+    //
+    //  Block height 0 has no producer (genesis), so skip it.
+    if (block.header.height > 0)
+    {
+      uint64_t producer_id = 0;
+      if (state.getValidatorByAddress(block.header.proposer, producer_id))
+      {
+        ValidatorInfo producer;
+        if (state.getValidator(producer_id, producer))
+        {
+          producer.total_blocks_produced += 1;
+          state.putValidator(producer);
+        }
+      }
+    }
+
     updateGlobalState(state, block, ctx);
 
-    //  Lifetime counters and per-block index writes. Both are
-    //  aggregation-only: they don't affect the state root, they
-    //  don't affect consensus, and they're skipped during dry-run
-    //  because the proposer's simulation shouldn't populate them
-    //  (the real block application will).
     if (!ctx.dry_run)
     {
       bumpLifetimeCounters(state, block);
@@ -1408,10 +1397,6 @@ namespace Core
   void BlockProcessor::indexBlockProducer(State::StateAccess &state,
                                           const Block &block)
   {
-    //  The proposer address is the header's proposer field, which is
-    //  the validator's reward address. The index maps
-    //  (proposer, height) -> block_hash so a validator page can list
-    //  the blocks that validator produced.
     state.indexBlockProducer(
         block.header.proposer,
         block.header.height,
@@ -1422,47 +1407,20 @@ namespace Core
                                          const Block &block,
                                          const BlockContext &ctx)
   {
-    //  One call per transaction, each writing:
-    //    - one row per address the transaction touched (from, to,
-    //      plus any address a type-specific payload references)
-    //    - one row per token involved
-    //    - one row for the transaction type
-    //
-    //  The address and token lists are type-specific. Rather than
-    //  duplicating that logic here, we derive them from the
-    //  transaction's fields with a small helper per category. The
-    //  rule of thumb: an address is "touched" if any state change
-    //  is applied to its balance, and a token is "involved" if any
-    //  balance of that token changes.
     for (size_t i = 0; i < block.transactions.size(); ++i)
     {
       const Transaction &tx = block.transactions[i];
 
-      //  System transactions don't have user-visible address or
-      //  token participants. The Slash tx touches the slashed
-      //  validator's reward address (which is where the stake
-      //  accounting changes), but routing it through the general
-      //  index would conflate "an address that sent a tx" with
-      //  "an address whose validator record was penalized". Skip
-      //  system txs from the by-address index entirely; a validator
-      //  page that wants slash history can query the by-type index
-      //  for Slash and filter.
-      if (isSystemTx(tx.tx_type))
+      const bool sys = isSystemTx(tx.tx_type);
+
+      if (sys)
+      {
         continue;
+      }
 
       std::vector<Crypto::Address> addresses;
       std::vector<Id> tokens;
 
-      //  Every user tx touches `from`. A transfer-like tx also
-      //  touches `to`. Token operations touch both addresses and
-      //  the token. AMM and order operations touch both tokens of
-      //  the pair plus the participating accounts.
-      //
-      //  We don't need to be exhaustive: the by-address index is a
-      //  query accelerator, not a consensus record. If a type's
-      //  participants are only partially captured, the query still
-      //  works — it just won't surface every edge case. The fields
-      //  below cover the common ones.
       addresses.push_back(tx.from);
 
       if (!tx.to.isNull())
@@ -1484,20 +1442,11 @@ namespace Core
       case TxType::Swap:
       case TxType::AddLiquidity:
       case TxType::RemoveLiquidity:
-        //  The exact token pair lives in the payload, which we
-        //  don't decode here. Index the tx.token_id (the "in"
-        //  side for a swap, the "supply" side for liquidity) so
-        //  the query surfaces the transaction at all. A more
-        //  complete index would decode the payload; that's a
-        //  follow-up.
         tokens.push_back(tx.token_id);
         break;
 
       case TxType::CreatePool:
         tokens.push_back(tx.token_id);
-        //  The other token is in the payload; leaving it out means
-        //  the pool's second token won't surface this tx. Acceptable
-        //  for v1 — the pool page queries by pool ID, not by token.
         break;
 
       case TxType::CreateOrder:
@@ -1511,8 +1460,6 @@ namespace Core
       case TxType::RegisterValidator:
       case TxType::UnregisterValidator:
       case TxType::UpdateRewardAddress:
-        //  Native-token only. Index the native token so a
-        //  "transactions involving CLRTY" query surfaces these.
         tokens.push_back(NATIVE_TOKEN_ID);
         break;
 

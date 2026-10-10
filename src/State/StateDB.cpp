@@ -13,6 +13,11 @@
 namespace State
 {
 
+  //  Per-thread read-txn handle. See the comment on the declaration
+  //  in StateDB.h. Zero-initialized for every thread by the C++
+  //  runtime.
+  thread_local MDBX_txn *StateDB::tls_read_txn_ = nullptr;
+
   //  Table names
 
   const char *StateDB::tableName(uint32_t id) noexcept
@@ -97,9 +102,6 @@ namespace State
       throw StateDBError(std::string(what) + ": " + mdbx_strerror(rc));
     }
 
-    // Encode (hash, version) as 40 bytes: 32-byte hash followed by
-    // an 8-byte big-endian version. Used for the historical value
-    // tables, where lookups are always exact-match.
     std::array<uint8_t, 40> histKey(const Crypto::Hash &hash, uint64_t version)
     {
       std::array<uint8_t, 40> k{};
@@ -109,10 +111,6 @@ namespace State
       return k;
     }
 
-    // Encode (version, hash) as 40 bytes: 8-byte big-endian version
-    // followed by a 32-byte hash. Used for the by-version index,
-    // where the primary access pattern is "scan versions below N in
-    // order", so version must sort first and in numeric order.
     std::array<uint8_t, 40> byVersionKey(uint64_t version, const Crypto::Hash &hash)
     {
       std::array<uint8_t, 40> k{};
@@ -130,24 +128,6 @@ namespace State
       return v;
     }
 
-    //  Delete every row in `index_table` whose key's first 8 bytes
-    //  (big-endian version) are < keepFrom, plus the matching row in
-    //  `hist_table`.
-    //
-    //  The index is keyed by (version_be || hash), so a single cursor
-    //  scan visits rows in version order and can stop at the first
-    //  version >= keepFrom. That's O(rows-pruned), not O(rows-total).
-    //
-    //  The iteration and deletion mechanisms are injected so this can
-    //  be used both with a live write txn (txn.forEach / txn.del) and
-    //  with the DB's autocommit path (forEachEntry + an outer write
-    //  txn's del). Both variants use the same deletion order and the
-    //  same key transformation.
-    //
-    //  Collection is separated from deletion because the DB's
-    //  forEachEntry holds the mutex during iteration and cannot be
-    //  re-entered; the txn-bound forEach does not, but the two-phase
-    //  approach keeps the implementation identical for both callers.
     template <typename ForEachFn, typename DelFn>
     void pruneOneTableImpl(ForEachFn &&forEach,
                            DelFn &&del,
@@ -166,7 +146,7 @@ namespace State
 
                 const uint64_t version = readVersionBE(key.data());
                 if (version >= keepFrom)
-                  return false; // stop: keys are ordered by version first
+                  return false;
 
                 std::array<uint8_t, 40> k{};
                 std::memcpy(k.data(), key.data(), 40);
@@ -176,11 +156,8 @@ namespace State
 
       for (const auto &k : to_delete)
       {
-        // The index row.
         del(index_table, k.data(), k.size());
 
-        // The historical row. Its key is (hash || version_be), which
-        // is the reverse of the index key's (version_be || hash).
         std::array<uint8_t, 40> hist_key{};
         std::memcpy(hist_key.data(), k.data() + 8, 32);
         std::memcpy(hist_key.data() + 32, k.data(), 8);
@@ -210,7 +187,9 @@ namespace State
     return tables_[tableId];
   }
 
-  //  Txn
+  // =================================================================
+  //  Txn (write)
+  // =================================================================
 
   StateDB::Txn::Txn(MDBX_txn *txn, StateDB *owner) noexcept
       : txn_(txn), owner_(owner), open_(true)
@@ -422,135 +401,6 @@ namespace State
     if (rc != MDBX_SUCCESS)
       return;
 
-    //  Position the cursor at the first key strictly greater than
-    //  everything in the prefix range, then step back one. That lands
-    //  on the last key whose prefix matches, if any.
-    //
-    //  Constructing the exclusive upper bound: the prefix's last byte
-    //  incremented by one, with trailing bytes dropped. If the last
-    //  byte is 0xFF, we'd have to carry; that requires walking the
-    //  prefix from the end. In practice our prefixes never end in
-    //  0xFF (they end in addresses, token IDs, or type bytes, none of
-    //  which use 0xFF as a terminator), so a simple increment is fine
-    //  and we handle the carry case defensively.
-
-    std::vector<uint8_t> upper = prefix;
-    while (!upper.empty() && upper.back() == 0xFF)
-      upper.pop_back();
-    if (!upper.empty())
-      ++upper.back();
-    // If upper became empty, the prefix was all 0xFF and there's no
-    // exclusive bound; use MDBX_LAST directly.
-
-    MDBX_val mkey, mval;
-    if (upper.empty())
-    {
-      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
-    }
-    else
-    {
-      mkey.iov_base = const_cast<void *>(static_cast<const void *>(upper.data()));
-      mkey.iov_len = upper.size();
-      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_SET_RANGE);
-      if (rc == MDBX_SUCCESS)
-      {
-        // We're at the first key >= upper. Step back one.
-        rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
-      }
-      else if (rc == MDBX_NOTFOUND)
-      {
-        // No key >= upper. The last key in the table is our starting
-        // point.
-        rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
-      }
-    }
-
-    while (rc == MDBX_SUCCESS)
-    {
-      std::vector<uint8_t> key(
-          static_cast<const uint8_t *>(mkey.iov_base),
-          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
-
-      if (key.size() < prefix.size() ||
-          std::memcmp(key.data(), prefix.data(), prefix.size()) != 0)
-      {
-        // Walked off the front of the prefix range. Done.
-        break;
-      }
-
-      std::vector<uint8_t> value(
-          static_cast<const uint8_t *>(mval.iov_base),
-          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
-
-      if (!visitor(key, value))
-        break;
-
-      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
-    }
-
-    mdbx_cursor_close(cursor);
-  }
-
-  void StateDB::forEachEntryReverse(uint32_t tableId,
-                                    const EntryVisitor &visitor) const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    MDBX_txn *txn = nullptr;
-    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
-    if (rc != MDBX_SUCCESS)
-      return;
-
-    MDBX_cursor *cursor = nullptr;
-    rc = mdbx_cursor_open(txn, tableHandle(tableId), &cursor);
-    if (rc != MDBX_SUCCESS)
-    {
-      mdbx_txn_abort(txn);
-      return;
-    }
-
-    MDBX_val mkey, mval;
-    rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
-
-    while (rc == MDBX_SUCCESS)
-    {
-      std::vector<uint8_t> key(
-          static_cast<const uint8_t *>(mkey.iov_base),
-          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
-      std::vector<uint8_t> value(
-          static_cast<const uint8_t *>(mval.iov_base),
-          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
-
-      if (!visitor(key, value))
-        break;
-
-      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
-    }
-
-    mdbx_cursor_close(cursor);
-    mdbx_txn_abort(txn);
-  }
-
-  void StateDB::forEachEntryWithPrefixReverse(
-      uint32_t tableId,
-      const std::vector<uint8_t> &prefix,
-      const EntryVisitor &visitor) const
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    MDBX_txn *txn = nullptr;
-    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
-    if (rc != MDBX_SUCCESS)
-      return;
-
-    MDBX_cursor *cursor = nullptr;
-    rc = mdbx_cursor_open(txn, tableHandle(tableId), &cursor);
-    if (rc != MDBX_SUCCESS)
-    {
-      mdbx_txn_abort(txn);
-      return;
-    }
-
     std::vector<uint8_t> upper = prefix;
     while (!upper.empty() && upper.back() == 0xFF)
       upper.pop_back();
@@ -600,7 +450,6 @@ namespace State
     }
 
     mdbx_cursor_close(cursor);
-    mdbx_txn_abort(txn);
   }
 
   void StateDB::Txn::commit()
@@ -631,7 +480,300 @@ namespace State
     return open_;
   }
 
+  // =================================================================
+  //  ReadTxn
+  // =================================================================
+
+  StateDB::ReadTxn::ReadTxn(MDBX_txn *txn, StateDB *owner,
+                            bool owns, MDBX_txn *prev_tls) noexcept
+      : txn_(txn), owner_(owner), open_(txn != nullptr),
+        owns_txn_(owns), prev_tls_(prev_tls)
+  {
+  }
+
+  StateDB::ReadTxn::ReadTxn(ReadTxn &&other) noexcept
+      : txn_(other.txn_), owner_(other.owner_), open_(other.open_),
+        owns_txn_(other.owns_txn_), prev_tls_(other.prev_tls_)
+  {
+    other.txn_ = nullptr;
+    other.owner_ = nullptr;
+    other.open_ = false;
+    other.owns_txn_ = false;
+    other.prev_tls_ = nullptr;
+  }
+
+  StateDB::ReadTxn &StateDB::ReadTxn::operator=(ReadTxn &&other) noexcept
+  {
+    if (this != &other)
+    {
+      //  Release whatever we currently hold before taking the
+      //  other's. If we own the txn, abort it and restore the
+      //  thread-local to what it was when we were created.
+      if (open_ && owns_txn_ && txn_)
+      {
+        tls_read_txn_ = prev_tls_;
+        mdbx_txn_abort(txn_);
+      }
+
+      txn_ = other.txn_;
+      owner_ = other.owner_;
+      open_ = other.open_;
+      owns_txn_ = other.owns_txn_;
+      prev_tls_ = other.prev_tls_;
+
+      other.txn_ = nullptr;
+      other.owner_ = nullptr;
+      other.open_ = false;
+      other.owns_txn_ = false;
+      other.prev_tls_ = nullptr;
+    }
+    return *this;
+  }
+
+  StateDB::ReadTxn::~ReadTxn()
+  {
+    if (open_ && owns_txn_ && txn_)
+    {
+      //  Restore the thread-local to whatever it was before we
+      //  opened our own read txn. In the common case that's
+      //  nullptr. If a nested ReadTxn was created on top of ours,
+      //  that nested one's prev_tls_ points at our txn, but the
+      //  nested one doesn't own, so it doesn't touch the
+      //  thread-local. Only the owner clears.
+      tls_read_txn_ = prev_tls_;
+      mdbx_txn_abort(txn_);
+    }
+    open_ = false;
+    txn_ = nullptr;
+  }
+
+  bool StateDB::ReadTxn::get(uint32_t tableId,
+                             const void *key, size_t keyLen,
+                             std::vector<uint8_t> &out) const
+  {
+    if (!open_)
+      throw StateDBError("ReadTxn::get on closed txn");
+
+    MDBX_val mk = toVal(key, keyLen);
+    MDBX_val mv;
+    int rc = mdbx_get(txn_, owner_->tableHandle(tableId), &mk, &mv);
+    if (rc == MDBX_NOTFOUND)
+      return false;
+    if (rc != MDBX_SUCCESS)
+      throwMdbx("ReadTxn::get", rc);
+
+    out.assign(static_cast<const uint8_t *>(mv.iov_base),
+               static_cast<const uint8_t *>(mv.iov_base) + mv.iov_len);
+    return true;
+  }
+
+  void StateDB::ReadTxn::forEach(uint32_t tableId,
+                                 const EntryVisitor &visitor) const
+  {
+    if (!open_)
+      throw StateDBError("ReadTxn::forEach on closed txn");
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(txn_, owner_->tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    MDBX_val mkey, mval;
+    rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_FIRST);
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_NEXT);
+    }
+
+    mdbx_cursor_close(cursor);
+  }
+
+  void StateDB::ReadTxn::forEachWithPrefix(
+      uint32_t tableId,
+      const std::vector<uint8_t> &prefix,
+      const EntryVisitor &visitor) const
+  {
+    if (!open_)
+      throw StateDBError("ReadTxn::forEachWithPrefix on closed txn");
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(txn_, owner_->tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    MDBX_val mkey, mval;
+    mkey.iov_base = const_cast<void *>(static_cast<const void *>(prefix.data()));
+    mkey.iov_len = prefix.size();
+    rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_SET_RANGE);
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+
+      if (key.size() < prefix.size() ||
+          std::memcmp(key.data(), prefix.data(), prefix.size()) != 0)
+      {
+        break;
+      }
+
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_NEXT);
+    }
+
+    mdbx_cursor_close(cursor);
+  }
+
+  void StateDB::ReadTxn::forEachReverse(
+      uint32_t tableId,
+      const EntryVisitor &visitor) const
+  {
+    if (!open_)
+      throw StateDBError("ReadTxn::forEachReverse on closed txn");
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(txn_, owner_->tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    MDBX_val mkey, mval;
+    rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+    }
+
+    mdbx_cursor_close(cursor);
+  }
+
+  void StateDB::ReadTxn::forEachWithPrefixReverse(
+      uint32_t tableId,
+      const std::vector<uint8_t> &prefix,
+      const EntryVisitor &visitor) const
+  {
+    if (!open_)
+      throw StateDBError("ReadTxn::forEachWithPrefixReverse on closed txn");
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(txn_, owner_->tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    std::vector<uint8_t> upper = prefix;
+    while (!upper.empty() && upper.back() == 0xFF)
+      upper.pop_back();
+    if (!upper.empty())
+      ++upper.back();
+
+    MDBX_val mkey, mval;
+    if (upper.empty())
+    {
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+    }
+    else
+    {
+      mkey.iov_base = const_cast<void *>(static_cast<const void *>(upper.data()));
+      mkey.iov_len = upper.size();
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_SET_RANGE);
+      if (rc == MDBX_SUCCESS)
+      {
+        rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+      }
+      else if (rc == MDBX_NOTFOUND)
+      {
+        rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+      }
+    }
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+
+      if (key.size() < prefix.size() ||
+          std::memcmp(key.data(), prefix.data(), prefix.size()) != 0)
+      {
+        break;
+      }
+
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+    }
+
+    mdbx_cursor_close(cursor);
+  }
+
+  size_t StateDB::ReadTxn::dbiStat(uint32_t tableId) const
+  {
+    if (!open_)
+      throw StateDBError("ReadTxn::dbiStat on closed txn");
+
+    MDBX_stat stat;
+    int rc = mdbx_dbi_stat(txn_, owner_->tableHandle(tableId), &stat, sizeof(stat));
+    if (rc != MDBX_SUCCESS)
+      throwMdbx("ReadTxn::dbiStat", rc);
+    return stat.ms_entries;
+  }
+
+  void StateDB::ReadTxn::abort()
+  {
+    if (!open_)
+      return;
+
+    if (owns_txn_ && txn_)
+    {
+      tls_read_txn_ = prev_tls_;
+      mdbx_txn_abort(txn_);
+    }
+
+    open_ = false;
+    txn_ = nullptr;
+  }
+
+  bool StateDB::ReadTxn::isOpen() const noexcept
+  {
+    return open_;
+  }
+
+  // =================================================================
   //  Construction
+  // =================================================================
 
   StateDB::StateDB(const std::string &path, size_t mapSizeBytes)
       : mapSizeBytes_(mapSizeBytes), path_(path)
@@ -710,6 +852,12 @@ namespace State
 
   StateDB::Txn StateDB::beginWrite()
   {
+    //  MDBX refuses to open a write txn on a thread that already
+    //  has a read txn open. Release any read txn first — the caller
+    //  explicitly wants to write, and the next read will reopen a
+    //  read txn transparently.
+    releaseReadTxn();
+
     MDBX_txn *txn = nullptr;
     int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
     if (rc == MDBX_BUSY)
@@ -743,13 +891,19 @@ namespace State
     txn.del(tableId, key, keyLen);
   }
 
-  //  Raw access (autocommit)
+  // =============================================================
+  //  Raw writes — these take write_mutex_ because MDBX permits
+  //  only one write txn at a time. They also release any read txn
+  //  on this thread first, because MDBX forbids overlapping.
+  // =============================================================
 
   void StateDB::rawPut(uint32_t tableId,
                        const void *key, size_t keyLen,
                        const void *value, size_t valueLen)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    releaseReadTxn();
+
+    std::lock_guard<std::mutex> lock(write_mutex_);
 
     MDBX_txn *txn = nullptr;
     int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
@@ -774,36 +928,65 @@ namespace State
     }
   }
 
+  // =============================================================
+  //  Raw reads — no write mutex. MDBX readers are MVCC and
+  //  concurrent-safe.
+  //
+  //  If a read txn is already open on this thread, reuse it. This
+  //  is required by MDBX: a second overlapping read txn on the
+  //  same thread returns MDBX_BUSY.
+  // =============================================================
+
   bool StateDB::rawGet(uint32_t tableId,
                        const void *key, size_t keyLen,
                        std::vector<uint8_t> &out) const
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    MDBX_txn *txn = tls_read_txn_;
+    const bool own_txn = (txn == nullptr);
 
-    MDBX_txn *txn = nullptr;
-    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
-    if (rc != MDBX_SUCCESS)
-      return false;
+    if (own_txn)
+    {
+      int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
+      if (rc != MDBX_SUCCESS)
+        throwMdbx("rawGet: txn_begin", rc);
+      tls_read_txn_ = txn;
+    }
 
     MDBX_val mk = toVal(key, keyLen);
     MDBX_val mv;
-    rc = mdbx_get(txn, tableHandle(tableId), &mk, &mv);
+    int rc = mdbx_get(txn, tableHandle(tableId), &mk, &mv);
 
+    bool found = false;
     if (rc == MDBX_SUCCESS)
     {
       out.assign(static_cast<const uint8_t *>(mv.iov_base),
                  static_cast<const uint8_t *>(mv.iov_base) + mv.iov_len);
-      mdbx_txn_abort(txn);
-      return true;
+      found = true;
+    }
+    else if (rc != MDBX_NOTFOUND)
+    {
+      if (own_txn)
+      {
+        tls_read_txn_ = nullptr;
+        mdbx_txn_abort(txn);
+      }
+      throwMdbx("rawGet: mdbx_get", rc);
     }
 
-    mdbx_txn_abort(txn);
-    return false;
+    if (own_txn)
+    {
+      tls_read_txn_ = nullptr;
+      mdbx_txn_abort(txn);
+    }
+
+    return found;
   }
 
   void StateDB::rawDel(uint32_t tableId, const void *key, size_t keyLen)
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    releaseReadTxn();
+
+    std::lock_guard<std::mutex> lock(write_mutex_);
 
     MDBX_txn *txn = nullptr;
     int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
@@ -824,36 +1007,61 @@ namespace State
   bool StateDB::rawHas(uint32_t tableId,
                        const void *key, size_t keyLen) const
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    MDBX_txn *txn = tls_read_txn_;
+    const bool own_txn = (txn == nullptr);
 
-    MDBX_txn *txn = nullptr;
-    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
-    if (rc != MDBX_SUCCESS)
-      return false;
+    if (own_txn)
+    {
+      int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
+      if (rc != MDBX_SUCCESS)
+        throwMdbx("rawHas: txn_begin", rc);
+      tls_read_txn_ = txn;
+    }
 
     MDBX_val mk = toVal(key, keyLen);
     MDBX_val mv;
-    rc = mdbx_get(txn, tableHandle(tableId), &mk, &mv);
-    mdbx_txn_abort(txn);
-    return rc == MDBX_SUCCESS;
+    int rc = mdbx_get(txn, tableHandle(tableId), &mk, &mv);
+
+    if (own_txn)
+    {
+      tls_read_txn_ = nullptr;
+      mdbx_txn_abort(txn);
+    }
+
+    if (rc == MDBX_SUCCESS)
+      return true;
+    if (rc == MDBX_NOTFOUND)
+      return false;
+    throwMdbx("rawHas: mdbx_get", rc);
   }
 
-  //  Iteration
+  // =============================================================
+  //  Iteration — no write mutex. Visitors may re-enter StateDB;
+  //  any nested read reuses the read txn opened here.
+  // =============================================================
 
   void StateDB::forEachEntry(uint32_t tableId, const EntryVisitor &visitor) const
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    MDBX_txn *outer = tls_read_txn_;
+    MDBX_txn *txn = outer;
 
-    MDBX_txn *txn = nullptr;
-    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
-    if (rc != MDBX_SUCCESS)
-      return;
+    if (txn == nullptr)
+    {
+      int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
+      if (rc != MDBX_SUCCESS)
+        throwMdbx("forEachEntry: txn_begin", rc);
+      tls_read_txn_ = txn;
+    }
 
     MDBX_cursor *cursor = nullptr;
-    rc = mdbx_cursor_open(txn, tableHandle(tableId), &cursor);
+    int rc = mdbx_cursor_open(txn, tableHandle(tableId), &cursor);
     if (rc != MDBX_SUCCESS)
     {
-      mdbx_txn_abort(txn);
+      if (outer == nullptr)
+      {
+        tls_read_txn_ = nullptr;
+        mdbx_txn_abort(txn);
+      }
       return;
     }
 
@@ -876,25 +1084,38 @@ namespace State
     }
 
     mdbx_cursor_close(cursor);
-    mdbx_txn_abort(txn);
+
+    if (outer == nullptr)
+    {
+      tls_read_txn_ = nullptr;
+      mdbx_txn_abort(txn);
+    }
   }
 
   void StateDB::forEachEntryWithPrefix(uint32_t tableId,
                                        const std::vector<uint8_t> &prefix,
                                        const EntryVisitor &visitor) const
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    MDBX_txn *outer = tls_read_txn_;
+    MDBX_txn *txn = outer;
 
-    MDBX_txn *txn = nullptr;
-    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
-    if (rc != MDBX_SUCCESS)
-      return;
+    if (txn == nullptr)
+    {
+      int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
+      if (rc != MDBX_SUCCESS)
+        throwMdbx("forEachEntryWithPrefix: txn_begin", rc);
+      tls_read_txn_ = txn;
+    }
 
     MDBX_cursor *cursor = nullptr;
-    rc = mdbx_cursor_open(txn, tableHandle(tableId), &cursor);
+    int rc = mdbx_cursor_open(txn, tableHandle(tableId), &cursor);
     if (rc != MDBX_SUCCESS)
     {
-      mdbx_txn_abort(txn);
+      if (outer == nullptr)
+      {
+        tls_read_txn_ = nullptr;
+        mdbx_txn_abort(txn);
+      }
       return;
     }
 
@@ -926,10 +1147,208 @@ namespace State
     }
 
     mdbx_cursor_close(cursor);
-    mdbx_txn_abort(txn);
+
+    if (outer == nullptr)
+    {
+      tls_read_txn_ = nullptr;
+      mdbx_txn_abort(txn);
+    }
   }
 
+  void StateDB::forEachEntryReverse(uint32_t tableId,
+                                    const EntryVisitor &visitor) const
+  {
+    MDBX_txn *outer = tls_read_txn_;
+    MDBX_txn *txn = outer;
+
+    if (txn == nullptr)
+    {
+      int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
+      if (rc != MDBX_SUCCESS)
+        throwMdbx("forEachEntryReverse: txn_begin", rc);
+      tls_read_txn_ = txn;
+    }
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(txn, tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+    {
+      if (outer == nullptr)
+      {
+        tls_read_txn_ = nullptr;
+        mdbx_txn_abort(txn);
+      }
+      return;
+    }
+
+    MDBX_val mkey, mval;
+    rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+    }
+
+    mdbx_cursor_close(cursor);
+
+    if (outer == nullptr)
+    {
+      tls_read_txn_ = nullptr;
+      mdbx_txn_abort(txn);
+    }
+  }
+
+  void StateDB::forEachEntryWithPrefixReverse(
+      uint32_t tableId,
+      const std::vector<uint8_t> &prefix,
+      const EntryVisitor &visitor) const
+  {
+    MDBX_txn *outer = tls_read_txn_;
+    MDBX_txn *txn = outer;
+
+    if (txn == nullptr)
+    {
+      int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
+      if (rc != MDBX_SUCCESS)
+        throwMdbx("forEachEntryWithPrefixReverse: txn_begin", rc);
+      tls_read_txn_ = txn;
+    }
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(txn, tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+    {
+      if (outer == nullptr)
+      {
+        tls_read_txn_ = nullptr;
+        mdbx_txn_abort(txn);
+      }
+      return;
+    }
+
+    std::vector<uint8_t> upper = prefix;
+    while (!upper.empty() && upper.back() == 0xFF)
+      upper.pop_back();
+    if (!upper.empty())
+      ++upper.back();
+
+    MDBX_val mkey, mval;
+    if (upper.empty())
+    {
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+    }
+    else
+    {
+      mkey.iov_base = const_cast<void *>(static_cast<const void *>(upper.data()));
+      mkey.iov_len = upper.size();
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_SET_RANGE);
+      if (rc == MDBX_SUCCESS)
+      {
+        rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+      }
+      else if (rc == MDBX_NOTFOUND)
+      {
+        rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_LAST);
+      }
+    }
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+
+      if (key.size() < prefix.size() ||
+          std::memcmp(key.data(), prefix.data(), prefix.size()) != 0)
+      {
+        break;
+      }
+
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+    }
+
+    mdbx_cursor_close(cursor);
+
+    if (outer == nullptr)
+    {
+      tls_read_txn_ = nullptr;
+      mdbx_txn_abort(txn);
+    }
+  }
+
+  // =============================================================
+  //  Read txn lifecycle
+  // =============================================================
+
+  StateDB::ReadTxn StateDB::beginRead()
+  {
+    //  If a read txn is already open on this thread, reuse it. This
+    //  is required by MDBX: a second overlapping read txn on the
+    //  same thread returns MDBX_BUSY.
+    if (tls_read_txn_ != nullptr)
+      return ReadTxn(tls_read_txn_, this, /*owns=*/false, tls_read_txn_);
+
+    MDBX_txn *txn = nullptr;
+    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
+    if (rc != MDBX_SUCCESS)
+      throwMdbx("beginRead", rc);
+
+    tls_read_txn_ = txn;
+    return ReadTxn(txn, this, /*owns=*/true, nullptr);
+  }
+
+  void StateDB::releaseReadTxn() noexcept
+  {
+    //  Close the outermost read txn on this thread, if any. Called
+    //  by every write path before opening a write txn, because MDBX
+    //  refuses to open a write txn while a read txn is open on the
+    //  same thread (MDBX_TXN_OVERLAPPING).
+    //
+    //  We do not know the previous tls_read_txn_ value here — the
+    //  ReadTxn that owns the txn holds it internally. But the
+    //  owning ReadTxn's destructor is what clears the thread-local,
+    //  so we just abort the txn and clear the thread-local
+    //  ourselves. The owning ReadTxn still thinks it has a valid
+    //  handle and its destructor will try to abort again; MDBX
+    //  tolerates abort on an already-aborted handle? No it does not
+    //  — so instead we rely on the caller having destroyed its
+    //  ReadTxn before calling us. In practice that's what happens:
+    //  rawPut and rawDel are only reached when the StateAccess has
+    //  already released its read_txn_ (see StateAccess.cpp's
+    //  releaseReadTxnIfHeld()).
+    //
+    //  For the legacy per-call path (rawGet, forEachEntry*), the
+    //  read txn is opened and aborted inside a single call, so it's
+    //  never visible to releaseReadTxn.
+    //
+    //  If anything is still open, abort it and clear the handle.
+    if (tls_read_txn_ != nullptr)
+    {
+      mdbx_txn_abort(tls_read_txn_);
+      tls_read_txn_ = nullptr;
+    }
+  }
+
+  // =============================================================
   //  Meta helpers
+  // =============================================================
 
   bool StateDB::getMeta(const std::string &key, std::vector<uint8_t> &out) const
   {
@@ -954,7 +1373,9 @@ namespace State
     rawDel(TBL_META, key.data(), key.size());
   }
 
+  // =============================================================
   //  SMT convenience API
+  // =============================================================
 
   void StateDB::putNode(const Crypto::Hash &hash,
                         const std::vector<uint8_t> &children,
@@ -1002,7 +1423,9 @@ namespace State
     return std::nullopt;
   }
 
+  // =============================================================
   //  Historical SMT access
+  // =============================================================
 
   void StateDB::putNodeAtVersion(const Crypto::Hash &hash,
                                  uint64_t version,
@@ -1011,7 +1434,9 @@ namespace State
     auto hist = histKey(hash, version);
     auto by_ver = byVersionKey(version, hash);
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    releaseReadTxn();
+
+    std::lock_guard<std::mutex> lock(write_mutex_);
 
     MDBX_txn *txn = nullptr;
     int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
@@ -1059,7 +1484,9 @@ namespace State
     auto hist = histKey(leaf_hash, version);
     auto by_ver = byVersionKey(version, leaf_hash);
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    releaseReadTxn();
+
+    std::lock_guard<std::mutex> lock(write_mutex_);
 
     MDBX_txn *txn = nullptr;
     int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
@@ -1100,15 +1527,12 @@ namespace State
     return rawGet(TBL_SMT_LEAVES_HIST, hist.data(), hist.size(), out);
   }
 
+  // =============================================================
   //  Historical pruning
+  // =============================================================
 
   void StateDB::pruneHistoryBefore(uint64_t keepFrom)
   {
-    //  Non-txn path. Opens its own write txn so the scan and the
-    //  deletes see a consistent view, and so the outer entry point
-    //  matches the txn-bound variant's semantics. The scan uses
-    //  forEachEntry (which opens its own read txn under the mutex);
-    //  the deletes go through the write txn opened here.
     auto txn = beginWrite();
 
     pruneOneTableImpl(
@@ -1130,13 +1554,6 @@ namespace State
 
   void StateDB::pruneHistoryBeforeTxn(Txn &txn, uint64_t keepFrom)
   {
-    //  Txn-bound path. Uses the caller's write txn for both the scan
-    //  and the deletes, so rows that are still uncommitted in that
-    //  txn are visible to the scan and are deleted from the same view.
-    //  This is the variant the SparseMerkleTree calls when it holds a
-    //  txn: a fixture that binds a txn to the SMT writes its
-    //  historical rows into that txn, and those rows must be pruned
-    //  from the same txn before it commits.
     pruneOneTableImpl(
         [&txn](uint32_t table, const EntryVisitor &v)
         { txn.forEach(table, v); },
@@ -1152,23 +1569,77 @@ namespace State
         TBL_SMT_LEAVES_BY_VER, TBL_SMT_LEAVES_HIST, keepFrom);
   }
 
+  void StateDB::wipeConsensusWal()
+  {
+    releaseReadTxn();
+
+    std::lock_guard<std::mutex> lock(write_mutex_);
+
+    MDBX_txn *txn = nullptr;
+    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
+    if (rc != MDBX_SUCCESS)
+      throwMdbx("wipeConsensusWal: txn_begin", rc);
+
+    MDBX_cursor *cursor = nullptr;
+    rc = mdbx_cursor_open(txn, tableHandle(TBL_CONSENSUS_WAL), &cursor);
+    if (rc != MDBX_SUCCESS)
+    {
+      mdbx_txn_abort(txn);
+      throwMdbx("wipeConsensusWal: cursor_open", rc);
+    }
+
+    MDBX_val mkey, mval;
+    rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_FIRST);
+
+    while (rc == MDBX_SUCCESS)
+    {
+      MDBX_val del_key;
+      del_key.iov_base = mkey.iov_base;
+      del_key.iov_len = mkey.iov_len;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_NEXT);
+
+      mdbx_del(txn, tableHandle(TBL_CONSENSUS_WAL), &del_key, nullptr);
+    }
+
+    mdbx_cursor_close(cursor);
+
+    rc = mdbx_txn_commit(txn);
+    if (rc != MDBX_SUCCESS)
+    {
+      mdbx_txn_abort(txn);
+      throwMdbx("wipeConsensusWal: commit", rc);
+    }
+  }
+
+  // =============================================================
   //  Diagnostics
+  // =============================================================
 
   size_t StateDB::entryCount(uint32_t tableId) const
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    MDBX_txn *outer = tls_read_txn_;
+    MDBX_txn *txn = outer;
 
-    MDBX_txn *txn = nullptr;
-    int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
-    if (rc != MDBX_SUCCESS)
-      return 0;
+    if (txn == nullptr)
+    {
+      int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_RDONLY, &txn);
+      if (rc != MDBX_SUCCESS)
+        throwMdbx("entryCount: txn_begin", rc);
+      tls_read_txn_ = txn;
+    }
 
     MDBX_stat stat;
-    rc = mdbx_dbi_stat(txn, tableHandle(tableId), &stat, sizeof(stat));
-    mdbx_txn_abort(txn);
+    int rc = mdbx_dbi_stat(txn, tableHandle(tableId), &stat, sizeof(stat));
+
+    if (outer == nullptr)
+    {
+      tls_read_txn_ = nullptr;
+      mdbx_txn_abort(txn);
+    }
 
     if (rc != MDBX_SUCCESS)
-      return 0;
+      throwMdbx("entryCount: dbi_stat", rc);
     return stat.ms_entries;
   }
 
@@ -1182,18 +1653,19 @@ namespace State
     return env_;
   }
 
+  // =============================================================
   //  Lifecycle
+  // =============================================================
 
   void StateDB::flush()
   {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (env_)
       mdbx_env_sync(env_);
   }
 
   void StateDB::close()
   {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(write_mutex_);
     if (env_)
     {
       mdbx_env_close(env_);

@@ -31,6 +31,8 @@ namespace State
     // Autocommit mode: each operation opens its own txn internally.
     StateAccess(StateDB &db, uint64_t version);
 
+    using EntryVisitor = StateDB::EntryVisitor;
+
     // Txn-bound mode: all writes go through the given txn.
     // The txn is NOT owned by StateAccess. Caller commits or aborts.
     StateAccess(StateDB &db, StateDB::Txn &txn, uint64_t version);
@@ -411,8 +413,40 @@ namespace State
     // Low-level: delete a row.
     void deleteRow(uint32_t table_id, const void *key, size_t key_len);
 
+    //  Dispatch a single-key lookup through whichever txn context
+    //  is active: write txn first, then read txn, then the DB's
+    //  autocommit path (which itself reuses the thread-local read
+    //  txn if one is open — this branch is a safety net).
+    bool readRow(uint32_t table_id,
+                 const void *key, size_t key_len,
+                 std::vector<uint8_t> &out) const;
+
+    void readForEach(uint32_t table_id,
+                     const EntryVisitor &visitor) const;
+
+    void readForEachWithPrefix(uint32_t table_id,
+                               const std::vector<uint8_t> &prefix,
+                               const EntryVisitor &visitor) const;
+
+    void readForEachReverse(uint32_t table_id,
+                            const EntryVisitor &visitor) const;
+
+    void readForEachWithPrefixReverse(uint32_t table_id,
+                                      const std::vector<uint8_t> &prefix,
+                                      const EntryVisitor &visitor) const;
+
+    size_t readTableCount(uint32_t table_id) const;
+
+    void releaseReadTxnIfHeld();
+
     StateDB &db_;
     StateDB::Txn *txn_{nullptr};
+
+    //  Autocommit-mode read transaction. Owns a single MDBX read
+    //  txn for the lifetime of this StateAccess. Null when the
+    //  StateAccess is bound to a write txn.
+    std::unique_ptr<StateDB::ReadTxn> read_txn_;
+
     uint64_t version_;
     SparseMerkleTree smt_;
   };

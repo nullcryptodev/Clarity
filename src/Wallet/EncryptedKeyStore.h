@@ -130,7 +130,28 @@ namespace Wallet
     //  Set a new label and persist. Returns the WalletError from save.
     WalletError setLabel(std::string_view label);
 
-  private:
+    //  Change the network label of this keystore.
+    //
+    //  The mnemonic, the derived keys, the ciphertext, and the MAC
+    //  are all network-independent and are not modified. Only three
+    //  fields change: the network string, the chain ID, and the
+    //  bech32m encoding of the default account's address. The
+    //  underlying pubkey is the same; only its HRP-prefixed encoding
+    //  changes.
+    //
+    //  Does not require the keystore to be unlocked. The network
+    //  field is not part of the AEAD's additional authenticated data
+    //  (the AAD is the fixed string KEYSTORE_AAD), so changing it
+    //  does not invalidate the MAC.
+    //
+    //  Returns WalletError::Ok on success. Returns
+    //  WalletError::BadArgument if new_network is not one of the
+    //  three known networks. Returns WalletError::KeyStoreCorrupt
+    //  if the existing address field can't be decoded, which would
+    //  mean the file was modified outside this tool.
+    WalletError convertNetwork(Network new_network);
+
+private:
     EncryptedKeyStore() = default;
 
     // Derive the KEK (key-encryption key) from a password, given the

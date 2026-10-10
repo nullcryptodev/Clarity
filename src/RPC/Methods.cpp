@@ -1,3 +1,8 @@
+// Copyright (c) 2018-2026 Conceal Network & Conceal Devs
+//
+// Distributed under the MIT/X11 software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
 #include <string>
 #include <thread>
 #include <algorithm>
@@ -1394,19 +1399,11 @@ namespace Rpc
 
       Common::Json arr = Common::Json::array();
 
-      //  Native CLRTY balance first.
-      {
-        Core::Account acct = state.getAccount(address);
-        if (acct.balance > 0)
-        {
-          Common::Json entry = Common::Json::object();
-          putU64(entry, "token_id", NATIVE_TOKEN_ID);
-          putU64(entry, "balance", acct.balance);
-          arr.push_back(std::move(entry));
-        }
-      }
-
-      //  Custom token balances.
+      //  Every token the address holds, including the native token
+      //  (id 0), comes from the by-token balance index. The native
+      //  balance is maintained there by StateAccess::putAccount, so
+      //  there's no separate synthesis step and no risk of a
+      //  duplicate row.
       state.forEachTokenBalanceForOwner(
           address,
           [&](Id token_id, uint64_t balance)
@@ -1654,8 +1651,6 @@ namespace Rpc
 
       //  Token holdings count.
       uint64_t token_count = 0;
-      if (acct.balance > 0)
-        ++token_count; // native
       state.forEachTokenBalanceForOwner(
           address, [&](Id, uint64_t)
           { ++token_count; });
@@ -1935,6 +1930,8 @@ namespace Rpc
           static_cast<size_t>(limit),
           [&](const Crypto::Hash &txid, uint64_t block_height, uint32_t tx_index)
           {
+            //  Resolve the transaction from its block. This is one
+            //  block lookup per hit, bounded by `limit`.
             auto block = node.chain().getBlockByHeight(block_height);
             if (!block.has_value())
               return;
@@ -2646,14 +2643,7 @@ namespace Rpc
       const uint64_t epoch_fees =
           sumFeesInWindow(node, height, Core::ROTATION_INTERVAL);
 
-      //  Last-24h window, in blocks. Uses the nominal block time
-      //  the reward system assumes; the real block time may drift,
-      //  but the window stays a useful approximation.
-      const uint64_t blocks_per_day =
-          (24ULL * 3600ULL) /
-          std::max<uint64_t>(1, Core::NOMINAL_BLOCK_SECONDS);
-      const uint64_t daily_fees =
-          sumFeesInWindow(node, height, blocks_per_day);
+      const uint64_t daily_fees = state.getMetaU64("fees_in_window");
 
       const uint64_t avg_fee_per_block =
           height > 0 ? lifetime_fees / (height + 1) : 0;

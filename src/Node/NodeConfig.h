@@ -74,6 +74,28 @@ namespace Node
     uint64_t max_block_txs{5'000};
     uint64_t consensus_poll_ms{100};
 
+    //  Number of blocks in the rolling fee window. Used by
+    //  getFeeStats to answer "fees in the last 24 hours" without
+    //  walking the whole window on every call.
+    //
+    //  Default: 86,400 blocks (24 hours at NOMINAL_BLOCK_SECONDS = 1).
+    //  On a test chain with a smaller window, set this lower so the
+    //  value is populated quickly.
+    uint64_t fee_window_blocks{86'400};
+
+    //  Number of recent versions of the SMT to retain. Older
+    //  versions are pruned after each block commit. Zero disables
+    //  pruning entirely (unbounded growth).
+    //
+    //  Default: 10,000 blocks. On a chain with meaningful state
+    //  traffic, the historical SMT is the dominant storage consumer;
+    //  keeping this bounded is what keeps disk usage predictable.
+    //
+    //  Pruning happens in a background pass after block commit, at
+    //  most once every HISTORY_PRUNE_INTERVAL_BLOCKS blocks, so the
+    //  cost is amortized.
+    uint64_t smt_history_blocks{10'000};
+
     // ---- Genesis ----
     bool apply_genesis_on_start{true};
 

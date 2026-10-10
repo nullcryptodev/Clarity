@@ -6,9 +6,9 @@
 
 #### Documents
 
-- [Economics of Clarity](https://github.com/nullcryptodev/Clarity/blob/main/ECONOMICS.md)
-- [Setup Clarity REGTEST](https://github.com/nullcryptodev/Clarity/blob/main/SETUP-REGTEST.md)
-- [Clarity Metrics Reference](https://github.com/nullcryptodev/Clarity/blob/main/METRICS.md)
+- [Economics of Clarity](https://github.com/nullcryptodev/Clarity/blob/main/docs/ECONOMICS.md)
+- [Setup Clarity REGTEST](https://github.com/nullcryptodev/Clarity/blob/main/docs/SETUP-REGTEST.md)
+- [Clarity Metrics Reference](https://github.com/nullcryptodev/Clarity/blob/main/docs/METRICS.md)
 
 #### Table of Contents
 
@@ -25,12 +25,16 @@
   - [Validator Set](#validator-set)
   - [Seed Validators](#seed-validators)
   - [Dry-run vs. finalized validation](#dry-run-vs-finalized-validation)
+  - [Commit failure handling](#commit-failure-handling)
 - [**State**: how the chain is stored](#state-how-the-chain-is-stored)
   - [Storage](#storage)
   - [State Commitment](#state-commitment)
   - [State Access](#state-access)
+  - [Read transactions](#read-transactions)
+  - [Write discipline](#write-discipline)
   - [Proofs](#proofs)
   - [Versioning](#versioning)
+  - [Historical pruning](#historical-pruning)
 - [**Transactions**: what users can do](#transactions-what-users-can-do)
   - [Native Transfers](#native-transfers)
   - [Token Operations](#token-operations)
@@ -205,18 +209,44 @@ Seeds are never removed from the active set by normal rotation, offline removal,
 #### Dry-run vs. finalized validation
 The block processor distinguishes between *simulating* a block (the proposer needs to know what state root a candidate block would produce, but the block's state root and quorum signatures aren't populated yet) and *applying* a finalized block. `BlockContext::dry_run` skips structural header checks, quorum verification, and the state-root comparison; the non-dry path runs them all. This split is load-bearing -- the consensus proposer relies on it, and the test suite exercises both paths.
 
+A subtle invariant: **every state change that touches the SMT must happen on both paths.** Only writes to the meta table (`TBL_META`) and to the non-SMT index tables may be gated on `!ctx.dry_run`. The dry-run path aborts its transaction, so the change is discarded; the apply path commits it. If a change is gated, the two paths produce different state roots and the proposer's block is rejected on apply. This was a source of a hard-to-diagnose bug where blocks 1 and 2 were committed by consensus but rejected by every node that tried to apply them.
+
+#### Commit failure handling
+The `on_block_committed` callback returns a `bool`. `BftConsensus::enterCommit` checks the return value: if the apply failed, the engine advances the **round** (`enterPropose(height, round + 1)`) rather than the height. It does **not** fire `on_height_advanced`, does **not** truncate the WAL, and does **not** set `pending_height_`. The height is not considered committed until a block applies successfully.
+
+Before this change, the callback returned `void`, and a failed apply still fired `on_height_advanced` and set `pending_height_`. The engine would march forward to height N+1 while the chain head stayed at N, and every subsequent block would fail the same way. The height would appear to advance in the consensus engine's state while the on-chain height stayed stuck.
+
 ## State: how the chain is stored
 
 #### Storage
-MDBX, a memory-mapped key-value store. Twenty-one tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, three index tables (stakers, validators, order expiry), receipts, tx index, blocks by hash, blocks by height, the persistent mempool, the consensus WAL, and four historical SMT tables (nodes-history, leaves-history, nodes-by-version, leaves-by-version).
+MDBX, a memory-mapped key-value store. Thirty-two tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, index tables (stakers, validators, order expiry), receipts, tx index, blocks by hash, blocks by height, the persistent mempool, the consensus WAL, and four historical SMT tables (nodes-history, leaves-history, nodes-by-version, leaves-by-version), plus the application index tables used by the RPC and metrics layers (AMM pools and positions, by-owner position and order indexes, by-token balances and pools, tx-by-address/token/type, blocks-by-producer, orders-by-pair).
 
 For v1, all of these live in a single MDBX database file at `<data_dir>/state`. Chain data — block indices, block bodies, receipts, the transaction index — shares the same file as state data. There is no separate chain DB directory. This is a storage-layout decision, not a consensus-relevant one: the atomic commit discipline that writes state, block index, and head together in one transaction relies on the two being in the same MDBX instance.
 
 #### State commitment
 A **sparse Merkle tree** of depth 256. Each key is a 32-byte hash (derived from an account address, token balance key, validator ID, or global state name). Each leaf commits to a value. The tree root is the state root, which is written into every block header. Any two nodes with the same state produce the same root.
 
-#### State access
+#### State Access
 A `StateAccess` object wraps the DB and provides typed getters and setters for accounts, token balances, token metadata, validators, orders, AMM pools, AMM positions, receipts, and global state. Reads and writes go through the SMT so every change updates the root.
+
+`StateAccess` exists in two modes. **Txn-bound mode** is used by the block processor and consensus paths: every read and write goes through a single MDBX write transaction that the caller opened and owns. **Autocommit mode** is used by the RPC layer, the metrics handler, and the various `Node` helpers: the `StateAccess` owns a single MDBX *read* transaction for its lifetime, and read methods route through it. The autocommit mode is what makes a 256-level SMT walk — hundreds of individual node lookups — cheap in reader-slot terms: the walk holds one reader, not one per lookup.
+
+#### Read transactions
+MDBX permits multiple read transactions across threads but exactly one read transaction per thread. A second `mdbx_txn_begin(RDONLY)` on a thread that already has a read transaction open returns `MDBX_BUSY`. This is a hard constraint that shapes the code.
+
+Every read path in the state layer takes one of two forms:
+
+- **Held transaction.** `StateAccess` in autocommit mode owns a `StateDB::ReadTxn` for its lifetime and routes all reads through it. `SparseMerkleTree` is bound to the same transaction via `setReadTxn`, so its own internal walks also go through it. A single `StateAccess` used for a chain of reads — the entire block-application state transition, or an RPC handler that scans a range — holds exactly one reader slot.
+- **Per-thread fallback.** `StateDB::rawGet`, `StateDB::forEachEntry`, and the other raw accessors check a thread-local handle (`tls_read_txn_`) before opening a transaction. If a read transaction is already open on this thread, they reuse it. This is what makes a nested read from inside a `forEach*` visitor safe: the visitor is called from within the outer iteration's read transaction, and any `get`/`has`/`forEach` the visitor performs reuses that same transaction rather than trying to open a second one.
+
+The second form is a safety net for code paths that predate the read-transaction binding. New code should prefer the first form — an explicit `ReadTxn` bound into the `StateAccess` — because it makes the transaction's lifetime explicit in the call graph.
+
+#### Write discipline
+MDBX also refuses to open a write transaction on a thread that has a read transaction open. This is the same constraint as above, applied to the write path.
+
+Every write method on `StateAccess` calls `releaseReadTxnIfHeld()` before delegating to the underlying `rawPut`/`rawDel`. This destroys the held `ReadTxn` (if any) and unbinds it from the SMT. The next read after the write transparently opens a fresh read transaction. This makes a `StateAccess` that interleaves reads and writes — which is most of the block-application path — safe without the caller having to know about the ordering.
+
+The write paths that call `releaseReadTxnIfHeld()` include `putAccount`, `deleteAccount`, `putTokenBalance`, `deleteTokenBalance`, `putToken`, `putTokenSupply`, `putValidator`, `deleteValidator`, `putValidatorByAddress`, `deleteValidatorByAddress`, `putOrder`, `deleteOrder`, `putAmmPool`, `deleteAmmPool`, `putAmmPosition`, `deleteAmmPosition`, `putPositionIndex`, `deletePositionIndex`, `putReceipt`, `putGlobal`, `putMetaImpl`, `putRaw`, `deleteRaw`, `commit`, and the four low-level row helpers `putSentinel`/`putU64Row`/`putBlobRow`/`deleteRow`.
 
 #### Proofs
 Inclusion and non-inclusion proofs can be generated for any key. A proof is a list of sibling hashes down to the leaf; verification recomputes the root from the proof and compares. Proofs are a pure-function construction: `verifyProof(expected_root, proof)` performs no DB access and no signature checks, so a caller that holds only a state root can verify a proof without trusting the server that produced it. Proof generation is exposed over P2P via the `GetProof`/`Proof` message pair (see [Proof Serving](#proof-serving)), over RPC via `clrty_getProof`, and in-process by tests and diagnostic tooling.
@@ -230,7 +260,10 @@ Version 0 is the bootstrap version -- the state before any block has been applie
 
 Historical storage is content-addressed and deduplicated: a node whose subtree did not change between two versions is stored once, at the version where it first appeared, and remains reachable from every later version's root. In practice this means the historical tables grow with *state changes*, not with block count or write count.
 
-`pruneHistory(keepFrom)` deletes every historical row whose version is strictly less than `keepFrom`, from both the historical tables and their by-version indexes. Pruning is not wired into the node's normal operation -- it's available for an operator to call from a startup pass or a periodic maintenance routine, and the retention policy is a local choice (two nodes with different pruning policies still agree on consensus, because pruning only affects local historical queries).
+#### Historical pruning
+`SparseMerkleTree::pruneHistory(keepFrom)` deletes every historical row whose version is strictly less than `keepFrom`, from both the historical tables and their by-version indexes. It is wired into the block-commit path via `NodeConfig::smt_history_blocks` (default 10,000) and runs after every block commit, throttled to at most once every 100 blocks. When `smt_history_blocks` is zero, pruning is disabled and the historical tables grow without bound.
+
+The retention window is a local choice — two nodes with different windows still agree on consensus, because pruning only affects historical proof serving and historical state reads, both of which are local queries. A node that prunes aggressively can still serve proofs against the current root and any version inside its window; a node that keeps everything can serve proofs against any version since genesis.
 
 ## Transactions: what users can do
 
@@ -376,6 +409,7 @@ On a two-validator regtest network with the defaults, the endpoint returns rough
 | `clrty_p2p_*` | Peer counts by direction and state, ban list size, address book size, aggregate rate-limiter config |
 | `clrty_mempool_*` | Pending transaction count, byte size, fee-tier split, fee-rate min/max/avg, and cumulative accept/reject counters with a `reason` label |
 | `clrty_storage_*` | On-disk database size, block count, SMT node and leaf counts |
+| `clrty_fees_in_window` | Rolling 24-hour fee total, maintained incrementally at each block commit and read from the meta table rather than by walking headers |
 | `clrty_pot`, `clrty_total_supply`, `clrty_total_staked`, `clrty_staker_count`, `clrty_last_effective_apy_bps`, `clrty_current_epoch`, `clrty_blocks_until_epoch` | Reward pool and staking state |
 | `clrty_consensus_*`, `clrty_active_set_size` | Consensus height, round, step ordinal, proposer flag, vote counts, consecutive timeouts, emergency rotation state, active set size and quorum threshold |
 | `clrty_validator_*` (opt-in) | Per-validator stake, uptime EMA, reward multiplier, cumulative rewards and blocks produced, pending unbond height |
@@ -384,7 +418,7 @@ On a two-validator regtest network with the defaults, the endpoint returns rough
 
 **Concurrency.** The scrape runs on the metrics server's worker thread, never on the P2P event loop. Every value comes from one of four sources: `Node::Status` (a value struct returned by `Node::status()`), the memory-mapped database through `StateAccess`, lock-free atomic counters on `P2PManager` (read via `snapshot()`), or value-returning accessors on `Mempool` and `BftConsensus` that take their own short-lived mutexes. None of them requires posting a request to the event loop and waiting for a reply. A scrape never blocks on the event loop, and the event loop never blocks on a scrape.
 
-**Port collisions.** Running two daemons on one host requires each to have a distinct metrics port. The second daemon binds `9101`, the third `9102`, and so on — the same as with any other network service. The [Setup Clarity REGTEST](https://github.com/nullcryptodev/Clarity/blob/main/SETUP-REGTEST.md) guide shows this pattern for the two-validator devnet.
+**Port collisions.** Running two daemons on one host requires each to have a distinct metrics port. The second daemon binds `9101`, the third `9102`, and so on — the same as with any other network service. The [Setup Clarity REGTEST](https://github.com/nullcryptodev/Clarity/blob/main/docs/SETUP-REGTEST.md) guide shows this pattern for the two-validator devnet.
 
 ## RPC: how clients talk
 
@@ -394,9 +428,18 @@ On a two-validator regtest network with the defaults, the endpoint returns rough
 
 Validator objects returned by the consensus methods expose both `reward_address` (bech32m) and `consensus_key` (0x-prefixed hex), in addition to the existing fields.
 
-**Methods** cover chain (`chainId`, `blockNumber`, `getBlockByNumber`, `getBlockByHash`, `getBlockHeaderByNumber`, `getStateRoot`, `methods`), state (`getBalance`, `getAccount`, `getNonce`, `getTokenInfo`, `getTokenSupply`, `getProof`), transactions (`sendRawTransaction`, `getTransactionByHash`, `getTransactionReceipt`, `simulateTransaction`), mempool (`getMempoolStats`, `getMempoolTx`), consensus (`getValidators`, `getValidator`, `getActiveSet`, `getConsensusState`), AMM (`getPool`, `getPosition`, `getPositionByOwner`), orders (`getOrder`, `getOrdersExpiringAt`), node (`ping`, `status`, `health`, `getPeers`, `getConfig`), and admin (`shutdown`, `setLogLevel`).
+**Method surface.** The dispatcher registers roughly seventy methods across ten groups:
 
-**Ethereum-style shims:** `web3_clientVersion`, `net_version`, `net_peerCount`, `net_listening` are implemented for tooling that probes these before deciding whether the endpoint is a chain.
+- **Chain:** `chainId`, `blockNumber`, `getBlockByNumber`, `getBlockByHash`, `getBlockHeaderByNumber`, `getRecentBlocks`, `getStateRoot`, `getBlocksRange`, `getBlocksByProducer`, `getBlockStats`, `getChainStats`, `getEpochInfo`, `getEpochSchedule`.
+- **State / accounts:** `getBalance`, `getAccount`, `getNonce`, `getTokensForAddress`, `getPositionsForAddress`, `getOrdersForAddress`, `getTransactionsForAddress`, `getStakingInfo`, `getAddressStats`, `getAddressList`, `getProof`.
+- **Tokens:** `getTokenInfo`, `getTokenSupply`, `getAllTokens`, `getTokenHolders`, `getTokenTransfers`, `getTokensByCreator`.
+- **Transactions:** `sendRawTransaction`, `getTransactionByHash`, `getTransactionReceipt`, `simulateTransaction`, `getRecentTransactions`, `getAllTransactions`, `getTransactionsByType`, `getTxCount`.
+- **Mempool:** `getMempoolStats`, `getMempoolTx`, `getMempoolList`.
+- **Consensus:** `getValidators`, `getValidator`, `getValidatorByAddress`, `getValidatorStats`, `getActiveSet`, `getConsensusState`.
+- **AMM:** `getPool`, `getPosition`, `getPositionByOwner`, `getAllPools`, `getPoolsForToken`, `getPositionsForPool`.
+- **Orders:** `getOrder`, `getOrdersExpiringAt`, `getAllOrders`, `getOrdersByPair`.
+- **Metrics (server-side aggregates):** `getFeeStats`, `getPotInfo`.
+- **Node / utility:** `ping`, `status`, `health`, `getPeers`, `getConfig`, `getMethods`, `web3_clientVersion`, `net_version`, `net_peerCount`, `net_listening`.
 
 **Error responses** use JSON-RPC standard codes for `InvalidRequest`, `MethodNotFound`, `InvalidParams`, `InternalError`, plus a project-specific range (`BlockNotFound`, `TransactionNotFound`, `ReceiptNotFound`, `PoolNotFound`, `OrderNotFound`, `ValidatorNotFound`, `TokenNotFound`, `TxMalformed`, `ChainReadInternal`, `StateReadInternal`, `Unauthorized`, `ProofVersionUnavailable`, `ProofNotAvailable`, etc.). The `InternalError` catch path in the dispatcher swallows exception text -- a deliberate v1 choice documented in the code.
 
@@ -465,8 +508,6 @@ The wallet layer supports the operations you'd need for an address book -- multi
 **No consensus key rotation.** A validator's consensus key is set at registration and immutable. Rotating it means unregistering and re-registering, which forfeits uptime history. This is a deliberate choice -- mutable consensus keys would invalidate every prior signature by the same validator and complicate equivocation proofs -- but it means a validator with a compromised consensus key has no recovery path short of full re-registration.
 
 **No wallet CLI for address-book operations.** The `clarity-wallet` client covers balance, transfer, staking, and validator operations, but not multi-account management, address labels, or key rotation from the CLI. Integrators still drive those through the library.
-
-**Historical pruning is not wired into the node.** `pruneHistory` is implemented and callable, but no startup path or config flag invokes it. The retention policy -- how far back to keep history, whether to prune on startup or periodically -- is left to the operator. This is a deliberate choice: pruning affects local historical queries but not consensus, so two nodes with different retention policies still agree on the chain.
 
 **AMM positions are not deleted when a pool closes.** When the last LP drains a pool, the pool record is deleted but the zeroed `AmmPosition` record persists. It is unreachable from any index (the position index was removed in the same operation), so it is invisible to any caller that doesn't already know its id -- but it costs 64 bytes per position ever created, and a `forEachPosition`-style scan would surface them. Cleaning them up would require either a `pool_id -> [position_ids]` index or a scan bounded by how many LPs the pool ever had. Neither is worth the code today; the historical SMT already preserves the fact that the position existed.
 
@@ -537,3 +578,18 @@ Proofs can be requested against historical versions because the SMT keeps histor
 **Each handler owns its own method contract.** The HTTP transport layer (`HttpConnection`) validates only what's universal: the HTTP version, the method is one the server speaks at all (`GET` or `POST`), and the request size is under the global limit. Everything else — which method is valid for which path, whether a body is required, what content type is acceptable — is the handler's job. This split is what makes `POST /metrics` return `405 use GET for metrics` from the metrics handler rather than `400 Content-Length is required` from the transport. The first is the correct diagnosis; the second is a true statement about a request whose real problem is that it targeted the wrong handler. `JsonRpcDispatcher` and `MetricsHandler` both implement `IHttpHandler`, both check their own method contract, and both return their own error responses for violations.
 
 **`clrty_` is a namespace, not decoration.** Every metric name carries the `clrty_` prefix. Prometheus treats metric names as a flat global namespace across every exporter the server scrapes — `node_`, `postgres_`, `nginx_`, `ethereum_`, and so on all live in the same bag. A metric named `height` would collide with `height` from any of a dozen other exporters, and the operator would have to disambiguate every query with `{job="clarity"}`. The prefix costs a few bytes per scrape (compressed on the wire by Prometheus's default gzip) and saves the operator from writing longer queries forever. This is the same reason every well-behaved Prometheus exporter in existence prefixes its metrics.
+
+**Read transactions are held, not opened per lookup.** A naive implementation opens a fresh MDBX read transaction for every `get`. That works but scales poorly: a 256-level SMT walk is 256 reader-slot acquisitions, and under concurrent RPC load a small reader table (MDBX's default is 126) can be exhausted, causing lookups to fail with `MDBX_BUSY` and — worse — be misinterpreted as "not found" by the caller. The fix is twofold. First, `StateAccess` in autocommit mode owns a single read transaction for its lifetime, and its SMT is bound to that transaction. Second, a per-thread handle (`StateDB::tls_read_txn_`) is checked before every raw read, so a nested read from inside a visitor reuses the outer transaction rather than opening a second one. The combination means a 256-level walk is one reader slot, and a whole RPC handler that does a dozen lookups is one reader slot.
+
+**Every write releases the held read transaction first.** MDBX refuses to open a write transaction on a thread with an open read transaction. The state layer's write methods therefore call `releaseReadTxnIfHeld()` before delegating to `rawPut`/`rawDel`. This makes the common case — a `StateAccess` that reads a value, writes a value, and reads another value — work transparently. The cost is one extra transaction open/abort per read-write transition, which is dwarfed by the write itself.
+
+**Only non-SMT writes may be gated on `dry_run`.** The block processor's dry-run path aborts its write transaction at the end, so any state change it makes is discarded. If a change is gated on `!ctx.dry_run`, the dry-run path doesn't make it and the two paths produce different state roots. The rule is: SMT writes happen unconditionally; meta-table and non-SMT index writes may be gated. This was the source of a hard-to-diagnose bug where a block's simulate and apply paths disagreed on the state root.
+
+**Commit failure advances the round, not the height.** The consensus engine treats a failed `on_block_committed` as a failed round: it advances to `round + 1` and tries a fresh proposal. It does not truncate the WAL, does not fire `on_height_advanced`, and does not set `pending_height_`. The height is not considered committed until a block applies. This makes the consensus engine's view of the chain consistent with the actual chain head even when a block is rejected — which is what the round-based retry mechanism is designed to handle.
+
+**The consensus WAL is wiped on fresh genesis.** A fresh DB is a fresh chain; any WAL rows from a previous life reference blocks whose height and hash no longer correspond to anything on the current chain. `Node::initGenesis` calls `state_db_->wipeConsensusWal()` after writing genesis on the fresh-DB path. Without it, the consensus engine replays its own votes for a chain that no longer exists and forces the validator to be loyal to a block that no other node recognises. On an existing DB, the WAL survives a restart — that's the crash-recovery case the WAL exists for.
+
+**Genesis is one atomic write.** The entire genesis state, the genesis block, and the chain head all live in a single MDBX write transaction opened at the start of `Node::initGenesis`. Either all of it commits or none of it does. Autocommit `StateAccess` was previously used on this path, which meant genesis was written one row at a time — a crash partway through left a partially-applied genesis that a restart couldn't detect or repair.
+
+**Historical pruning is throttled.** `pruneHistoryBefore` runs after every block commit when `smt_history_blocks > 0`, but only when the current height has advanced at least 100 blocks past the last prune. The throttle bounds the per-commit latency cost: without it, a chain with a lot of history would prune on every block, which is expensive and unnecessary (the window moves by one block per commit, so pruning once per 100 blocks removes 100 versions at a time). A failed prune is logged and skipped; the next attempt happens 100 blocks later.
+```
