@@ -2,7 +2,7 @@
 
 # Clarity - Authority rotates, the chain doesn't.
 
-![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C979-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
+![Known Tests](https://img.shields.io/badge/Known_Tests-2%2C056-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
 
 #### Documents
 
@@ -42,6 +42,7 @@
   - [Validator Operations](#validator-operations)
   - [AMM Operations](#amm-operations)
   - [Limit Orders](#limit-orders)
+  - [NFTs](#nfts)
   - [Claim Rewards](#claim-rewards)
   - [System Transactions](#system-transactions)
 - [**Matching engine**: how Passive orders are filled](#matching-engine-how-passive-orders-are-filled)
@@ -60,6 +61,16 @@
   - [Fill accounting](#fill-accounting)
   - [Epoch fills commitment](#epoch-fills-commitment)
   - [Cancellation policy](#cancellation-policy)
+- [**NFTs**: how non-fungible tokens work](#nfts-how-non-fungible-tokens-work)
+  - [The model](#the-model)
+  - [Shadow tokens](#shadow-tokens)
+  - [Wrapped NFTs and virtual custody](#wrapped-nfts-and-virtual-custody)
+  - [Collections](#collections)
+  - [Reward schedules](#reward-schedules)
+  - [Transaction types](#transaction-types)
+  - [State layout](#state-layout)
+  - [Ownership and transfers](#ownership-and-transfers)
+  - [Where NFTs fit in the codebase](#where-nfts-fit-in-the-codebase)
 - [**Validator identity**: two keys, two roles](#validator-identity-two-keys-two-roles)
   - [Consensus Key](#consensus-key)
   - [Reward Address](#reward-address)
@@ -92,15 +103,15 @@
 
 ## What it is
 
-Clarity is a **single-chain, Byzantine-fault-tolerant proof-of-stake network** with a native currency ($CLRTY), a general-purpose token system, an automated market maker, a **price-time-priority limit-order book with an in-process matching engine and AMM routing for Active orders**, validator rewards with a pot mechanism, mutable validator signing keys with full history, and a growing feature set around staking, validator rotation, and on-chain governance of validator sets.
+Clarity is a **single-chain, Byzantine-fault-tolerant proof-of-stake network** with a native currency ($CLRTY), a general-purpose token system, an automated market maker, a **price-time-priority limit-order book with an in-process matching engine and AMM routing for Active orders**, a **first-class NFT system with optional on-chain reward schedules**, validator rewards with a pot mechanism, mutable validator signing keys with full history, and a growing feature set around staking, validator rotation, and on-chain governance of validator sets.
 
-It's not a direct fork of anything. The block format, consensus protocol, state model, matching engine, Active-order routing, key-rotation machinery, and reward math are original. It uses well-known primitives (Ed25519, X25519, Blake2b, SHA-512, XChaCha20-Poly1305) from Monocypher, the Argon2 reference implementation for keystore KDF, the BLAKE2 reference code, and a project-internal Keccak implementation verified against the official Keccak test vectors.
+It's not a direct fork of anything. The block format, consensus protocol, state model, matching engine, Active-order routing, NFT model, key-rotation machinery, and reward math are original. It uses well-known primitives (Ed25519, X25519, Blake2b, SHA-512, XChaCha20-Poly1305) from Monocypher, the Argon2 reference implementation for keystore KDF, the BLAKE2 reference code, and a project-internal Keccak implementation verified against the official Keccak test vectors.
 
-The project is at the code-complete, pre-launch stage. The daemon builds, the full test suite passes, and the end-to-end path (from transaction submission through consensus through block application through matching and Active-order routing through state persistence through restart) has been exercised on a live two-validator regtest network. The RPC surface is complete and tested. The wallet layer (keystores, HD derivation, signing, address encoding) is complete and tested, and there is an interactive CLI wallet client. The P2P layer has authentication, session encryption, sync, block relay, transaction relay, proof serving, per-peer and node-wide rate limiting, and periodic refresh. A Prometheus-compatible metrics endpoint exposes node, P2P, mempool, storage, reward, and consensus state. It has not been deployed to a public network.
+The project is at the code-complete, pre-launch stage. The daemon builds, the full test suite (2,056 tests) passes, and the end-to-end path (from transaction submission through consensus through block application through matching and Active-order routing through NFT mint/wrap/transfer/burn and reward accrual through state persistence through restart) has been exercised on a live two-validator regtest network. The RPC surface is complete and tested. The wallet layer (keystores, HD derivation, signing, address encoding) is complete and tested, and there is an interactive CLI wallet client. The P2P layer has authentication, session encryption, sync, block relay, transaction relay, proof serving, per-peer and node-wide rate limiting, and periodic refresh. A Prometheus-compatible metrics endpoint exposes node, P2P, mempool, storage, reward, and consensus state. It has not been deployed to a public network.
 
 ## The architecture
 
-Ten main modules, from bottom to top:
+Eleven main modules, from bottom to top:
 
 ```
 Crypto           hashes, signatures, AEAD, key exchange, key types
@@ -109,13 +120,15 @@ Serialization    binary, KV-binary, JSON serializers
 State            MDBX storage, sparse Merkle tree, state access, proofs, historical reads
 Core             blocks, transactions, execution, block processing, rewards,
                  order book, matching engine, Active-order AMM router,
-                 validator key-rotation history, equivocation proofs
+                 validator key-rotation history, equivocation proofs,
+                 NFT records, NFT collections, NFT reward schedules
 Consensus        BFT state machine, proposer selection, message encoding
 P2P              TCP transport, peer management, message framing, auth, session encryption,
                  sync, relay, proof serving, rate limiting
 Node             assembles everything into a running daemon
 RPC              JSON-RPC 2.0 server, dispatcher, method handlers, encoders, metrics endpoint
-Wallet           keystores, HD derivation (BIP39/SLIP10), signing, addresses
+Wallet           keystores, HD derivation (BIP39/SLIP10), signing, addresses,
+                 NFT transaction builders
 ```
 
 Companion binaries:
@@ -232,7 +245,7 @@ The block processor distinguishes between *simulating* a block (the proposer nee
 
 A subtle invariant: **every state change that touches the SMT must happen on both paths.** Only writes to the meta table (`TBL_META`) and to the non-SMT index tables may be gated on `!ctx.dry_run`. The dry-run path aborts its transaction, so the change is discarded; the apply path commits it. If a change is gated, the two paths produce different state roots and the proposer's block is rejected on apply. This was a source of a hard-to-diagnose bug where blocks 1 and 2 were committed by consensus but rejected by every node that tried to apply them.
 
-The matching engine, the Active-order router, and the consensus-key history all obey this invariant. Their book rows, fill-history rows, order-sequence counter, pool reserve updates, and key-history writes all go through the SMT unconditionally, and the `MatchingSimulateAndApplyProduceSameRoot` and `MatchingRootIdenticalAcrossFreshInstances` tests are the canaries that catch a future gated write.
+The matching engine, the Active-order router, the consensus-key history maintenance, and the NFT epoch-boundary reward accrual all obey this invariant. Their book rows, fill-history rows, order-sequence counter, pool reserve updates, key-history writes, and NFT collection escrow decrements all go through the SMT unconditionally, and the `MatchingSimulateAndApplyProduceSameRoot`, `MatchingRootIdenticalAcrossFreshInstances`, and `NftReward_SimulateAndApplyProduceSameRoot` tests are the canaries that catch a future gated write.
 
 #### Commit failure handling
 The `on_block_committed` callback returns a `bool`. `BftConsensus::tryApplyCommit` checks the return value, and on failure the engine retries the apply **in place**, with a linear backoff. Up to `max_commit_retries` retries are attempted. Each retry is driven by `pollTimers`, which compares `deps_.now_ms()` against `next_commit_attempt_ms_`.
@@ -248,19 +261,19 @@ Before this change, the callback returned `void`, and a failed apply still fired
 ## State: how the chain is stored
 
 #### Storage
-MDBX, a memory-mapped key-value store. Thirty-five tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, index tables (stakers, validators, order expiry, orders by owner, orders by pair, orders by pool), receipts, tx index, blocks by hash, blocks by height, the persistent mempool, the consensus WAL, four historical SMT tables (nodes-history, leaves-history, nodes-by-version, leaves-by-version), the application index tables used by the RPC and metrics layers (AMM pools and positions, by-owner position and order indexes, by-token balances and pools, tx-by-address/token/type, blocks-by-producer), the price-sorted order book placement index, and the fill-history index.
+MDBX, a memory-mapped key-value store. Thirty-nine tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, index tables (stakers, validators, order expiry, orders by owner, orders by pair, orders by pool), receipts, tx index, blocks by hash, blocks by height, the persistent mempool, the consensus WAL, four historical SMT tables (nodes-history, leaves-history, nodes-by-version, leaves-by-version), the application index tables used by the RPC and metrics layers (AMM pools and positions, by-owner position and order indexes, by-token balances and pools, tx-by-address/token/type, blocks-by-producer), the price-sorted order book placement index, the fill-history index, and the four NFT tables (`TBL_NFTS`, `TBL_NFT_COLLECTIONS`, `TBL_INDEX_NFTS_BY_OWNER`, `TBL_INDEX_NFTS_BY_COLLECTION`).
 
 For v1, all of these live in a single MDBX database file at `<data_dir>/state`. Chain data — block indices, block bodies, receipts, the transaction index — shares the same file as state data. There is no separate chain DB directory. This is a storage-layout decision, not a consensus-relevant one: the atomic commit discipline that writes state, block index, and head together in one transaction relies on the two being in the same MDBX instance.
 
 #### State commitment
-A **sparse Merkle tree** of depth 256. Each key is a 32-byte hash (derived from an account address, token balance key, validator ID, validator key-history ID, or global state name). Each leaf commits to a value. The tree root is the state root, which is written into every block header. Any two nodes with the same state produce the same root.
+A **sparse Merkle tree** of depth 256. Each key is a 32-byte hash (derived from an account address, token balance key, validator ID, validator key-history ID, NFT id, NFT collection id, or global state name). Each leaf commits to a value. The tree root is the state root, which is written into every block header. Any two nodes with the same state produce the same root.
 
 #### State Access
-A `StateAccess` object wraps the DB and provides typed getters and setters for accounts, token balances, token metadata, validators, validator key histories, orders, AMM pools, AMM positions, receipts, and global state. Reads and writes go through the SMT so every change updates the root.
+A `StateAccess` object wraps the DB and provides typed getters and setters for accounts, token balances, token metadata, validators, validator key histories, orders, AMM pools, AMM positions, NFTs, NFT collections, receipts, and global state. Reads and writes go through the SMT so every change updates the root.
 
 `StateAccess` exists in two modes. **Txn-bound mode** is used by the block processor and consensus paths: every read and write goes through a single MDBX write transaction that the caller opened and owns. **Autocommit mode** is used by the RPC layer, the metrics handler, and the various `Node` helpers: the `StateAccess` owns a single MDBX *read* transaction for its lifetime, and read methods route through it. The autocommit mode is what makes a 256-level SMT walk — hundreds of individual node lookups — cheap in reader-slot terms: the walk holds one reader, not one per lookup.
 
-The matching engine, the Active-order router, and the key-history maintenance paths are txn-bound callers: they run inside the block processor's write transaction, and every read they make (`getOrder`, `forEachBookLevel`, `getAmmPool`, `getValidatorKeyHistory`) and every write they make (`putOrder`, `deleteOrder`, `addToOrderBook`, `removeFromOrderBook`, `indexFill`, `putAmmPool`, `putValidatorKeyHistory`) goes through the same `StateAccess` that the executor uses. This is why a fill's balances, records, book rows, fill-history rows, pool reserve changes, and key-history updates all commit or abort together with the block.
+The matching engine, the Active-order router, the key-history maintenance paths, and the NFT reward accrual are txn-bound callers: they run inside the block processor's write transaction, and every read they make (`getOrder`, `forEachBookLevel`, `getAmmPool`, `getValidatorKeyHistory`, `getNft`, `getNftCollection`, `forEachNftCollection`) and every write they make (`putOrder`, `deleteOrder`, `addToOrderBook`, `removeFromOrderBook`, `indexFill`, `putAmmPool`, `putValidatorKeyHistory`, `putNft`, `putNftCollection`, `deleteNft`) goes through the same `StateAccess` that the executor uses. This is why a fill's balances, records, book rows, fill-history rows, pool reserve changes, key-history updates, and NFT record and escrow changes all commit or abort together with the block.
 
 #### Read transactions
 MDBX permits multiple read transactions across threads but exactly one read transaction per thread. A second `mdbx_txn_begin(RDONLY)` on a thread that already has a read transaction open returns `MDBX_BUSY`. This is a hard constraint that shapes the code.
@@ -277,15 +290,17 @@ MDBX also refuses to open a write transaction on a thread that has a read transa
 
 Every write method on `StateAccess` calls `releaseReadTxnIfHeld()` before delegating to the underlying `rawPut`/`rawDel`. This destroys the held `ReadTxn` (if any) and unbinds it from the SMT. The next read after the write transparently opens a fresh read transaction. This makes a `StateAccess` that interleaves reads and writes — which is most of the block-application path — safe without the caller having to know about the ordering.
 
-The write paths that call `releaseReadTxnIfHeld()` include `putAccount`, `deleteAccount`, `putTokenBalance`, `deleteTokenBalance`, `putToken`, `putTokenSupply`, `putValidator`, `deleteValidator`, `putValidatorByAddress`, `deleteValidatorByAddress`, `putValidatorKeyHistory`, `putOrder`, `deleteOrder`, `addToOrderBook`, `removeFromOrderBook`, `refundOrder`, `deleteRestingOrder`, `indexFill`, `putAmmPool`, `deleteAmmPool`, `putAmmPosition`, `deleteAmmPosition`, `putPositionIndex`, `deletePositionIndex`, `putReceipt`, `putGlobal`, `putMetaImpl`, `putRaw`, `deleteRaw`, `commit`, and the four low-level row helpers `putSentinel`/`putU64Row`/`putBlobRow`/`deleteRow`.
+A related invariant that emerged during NFT development: **`putX` methods do not read the old record before writing.** Every put-method in `StateAccess` — `putAccount`, `putOrder`, `putValidator`, `putAmmPool`, `putToken`, `putNft`, `putNftCollection` — is a pure write. When a caller needs to clean up an old record's index rows (a transfer moving an NFT to a new owner, a validator rotation changing its key), the caller reads the old record first and then calls a dedicated unindex method (`unindexNft`, `deleteValidatorByAddress`, etc.) before the new put. A read inside a write path interleaves with the SMT's content-addressed node update buffer and, for reasons that are subtle in `updateRecursive`'s content-addressed skip logic, can leave the tree in a state where a subsequent update in a later transaction is computed against a stale root and silently dropped. The rule is: writes write; callers read when they need to.
+
+The write paths that call `releaseReadTxnIfHeld()` include `putAccount`, `deleteAccount`, `putTokenBalance`, `deleteTokenBalance`, `putToken`, `putTokenSupply`, `putValidator`, `deleteValidator`, `putValidatorByAddress`, `deleteValidatorByAddress`, `putValidatorKeyHistory`, `putOrder`, `deleteOrder`, `addToOrderBook`, `removeFromOrderBook`, `refundOrder`, `deleteRestingOrder`, `indexFill`, `putAmmPool`, `deleteAmmPool`, `putAmmPosition`, `deleteAmmPosition`, `putPositionIndex`, `deletePositionIndex`, `putReceipt`, `putGlobal`, `putMetaImpl`, `putRaw`, `deleteRaw`, `commit`, `putNft`, `deleteNft`, `putNftCollection`, `deleteNftCollection`, `unindexNft`, and the four low-level row helpers `putSentinel`/`putU64Row`/`putBlobRow`/`deleteRow`.
 
 #### Proofs
-Inclusion and non-inclusion proofs can be generated for any key. A proof is a list of sibling hashes down to the leaf; verification recomputes the root from the proof and compares. Proofs are a pure-function construction: `verifyProof(expected_root, proof)` performs no DB access and no signature checks, so a caller that holds only a state root can verify a proof without trusting the server that produced it. Proof generation is exposed over P2P via the `GetProof`/`Proof` message pair (see [Proof Serving](#proof-serving)), over RPC via `clrty_getProof`, and in-process by tests and diagnostic tooling.
+Inclusion and non-inclusion proofs can be generated for any key. A proof is a list of sibling hashes down to the leaf; verification recomputes the root from the proof and compares. Proofs are a pure-function construction: `verifyProof(expected_root, proof)` performs no DB access and no signature checks, so a caller that holds only a state root can verify a proof without trusting the server that produced it. Proof generation is exposed over P2P via the `GetProof`/`Proof` message pair (see [Proof Serving](#proof-serving)), over RPC via `clrty_getProof`, and in-process by tests and diagnostic tooling. NFT records and collections live in the SMT under their own domain-separated keys, so proofs work on them exactly as they do on accounts and orders.
 
 `proveAtRoot(tree, root, key)` produces a proof against an explicit root, which is what lets a node serve proofs against *historical* state, not just the current head. A proof's value and its sibling list must come from a single walk from a single root -- reading the leaf separately from the current tree would produce a proof whose value and siblings disagree whenever the requested root is historical.
 
 #### Versioning
-The SMT saves its root at every version number, and stores a historical row for each SMT node and leaf it writes at a non-zero version. `rootAtVersion(n)` retrieves a historical root, and `SparseMerkleTree::getAtVersion(key, n)` retrieves a *key's value* as it was at version `n`. Typed historical reads are exposed on `StateAccess` as `getAccountAtVersion`, `getValidatorAtVersion`, and `getGlobalAtVersion`; the raw primitive is `getRawAtVersion`, which takes the same SMT keys the current-version getters use.
+The SMT saves its root at every version number, and stores a historical row for each SMT node and leaf it writes at a non-zero version. `rootAtVersion(n)` retrieves a historical root, and `SparseMerkleTree::getAtVersion(key, n)` retrieves a *key's value* as it was at version `n`. Typed historical reads are exposed on `StateAccess` as `getAccountAtVersion`, `getValidatorAtVersion`, and `getGlobalAtVersion`; the raw primitive is `getRawAtVersion`, which takes the same SMT keys the current-version getters use. Historical reads work on NFT keys as well, so a block explorer can ask "who owned NFT 42 at height 1000?" after the NFT has changed hands.
 
 Version 0 is the bootstrap version -- the state before any block has been applied -- and is not stored historically. The chain's genesis state is applied at version 0 and never queried historically, so skipping it keeps the historical tables from accumulating rows that nothing reads.
 
@@ -298,7 +313,7 @@ The retention window is a local choice — two nodes with different windows stil
 
 ## Transactions: what users can do
 
-Every transaction is signed with Ed25519 by the sender, has a nonce for replay protection, a chain ID, a fee, and a type-specific payload. There are roughly sixteen transaction types:
+Every transaction is signed with Ed25519 by the sender, has a nonce for replay protection, a chain ID, a fee, and a type-specific payload. There are roughly twenty-five transaction types:
 
 #### Native transfers
 Send CLRTY from one address to another. The `from` balance decreases by amount + fee; `to` increases by amount. Nonce bumps on success, stays on failure.
@@ -335,6 +350,12 @@ A fill has a maker side and a taker side for a Passive order, or just a taker si
 **Receipts.** A `CreateOrder` transaction that produces at least one fill returns a receipt whose `fills` vector carries the fills in execution order. This is true for both Passive (matcher) and Active-without-conditions (router on creation) orders. An Active order that routes at the *epoch boundary* has no transaction to attach its fills to, so those fills are committed to the header via `epoch_fills_root` instead (see [Epoch fills commitment](#epoch-fills-commitment)). Adding or removing a field from the receipt format, or from the `epoch_fills_root` leaf format, is a hard fork.
 
 **Book levels cap.** A single taker crosses at most `MAX_BOOK_LEVELS_PER_TAKER` (256) resting orders in one transaction. This bounds block-apply time; the taker's remainder rests if the cap is hit.
+
+#### NFTs
+
+Clarity has a first-class NFT system. An NFT is a record in the SMT, not a contract. Every NFT is also a token with a supply of 1, so the existing DEX, AMM, and reward machinery sees it without special-casing. Wrapped NFTs hold an underlying token balance in a virtual custody address. Collections group NFTs and can carry an on-chain reward schedule paid from a pre-funded escrow. There are nine NFT transaction types.
+
+See the [NFTs](#nfts-how-non-fungible-tokens-work) section for the full model.
 
 #### Claim rewards
 Move an account's pending rewards into its balance. Recomputes staked amount after the transfer.
@@ -489,6 +510,129 @@ The three cases:
 
 The same policy applies to the route-on-creation path: an Active order with no conditions that is unroutable at creation is rejected by the executor, not left in state. `executeCreateOrder` performs a pre-route check (pool exists, is active, contains both tokens, has non-zero reserves) before taking the sell-token lock, so a rejection cannot leave a lock or an order record behind.
 
+## NFTs: how non-fungible tokens work
+
+Clarity's NFT system is built directly on the state layer. An NFT is a record in the SMT, not a contract, and every existing mechanism — the DEX, the AMM, the reward layer, the proof layer — treats NFTs as tokens it already understands.
+
+#### The model
+
+An NFT in Clarity is two things at once:
+
+1. **A shadow token.** Every NFT is also a `TokenInfo` record with `maxSupply = 1` and `decimals = 0`. This is what the DEX, the AMM, and the reward layer see when they enumerate tokens. Its id is the NFT's id.
+2. **An `NftInfo` record** carrying the metadata (a content hash and/or URI), the collection reference, a `frozen` flag, and — for wrapped NFTs — a reference to an underlying token whose balance is held at the NFT's virtual custody address.
+
+There is no VM, no script, no contract storage. The state layer knows about `NftInfo` directly, the same way it knows about `TokenInfo`, `Order`, and `ValidatorInfo`. An NFT transaction is a typed transaction with a payload, not a call into an interpreter.
+
+#### Shadow tokens
+
+Every NFT gets a shadow token created alongside it. The shadow token's `id` equals the NFT's `id`, which comes from the same SMT global counter (`next_token_id`) that user-created fungible tokens come from. There is no separate NFT id counter and no reserved id range; a user token and an NFT shadow cannot collide because they draw from the same monotonic counter.
+
+The shadow token's `name` and `symbol` are inherited from the NFT's collection when it has one, or defaulted (`NFT #<id>` / `NFT`) when it doesn't. The shadow's `maxSupply` is 1 and its `decimals` is 0; the owner's balance of the shadow token is 1 while they own the NFT and 0 otherwise.
+
+A shadow token is a token. `getTokenInfo`, `getBalance`, `getTokenHolders`, `getTokenSupply`, and `getTokensForAddress` all return meaningful results for it. `TransferNft` moves the shadow token from seller to buyer as part of the same transaction that updates the `NftInfo` record's owner, so a client that watches token balances sees the change without knowing what an NFT is.
+
+#### Wrapped NFTs and virtual custody
+
+A wrapped NFT holds an amount of an underlying token in custody. The custody lives at a virtual address derived from the NFT id:
+
+```
+Keys::nftAddress(nft_id) = Blake2b("nfa " || LE(nft_id))
+```
+
+This address is in the same 32-byte space as real Ed25519 public keys, so the token balance table — which keys on address bytes — treats it as an ordinary address. A wrapped NFT's underlying balance is just a normal balance at that address.
+
+This has three consequences:
+
+1. **The custody is real.** `getBalance(nftAddress(id), token_id)` returns the wrapped amount. The same SMT proofs, the same historical reads, and the same token-balance indexes apply to the custody as to any other balance.
+2. **Refills are ordinary transfers.** `TopUpNft` credits the custody address from the sender. `Transfer` directly to the custody address also works, though it does not update the `wrapped_amount` field on the `NftInfo` record, so the record and the custody can diverge if a client uses raw `Transfer`. `TopUpNft` is the intended path.
+3. **Wrapped NFTs compose with the DEX and AMM.** The underlying holding is a balance like any other; the NFT's shadow token is a token like any other. An NFT that wraps an LP position can be sold as an NFT, or the underlying position can be interacted with directly by the NFT's owner using the custody address.
+
+The `wrapped_amount` field on the `NftInfo` record is a cache of the custody balance, not a separate source of truth. It is updated by `WrapNft`, `TopUpNft`, and `BurnNft`; it is not decremented by `TransferNft`, because a transfer moves ownership of the NFT without moving the custody. The custody stays at the virtual address; only the `NftInfo.owner` and the shadow token's balance table entry change.
+
+#### Collections
+
+A collection is an `NftCollection` record. It groups NFTs and optionally carries a reward schedule. Creating a collection is one transaction; minting into it is another. A collection has:
+
+- A name, a symbol, and an optional base URI (inherited by NFTs that don't set their own URI).
+- A `creator` (the only address that can refill the reward escrow).
+- A `minted_count` tracking how many NFTs currently belong to it (incremented on mint, decremented on burn).
+- An optional reward schedule: a reward token id, a rate per NFT per epoch, an escrow balance, and a paused flag.
+
+A standalone NFT with no collection is the throwaway case: one `NftInfo` record, one metadata blob, no collection, no reward schedule. A collection is optional.
+
+Deleting a collection while NFTs reference it is not supported in v1. The `minted_count == 0` condition — reached when all NFTs in the collection have been burned — is the natural gate for a future `DeleteNftCollection` transaction.
+
+#### Reward schedules
+
+A collection can carry a reward schedule: a rate per NFT per epoch, drawn from a pre-funded escrow. The schedule is per-collection, not per-NFT, because a 10,000-NFT collection with the same rate for every NFT is 100× cheaper to track as one schedule than 10,000.
+
+The reward accrual model is **accrue-then-claim**:
+
+- **At the epoch boundary**, `processEpochBoundary` walks every collection with an active schedule and decrements `reward_escrow_remaining` by `minted_count * reward_rate_per_epoch`. If the escrow cannot cover the obligation, it drains what's left and sets `reward_paused = true`. The epoch boundary does not credit any individual holder; it only moves the escrow.
+- **At claim time**, `ClaimNftReward` walks every NFT the caller owns, computes the accrual since the NFT's `last_accrual_height` (`(current_height - last_accrual_height) / ROTATION_INTERVAL * reward_rate_per_epoch`), credits the caller's `pending_rewards`, and resets the NFT's `last_accrual_height`. The credits flow through the existing `ClaimRewards` path — NFT reward claims land in the same `pending_rewards` bucket as staking rewards, so a caller who has both claims them with one transaction.
+
+The accounting invariant is that the collection's escrow is the single source of truth. The sum of all pending claims across all NFTs is always ≤ the total the escrow has decremented for. Two mechanisms enforce this:
+
+- The epoch-boundary decrement is the **only** place the escrow decreases. A `RefillCollectionReward` transaction is the only place it increases.
+- A claim never decrements the escrow; it only settles the accrued amount into the holder's `pending_rewards`. Since the escrow decremented at the epoch boundary by the full per-epoch obligation, and every NFT's `last_accrual_height` advances only when the holder acts, the pending claims cannot exceed what the escrow has already accounted for.
+
+The epoch-boundary pass is O(collections), not O(NFTs). A chain with 1,000,000 NFTs across 100 collections pays 100 SMT writes at each boundary, not a million.
+
+Transfers and burns settle accrued rewards to the current owner before the NFT record is updated or deleted, so a seller cannot lose rewards they earned and a buyer cannot claim rewards the seller earned.
+
+#### Transaction types
+
+Nine NFT transaction types:
+
+- **`CreateNftCollection`** — creates an `NftCollection` record. If a reward schedule is specified, the escrow is funded from the creator's balance of the reward token in the same transaction.
+- **`MintNft`** — mints a standalone NFT. Creates the shadow token, mints it to the creator, and writes the `NftInfo` record. `collection_id` is optional; if set, the collection's `minted_count` is incremented.
+- **`WrapNft`** — mints a wrapped NFT. Takes `wrapped_amount` of an underlying token from the creator, credits it to the NFT's virtual custody address, and writes the `NftInfo` record with `underlying_token_id` and `wrapped_amount` set. A wrapped NFT's underlying cannot be the NFT's own shadow token.
+- **`TransferNft`** — transfers an NFT to a new owner. Moves the shadow token balance, updates the `NftInfo.owner`, and settles accrued rewards to the seller. The custody — if any — stays at the NFT's virtual address.
+- **`BurnNft`** — burns an NFT. Deletes the shadow token balance and the `NftInfo` record. If the NFT was wrapped, the custody is released to the current owner. If the NFT was in a collection, the collection's `minted_count` is decremented.
+- **`UpdateNftMetadata`** — changes an NFT's metadata hash and/or URI. Owner-only. A `frozen` flag can be set on the same transaction, after which no further metadata changes are possible.
+- **`TopUpNft`** — credits additional underlying to a wrapped NFT's custody from the caller. The token must match the NFT's underlying (for wrapped NFTs) or be any token (for standalone NFTs; the custody is a real balance but the `wrapped_amount` field stays zero).
+- **`ClaimNftReward`** — settles all of the caller's accrued NFT rewards into `pending_rewards`. Empty payload. The caller then claims normally.
+- **`RefillCollectionReward`** — creator-only. Adds to a collection's reward escrow and un-pauses it if it was drained.
+
+#### State layout
+
+Four new tables and four new SMT keys:
+
+- **`TBL_NFTS`** — mirror table of `NftInfo` records, keyed by `nft_id(8 LE)`. Written alongside the SMT leaf by `putNft`. Used by `forEachNft` for enumeration and by the indexes for reverse lookups.
+- **`TBL_NFT_COLLECTIONS`** — mirror table of `NftCollection` records, keyed by `collection_id(8 LE)`. Written by `putNftCollection`. Used by `forEachNftCollection` — notably, the epoch-boundary reward pass iterates over this table.
+- **`TBL_INDEX_NFTS_BY_OWNER`** — owner index, key = `owner(32) || nft_id(8 LE)`, sentinel value. Maintained by `putNft` and `unindexNft`. Used by `forEachNftForOwner`.
+- **`TBL_INDEX_NFTS_BY_COLLECTION`** — collection index, key = `collection_id(8 LE) || nft_id(8 LE)`, sentinel value. Maintained by `putNft` and `unindexNft`. Used by `forEachNftForCollection`.
+
+The SMT keys, defined in `State::Keys`:
+
+- **`Keys::nft(nft_id)`** = `hashDomain("nft ", LE(nft_id))` — the `NftInfo` leaf.
+- **`Keys::nftCollection(collection_id)`** = `hashDomain("ncol", LE(collection_id))` — the `NftCollection` leaf.
+- **`Keys::nftAddress(nft_id)`** = `Blake2b("nfa " || LE(nft_id))` — the virtual custody address.
+- **`Keys::nftCollectionAddress(collection_id)`** = `Blake2b("nca " || LE(collection_id))` — the escrow address.
+
+The custody and escrow addresses are deliberately in the same 32-byte space as real addresses, so the token balance table — which keys on address bytes — treats them as ordinary addresses with no special-casing.
+
+The mirror-table pattern matches the rest of the state layer: `putX` writes both the SMT leaf and a mirror row; `forEachX` walks the mirror; `deleteX` removes both. The chain's state root commits only to the SMT, so a node that skipped the mirror tables would still agree with every other node — the mirrors are a local index, not a consensus commitment.
+
+#### Ownership and transfers
+
+An NFT's owner is recorded in two places: the `NftInfo.owner` field and the shadow token balance table (the owner has a balance of 1). Both are updated by `TransferNft` in the same transaction. The shadow token balance is the more general source of truth — a client that watches token balances sees the ownership change without knowing about NFTs — but the `NftInfo.owner` field is what the executor checks for authorization.
+
+`TransferNft` uses `unindexNft` on the old record before `putNft` on the new record, so the previous owner's `forEachNftForOwner` no longer returns the NFT after the transfer. This is why `putNft` itself does not read the old record: a read inside a write path interleaves with the SMT's content-addressed node update buffer and can cause subsequent updates in the same transaction to be silently dropped. The cleanup is the caller's job, and the transfer executor does it explicitly.
+
+#### Where NFTs fit in the codebase
+
+- `Core/NftTypes.{h,cpp}` — the `NftInfo` and `NftCollection` record types and their state codecs.
+- `State/SparseMerkleTree.{h,cpp}` — the `Keys::nft*` and `Keys::nftCollection*` derivations.
+- `State/StateDB.h` — the four new table ids.
+- `State/StateAccess.{h,cpp}` — `getNft`/`putNft`/`deleteNft`/`unindexNft`, `getNftCollection`/`putNftCollection`/`deleteNftCollection`, and the four `forEach*` iterators.
+- `Core/TransactionTypes.h` — the nine new `TxType` values.
+- `Core/TransactionExecutor.{h,cpp}` — the nine handlers and the epoch reward settlement on transfer and burn.
+- `Core/BlockProcessor.cpp` — the epoch-boundary reward accrual in `processEpochBoundary`.
+- `Wallet/TransactionBuilder.{h,cpp}` — the nine builder functions.
+- `RPC/Methods.cpp`, `RPC/Encoders.{h,cpp}` — the six NFT read methods and the two JSON encoders.
+- `Tests/Core/Nft.cpp` — the codec tests, executor tests, state-layer tests, block-processor tests, and integration tests.
+
 ## Validator identity: two keys, two roles
 
 Every validator has two keys with independent lifecycles:
@@ -642,7 +786,7 @@ On a two-validator regtest network with the defaults, the endpoint returns rough
 
 Validator objects returned by the consensus methods expose both `reward_address` (bech32m) and `consensus_key` (0x-prefixed hex), in addition to the existing fields.
 
-**Method surface.** The dispatcher registers roughly seventy methods across ten groups:
+**Method surface.** The dispatcher registers roughly eighty methods across eleven groups:
 
 - **Chain:** `chainId`, `blockNumber`, `getBlockByNumber`, `getBlockByHash`, `getBlockHeaderByNumber`, `getRecentBlocks`, `getStateRoot`, `getBlocksRange`, `getBlocksByProducer`, `getBlockStats`, `getChainStats`, `getEpochInfo`, `getEpochSchedule`.
 - **State / accounts:** `getBalance`, `getAccount`, `getNonce`, `getTokensForAddress`, `getPositionsForAddress`, `getOrdersForAddress`, `getTransactionsForAddress`, `getStakingInfo`, `getAddressStats`, `getAddressList`, `getProof`.
@@ -652,14 +796,17 @@ Validator objects returned by the consensus methods expose both `reward_address`
 - **Consensus:** `getValidators`, `getValidator`, `getValidatorByAddress`, `getValidatorStats`, `getActiveSet`, `getConsensusState`.
 - **AMM:** `getPool`, `getPosition`, `getPositionByOwner`, `getAllPools`, `getPoolsForToken`, `getPositionsForPool`.
 - **Orders:** `getOrder`, `getOrdersExpiringAt`, `getAllOrders`, `getOrdersByPair`, `getOrderBook`, `getOrderFills`, `getPairTrades`.
+- **NFTs:** `getNft`, `getNftsForOwner`, `getNftsForCollection`, `getCollection`, `getAllCollections`.
 - **Metrics (server-side aggregates):** `getFeeStats`, `getPotInfo`.
 - **Node / utility:** `ping`, `status`, `health`, `getPeers`, `getConfig`, `getMethods`, `web3_clientVersion`, `net_version`, `net_peerCount`, `net_listening`.
 
 **Order book methods.** `getOrderBook(base, quote, depth)` returns aggregated bids and asks, best-first, up to `depth` levels. Prices are in the canonical frame (`quote per base`, scaled by `BOOK_PRICE_SCALE`), which is exposed alongside the levels so a client can convert to a human price. `getOrderFills(order_id)` returns the newest fills for one order (either side) from the order-view of `TBL_FILL_HISTORY`. `getPairTrades(base, quote, limit)` returns the newest fills on a pair from the pair-view. All three are read-only and can be served from an autocommit `StateAccess`.
 
+**NFT methods.** `getNft(nft_id)` returns one NFT's full record, including the shadow token id, the underlying token and wrapped amount (for wrapped NFTs), the collection id, the metadata, the freeze flag, and the derived custody address. `getNftsForOwner(address, limit, offset)` enumerates the NFTs held by an address via the owner index. `getNftsForCollection(collection_id, limit, offset)` enumerates the NFTs in a collection via the collection index, and rejects early with `NftCollectionNotFound` if the collection does not exist. `getCollection(collection_id)` returns the collection record with its reward schedule and current escrow. `getAllCollections(limit, offset)` pages every collection.
+
 **Fill encoder.** A `Fill` on the wire carries its `source` field (`"limit"` or `"amm"`), the `maker_order_id` (zero for an AMM fill), the `taker_order_id`, the `pool_id` (zero for a limit fill), the `qty_base` and `qty_quote` in the canonical frame, the `price` (scaled by `BOOK_PRICE_SCALE`), and the `base_token` and `quote_token` ids. A client that wants to know whether a fill was a book match or an AMM route reads `source`, not the presence or absence of a maker id.
 
-**Error responses** use JSON-RPC standard codes for `InvalidRequest`, `MethodNotFound`, `InvalidParams`, `InternalError`, plus a project-specific range (`BlockNotFound`, `TransactionNotFound`, `ReceiptNotFound`, `PoolNotFound`, `OrderNotFound`, `ValidatorNotFound`, `TokenNotFound`, `TxMalformed`, `ChainReadInternal`, `StateReadInternal`, `Unauthorized`, `ProofVersionUnavailable`, `ProofNotAvailable`, etc.). The `InternalError` catch path in the dispatcher swallows exception text -- a deliberate v1 choice documented in the code.
+**Error responses** use JSON-RPC standard codes for `InvalidRequest`, `MethodNotFound`, `InvalidParams`, `InternalError`, plus a project-specific range (`BlockNotFound`, `TransactionNotFound`, `ReceiptNotFound`, `PoolNotFound`, `OrderNotFound`, `ValidatorNotFound`, `TokenNotFound`, `NftNotFound`, `NftCollectionNotFound`, `TxMalformed`, `ChainReadInternal`, `StateReadInternal`, `Unauthorized`, `ProofVersionUnavailable`, `ProofNotAvailable`, etc.). The `InternalError` catch path in the dispatcher swallows exception text -- a deliberate v1 choice documented in the code.
 
 **Admin methods** require a bearer token in the `Authorization` header. The token is threaded through a thread-local set by `HttpConnection` before dispatch, since `JsonRpcRequest` doesn't carry transport-level data. An empty `admin_token` in the config means admin methods aren't registered at all.
 
@@ -708,6 +855,8 @@ open / close                    session management
 
 The wallet derives keys locally, signs with the reward key, and submits via `clrty_sendRawTransaction`. It does not manage consensus keys -- those are raw hex secrets the daemon reads directly.
 
+The library layer also carries nine NFT transaction builders — `buildCreateNftCollection`, `buildMintNft`, `buildWrapNft`, `buildTransferNft`, `buildBurnNft`, `buildUpdateNftMetadata`, `buildTopUpNft`, `buildClaimNftReward`, `buildRefillCollectionReward` — mirroring the existing `build*` functions. Each takes a parameter struct, validates locally, and returns an unsigned `Core::Transaction` that the caller signs and submits. The CLI does not yet expose NFT commands, but the builders are the integration point for a wallet that wants to mint, wrap, or transfer NFTs.
+
 `balance --verify` fetches the state root from the connected node, optionally requires a second endpoint (`connect-peer`) to agree on that root, and then requests an SMT proof for the account. The proof is verified locally with `State::verifyProof` before the balance is reported, so the value comes from a proof rather than the server's word. Without a peer endpoint configured, the wallet warns that it is trusting a single server for the root. With one, two independent servers must agree before either is trusted.
 
 #### Startup wizard
@@ -724,6 +873,16 @@ The wallet layer supports the operations you'd need for an address book -- multi
 
 **No wallet CLI for address-book operations.** The `clarity-wallet` client covers balance, transfer, staking, and validator operations, but not multi-account management or address labels. Integrators still drive those through the library.
 
+**No wallet CLI for NFT operations.** The library layer has the nine builders, but the interactive client does not yet expose `mint`, `wrap`, `transfer-nft`, or `collection` commands. A user who wants to mint an NFT today calls the builders directly from an integration. This is the same shape as the address-book gap: the pieces are there, the CLI surface is not.
+
+**No collection deletion.** A collection with NFTs in it cannot be deleted. Deleting an empty collection (`minted_count == 0`) is not exposed as a transaction in v1. The `minted_count == 0` condition is the natural gate for a future `DeleteNftCollection`, but there is no need for it today, and forbidding deletion while NFTs reference a collection is the safer default.
+
+**No batch mint.** Minting N NFTs is N `MintNft` transactions. A `MintNftBatch` transaction that creates up to 256 NFTs in one call would be a straightforward extension — the executor logic is the same loop — but it is not in v1. The RPC `getNftsForCollection` returns paginated results, so a client that mints in bulk has no read-side problem; the write side is a matter of when the gas budget makes batching worthwhile.
+
+**No per-NFT reward schedules.** A reward schedule lives on a collection, not on an individual NFT. Every NFT in a collection accrues at the collection's rate. Per-NFT schedules would be more flexible and roughly 100× more expensive at the epoch boundary. Per-collection is the correct default for v1; a per-NFT override is an additive change if there is ever demand.
+
+**NFT rewards don't pay out automatically.** The collection's escrow decrements at every epoch boundary, but the holder's `pending_rewards` bucket is credited only when they call `ClaimNftReward` (or when they call `ClaimRewards`, which settles the NFT accrual through the same path). A holder who never claims keeps accruing in the collection's accounting but sees no balance change. This is intentional: a push-based payout would cost one SMT write per NFT per epoch, which is unbounded; accrue-then-claim costs one write per holder per claim, which is bounded by activity. The trade-off is that a holder has to submit a transaction to see the reward — but they already have to submit one to move the reward out of `pending_rewards` into balance, so the cost is the same.
+
 **AMM positions are not deleted when a pool closes.** When the last LP drains a pool, the pool record is deleted but the zeroed `AmmPosition` record persists. It is unreachable from any index (the position index was removed in the same operation), so it is invisible to any caller that doesn't already know its id -- but it costs 64 bytes per position ever created, and a `forEachPosition`-style scan would surface them. Cleaning them up would require either a `pool_id -> [position_ids]` index or a scan bounded by how many LPs the pool ever had. Neither is worth the code today; the historical SMT already preserves the fact that the position existed.
 
 **The wallet uses RPC-proxied proofs, not the P2P protocol.** `balance --verify` requests a proof over the `clrty_getProof` RPC method and verifies it locally against a state root the wallet obtained from (optionally two) RPC endpoints. The proof itself is verified with the same `State::verifyProof` function a light client would use, so a server that lies about a balance produces a failing proof. But the *root* comes from the RPC endpoint, not from the chain -- a client that doesn't want to trust any RPC endpoint at all would need to fetch headers over P2P, follow the header chain, and obtain the current root independently. That's the `GetHeaders`/`Headers` P2P pair plus header-chain verification in the wallet, and it's the next step toward a full light client. The RPC path closes the "does anything use the proof protocol" gap; the P2P path would close the "is the root itself trusted" gap.
@@ -738,17 +897,17 @@ The wallet layer supports the operations you'd need for an address book -- multi
 
 **One block per round, immediate finality.** No fork choice, no probabilistic finality, no reorgs. Simpler than Bitcoin-style consensus and matches the BFT model, but the network can't make progress if fewer than `bftQuorum` validators are online.
 
-**Reward distribution is epoch-based for stakers, block-based for validators.** Validators get paid every block. Stakers get paid every epoch (60 blocks). Keeps the per-block state transition cheap and defers the expensive iteration to the epoch boundary.
+**Reward distribution is epoch-based for stakers, block-based for validators.** Validators get paid every block. Stakers get paid every epoch (60 blocks). Keeps the per-block state transition cheap and defers the expensive iteration to the epoch boundary. NFT collection reward accrual joins the epoch-boundary pass: the per-epoch obligation is `minted_count * reward_rate_per_epoch`, and the pass is O(collections), not O(NFTs).
 
 **Pot mechanism as a smoothing buffer.** The pot accumulates staker rewards when activity is low and releases them when activity is high. Decouples the staker payout from the current block's activity, giving a more stable APY. The pot is the destination for every unallocated reward: validator pool remainders when the active set contains unknown validator IDs, reward multiplier penalty differences, seed-only set shares, and slash proceeds.
 
 **Validator rotation is bounded by BFT safety.** `computeRotationCount` never removes more validators than would keep the remaining set above quorum. A validator set of 4 can rotate at most 1 per epoch; the cap is `n - bftQuorum(n)`, which for n=100 is 33, but the epoch-proportional bound `ceil(n/21)` gives 5 for n=100. Both bounds are applied and the smaller one wins.
 
-**State transitions are pure functions of the block and the state they run against.** Nothing inside `applyBlock` reads wall-clock time, local peer state, or hardware entropy. This is why the emergency rotation decision lives in the block header rather than a per-node timer: a node can look at its own clock to decide *whether* to stamp the flag, but only the *value* it stamped goes into the block, and only the block feeds the state. The matching engine, the Active-order router, and the key-history maintenance paths are held to the same rule: they read nothing but their arguments.
+**State transitions are pure functions of the block and the state they run against.** Nothing inside `applyBlock` reads wall-clock time, local peer state, or hardware entropy. This is why the emergency rotation decision lives in the block header rather than a per-node timer: a node can look at its own clock to decide *whether* to stamp the flag, but only the *value* it stamped goes into the block, and only the block feeds the state. The matching engine, the Active-order router, the key-history maintenance paths, and the NFT reward accrual are held to the same rule: they read nothing but their arguments.
 
 **Wire codec is a codec, not a validator.** `BlockHeader::deserialize` round-trips bytes without applying consensus rules. `isWellFormed` is a separate, explicit step the acceptance path runs. This matters for three reasons: historical blocks remain readable if rules change, diagnostic tools can inspect malformed blocks without satisfying consensus rules, and test fixtures can construct blocks whose fields aren't all populated yet.
 
-**Dry-run block application.** `BlockContext::dry_run` skips structural header checks, quorum verification, and the state-root comparison. The proposer relies on this to simulate a candidate block before populating the state root and collecting signatures. The non-dry path runs every check. The invariant that makes this safe is that **every state change that touches the SMT happens on both paths**; only writes to the meta table and to non-SMT index tables may be gated on `!ctx.dry_run`. The matching engine, the Active-order router, and the key-history writes all obey this: they write their book rows, their fill-history rows, their sequence counter, their pool updates, and their key-history entries through the SMT unconditionally, and the simulate-vs-apply test in `Tests/Core/BlockProcessor.cpp` is the canary.
+**Dry-run block application.** `BlockContext::dry_run` skips structural header checks, quorum verification, and the state-root comparison. The proposer relies on this to simulate a candidate block before populating the state root and collecting signatures. The non-dry path runs every check. The invariant that makes this safe is that **every state change that touches the SMT happens on both paths**; only writes to the meta table and to non-SMT index tables may be gated on `!ctx.dry_run`. The matching engine, the Active-order router, the key-history writes, and the NFT reward accrual all obey this: they write their book rows, their fill-history rows, their sequence counter, their pool updates, their key-history entries, and their collection escrow decrements through the SMT unconditionally, and the simulate-vs-apply tests in `Tests/Core/BlockProcessor.cpp` and `Tests/Core/Nft.cpp` are the canaries.
 
 **The book is canonicalized, not directional.** The order wire format is directional — "sell A, buy B" — because that is what the user means. The book index is pair-symmetric: base is `min(sell, buy)`, quote is `max(sell, buy)`, and the side byte captures the direction. A sell-A-buy-B order and a sell-B-buy-A order end up in the same index range, on different sides, at reciprocal prices. This is what makes the matcher's crossing check a single comparison with no division in the hot loop.
 
@@ -759,6 +918,24 @@ The wallet layer supports the operations you'd need for an address book -- multi
 **Order ids and order sequences are separate counters.** `next_order_id` is allocated by the executor and identifies the order globally. `order:next_sequence` is allocated by the matcher and orders book rows at the same price. They are distinct SMT globals and they never collide. The first is part of every receipt and every index row. The second is internal to the book index and never appears in a receipt.
 
 **Active fills commit through one of two channels, depending on when they happen.** A fill produced at order creation rides the transaction's receipt (`receipts_root`). A fill produced at an epoch boundary has no transaction, so it commits through the block header's `epoch_fills_root`. Both channels use the same `Fill::serializeState()` bytes; only the Merkle leaf domain tag differs (`"rcpt"` vs `"efil"`). This is what makes an epoch-boundary fill a first-class consensus event while leaving the per-transaction receipt format unchanged.
+
+**Every NFT is also a token.** The NFT's shadow token is a `TokenInfo` with `maxSupply = 1` and `decimals = 0`. It draws its id from the same `next_token_id` counter that user-created tokens draw from, so there is no reserved range, no collision class, and no second counter to keep in sync. The consequence is that every existing token mechanism — `getTokenInfo`, `getBalance`, `getTokenHolders`, the DEX, the AMM, the reward layer, the proof layer — works on NFTs without special-casing. A client that doesn't know about NFTs still sees them as tokens with a supply of one. A client that does know about NFTs gets the extra `NftInfo` record through the NFT RPC methods. This is the same "everything is a first-class state object" principle that makes the DEX and AMM simple: no VM, no contracts, no interface discovery.
+
+**Wrapped NFT custody is a virtual address, not a field.** The underlying of a wrapped NFT lives at `Keys::nftAddress(nft_id)` in the token-balance table, which is the same balance table every other address uses. This means the custody is a real balance: it participates in proofs, historical reads, and the by-token balance index without any special case. A client that wants to see the wrapped amount calls `getBalance(custody_address, token_id)`, which is the same call it makes for any other address. The alternative — storing the custody as a field on the `NftInfo` record — would require every balance query to know about NFTs, which is exactly the kind of special-casing the state layer avoids.
+
+**A wrapped NFT's custody does not move on transfer.** `TransferNft` changes the NFT's owner and moves the shadow token, but the custody stays at the virtual address. The custody is a property of the NFT, not of its owner, and the transfer moves the right to control the custody without moving the custody itself. This is what makes an NFT a stable reference — a client that holds a pointer to the NFT's id and custody address can always find the underlying balance, regardless of who owns the NFT today.
+
+**NFTs and collections use companion records, not widened existing records.** `TokenInfo` is a fixed-layout record; adding NFT fields to it would hard-fork every previously serialized token. Instead, `NftInfo` is a separate record with its own SMT key, sibling to `Keys::token` in the same domain-separated namespace. The shadow token is created alongside the `NftInfo` and they are updated together, but they have distinct codecs. This is the same pattern the key-rotation history uses (`Keys::validatorKeyHistory` is a companion to `Keys::validator`), and it is what lets a new feature land without touching the record whose codec is already in the wild.
+
+**The NFT owner index is maintained explicitly, not by convention.** `putNft` writes the owner index row for the new owner. `unindexNft` removes the owner index row for an old owner. A transfer calls both, in that order, so the previous owner's `forEachNftForOwner` no longer returns the NFT after the transfer. This is the same explicit-index discipline the order book uses (`addToOrderBook` and `removeFromOrderBook` are separate calls, not side effects of `putOrder`). It is what makes the index's semantics clear: the owner index says "this NFT is currently owned by this address", nothing more.
+
+**`putNft` does not read the old record.** Every `putX` in `StateAccess` is a pure write. The cleanup of an old record's index rows is the caller's job, exposed as a separate unindex method. This rule emerged from a hard-to-diagnose bug in NFT development: an early `putNft` read the old record first to unindex it, and that read — interleaved with the SMT's content-addressed node update buffer — could cause a subsequent update in the same or a later transaction to be silently dropped. The fix was to make `putNft` a pure write and move the read to the caller, which is where every other put-method already had it. The rule is documented on `putNft` so it is not reintroduced.
+
+**NFT reward accrual is per-collection, not per-NFT.** A collection with a reward schedule decrements its escrow once per epoch by `minted_count * reward_rate_per_epoch`. A per-NFT schedule would require one write per NFT per epoch, which is unbounded. A per-collection schedule requires one write per collection per epoch, which is bounded by the number of collections on the chain. The trade-off is that every NFT in a collection accrues at the same rate. For v1 that is the correct default — the most common reward program is a uniform rate across a whole collection — and a per-NFT override is additive if demand ever warrants it.
+
+**NFT reward accrual uses accrue-then-claim, not pay-per-epoch.** The epoch boundary decrements the collection's escrow but does not credit any holder. The holder's `pending_rewards` bucket is credited at claim time, from the accrual computed against the NFT's `last_accrual_height`. This is the same model staking rewards use. The alternative — pushing rewards to holders at the epoch boundary — would cost one write per holder per epoch, which is unbounded. Accrue-then-claim costs one write per claim, which is bounded by activity. The invariant that makes the model sound is that the escrow is the single source of truth: the sum of all pending claims is always ≤ the total the escrow has decremented for, because the epoch boundary is the only place the escrow changes and every NFT's `last_accrual_height` advances only when the holder acts.
+
+**The NFT reward pass runs before the staker early-return.** `processEpochBoundary` has an early-return when no stakers were paid this epoch (`adj.distributed == 0 || total_staked == 0 || staker_count == 0`). The NFT reward pass is placed above that return, so it runs unconditionally. If it were below, a chain with an empty pot or no stakers would never decrement any collection's escrow, and NFT reward schedules would silently stall. This is a general principle: an independent bookkeeping pass should not be gated on an unrelated pass's early-return.
 
 **The consensus key history is a companion SMT key, not a widened record.** `ValidatorInfo` is a fixed 249-byte record with a stable wire layout. Adding a history field would widen it and hard-fork every previously serialized record. The history instead lives under a separate SMT key (`Keys::validatorKeyHistory`), sibling to `Keys::validator` and `Keys::validatorByAddress` in the same domain-separated namespace. The record's `consensus_key` field is a cache of the current key; the history is the source of truth. This is the same pattern as `Keys::orderSequence` for the book sequence companion, and it's what lets the feature land without a codec change.
 

@@ -75,6 +75,10 @@ namespace Rpc
       return "ProofVersionUnavailable";
     case ErrorCode::ProofNotAvailable:
       return "ProofNotAvailable";
+    case ErrorCode::NftNotFound:
+      return "NftNotFound";
+    case ErrorCode::NftCollectionNotFound:
+      return "NftCollectionNotFound";
 
     // ---- Chain ----
     case ErrorCode::BlockNotFound:
@@ -168,6 +172,10 @@ namespace Rpc
       return "No committed state root at the requested version";
     case ErrorCode::ProofNotAvailable:
       return "Proof could not be produced for this key";
+    case ErrorCode::NftNotFound:
+      return "NFT not found";
+    case ErrorCode::NftCollectionNotFound:
+      return "NFT collection not found";
 
     case ErrorCode::BlockNotFound:
       return "Block not found";

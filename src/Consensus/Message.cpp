@@ -11,7 +11,7 @@
 
 #include "Core/Block.h"
 
-#include "Crypto/Blake2b.h"
+#include "Crypto/Helpers.h"
 
 namespace Consensus
 {
@@ -19,23 +19,6 @@ namespace Consensus
   {
     constexpr const char *PROPOSAL_DOMAIN = "CLRTY_PROPOSAL_V1";
     constexpr const char *VOTE_DOMAIN = "CLRTY_VOTE_V1";
-
-    Crypto::Hash hashDomain(const char *domain,
-                            const uint8_t *data, size_t len)
-    {
-      size_t dlen = std::strlen(domain);
-      std::vector<uint8_t> buf;
-      buf.reserve(dlen + len);
-      buf.insert(buf.end(),
-                 reinterpret_cast<const uint8_t *>(domain),
-                 reinterpret_cast<const uint8_t *>(domain) + dlen);
-      buf.insert(buf.end(), data, data + len);
-
-      Crypto::Hash h;
-      Crypto::blake2b(buf.data(), buf.size(), h.data.data(), 32);
-      return h;
-    }
-
     constexpr uint32_t MAX_BLOCK_BYTES_WIRE = 8 * 1024 * 1024;
   } // anonymous namespace
 
@@ -138,7 +121,7 @@ namespace Consensus
     for (int i = 0; i < 8; ++i)
       buf[8 + i] = uint8_t(round >> (i * 8));
     std::memcpy(buf + 16, block_hash.data.data(), 32);
-    return hashDomain(PROPOSAL_DOMAIN, buf, sizeof(buf));
+    return Crypto::hashDomain(PROPOSAL_DOMAIN, buf, sizeof(buf));
   }
 
   Crypto::Hash voteSigningHash(Height height, Round round,
@@ -151,7 +134,7 @@ namespace Consensus
       buf[8 + i] = uint8_t(round >> (i * 8));
     buf[16] = is_nil ? 1 : 0;
     std::memcpy(buf + 17, block_hash.data.data(), 32);
-    return hashDomain(VOTE_DOMAIN, buf, sizeof(buf));
+    return Crypto::hashDomain(VOTE_DOMAIN, buf, sizeof(buf));
   }
 
 } // namespace Consensus

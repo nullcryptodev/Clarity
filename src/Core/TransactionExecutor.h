@@ -149,6 +149,41 @@ namespace Core
                                       const Transaction &tx,
                                       const TxExecutionContext &ctx);
 
+    static Receipt executeCreateNftCollection(State::StateAccess &state,
+                                              const Transaction &tx,
+                                              const TxExecutionContext &ctx);
+
+    static Receipt executeMintNft(State::StateAccess &state,
+                                  const Transaction &tx,
+                                  const TxExecutionContext &ctx);
+
+    static Receipt executeWrapNft(State::StateAccess &state,
+                                  const Transaction &tx,
+                                  const TxExecutionContext &ctx);
+
+    static Receipt executeTransferNft(State::StateAccess &state,
+                                      const Transaction &tx,
+                                      const TxExecutionContext &ctx);
+
+    static Receipt executeBurnNft(State::StateAccess &state,
+                                  const Transaction &tx,
+                                  const TxExecutionContext &ctx);
+
+    static Receipt executeUpdateNftMetadata(State::StateAccess &state,
+                                            const Transaction &tx,
+                                            const TxExecutionContext &ctx);
+
+    static Receipt executeTopUpNft(State::StateAccess &state,
+                                   const Transaction &tx,
+                                   const TxExecutionContext &ctx);
+
+    static Receipt executeClaimNftReward(State::StateAccess &state,
+                                         const Transaction &tx,
+                                         const TxExecutionContext &ctx);
+
+    static Receipt executeRefillCollectionReward(State::StateAccess &state,
+                                                 const Transaction &tx,
+                                                 const TxExecutionContext &ctx);
     // ---- Common helpers ----
 
     // Charge the fee from `tx.from`. Returns true if the fee was charged.

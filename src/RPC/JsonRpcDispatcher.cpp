@@ -63,6 +63,7 @@ namespace Rpc
     registerConsensusMethods(*this);
     registerAmmMethods(*this);
     registerOrderMethods(*this);
+    registerNftMethods(*this);
     registerNodeMethods(*this);
     registerAdminMethods(*this);
 

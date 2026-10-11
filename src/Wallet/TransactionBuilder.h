@@ -183,6 +183,178 @@ namespace Wallet
       const RotateConsensusParams &params,
       WalletStatus *error_out = nullptr);
 
+  //  ---- NFT: Create Collection ----
+  //
+  //  Creates a collection with an optional reward schedule. The
+  //  reward escrow, if any, is funded from `from`'s balance of
+  //  reward_token_id in the same transaction.
+  //
+  //  A collection with no reward schedule (reward_token_id == 0
+  //  and reward_rate_per_epoch == 0) is a pure grouping: a name,
+  //  a symbol, and an optional base URI.
+
+  struct CreateNftCollectionParams
+  {
+    TxCommonParams common;
+
+    std::string name;
+    std::string symbol;
+    std::string base_uri;
+
+    //  Reward schedule. Zero reward_token_id means "no schedule";
+    //  in that case reward_rate_per_epoch and escrow_amount must
+    //  also be zero.
+    Id reward_token_id{0};
+    uint64_t reward_rate_per_epoch{0};
+    uint64_t escrow_amount{0};
+  };
+
+  std::optional<Core::Transaction> buildCreateNftCollection(
+      const Crypto::Address &from,
+      const CreateNftCollectionParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- NFT: Mint (standalone) ----
+  //
+  //  Mints one standalone NFT. The NFT is a shadow token with
+  //  maxSupply = 1 and decimals = 0, plus an NftInfo record with
+  //  the metadata.
+  //
+  //  collection_id == 0 means "no collection". A standalone NFT
+  //  with no collection is the throwaway case: one record, one
+  //  metadata blob, no grouping, no reward schedule.
+
+  struct MintNftParams
+  {
+    TxCommonParams common;
+    uint64_t collection_id{0};
+    Crypto::Hash metadata_hash{};
+    std::string metadata_uri;
+  };
+
+  std::optional<Core::Transaction> buildMintNft(
+      const Crypto::Address &from,
+      const MintNftParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- NFT: Wrap ----
+  //
+  //  Mints a wrapped NFT. `wrapped_amount` of `underlying_token_id`
+  //  is taken from `from` and locked at the NFT's virtual address.
+  //  Transferring the NFT moves the whole lock; burning releases it.
+
+  struct WrapNftParams
+  {
+    TxCommonParams common;
+    Id underlying_token_id{0};
+    uint64_t wrapped_amount{0};
+    uint64_t collection_id{0};
+    Crypto::Hash metadata_hash{};
+    std::string metadata_uri;
+  };
+
+  std::optional<Core::Transaction> buildWrapNft(
+      const Crypto::Address &from,
+      const WrapNftParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- NFT: Transfer ----
+
+  struct TransferNftParams
+  {
+    TxCommonParams common;
+    uint64_t nft_id{0};
+    Crypto::Address new_owner{};
+  };
+
+  std::optional<Core::Transaction> buildTransferNft(
+      const Crypto::Address &from,
+      const TransferNftParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- NFT: Burn ----
+
+  struct BurnNftParams
+  {
+    TxCommonParams common;
+    uint64_t nft_id{0};
+  };
+
+  std::optional<Core::Transaction> buildBurnNft(
+      const Crypto::Address &from,
+      const BurnNftParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- NFT: Update Metadata ----
+  //
+  //  `freeze` is one-way. Once set, no further UpdateNftMetadata
+  //  can touch this NFT. Burning and transferring are unaffected.
+
+  struct UpdateNftMetadataParams
+  {
+    TxCommonParams common;
+    uint64_t nft_id{0};
+    Crypto::Hash metadata_hash{};
+    std::string metadata_uri;
+    bool freeze{false};
+  };
+
+  std::optional<Core::Transaction> buildUpdateNftMetadata(
+      const Crypto::Address &from,
+      const UpdateNftMetadataParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- NFT: Top Up ----
+  //
+  //  Credits `amount` of `token_id` to the NFT's custody address.
+  //  For a wrapped NFT, token_id must equal the NFT's underlying.
+  //  For a standalone NFT, any token is accepted as a gift.
+
+  struct TopUpNftParams
+  {
+    TxCommonParams common;
+    uint64_t nft_id{0};
+    Id token_id{0};
+    uint64_t amount{0};
+  };
+
+  std::optional<Core::Transaction> buildTopUpNft(
+      const Crypto::Address &from,
+      const TopUpNftParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- NFT: Claim Reward ----
+  //
+  //  Settles every NFT reward the caller has accrued into the
+  //  caller's pending_rewards, which ClaimRewards then moves to
+  //  balance. Empty payload.
+
+  struct ClaimNftRewardParams
+  {
+    TxCommonParams common;
+  };
+
+  std::optional<Core::Transaction> buildClaimNftReward(
+      const Crypto::Address &from,
+      const ClaimNftRewardParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- NFT: Refill Collection Reward ----
+  //
+  //  Creator-only. Adds `amount` of the collection's reward token
+  //  to the collection's escrow, un-pausing it if it was drained.
+
+  struct RefillCollectionRewardParams
+  {
+    TxCommonParams common;
+    uint64_t collection_id{0};
+    uint64_t amount{0};
+  };
+
+  std::optional<Core::Transaction> buildRefillCollectionReward(
+      const Crypto::Address &from,
+      const RefillCollectionRewardParams &params,
+      WalletStatus *error_out = nullptr);
   //  ---- Sign ----
 
   //  Compute the transaction's signing hash, ask the signer to sign

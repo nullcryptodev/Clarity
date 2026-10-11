@@ -236,6 +236,29 @@ namespace State
     //  StateAccess::validatorKeyAtHeight, removed by
     //  StateAccess::deleteValidator.
     Crypto::Hash validatorKeyHistory(uint64_t validator_id) noexcept;
+
+    //  NFT record, keyed by nft_id.
+    Crypto::Hash nft(uint64_t nft_id) noexcept;
+
+    //  NFT collection record, keyed by collection_id.
+    Crypto::Hash nftCollection(uint64_t collection_id) noexcept;
+
+    //  NFT virtual custody address. The wrapped underlying of an
+    //  NFT lives at this address in the token-balance table. The
+    //  address is derived from the NFT id so it is deterministic
+    //  and requires no separate storage.
+    //
+    //  Deliberately in the same 32-byte space as Ed25519 public
+    //  keys, so the balance table (which keys on address bytes)
+    //  doesn't need to know the difference. A collision with a
+    //  real address is a hash collision, which the chain's security
+    //  model already assumes is infeasible.
+    Crypto::Address nftAddress(uint64_t nft_id) noexcept;
+
+    //  NFT collection escrow address. Same derivation, different
+    //  domain tag, so a collection's escrow and its NFTs' custody
+    //  never collide.
+    Crypto::Address nftCollectionAddress(uint64_t collection_id) noexcept;
   }
 
 } // namespace State

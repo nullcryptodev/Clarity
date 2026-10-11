@@ -26,4 +26,5 @@ namespace Rpc
   void registerConsensusMethods(JsonRpcDispatcher &d);
   void registerOrderMethods(JsonRpcDispatcher &d);
   void registerNodeMethods(JsonRpcDispatcher &d);
+  void registerNftMethods(JsonRpcDispatcher &d);
 }

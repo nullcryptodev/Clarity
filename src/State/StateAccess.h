@@ -19,6 +19,7 @@
 #include "Core/TokenTypes.h"
 #include "Core/ValidatorTypes.h"
 #include "Core/KeyRotation.h"
+#include "Core/NftTypes.h"
 #include "Crypto/Types.h"
 #include "SparseMerkleTree.h"
 #include "StateDB.h"
@@ -210,6 +211,64 @@ namespace State
     //  never rotated and is the common case.
     std::optional<Crypto::PublicKey> validatorKeyAtHeight(
         uint64_t validator_id, uint64_t height) const;
+
+    // =================================================================
+    //  NFTs
+    //
+    //  An NFT is a TokenInfo with maxSupply = 1 and decimals = 0,
+    //  plus a companion NftInfo record. The TokenInfo is the
+    //  tradeable shadow; the NftInfo carries the metadata, the
+    //  collection reference, and (for wrapped NFTs) the underlying
+    //  token whose balance sits at Keys::nftAddress(id).
+    //
+    //  Collections group NFTs and optionally carry a reward schedule.
+    //  The schedule is per-collection; the epoch-boundary payout
+    //  decrements the collection's escrow, and each holder's claim
+    //  settles the accrued amount lazily. See BlockProcessor for
+    //  the epoch-boundary accounting.
+    // =================================================================
+
+    bool getNft(uint64_t nft_id, Core::NftInfo &out) const;
+    void putNft(const Core::NftInfo &nft);
+    void deleteNft(uint64_t nft_id);
+
+    //  Remove an NFT record's index rows for a specific old state.
+    //  Called by callers that change the owner or the collection,
+    //  before they call putNft with the new state.
+    void unindexNft(const Core::NftInfo &old);
+
+    bool getNftCollection(uint64_t collection_id,
+                          Core::NftCollection &out) const;
+    void putNftCollection(const Core::NftCollection &collection);
+    void deleteNftCollection(uint64_t collection_id);
+
+    //  Enumerate every NFT, ordered by nft_id.
+    //
+    //  Exhaustive walk; the callback's return value is ignored.
+    void forEachNft(
+        const std::function<void(const Core::NftInfo &)> &fn) const;
+
+    //  Every NFT owned by an address, ordered by nft_id. Uses
+    //  TBL_INDEX_NFTS_BY_OWNER.
+    //
+    //  Exhaustive walk; the callback's return value is ignored.
+    void forEachNftForOwner(
+        const Crypto::Address &owner,
+        const std::function<void(const Core::NftInfo &)> &fn) const;
+
+    //  Every NFT in a collection, ordered by nft_id. Uses
+    //  TBL_INDEX_NFTS_BY_COLLECTION.
+    //
+    //  Exhaustive walk; the callback's return value is ignored.
+    void forEachNftForCollection(
+        uint64_t collection_id,
+        const std::function<void(const Core::NftInfo &)> &fn) const;
+
+    //  Enumerate every collection, ordered by collection_id.
+    //
+    //  Exhaustive walk; the callback's return value is ignored.
+    void forEachNftCollection(
+        const std::function<void(const Core::NftCollection &)> &fn) const;
 
     // =================================================================
     //  Orders

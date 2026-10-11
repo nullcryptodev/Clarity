@@ -319,6 +319,26 @@ namespace State
     {
       return Keys::global(name);
     }
+
+    Crypto::Hash nft(uint64_t nft_id) noexcept
+    {
+      return Keys::nft(nft_id);
+    }
+
+    Crypto::Hash nftCollection(uint64_t collection_id) noexcept
+    {
+      return Keys::nftCollection(collection_id);
+    }
+
+    Crypto::Address nftAddress(uint64_t nft_id) noexcept
+    {
+      return Keys::nftAddress(nft_id);
+    }
+
+    Crypto::Address nftCollectionAddress(uint64_t collection_id) noexcept
+    {
+      return Keys::nftCollectionAddress(collection_id);
+    }
   } // namespace ProofKeys
 
 } // namespace State

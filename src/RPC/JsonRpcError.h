@@ -84,6 +84,8 @@ namespace Rpc
     StateReadInternal = 1056,
     ProofVersionUnavailable = 1057,
     ProofNotAvailable = 1058,
+    NftNotFound = 1059,
+    NftCollectionNotFound = 1060,
 
     // ---- Application: chain lookup (1100..1149) ----
 

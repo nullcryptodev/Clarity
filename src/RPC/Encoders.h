@@ -15,6 +15,7 @@
 #include "Core/TokenTypes.h"
 #include "Core/Receipt.h"
 #include "Core/ValidatorTypes.h"
+#include "Core/NftTypes.h"
 
 namespace Rpc
 {
@@ -284,4 +285,10 @@ namespace Rpc
                           uint64_t height,
                           uint32_t tx_index_in_block,
                           const std::string &hrp);
+
+  Common::Json encodeNftInfo(const Core::NftInfo &nft,
+                             const std::string &hrp);
+
+  Common::Json encodeNftCollection(const Core::NftCollection &collection,
+                                   const std::string &hrp);
 } // namespace Rpc

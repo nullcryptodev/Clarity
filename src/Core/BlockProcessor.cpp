@@ -1618,6 +1618,70 @@ namespace Core
     total_pot_distributed += adj.distributed;
     state.putMetaU64("total_pot_distributed", total_pot_distributed);
 
+    //  NFT collection reward accrual.
+    //
+    //  Runs before the staker early-return below: the escrow
+    //  decrement is independent of whether stakers were paid this
+    //  epoch. If it ran after the return, a chain with an empty pot
+    //  or no stakers would never decrement any collection's escrow,
+    //  and NFT reward schedules would silently stall.
+    //
+    //  For each collection with an active reward schedule, the
+    //  per-epoch obligation is:
+    //
+    //    minted_count * reward_rate_per_epoch
+    //
+    //  Decrement the escrow by that amount. If the escrow cannot
+    //  cover it, pay what's left, mark the collection paused, and
+    //  stop. The actual credit to a holder happens lazily at claim
+    //  time; this pass only moves the escrow.
+    //
+    //  This is the only place the escrow changes other than a
+    //  RefillCollectionReward transaction. That single-writer
+    //  invariant is what makes the accrual accounting sound: the
+    //  sum of all pending claims is always <= the total the escrow
+    //  has decremented for.
+    //
+    //  The pass is O(collections), not O(NFTs). A chain with
+    //  1,000,000 NFTs across 100 collections pays 100 writes here,
+    //  not a million.
+    state.forEachNftCollection(
+        [&](const Core::NftCollection &collection)
+        {
+          std::cerr << "[NFT] forEachNftCollection: id=" << collection.id
+                    << " minted=" << collection.minted_count
+                    << " rate=" << collection.reward_rate_per_epoch
+                    << " escrow=" << collection.reward_escrow_remaining
+                    << " paused=" << collection.reward_paused << "\n";
+          if (!collection.hasReward())
+            return;
+          if (collection.reward_paused)
+            return;
+          if (collection.minted_count == 0)
+            return;
+
+          const uint64_t per_epoch =
+              collection.minted_count * collection.reward_rate_per_epoch;
+
+          Core::NftCollection updated = collection;
+
+          if (updated.reward_escrow_remaining >= per_epoch)
+          {
+            updated.reward_escrow_remaining -= per_epoch;
+          }
+          else
+          {
+            //  Partial payout: drain what's left and pause. The
+            //  remaining claims for this epoch settle to whatever
+            //  the escrow could cover, and the schedule stops until
+            //  the creator refills.
+            updated.reward_escrow_remaining = 0;
+            updated.reward_paused = true;
+          }
+
+          state.putNftCollection(updated);
+        });
+
     if (adj.distributed == 0 || total_staked == 0 || staker_count == 0)
       return;
 

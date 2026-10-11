@@ -1298,6 +1298,246 @@ namespace State
   }
 
   // ===========================================================================
+  //  NFTs
+  // ===========================================================================
+
+  bool StateAccess::getNft(uint64_t nft_id, Core::NftInfo &out) const
+  {
+    Crypto::Hash key = Keys::nft(nft_id);
+    auto value = smt_.get(key);
+    if (!value.has_value())
+      return false;
+    return Core::NftInfo::deserializeState(value->data(), value->size(), out);
+  }
+
+  void StateAccess::putNft(const Core::NftInfo &nft)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::nft(nft.id);
+    auto value = nft.serializeState();
+    smt_.update(key, value, version_);
+
+    uint8_t id_key[8];
+    Common::writeU64(id_key, nft.id);
+    putBlobRow(StateDB::TBL_NFTS, id_key, sizeof(id_key),
+               value.data(), value.size());
+
+    uint8_t owner_key[40];
+    std::memcpy(owner_key, nft.owner.data.data(), 32);
+    Common::writeU64(owner_key + 32, nft.id);
+    putSentinel(StateDB::TBL_INDEX_NFTS_BY_OWNER,
+                owner_key, sizeof(owner_key));
+
+    if (nft.collection_id != 0)
+    {
+      uint8_t coll_key[16];
+      Common::writeU64(coll_key, nft.collection_id);
+      Common::writeU64(coll_key + 8, nft.id);
+      putSentinel(StateDB::TBL_INDEX_NFTS_BY_COLLECTION,
+                  coll_key, sizeof(coll_key));
+    }
+  }
+
+  void StateAccess::unindexNft(const Core::NftInfo &old)
+  {
+    //  Remove the index rows that correspond to a specific *old*
+    //  state of an NFT record. Called by the transfer and burn
+    //  paths before they write a new version of the record, so the
+    //  previous owner's forEachNftForOwner and the previous
+    //  collection's forEachNftForCollection do not return a stale
+    //  entry.
+    //
+    //  Safe to call with a record that was never indexed (e.g. a
+    //  fresh mint whose index rows were just written): MDBX's
+    //  mdbx_del returns MDBX_NOTFOUND, which deleteRow ignores.
+    releaseReadTxnIfHeld();
+
+    if (!old.owner.isNull())
+    {
+      uint8_t owner_key[40];
+      std::memcpy(owner_key, old.owner.data.data(), 32);
+      Common::writeU64(owner_key + 32, old.id);
+      deleteRow(StateDB::TBL_INDEX_NFTS_BY_OWNER,
+                owner_key, sizeof(owner_key));
+    }
+
+    if (old.collection_id != 0)
+    {
+      uint8_t coll_key[16];
+      Common::writeU64(coll_key, old.collection_id);
+      Common::writeU64(coll_key + 8, old.id);
+      deleteRow(StateDB::TBL_INDEX_NFTS_BY_COLLECTION,
+                coll_key, sizeof(coll_key));
+    }
+  }
+
+  void StateAccess::deleteNft(uint64_t nft_id)
+  {
+    Core::NftInfo nft;
+    const bool have_nft = getNft(nft_id, nft);
+
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::nft(nft_id);
+    smt_.remove(key, version_);
+
+    uint8_t id_key[8];
+    Common::writeU64(id_key, nft_id);
+    deleteRow(StateDB::TBL_NFTS, id_key, sizeof(id_key));
+
+    if (!have_nft)
+      return;
+
+    //  Owner index.
+    {
+      uint8_t owner_key[40];
+      std::memcpy(owner_key, nft.owner.data.data(), 32);
+      Common::writeU64(owner_key + 32, nft_id);
+      deleteRow(StateDB::TBL_INDEX_NFTS_BY_OWNER,
+                owner_key, sizeof(owner_key));
+    }
+
+    //  Collection index.
+    if (nft.collection_id != 0)
+    {
+      uint8_t coll_key[16];
+      Common::writeU64(coll_key, nft.collection_id);
+      Common::writeU64(coll_key + 8, nft_id);
+      deleteRow(StateDB::TBL_INDEX_NFTS_BY_COLLECTION,
+                coll_key, sizeof(coll_key));
+    }
+  }
+
+  bool StateAccess::getNftCollection(uint64_t collection_id,
+                                     Core::NftCollection &out) const
+  {
+    Crypto::Hash key = Keys::nftCollection(collection_id);
+    auto value = smt_.get(key);
+    if (!value.has_value())
+      return false;
+    return Core::NftCollection::deserializeState(
+        value->data(), value->size(), out);
+  }
+
+  void StateAccess::putNftCollection(const Core::NftCollection &collection)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::nftCollection(collection.id);
+    auto value = collection.serializeState();
+    smt_.update(key, value, version_);
+
+    uint8_t id_key[8];
+    Common::writeU64(id_key, collection.id);
+    putBlobRow(StateDB::TBL_NFT_COLLECTIONS, id_key, sizeof(id_key),
+               value.data(), value.size());
+  }
+
+  void StateAccess::deleteNftCollection(uint64_t collection_id)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::nftCollection(collection_id);
+    smt_.remove(key, version_);
+
+    uint8_t id_key[8];
+    Common::writeU64(id_key, collection_id);
+    deleteRow(StateDB::TBL_NFT_COLLECTIONS, id_key, sizeof(id_key));
+  }
+
+  void StateAccess::forEachNft(
+      const std::function<void(const Core::NftInfo &)> &fn) const
+  {
+    //  Exhaustive walk; the callback's return value is ignored.
+    auto visitor = [&fn](const std::vector<uint8_t> &key,
+                         const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != 8)
+        return true;
+
+      Core::NftInfo nft;
+      if (!Core::NftInfo::deserializeState(value.data(), value.size(), nft))
+        return true;
+
+      fn(nft);
+      return true;
+    };
+
+    readForEach(StateDB::TBL_NFTS, visitor);
+  }
+
+  void StateAccess::forEachNftForOwner(
+      const Crypto::Address &owner,
+      const std::function<void(const Core::NftInfo &)> &fn) const
+  {
+    //  Exhaustive walk; the callback's return value is ignored.
+    std::vector<uint8_t> prefix(owner.data.begin(), owner.data.end());
+
+    auto visitor = [this, &fn](const std::vector<uint8_t> &key,
+                               const std::vector<uint8_t> &) -> bool
+    {
+      if (key.size() != 40)
+        return true;
+      Id nft_id = Common::readU64(key.data() + 32);
+      Core::NftInfo nft;
+      if (getNft(nft_id, nft))
+        fn(nft);
+      return true;
+    };
+
+    readForEachWithPrefix(StateDB::TBL_INDEX_NFTS_BY_OWNER,
+                          prefix, visitor);
+  }
+
+  void StateAccess::forEachNftForCollection(
+      uint64_t collection_id,
+      const std::function<void(const Core::NftInfo &)> &fn) const
+  {
+    //  Exhaustive walk; the callback's return value is ignored.
+    uint8_t prefix_bytes[8];
+    Common::writeU64(prefix_bytes, collection_id);
+    std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 8);
+
+    auto visitor = [this, &fn](const std::vector<uint8_t> &key,
+                               const std::vector<uint8_t> &) -> bool
+    {
+      if (key.size() != 16)
+        return true;
+      Id nft_id = Common::readU64(key.data() + 8);
+      Core::NftInfo nft;
+      if (getNft(nft_id, nft))
+        fn(nft);
+      return true;
+    };
+
+    readForEachWithPrefix(StateDB::TBL_INDEX_NFTS_BY_COLLECTION,
+                          prefix, visitor);
+  }
+
+  void StateAccess::forEachNftCollection(
+      const std::function<void(const Core::NftCollection &)> &fn) const
+  {
+    //  Exhaustive walk; the callback's return value is ignored.
+    auto visitor = [&fn](const std::vector<uint8_t> &key,
+                         const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != 8)
+        return true;
+
+      Core::NftCollection c;
+      if (!Core::NftCollection::deserializeState(
+              value.data(), value.size(), c))
+        return true;
+
+      fn(c);
+      return true;
+    };
+
+    readForEach(StateDB::TBL_NFT_COLLECTIONS, visitor);
+  }
+
+  // ===========================================================================
   //  Orders
   // ===========================================================================
 

@@ -1800,6 +1800,177 @@ namespace Rpc
     }
 
     // =========================================================================
+    //  NFT methods
+    // =========================================================================
+
+    Common::Json method_getNft(Node::Node &node, const RpcConfig & /*config*/,
+                               const JsonRpcRequest &req)
+    {
+      const uint64_t nft_id = requireU64(req.params, "nft_id");
+      const uint64_t height = node.chain().height();
+      const std::string hrp = hrpForNode(node);
+
+      State::StateAccess state(node.stateDB(), height);
+      Core::NftInfo nft;
+      if (!state.getNft(nft_id, nft))
+      {
+        throw RpcMethodError(
+            ErrorCode::NftNotFound,
+            "no NFT with id " + encodeU64Hex(nft_id),
+            makeErrorData(ErrorCode::NftNotFound,
+                          {{"nft_id", encodeU64Hex(nft_id)}}));
+      }
+
+      return encodeNftInfo(nft, hrp);
+    }
+
+    Common::Json method_getNftsForOwner(Node::Node &node,
+                                        const RpcConfig & /*config*/,
+                                        const JsonRpcRequest &req)
+    {
+      const std::string hrp = hrpForNode(node);
+      const Crypto::Address owner =
+          requireAddress(req.params, "address", hrp);
+      const PageParams page = parsePageParams(req.params);
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      Common::Json arr = Common::Json::array();
+      uint64_t seen = 0;
+      uint64_t emitted = 0;
+
+      state.forEachNftForOwner(
+          owner,
+          [&](const Core::NftInfo &nft)
+          {
+            if (seen < page.offset)
+            {
+              ++seen;
+              return;
+            }
+            if (emitted >= page.limit)
+              return;
+            arr.push_back(encodeNftInfo(nft, hrp));
+            ++emitted;
+          });
+
+      Common::Json out = Common::Json::object();
+      putAddress(out, "address", owner, hrp);
+      putU64(out, "count", emitted);
+      putU64(out, "offset", page.offset);
+      putU64(out, "limit", page.limit);
+      out["nfts"] = std::move(arr);
+      return out;
+    }
+
+    Common::Json method_getNftsForCollection(Node::Node &node,
+                                             const RpcConfig & /*config*/,
+                                             const JsonRpcRequest &req)
+    {
+      const uint64_t collection_id = requireU64(req.params, "collection_id");
+      const PageParams page = parsePageParams(req.params);
+      const std::string hrp = hrpForNode(node);
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      //  Reject early if the collection doesn't exist, so a typo
+      //  returns CollectionNotFound rather than an empty list.
+      Core::NftCollection collection;
+      if (!state.getNftCollection(collection_id, collection))
+      {
+        throw RpcMethodError(
+            ErrorCode::NftCollectionNotFound,
+            "no collection with id " + encodeU64Hex(collection_id),
+            makeErrorData(ErrorCode::NftCollectionNotFound,
+                          {{"collection_id", encodeU64Hex(collection_id)}}));
+      }
+
+      Common::Json arr = Common::Json::array();
+      uint64_t seen = 0;
+      uint64_t emitted = 0;
+
+      state.forEachNftForCollection(
+          collection_id,
+          [&](const Core::NftInfo &nft)
+          {
+            if (seen < page.offset)
+            {
+              ++seen;
+              return;
+            }
+            if (emitted >= page.limit)
+              return;
+            arr.push_back(encodeNftInfo(nft, hrp));
+            ++emitted;
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "collection_id", collection_id);
+      putU64(out, "count", emitted);
+      putU64(out, "offset", page.offset);
+      putU64(out, "limit", page.limit);
+      out["nfts"] = std::move(arr);
+      return out;
+    }
+
+    Common::Json method_getCollection(Node::Node &node,
+                                      const RpcConfig & /*config*/,
+                                      const JsonRpcRequest &req)
+    {
+      const uint64_t collection_id = requireU64(req.params, "collection_id");
+      const uint64_t height = node.chain().height();
+      const std::string hrp = hrpForNode(node);
+
+      State::StateAccess state(node.stateDB(), height);
+      Core::NftCollection collection;
+      if (!state.getNftCollection(collection_id, collection))
+      {
+        throw RpcMethodError(
+            ErrorCode::NftCollectionNotFound,
+            "no collection with id " + encodeU64Hex(collection_id),
+            makeErrorData(ErrorCode::NftCollectionNotFound,
+                          {{"collection_id", encodeU64Hex(collection_id)}}));
+      }
+
+      return encodeNftCollection(collection, hrp);
+    }
+
+    Common::Json method_getAllCollections(Node::Node &node,
+                                          const RpcConfig & /*config*/,
+                                          const JsonRpcRequest &req)
+    {
+      const PageParams page = parsePageParams(req.params);
+      const std::string hrp = hrpForNode(node);
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      Common::Json arr = Common::Json::array();
+      uint64_t seen = 0;
+      uint64_t emitted = 0;
+
+      state.forEachNftCollection(
+          [&](const Core::NftCollection &c)
+          {
+            if (seen < page.offset)
+            {
+              ++seen;
+              return;
+            }
+            if (emitted >= page.limit)
+              return;
+            arr.push_back(encodeNftCollection(c, hrp));
+            ++emitted;
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "count", emitted);
+      putU64(out, "offset", page.offset);
+      putU64(out, "limit", page.limit);
+      out["collections"] = std::move(arr);
+      return out;
+    }
+
+    // =========================================================================
     //  Order methods (existing + new)
     // =========================================================================
 
@@ -2610,6 +2781,14 @@ namespace Rpc
           "getTokensByCreator",
       });
 
+      out["nfts"] = makeArray({
+          "getNft",
+          "getNftsForOwner",
+          "getNftsForCollection",
+          "getCollection",
+          "getAllCollections",
+      });
+
       out["amm"] = makeArray({
           "getPool",
           "getPosition",
@@ -2982,5 +3161,14 @@ namespace Rpc
     d.registerMethod("getAllTransactions", method_getAllTransactions);
     d.registerMethod("getTransactionsByType", method_getTransactionsByType);
     d.registerMethod("getTxCount", method_getTxCount);
+  }
+
+  void registerNftMethods(JsonRpcDispatcher &d)
+  {
+    d.registerMethod("getNft", method_getNft);
+    d.registerMethod("getNftsForOwner", method_getNftsForOwner);
+    d.registerMethod("getNftsForCollection", method_getNftsForCollection);
+    d.registerMethod("getCollection", method_getCollection);
+    d.registerMethod("getAllCollections", method_getAllCollections);
   }
 } // namespace Rpc

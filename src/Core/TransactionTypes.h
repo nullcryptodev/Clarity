@@ -56,6 +56,20 @@ namespace Core
     CreateOrder = 0x40,
     CancelOrder = 0x41,
 
+    //  NFT types. Placed here rather than in a new range so
+    //  the naming stays adjacent to the asset primitive that
+    //  an NFT extends. The two are appended, not inserted —
+    //  existing values must never change.
+    CreateNftCollection = 0x42,
+    MintNft = 0x43,
+    WrapNft = 0x44,
+    TransferNft = 0x45,
+    BurnNft = 0x46,
+    UpdateNftMetadata = 0x47,
+    TopUpNft = 0x48,
+    ClaimNftReward = 0x49,
+    RefillCollectionReward = 0x4A,
+
     // ---- Token management (0x50 - 0x5F) ----
     CreateToken = 0x50,
     MintToken = 0x51,

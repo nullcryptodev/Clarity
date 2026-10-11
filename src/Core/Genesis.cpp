@@ -289,6 +289,7 @@ namespace Core
     state.putGlobal("next_order_id", u64Bytes(1));
     state.putGlobal("next_pool_id", u64Bytes(1));
     state.putGlobal("next_position_id", u64Bytes(1));
+    state.putGlobal("next_collection_id", u64Bytes(1));
     state.putGlobal("last_rotation_height", u64Bytes(0));
     state.putGlobal("apy_activity_bps", u64Bytes(0));
     state.putGlobal("apy_pot_bps", u64Bytes(0));

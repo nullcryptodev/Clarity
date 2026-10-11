@@ -34,6 +34,17 @@ std::string_view txTypeName(TxType t) noexcept
     case TxType::CreateOrder:         return "create-order";
     case TxType::CancelOrder:         return "cancel-order";
 
+    // NFT
+    case TxType::CreateNftCollection:    return "CreateNftCollection";
+    case TxType::MintNft:                return "MintNft";
+    case TxType::WrapNft:                return "WrapNft";
+    case TxType::TransferNft:            return "TransferNft";
+    case TxType::BurnNft:                return "BurnNft";
+    case TxType::UpdateNftMetadata:      return "UpdateNftMetadata";
+    case TxType::TopUpNft:               return "TopUpNft";
+    case TxType::ClaimNftReward:         return "ClaimNftReward";
+    case TxType::RefillCollectionReward: return "RefillCollectionReward";
+
     // Token management
     case TxType::CreateToken:         return "create-token";
     case TxType::MintToken:           return "mint-token";

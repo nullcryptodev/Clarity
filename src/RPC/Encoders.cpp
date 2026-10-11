@@ -7,6 +7,7 @@
 #include "Encoding.h"
 
 #include "Wallet/AddressCodec.h"
+#include "State/SparseMerkleTree.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -690,5 +691,63 @@ namespace Rpc
     w.setNumber("tx_index_in_block", static_cast<uint64_t>(tx_index_in_block));
 
     return j;
+  }
+
+  Common::Json encodeNftInfo(const Core::NftInfo &nft,
+                             const std::string &hrp)
+  {
+    Common::Json out = Common::Json::object();
+    putU64(out, "id", nft.id);
+    putAddress(out, "owner", nft.owner, hrp);
+    putAddress(out, "creator", nft.creator, hrp);
+    putU64(out, "shadow_token_id", nft.shadow_token_id);
+    putU64(out, "underlying_token_id", nft.underlying_token_id);
+    putU64(out, "wrapped_amount", nft.wrapped_amount);
+    putU64(out, "collection_id", nft.collection_id);
+
+    if (!nft.metadata_hash.isNull())
+      putHash(out, "metadata_hash", nft.metadata_hash);
+    else
+      out["metadata_hash"] = nullptr;
+
+    out["metadata_uri"] = nft.metadata_uri;
+    out["frozen"] = nft.frozen;
+
+    putU64(out, "last_accrual_height", nft.last_accrual_height);
+    putU64(out, "accrued_owed", nft.accrued_owed);
+    putU64(out, "created_at_height", nft.created_at_height);
+
+    //  Custody address, so a client can look up the wrapped balance
+    //  with getBalance against it.
+    if (nft.isWrapped())
+      putAddress(out, "custody_address",
+                 State::Keys::nftAddress(nft.id), hrp);
+
+    return out;
+  }
+
+  Common::Json encodeNftCollection(const Core::NftCollection &c,
+                                   const std::string &hrp)
+  {
+    Common::Json out = Common::Json::object();
+    putU64(out, "id", c.id);
+    putAddress(out, "creator", c.creator, hrp);
+    out["name"] = c.name;
+    out["symbol"] = c.symbol;
+    out["base_uri"] = c.base_uri;
+
+    putU64(out, "reward_token_id", c.reward_token_id);
+    putU64(out, "reward_rate_per_epoch", c.reward_rate_per_epoch);
+    putU64(out, "reward_escrow_remaining", c.reward_escrow_remaining);
+    out["reward_paused"] = c.reward_paused;
+
+    putU64(out, "created_at_height", c.created_at_height);
+    putU64(out, "minted_count", c.minted_count);
+
+    if (c.hasReward())
+      putAddress(out, "escrow_address",
+                 State::Keys::nftCollectionAddress(c.id), hrp);
+
+    return out;
   }
 } // namespace Rpc

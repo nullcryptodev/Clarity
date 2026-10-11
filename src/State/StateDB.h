@@ -125,7 +125,12 @@ namespace State
       //  can be added later without a schema change.
       TBL_FILL_HISTORY = 34,
 
-      TBL_COUNT = 35,
+      TBL_NFTS = 35,
+      TBL_NFT_COLLECTIONS = 36,
+      TBL_INDEX_NFTS_BY_OWNER = 37,
+      TBL_INDEX_NFTS_BY_COLLECTION = 38,
+
+      TBL_COUNT = 39,
     };
 
     using EntryVisitor = std::function<bool(const std::vector<uint8_t> &key,
