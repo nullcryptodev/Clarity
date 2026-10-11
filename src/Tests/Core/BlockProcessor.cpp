@@ -7,6 +7,10 @@
 
 #include "Fixtures.h"
 
+#include "Core/BlockProcessor.h"
+#include "Core/MatchingEngine.h"
+#include "Core/OrderBook.h"
+#include "Core/TransactionExecutor.h"
 #include "Core/ValidatorRotation.h"
 
 using namespace Core;
@@ -70,9 +74,6 @@ TEST_F(Core_BlockProcessorFixture, RejectsNullParentForNonGenesis)
   t.abort();
 
   EXPECT_FALSE(r.valid);
-  // A null parent fails structural validation before the block
-  // processor's chain-connectivity check runs. Either message is a
-  // correct rejection.
   EXPECT_TRUE(r.error == "parent hash is null" ||
               r.error == "block header not well-formed")
       << "got: " << r.error;
@@ -115,9 +116,6 @@ TEST_F(Core_BlockProcessorFixture, RejectsValidatorSetRootMismatch)
   for (size_t i = 0; i < 32; ++i)
     b.header.validator_set_root.data[i] = 0xBB;
 
-  // The header field is part of the block hash, so corrupting it after
-  // signing invalidates the signatures. Re-sign so the signature check
-  // passes and the validator_set_root check is the one that fires.
   b.quorum_signatures = makeQuorumForBlock(b, {seed1_, seed2_});
 
   BlockContext ctx = makeContext(1);
@@ -311,9 +309,6 @@ TEST_F(Core_BlockProcessorFixture, RejectsWrongStateRoot)
   for (size_t i = 0; i < 32; ++i)
     b.header.state_root.data[i] ^= 0xFF;
 
-  // state_root is part of the block hash, so re-sign to make sure the
-  // signature check passes and the state-root check is the one that
-  // fires.
   b.quorum_signatures = makeQuorumForBlock(b, {seed1_, seed2_});
 
   BlockContext ctx = makeContext(1);
@@ -371,8 +366,6 @@ TEST_F(Core_BlockProcessorFixture, RejectsWrongReceiptsRoot)
   for (size_t i = 0; i < 32; ++i)
     b.header.receipts_root.data[i] ^= 0xFF;
 
-  // receipts_root is part of the block hash; re-sign so the signature
-  // check passes and the receipts_root check is the one that fires.
   b.quorum_signatures = makeQuorumForBlock(b, {seed1_, seed2_});
 
   BlockContext ctx = makeContext(1);
@@ -502,22 +495,6 @@ TEST_F(Core_BlockProcessorFixture, TotalRewardsEqualBlockReward)
 
 TEST_F(Core_BlockProcessorFixture, MissingValidatorRewardGoesToPot)
 {
-  // The active set contains validator 999, which has no validator
-  // record in state. The reward distribution code path being tested
-  // here is: an active set entry with no record has its share routed
-  // to the pot.
-  //
-  // This scenario cannot produce a validly signed block, because
-  // checkQuorum would try to resolve active_set[1] = 999 to a signing
-  // key and fail. So the block is applied in dry_run mode, which
-  // skips checkQuorum and the state-root check. The state writes still
-  // happen inside the txn, and the caller commits them.
-  //
-  // This is an honest tradeoff: the property being tested (reward
-  // routing for an unknown validator) doesn't depend on signature
-  // verification, and the alternative — allowing unsigned blocks to
-  // bypass checkQuorum — would be a worse test.
-
   const std::vector<Id> weird_set = {1, 999};
 
   withState([&](State::StateAccess &s)
@@ -686,9 +663,6 @@ TEST_F(Core_BlockProcessorFixture, OfflineCheckRunsEveryTenBlocks)
 
 TEST_F(Core_BlockProcessorFixture, RotationCannotShrinkBelowSeeds)
 {
-  // Write a target size of 1 to global state. planRotation's shrink
-  // branch will try to remove (current_size - target_size) validators,
-  // but both active validators are seeds, so no removal is possible.
   withState([&](State::StateAccess &s)
             {
     std::vector<uint8_t> bytes(8);
@@ -705,9 +679,6 @@ TEST_F(Core_BlockProcessorFixture, RotationCannotShrinkBelowSeeds)
 
 TEST_F(Core_BlockProcessorFixture, RotationNoOpWhenOnlySeedsActive)
 {
-  // Fixture's active set is {1, 2}, both seeds. Seeds are never removed,
-  // and there are no candidates to add, so a rotation-boundary block
-  // must leave the active set unchanged.
   BlockResult r = applyBlock(59, genesis_hash_, {});
   ASSERT_TRUE(r.valid) << r.error;
 
@@ -719,20 +690,6 @@ TEST_F(Core_BlockProcessorFixture, RotationNoOpWhenOnlySeedsActive)
 
 TEST_F(Core_BlockProcessorFixture, RotationPromotesWaitingValidator)
 {
-  //  The rotation target size is derived from traffic:
-  //
-  //      target = ACTIVE_SET_MIN + (traffic * (MAX - MIN)) / SATURATION
-  //             = 2 + (traffic * 98) / 1000
-  //
-  //  With the fixture's active set of {1, 2}, the target must exceed 2
-  //  for the grow branch of planRotation to fire. That requires
-  //  traffic >= 11 (11 * 98 / 1000 == 1, giving target = 3).
-  //
-  //  So we build a block with 11 transfers. The transfers must succeed
-  //  (executor validation, nonce ordering, sufficient balance), which
-  //  is why they're issued from Alice in nonce order rather than
-  //  being stubs.
-
   ValidatorInfo waiting;
   waiting.id = 3;
   waiting.reward_address = carol_.publicKey;
@@ -745,8 +702,6 @@ TEST_F(Core_BlockProcessorFixture, RotationPromotesWaitingValidator)
   putValidatorDirect(waiting);
   setNextValidatorId(4);
 
-  //  11 transfers from Alice, nonce 0..10. The fixture funds Alice
-  //  with 1e9 at setup, so 11 * (100 + 2) is well within budget.
   std::vector<Transaction> txs;
   for (uint64_t n = 0; n < 11; ++n)
     txs.push_back(makeSignedTransfer(alice_, bob_.publicKey, 100, 2, n));
@@ -766,7 +721,6 @@ TEST_F(Core_BlockProcessorFixture, RotationPromotesWaitingValidator)
 
 TEST_F(Core_BlockProcessorFixture, RotationDoesNotRunMidEpoch)
 {
-  // Seed the pool so rotation would have something to do.
   ValidatorInfo waiting;
   waiting.id = 3;
   waiting.reward_address = carol_.publicKey;
@@ -779,7 +733,6 @@ TEST_F(Core_BlockProcessorFixture, RotationDoesNotRunMidEpoch)
   putValidatorDirect(waiting);
   setNextValidatorId(4);
 
-  // Block 30 is mid-epoch. Rotation must not fire.
   BlockResult r = applyBlock(30, genesis_hash_, {});
   ASSERT_TRUE(r.valid) << r.error;
 
@@ -791,27 +744,16 @@ TEST_F(Core_BlockProcessorFixture, RotationDoesNotRunMidEpoch)
 
 TEST_F(Core_BlockProcessorFixture, RotationDoesNotBreakQuorum)
 {
-  // computeRotationCount(n) = min(ceil(n / TARGET_ROTATION_EPOCHS),
-  //                               n - bftQuorum(n))
-  // with the caveat that when n - bftQuorum(n) is 0 or negative,
-  // the function returns 0 — no rotation is safe.
-  //
-  // TARGET_ROTATION_EPOCHS = 21.
-  // bftQuorum(n) = (2n)/3 + 1 (integer division).
-
-  // No safe rotation possible — margin is zero or negative.
   EXPECT_EQ(computeRotationCount(0), 0u);
   EXPECT_EQ(computeRotationCount(1), 0u);
   EXPECT_EQ(computeRotationCount(2), 0u);
   EXPECT_EQ(computeRotationCount(3), 0u);
 
-  // Margin exists, but ceil(n/21) is 1 for n up to 21.
   EXPECT_EQ(computeRotationCount(4), 1u);
   EXPECT_EQ(computeRotationCount(7), 1u);
   EXPECT_EQ(computeRotationCount(11), 1u);
   EXPECT_EQ(computeRotationCount(21), 1u);
 
-  // Now ceil dominates.
   EXPECT_EQ(computeRotationCount(22), 2u);
   EXPECT_EQ(computeRotationCount(42), 2u);
   EXPECT_EQ(computeRotationCount(43), 3u);
@@ -835,9 +777,6 @@ TEST_F(Core_BlockProcessorFixture, RotationPersistsTargetSize)
   BlockResult r = applyBlock(59, genesis_hash_, {});
   ASSERT_TRUE(r.valid) << r.error;
 
-  // The target size with zero traffic is ACTIVE_SET_MIN (2).
-  // computeTargetActiveSetSize interpolates linearly from MIN at
-  // zero traffic to MAX at saturation.
   const uint64_t expected_target = computeTargetActiveSetSize(0);
   EXPECT_EQ(expected_target, GlobalConfig::ACTIVE_SET_MIN)
       << "sanity: zero traffic should target the minimum";
@@ -932,8 +871,6 @@ TEST_F(Core_BlockProcessorFixture, AbortTxnLeavesNoState)
 
 TEST_F(Core_BlockProcessorFixture, GenesisWritesValidatorByAddressIndex)
 {
-  // The fixture applies genesis in SetUp. Seed validators 1 and 2
-  // should both be reachable by their reward address.
   Crypto::Address seed1 = validatorAddress(1);
   Crypto::Address seed2 = validatorAddress(2);
 
@@ -954,8 +891,6 @@ TEST_F(Core_BlockProcessorFixture, GenesisWritesValidatorByAddressIndex)
 
 TEST_F(Core_BlockProcessorFixture, GenesisWritesActiveSetSize)
 {
-  // active_set_size should match the number of seed validators (2),
-  // not the compile-time default.
   EXPECT_EQ(readActiveSetSize(), 2u);
 }
 
@@ -963,7 +898,6 @@ TEST_F(Core_BlockProcessorFixture, GenesisWritesActiveSetSize)
 
 TEST_F(Core_BlockProcessorFixture, ProcessOrderExpiriesRefundsAndDeletes)
 {
-  // Create an order that expires at the block we're about to apply.
   const Id buy_token = 200;
   const uint64_t expires_at = 1;
 
@@ -986,23 +920,11 @@ TEST_F(Core_BlockProcessorFixture, ProcessOrderExpiriesRefundsAndDeletes)
               expires_at))
           .build();
 
-  // Apply the create-order block. It runs at height 1, which is where
-  // the order expires. Since the executor adds to the expiry index,
-  // and the block processor's expiry pass runs *after* the
-  // transactions, the order created in this block will be expired in
-  // the same block. That's the edge case worth pinning: an order with
-  // expiry == current height is treated as already expired by the
-  // time the block finishes.
   BlockResult r1 = applyBlock(1, genesis_hash_, {create_tx});
   ASSERT_TRUE(r1.valid) << r1.error;
 
-  // After this block:
-  //   - Alice paid 1 fee.
-  //   - The 500 she locked was refunded by the expiry pass.
-  //   - The order record was deleted.
   EXPECT_EQ(balanceOf(alice_.publicKey), alice_before - 1);
 
-  // Confirm the order is gone.
   bool order_found = false;
   readState([&](State::StateAccess &s)
             {
@@ -1021,8 +943,6 @@ TEST_F(Core_BlockProcessorFixture, ProcessOrderExpiriesRefundsAndDeletes)
 
 TEST_F(Core_BlockProcessorFixture, ProcessOrderExpiriesSkipsLaterHeight)
 {
-  // Create an order that expires far in the future. Applying a block
-  // at height 1 should not touch it.
   const Id buy_token = 200;
   const uint64_t expires_at = 1000;
 
@@ -1048,11 +968,8 @@ TEST_F(Core_BlockProcessorFixture, ProcessOrderExpiriesSkipsLaterHeight)
   BlockResult r = applyBlock(1, genesis_hash_, {create_tx});
   ASSERT_TRUE(r.valid) << r.error;
 
-  // Alice paid the fee and had 500 locked into the order. No refund
-  // because the order hasn't expired yet.
   EXPECT_EQ(balanceOf(alice_.publicKey), alice_before - 500 - 1);
 
-  // The order record should still exist.
   bool order_found = false;
   readState([&](State::StateAccess &s)
             {
@@ -1072,7 +989,6 @@ TEST_F(Core_BlockProcessorFixture, ProcessOrderExpiriesSkipsLaterHeight)
 TEST_F(Core_BlockProcessorFixture, RejectsBlockWithInvalidQuorumSignature)
 {
   Block b = makeProcessableBlock(1, genesis_hash_, {}, activeSet());
-  // Corrupt one byte of the first signature.
   b.quorum_signatures[0].signature.data[0] ^= 0xFF;
 
   BlockContext ctx = makeContext(1);
@@ -1091,8 +1007,6 @@ TEST_F(Core_BlockProcessorFixture, RejectsBlockWithInvalidQuorumSignature)
 
 TEST_F(Core_BlockProcessorFixture, SeedOnlySingleSeed_EarnsProducerBonus)
 {
-  //  Fixture genesis has two seeds. Reduce the active set to just
-  //  seed 1 and apply a block.
   const std::vector<Id> seed_set = {1};
   withState([&](State::StateAccess &s)
             { s.putGlobal("active_set", encodeActiveSet(seed_set)); });
@@ -1104,8 +1018,6 @@ TEST_F(Core_BlockProcessorFixture, SeedOnlySingleSeed_EarnsProducerBonus)
   BlockResult r = applyBlock(1, genesis_hash_, {}, false, seed_set);
   ASSERT_TRUE(r.valid) << r.error;
 
-  //  Expected: seed 1 earns the full producer bonus; pot gains the
-  //  set share plus the staker pool.
   const uint64_t validator_pool =
       applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::VALIDATOR_SHARE_BPS);
   const uint64_t producer_amount =
@@ -1120,7 +1032,6 @@ TEST_F(Core_BlockProcessorFixture, SeedOnlySingleSeed_EarnsProducerBonus)
 
 TEST_F(Core_BlockProcessorFixture, SeedOnlyTwoSeeds_SplitProducerBonus)
 {
-  //  Fixture default active set is {1, 2}, both seeds.
   Crypto::Address seed1 = validatorAddress(1);
   Crypto::Address seed2 = validatorAddress(2);
   uint64_t s1_before = balanceOf(seed1);
@@ -1147,9 +1058,6 @@ TEST_F(Core_BlockProcessorFixture, SeedOnlyTwoSeeds_SplitProducerBonus)
 
 TEST_F(Core_BlockProcessorFixture, MixedActiveSet_PaysNormalSplit)
 {
-  //  Add a non-seed validator to the active set. The seed-only branch
-  //  must not fire; both seeds and the new validator participate in
-  //  the normal distribution.
   auto target_key = Crypto::generateKeyPair();
   constexpr Id NON_SEED_ID = 100;
   registerValidatorWithKey(NON_SEED_ID, target_key);
@@ -1166,12 +1074,8 @@ TEST_F(Core_BlockProcessorFixture, MixedActiveSet_PaysNormalSplit)
   const uint64_t staker_pool =
       applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::STAKER_SHARE_BPS);
 
-  //  Under normal distribution, the pot only receives the staker pool
-  //  plus any multiplier-penalty differences (zero here, all multipliers
-  //  are START). The set share is paid to validators, not to the pot.
   EXPECT_EQ(currentPot() - pot_before, staker_pool);
 
-  //  And the non-seed validator earned its share of the set amount.
   ValidatorInfo non_seed;
   ASSERT_TRUE(readValidator(NON_SEED_ID, non_seed));
   EXPECT_GT(non_seed.total_rewards_earned, 0u);
@@ -1180,50 +1084,17 @@ TEST_F(Core_BlockProcessorFixture, MixedActiveSet_PaysNormalSplit)
 // ============================================================================
 //  Emergency rotation
 // ============================================================================
-//
-//  These tests exercise the block-processor path for an emergency
-//  block: the block carries emergency_rotation > 0 and a certificate
-//  whose signatures come from the committed set, and the block's
-//  quorum is formed against the emergency set (committed minus
-//  offline, plus promotions from the pool).
-//
-//  verifyTimeoutCertificate requires a committed set of at least 4
-//  validators (it computes f = (n-1)/3 and requires f+1 attestations).
-//  With n = 2 the certificate cannot exist, so the fixture cannot
-//  build a well-formed emergency block. Each test below therefore
-//  builds a 4-validator committed set.
-//
-//  The setup for all three is the same:
-//
-//      committed = {1, 2, 3, 4}      (written to state as "active_set")
-//      1 is offline at height 100    (last_seen_height = 0)
-//      2, 3, 4 are live              (last_seen_height = 100)
-//      5 is a pool candidate         (registered, not active, healthy)
-//
-//  resolveActiveSet(committed, 100, true) drops 1, promotes 5, and
-//  returns {2, 3, 4, 5}. The block is built with that as its
-//  emergency set and a certificate signed by the first f+1 = 2
-//  members of the committed set.
 
 namespace
 {
-  //  Shared setup for the three emergency-block tests. Kept as a
-  //  lambda so each test body can read its own pre-state cleanly.
   constexpr uint64_t EMERGENCY_HEIGHT = 100;
 
-  //  The committed set as the tests set it up. Used to construct the
-  //  certificate and to assert what resolveActiveSet should produce.
   inline std::vector<Id> emergencyCommittedSet() { return {1, 2, 3, 4}; }
-
-  //  The expected emergency set: committed minus offline 1, plus
-  //  promotion of 5.
   inline std::vector<Id> emergencyDerivedSet() { return {2, 3, 4, 5}; }
 } // anonymous namespace
 
 TEST_F(Core_BlockProcessorFixture, EmergencyBlock_CommitsNewActiveSet)
 {
-  //  Register validators 3 and 4 as active non-seeds. Validator 5 is
-  //  a pool candidate (registered, not active).
   auto key3 = Crypto::generateKeyPair();
   auto key4 = Crypto::generateKeyPair();
   auto key5 = Crypto::generateKeyPair();
@@ -1235,27 +1106,18 @@ TEST_F(Core_BlockProcessorFixture, EmergencyBlock_CommitsNewActiveSet)
   registerValidatorWithKey(5, key5, /*stake=*/1'000'000'000ULL,
                            /*is_seed=*/false, /*is_active=*/false);
 
-  //  Write the committed set to state. This is what
-  //  BlockProcessor::applyBlock reads as committed_set, and what the
-  //  certificate's signers must be drawn from.
   withState([&](State::StateAccess &s)
             { s.putGlobal("active_set",
                           encodeActiveSet(emergencyCommittedSet())); });
 
-  //  Liveness. 1 is offline; 2, 3, 4 are current; 5 is fresh.
   setValidatorLastSeen(1, 0);
   setValidatorLastSeen(2, EMERGENCY_HEIGHT);
   setValidatorLastSeen(3, EMERGENCY_HEIGHT);
   setValidatorLastSeen(4, EMERGENCY_HEIGHT);
   setValidatorLastSeen(5, EMERGENCY_HEIGHT);
 
-  //  Also set the "next_validator_id" global so any subsequent
-  //  bookkeeping that walks the registry sees 5.
   setNextValidatorId(6);
 
-  //  Build the block. The active_set argument is the emergency set
-  //  (the block's header commits to it); committed_set is the set the
-  //  certificate's signers are drawn from.
   Block b = makeProcessableBlock(
       EMERGENCY_HEIGHT,
       genesis_hash_,
@@ -1271,11 +1133,9 @@ TEST_F(Core_BlockProcessorFixture, EmergencyBlock_CommitsNewActiveSet)
   BlockResult r = applyPrebuiltBlock(b);
   ASSERT_TRUE(r.valid) << r.error;
 
-  //  State reflects the emergency set.
   auto active = readActiveSet();
   EXPECT_EQ(active, emergencyDerivedSet());
 
-  //  Flags updated to match.
   ValidatorInfo v1, v5;
   ASSERT_TRUE(readValidator(1, v1));
   ASSERT_TRUE(readValidator(5, v5));
@@ -1284,7 +1144,6 @@ TEST_F(Core_BlockProcessorFixture, EmergencyBlock_CommitsNewActiveSet)
   EXPECT_TRUE(v5.is_active)
       << "promoted pool validator 5 should be active";
 
-  //  The block was applied at the emergency height.
   EXPECT_EQ(b.header.height, EMERGENCY_HEIGHT);
 }
 
@@ -1315,16 +1174,10 @@ TEST_F(Core_BlockProcessorFixture, EmergencyBlock_QuorumVerifiedAgainstDerivedSe
       EMERGENCY_HEIGHT,
       emergencyCommittedSet());
 
-  //  Corrupt one quorum signature. checkQuorum resolves signer_index 0
-  //  against the derived emergency set, so emergency_set[0] = 2. The
-  //  signature was produced by validator 2's key. Corrupting it fails
-  //  verification.
   Block bad = good;
   ASSERT_FALSE(bad.quorum_signatures.empty());
   bad.quorum_signatures[0].signature.data[0] ^= 0xFF;
 
-  //  Apply the corrupted block first, from a throwaway txn, so the
-  //  real state stays at the pre-block root for the second apply.
   {
     BlockContext ctx = makeContext(EMERGENCY_HEIGHT);
     auto t = db_->beginWrite();
@@ -1336,25 +1189,12 @@ TEST_F(Core_BlockProcessorFixture, EmergencyBlock_QuorumVerifiedAgainstDerivedSe
     EXPECT_EQ(r.error, "invalid quorum signature");
   }
 
-  //  Now apply the good one for real.
   BlockResult r = applyPrebuiltBlock(good);
   EXPECT_TRUE(r.valid) << r.error;
 }
 
 TEST_F(Core_BlockProcessorFixture, EmergencyBlock_StateRootMatchesDerivedSet)
 {
-  //  The state root the block commits to must be the root produced by
-  //  applying it against the emergency set. If the block's simulation
-  //  and its real application disagreed about the set, the state-root
-  //  check inside applyBlock would fire and the block would be
-  //  rejected.
-  //
-  //  This test exists to catch a specific class of bug: if
-  //  makeProcessableBlock sets emergency_rotation *after* simulation,
-  //  the dry run uses the committed set and the real application uses
-  //  the emergency set. Their roots differ, and the block is rejected
-  //  even though everything else is correct.
-
   auto key3 = Crypto::generateKeyPair();
   auto key4 = Crypto::generateKeyPair();
   auto key5 = Crypto::generateKeyPair();
@@ -1380,10 +1220,288 @@ TEST_F(Core_BlockProcessorFixture, EmergencyBlock_StateRootMatchesDerivedSet)
       EMERGENCY_HEIGHT,
       emergencyCommittedSet());
 
-  //  The block's header state_root was produced by the fixture's
-  //  dry-run simulation. Applying the block for real must produce
-  //  the same root.
   BlockResult r = applyPrebuiltBlock(b);
   ASSERT_TRUE(r.valid) << r.error;
   EXPECT_EQ(r.new_state_root, b.header.state_root);
+}
+
+// =================================================================
+//  Matching engine: simulate-vs-apply state-root equality
+//
+//  The matcher writes to state through three channels that did
+//  not exist before this feature:
+//
+//    - nextOrderSequence()      — an SMT global write
+//    - indexFill(...)           — three index rows in
+//                                 TBL_FILL_HISTORY per fill
+//    - addToOrderBook's
+//      companion sequence key   — an SMT write
+//
+//  Every one of those must happen on BOTH the dry-run and the
+//  apply path. If any of them is gated on !ctx.dry_run upstream,
+//  the two paths produce different state roots and a proposer's
+//  block is rejected by every node that tries to apply it.
+//
+//  DIAG lines are temporary; delete them once the test passes.
+// =================================================================
+
+TEST_F(Core_BlockProcessorFixture, MatchingSimulateAndApplyProduceSameRoot)
+{
+  const Id sell_token = 1; // "base"
+  const Id buy_token = 2;  // "quote"
+
+  //  ---- Fund the two custom tokens ----
+  {
+    auto txn = db_->beginWrite();
+    State::StateAccess st(*db_, txn, 0);
+
+    st.putTokenBalance(bob_.publicKey, sell_token, 1'000'000);
+    st.putTokenBalance(bob_.publicKey, buy_token, 1'000'000);
+    st.putTokenBalance(alice_.publicKey, sell_token, 1'000'000);
+    st.putTokenBalance(alice_.publicKey, buy_token, 1'000'000);
+
+    st.commit(0);
+    txn.commit();
+  }
+
+  //  ---- Seed the maker ----
+  const uint64_t maker_sell_amount = 100;
+  const uint64_t maker_min_buy_amount = 2500; // price = 25
+
+  Core::Order maker;
+  maker.id = 1;
+  maker.owner = bob_.publicKey;
+  maker.mode = Core::OrderExecutionMode::Passive;
+  maker.sell_token = sell_token;
+  maker.buy_token = buy_token;
+  maker.sell_amount = maker_sell_amount;
+  maker.min_buy_amount = maker_min_buy_amount;
+  maker.created_at_height = 0;
+  maker.filled_amount = 0;
+  maker.condition_count = 0;
+
+  {
+    auto txn = db_->beginWrite();
+    State::StateAccess st(*db_, txn, 0);
+
+    const uint64_t bob_before =
+        st.getTokenBalance(bob_.publicKey, sell_token);
+    ASSERT_GE(bob_before, maker_sell_amount)
+        << "fixture did not fund Bob with token " << sell_token;
+    st.putTokenBalance(bob_.publicKey, sell_token,
+                       bob_before - maker_sell_amount);
+
+    st.putOrder(maker);
+    st.addToOrderBook(maker, st.nextOrderSequence());
+
+    //  Advance the id counter past the maker's id. The maker was
+    //  seeded by hand with id = 1; without this, the taker tx in
+    //  the block below would read next_order_id = 1 and overwrite
+    //  the maker's record at Keys::order(1).
+    st.putGlobalU64("next_order_id", 2);
+
+    st.commit(0);
+    txn.commit();
+  }
+
+  //  ---- Build the crossing taker tx ----
+  Core::Transaction taker_tx = makeSignedCreateOrder(
+      /*from=*/alice_,
+      /*sell_token=*/buy_token,
+      /*sell_amount=*/2500,
+      /*buy_token=*/sell_token,
+      /*min_buy_amount=*/100,
+      /*mode=*/Core::OrderExecutionMode::Passive,
+      /*expires_at_height=*/0,
+      /*nonce=*/0);
+
+  //  ---- Build the block ----
+  Core::Block block = buildSignedBlockForTest(
+      1, genesis_hash_, {taker_tx}, activeSet());
+
+  //  ---- Dry-run ----
+  Crypto::Hash dry_root;
+  {
+    auto txn = db_->beginWrite();
+    State::StateAccess st(*db_, txn, 0);
+
+    BlockContext ctx = makeContext(1);
+    ctx.dry_run = true;
+
+    BlockResult r = BlockProcessor::applyBlock(st, block, ctx);
+    ASSERT_TRUE(r.valid) << "dry-run failed: " << r.error;
+
+    dry_root = r.new_state_root;
+
+    txn.abort();
+  }
+
+  //  ---- Apply ----
+  Crypto::Hash apply_root;
+  {
+    auto txn = db_->beginWrite();
+    State::StateAccess st(*db_, txn, 0);
+
+    BlockContext ctx = makeContext(1);
+    ctx.dry_run = false;
+
+    BlockResult r = BlockProcessor::applyBlock(st, block, ctx);
+    ASSERT_TRUE(r.valid) << "apply failed: " << r.error;
+
+    apply_root = r.new_state_root;
+
+    ASSERT_EQ(r.receipts.size(), 1u);
+    ASSERT_EQ(r.receipts[0].fills.size(), 1u);
+    ASSERT_EQ(r.receipts[0].fills[0].maker_order_id, maker.id);
+    ASSERT_EQ(r.receipts[0].fills[0].qty_base, 100u);
+    ASSERT_EQ(r.receipts[0].fills[0].qty_quote, 2500u);
+
+    st.commit(1);
+    txn.commit();
+  }
+
+  EXPECT_EQ(dry_root, apply_root)
+      << "dry-run and apply paths produced different state roots.";
+}
+
+// =================================================================
+//  Matching engine: end-to-end through a block
+//
+//  Two CreateOrder txs in one block. The first rests; the second
+//  crosses.
+//
+//  DIAG lines are temporary; delete them once the test passes.
+// =================================================================
+
+TEST_F(Core_BlockProcessorFixture, MatchingEndToEndThroughBlock)
+{
+  const Id sell_token = 1;
+  const Id buy_token = 2;
+
+  //  ---- Fund the two custom tokens ----
+  {
+    auto txn = db_->beginWrite();
+    State::StateAccess st(*db_, txn, 0);
+
+    st.putTokenBalance(bob_.publicKey, sell_token, 1'000'000);
+    st.putTokenBalance(bob_.publicKey, buy_token, 1'000'000);
+    st.putTokenBalance(alice_.publicKey, sell_token, 1'000'000);
+    st.putTokenBalance(alice_.publicKey, buy_token, 1'000'000);
+
+    st.commit(0);
+    txn.commit();
+  }
+
+  //  ---- Capture before-balances ----
+  const uint64_t alice_t1_before = [&]
+  {
+    uint64_t v = 0;
+    readState([&](State::StateAccess &s)
+              { v = s.getTokenBalance(alice_.publicKey, sell_token); });
+    return v;
+  }();
+  const uint64_t alice_t2_before = [&]
+  {
+    uint64_t v = 0;
+    readState([&](State::StateAccess &s)
+              { v = s.getTokenBalance(alice_.publicKey, buy_token); });
+    return v;
+  }();
+  const uint64_t bob_t1_before = [&]
+  {
+    uint64_t v = 0;
+    readState([&](State::StateAccess &s)
+              { v = s.getTokenBalance(bob_.publicKey, sell_token); });
+    return v;
+  }();
+  const uint64_t bob_t2_before = [&]
+  {
+    uint64_t v = 0;
+    readState([&](State::StateAccess &s)
+              { v = s.getTokenBalance(bob_.publicKey, buy_token); });
+    return v;
+  }();
+
+  //  ---- Build the two CreateOrder txs ----
+  Core::Transaction maker_tx = makeSignedCreateOrder(
+      /*from=*/bob_,
+      /*sell_token=*/sell_token,
+      /*sell_amount=*/100,
+      /*buy_token=*/buy_token,
+      /*min_buy_amount=*/2500,
+      /*mode=*/Core::OrderExecutionMode::Passive,
+      /*expires_at_height=*/0,
+      /*nonce=*/nonceOf(bob_.publicKey));
+
+  Core::Transaction taker_tx = makeSignedCreateOrder(
+      /*from=*/alice_,
+      /*sell_token=*/buy_token,
+      /*sell_amount=*/2500,
+      /*buy_token=*/sell_token,
+      /*min_buy_amount=*/100,
+      /*mode=*/Core::OrderExecutionMode::Passive,
+      /*expires_at_height=*/0,
+      /*nonce=*/nonceOf(alice_.publicKey));
+
+  //  ---- Build the block ----
+  Core::Block block = buildSignedBlockForTest(
+      1, genesis_hash_, {maker_tx, taker_tx}, activeSet());
+
+  //  ---- Apply ----
+  BlockResult result;
+  {
+    auto txn = db_->beginWrite();
+    State::StateAccess st(*db_, txn, 0);
+
+    BlockContext ctx = makeContext(1);
+    ctx.dry_run = false;
+
+    result = BlockProcessor::applyBlock(st, block, ctx);
+    ASSERT_TRUE(result.valid) << "block failed: " << result.error;
+
+    st.commit(1);
+    txn.commit();
+  }
+
+  //  ---- Receipts ----
+  ASSERT_EQ(result.receipts.size(), 2u);
+  ASSERT_TRUE(result.receipts[0].fills.empty());
+  ASSERT_EQ(result.receipts[1].fills.size(), 1u);
+
+  const Core::Fill &fill = result.receipts[1].fills[0];
+
+  ASSERT_EQ(fill.maker_order_id, 1u);
+  ASSERT_EQ(fill.taker_order_id, 2u);
+  ASSERT_EQ(fill.qty_base, 100u);
+  ASSERT_EQ(fill.qty_quote, 2500u);
+  ASSERT_EQ(fill.price, 25ULL * Core::OrderBook::BOOK_PRICE_SCALE);
+  ASSERT_EQ(fill.base_token, sell_token);
+  ASSERT_EQ(fill.quote_token, buy_token);
+
+  //  ---- Balances ----
+  readState([&](State::StateAccess &s)
+            {
+    EXPECT_EQ(s.getTokenBalance(bob_.publicKey, buy_token),
+              bob_t2_before + 2500u);
+    EXPECT_EQ(s.getTokenBalance(alice_.publicKey, sell_token),
+              alice_t1_before + 100u);
+    EXPECT_EQ(s.getTokenBalance(bob_.publicKey, sell_token),
+              bob_t1_before - 100u);
+    EXPECT_EQ(s.getTokenBalance(alice_.publicKey, buy_token),
+              alice_t2_before - 2500u); });
+
+  //  ---- Book empty, records gone ----
+  readState([&](State::StateAccess &s)
+            {
+    Core::Order gone;
+    EXPECT_FALSE(s.getOrder(fill.maker_order_id, gone));
+    EXPECT_FALSE(s.getOrder(fill.taker_order_id, gone));
+
+    size_t side0 = 0, side1 = 0;
+    s.forEachBookLevel(sell_token, buy_token, 0,
+        [&](Id, uint64_t, uint64_t) { ++side0; return true; });
+    s.forEachBookLevel(sell_token, buy_token, 1,
+        [&](Id, uint64_t, uint64_t) { ++side1; return true; });
+    EXPECT_EQ(side0, 0u);
+    EXPECT_EQ(side1, 0u); });
 }

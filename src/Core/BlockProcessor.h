@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <unordered_set>
 
 #include "Block.h"
 #include "Order.h"
@@ -239,6 +240,33 @@ namespace Core
     static void indexTransactions(State::StateAccess &state,
                                   const Block &block,
                                   const BlockContext &ctx);
+
+    //  Update the rolling 24-hour fee window. Called from
+    //  bumpLifetimeCounters on the non-dry-run path only, because
+    //  the window is an aggregation counter (meta table) and has no
+    //  effect on the state root.
+    //
+    //  The window is stored as a small ring buffer in the meta
+    //  table:
+    //    fees_window_sum        (uint64, running sum of the
+    //                            currently-retained blocks)
+    //    fees_window_ring       (512 * 8 bytes, one entry per block
+    //                            slot, most-recent-first modulo)
+    //    fees_window_ring_head  (uint64, index of the next slot to
+    //                            write)
+    //    fees_window_block_count(uint64, how many slots are populated;
+    //                            saturates at the ring size)
+    //
+    //  At ~6 s per block (NOMINAL_BLOCK_SECONDS), 24 h is 14,400
+    //  blocks. The ring is sized to 14,400 exactly; the value read
+    //  by the RPC is a strict trailing window, not a padded one.
+    //
+    //  Storing the ring in the meta table rather than in the SMT is
+    //  what keeps this a display-only counter. A verifier that
+    //  never runs this function still agrees on every committed
+    //  state root.
+    static void updateFeeWindow(State::StateAccess &state,
+                                uint64_t block_fees);
   };
 
 } // namespace Core

@@ -570,6 +570,28 @@ namespace Rpc
     w.setNumber("status_code", static_cast<uint64_t>(r.status));
     w.setHexU64("fee_paid", r.fee_paid);
 
+    //  Fills produced by this transaction, if any. The list is
+    //  empty for every non-order tx and for a limit order that
+    //  rested without crossing. Height is not part of the receipt
+    //  itself — it lives on the block that contains it — so the
+    //  fill entries omit height and leave the caller to look it up
+    //  from the enclosing block if needed.
+    Common::Json fills = Common::Json::array();
+    for (const auto &f : r.fills)
+    {
+      Common::Json entry = Common::Json::object();
+      JsonWriter fw(entry);
+      fw.setHexU64("maker_order_id", f.maker_order_id);
+      fw.setHexU64("taker_order_id", f.taker_order_id);
+      fw.setHexU64("base_token", f.base_token);
+      fw.setHexU64("quote_token", f.quote_token);
+      fw.setHexU64("qty_base", f.qty_base);
+      fw.setHexU64("qty_quote", f.qty_quote);
+      fw.setHexU64("price", f.price);
+      fills.push_back(std::move(entry));
+    }
+    w.setObject("fills", std::move(fills));
+
     return j;
   }
 
@@ -641,5 +663,27 @@ namespace Rpc
       arr.push_back(encodeValidator(v, current_height, hrp));
     }
     return arr;
+  }
+
+  Common::Json encodeFill(const Core::Fill &f,
+                          uint64_t height,
+                          uint32_t tx_index_in_block,
+                          const std::string & /*hrp*/)
+  {
+    Common::Json j = Common::Json::object();
+    JsonWriter w(j);
+
+    w.setHexU64("maker_order_id", f.maker_order_id);
+    w.setHexU64("taker_order_id", f.taker_order_id);
+    w.setHexU64("base_token", f.base_token);
+    w.setHexU64("quote_token", f.quote_token);
+    w.setHexU64("qty_base", f.qty_base);
+    w.setHexU64("qty_quote", f.qty_quote);
+    w.setHexU64("price", f.price);
+
+    w.setHexU64("height", height);
+    w.setNumber("tx_index_in_block", static_cast<uint64_t>(tx_index_in_block));
+
+    return j;
   }
 } // namespace Rpc

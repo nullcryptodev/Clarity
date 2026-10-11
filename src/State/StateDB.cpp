@@ -90,6 +90,10 @@ namespace State
       return "index_orders_by_pair";
     case TBL_INDEX_ORDERS_BY_POOL:
       return "index_orders_by_pool";
+    case TBL_INDEX_ORDER_BOOK:
+      return "index_order_book";
+    case TBL_FILL_HISTORY:
+      return "fill_history";
     default:
       return "<unknown>";
     }

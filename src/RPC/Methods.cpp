@@ -2910,6 +2910,9 @@ namespace Rpc
           "getOrdersExpiringAt",
           "getAllOrders",
           "getOrdersByPair",
+          "getOrderBook",
+          "getOrderFills",
+          "getPairTrades",
       });
 
       out["transactions"] = makeArray({
@@ -2984,6 +2987,193 @@ namespace Rpc
                                       const JsonRpcRequest &)
     {
       return Common::Json(node.status().peer_count > 0);
+    }
+
+    // ---- clrty_getOrderBook ----
+    //
+    // Params:
+    //   base_token   (required, hex)
+    //   quote_token  (required, hex)
+    //   depth        (optional, hex; default 20; max 100)
+    //
+    // Returns bids and asks, aggregated by price level, best-first
+    // on each side. Bids are the buy-base side (side 1); asks are
+    // the sell-base side (side 0). Prices are in the canonical
+    // frame (quote per base, scaled by BOOK_PRICE_SCALE).
+
+    Common::Json method_getOrderBook(Node::Node &node,
+                                     const RpcConfig & /*config*/,
+                                     const JsonRpcRequest &req)
+    {
+      const Id base = requireU64(req.params, "base_token");
+      const Id quote = requireU64(req.params, "quote_token");
+
+      if (base == quote)
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "base_token and quote_token must differ",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"base_token", encodeU64Hex(base)},
+                           {"quote_token", encodeU64Hex(quote)}}));
+      }
+
+      uint64_t depth = 20;
+      if (auto v = optionalU64(req.params, "depth"); v.has_value())
+        depth = *v;
+      if (depth == 0 || depth > 100)
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "field 'depth' must be 1..100",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"field", "depth"},
+                           {"value", encodeU64Hex(depth)}}));
+      }
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      Common::Json bids = Common::Json::array();
+      Common::Json asks = Common::Json::array();
+
+      state.snapshotBookSide(
+          base, quote, /*side=*/1, static_cast<size_t>(depth),
+          [&](uint64_t price, uint64_t total_base, size_t order_count)
+          {
+            Common::Json lvl = Common::Json::object();
+            putU64(lvl, "price", price);
+            putU64(lvl, "total_base", total_base);
+            putU64(lvl, "order_count", static_cast<uint64_t>(order_count));
+            bids.push_back(std::move(lvl));
+          });
+
+      state.snapshotBookSide(
+          base, quote, /*side=*/0, static_cast<size_t>(depth),
+          [&](uint64_t price, uint64_t total_base, size_t order_count)
+          {
+            Common::Json lvl = Common::Json::object();
+            putU64(lvl, "price", price);
+            putU64(lvl, "total_base", total_base);
+            putU64(lvl, "order_count", static_cast<uint64_t>(order_count));
+            asks.push_back(std::move(lvl));
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "base_token", base);
+      putU64(out, "quote_token", quote);
+      putU64(out, "price_scale", Core::OrderBook::BOOK_PRICE_SCALE);
+      out["bids"] = std::move(bids);
+      out["asks"] = std::move(asks);
+      return out;
+    }
+
+    // ---- clrty_getOrderFills ----
+    //
+    // Params:
+    //   order_id  (required, hex)
+    //   limit     (optional, hex; default 100; max 500)
+    //
+    // Returns the fills for one order (either side), newest first.
+    // Uses the order-view of the fill-history table.
+
+    Common::Json method_getOrderFills(Node::Node &node,
+                                      const RpcConfig & /*config*/,
+                                      const JsonRpcRequest &req)
+    {
+      const Id order_id = requireU64(req.params, "order_id");
+
+      uint64_t limit = 100;
+      if (auto v = optionalU64(req.params, "limit"); v.has_value())
+        limit = *v;
+      if (limit == 0 || limit > 500)
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "field 'limit' must be 1..500",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"field", "limit"},
+                           {"value", encodeU64Hex(limit)}}));
+      }
+
+      const std::string hrp = hrpForNode(node);
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      Common::Json arr = Common::Json::array();
+
+      state.forEachRecentFillForOrder(
+          order_id, static_cast<size_t>(limit),
+          [&](const Core::Fill &f, uint64_t height, uint32_t tx_index)
+          {
+            arr.push_back(encodeFill(f, height, tx_index, hrp));
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "order_id", order_id);
+      putU64(out, "count", static_cast<uint64_t>(arr.size()));
+      out["fills"] = std::move(arr);
+      return out;
+    }
+
+    // ---- clrty_getPairTrades ----
+    //
+    // Params:
+    //   base_token   (required, hex)
+    //   quote_token  (required, hex)
+    //   limit        (optional, hex; default 100; max 500)
+    //
+    // Returns recent trades on a pair, newest first. Uses the
+    // pair-view of the fill-history table.
+
+    Common::Json method_getPairTrades(Node::Node &node,
+                                      const RpcConfig & /*config*/,
+                                      const JsonRpcRequest &req)
+    {
+      const Id base = requireU64(req.params, "base_token");
+      const Id quote = requireU64(req.params, "quote_token");
+
+      if (base == quote)
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "base_token and quote_token must differ",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"base_token", encodeU64Hex(base)},
+                           {"quote_token", encodeU64Hex(quote)}}));
+      }
+
+      uint64_t limit = 100;
+      if (auto v = optionalU64(req.params, "limit"); v.has_value())
+        limit = *v;
+      if (limit == 0 || limit > 500)
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "field 'limit' must be 1..500",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"field", "limit"},
+                           {"value", encodeU64Hex(limit)}}));
+      }
+
+      const std::string hrp = hrpForNode(node);
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      Common::Json arr = Common::Json::array();
+
+      state.forEachRecentFillForPair(
+          base, quote, static_cast<size_t>(limit),
+          [&](const Core::Fill &f, uint64_t height, uint32_t tx_index)
+          {
+            arr.push_back(encodeFill(f, height, tx_index, hrp));
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "base_token", base);
+      putU64(out, "quote_token", quote);
+      putU64(out, "count", static_cast<uint64_t>(arr.size()));
+      out["trades"] = std::move(arr);
+      return out;
     }
   } // anon namespace
 
@@ -3065,6 +3255,9 @@ namespace Rpc
     d.registerMethod("getOrdersExpiringAt", method_getOrdersExpiringAt);
     d.registerMethod("getAllOrders", method_getAllOrders);
     d.registerMethod("getOrdersByPair", method_getOrdersByPair);
+    d.registerMethod("getOrderBook", method_getOrderBook);
+    d.registerMethod("getOrderFills", method_getOrderFills);
+    d.registerMethod("getPairTrades", method_getPairTrades);
   }
 
   void registerStateMethods(JsonRpcDispatcher &d)

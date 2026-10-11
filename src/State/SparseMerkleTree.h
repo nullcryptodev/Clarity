@@ -216,6 +216,15 @@ namespace State
 
     // Receipt, keyed by transaction hash.
     Crypto::Hash receipt(const Crypto::Hash &tx_hash) noexcept;
+
+    //  Book sequence companion key. Written by
+    //  StateAccess::addToOrderBook and removed by
+    //  StateAccess::removeFromOrderBook. Value is the 8-byte LE
+    //  sequence the order was assigned when it entered the book.
+    //  This exists so removeFromOrderBook can reconstruct the book
+    //  key (which encodes the sequence) without scanning the entire
+    //  pair+side prefix.
+    Crypto::Hash orderSequence(uint64_t order_id) noexcept;
   }
 
 } // namespace State

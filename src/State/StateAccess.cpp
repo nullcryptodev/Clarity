@@ -8,6 +8,7 @@
 #include "Common/Wire.h"
 #include "Core/GlobalState.h"
 #include "Core/RewardTypes.h"
+#include "Core/OrderBook.h"
 
 #include <algorithm>
 #include <cstring>
@@ -25,6 +26,63 @@ namespace State
 
   namespace
   {
+
+    //  Compose the 49-byte book key.
+    //
+    //    [0..32)  pair_key
+    //    [32]     side
+    //    [33..41) ~canonical_price (8 BE)
+    //    [41..49) sequence (8 BE)
+    //
+    //  The ~price byte order makes ascending MDBX iteration yield
+    //  best-price-first. The sequence byte is big-endian so
+    //  lexicographic order equals numeric order, which makes the
+    //  tiebreaker deterministic and gives later orders higher keys
+    //  (they lose to earlier orders at the same price, which is the
+    //  FIFO behavior a price-time book is supposed to have).
+    void encodeBookKey(const Crypto::Hash &pair_key,
+                       uint8_t side,
+                       uint64_t canonical_price,
+                       uint64_t sequence,
+                       uint8_t out[49])
+    {
+      std::memcpy(out, pair_key.data.data(), 32);
+      out[32] = side;
+
+      //  Sellers (side 0) want the lowest price first: store price
+      //  directly so ascending key order puts the best ask first.
+      //  Buyers (side 1) want the highest price first: store ~price
+      //  so ascending key order puts the best bid first.
+      const uint64_t key_price = (side == 0) ? canonical_price
+                                             : ~canonical_price;
+      for (int i = 0; i < 8; ++i)
+        out[33 + i] = uint8_t(key_price >> ((7 - i) * 8));
+
+      for (int i = 0; i < 8; ++i)
+        out[41 + i] = uint8_t(sequence >> ((7 - i) * 8));
+    }
+
+    //  Decode the ~price and sequence back out of a book key.
+    //  Used by forEachBookLevel to hand the caller the un-inverted
+    //  price and the numeric sequence.
+    void decodeBookKey(const uint8_t *key,
+                       uint64_t &canonical_price_out,
+                       uint64_t &sequence_out)
+    {
+      const uint8_t side = key[32];
+
+      uint64_t stored = 0;
+      for (int i = 0; i < 8; ++i)
+        stored = (stored << 8) | key[33 + i];
+
+      canonical_price_out = (side == 0) ? stored : ~stored;
+
+      uint64_t seq = 0;
+      for (int i = 0; i < 8; ++i)
+        seq = (seq << 8) | key[41 + i];
+      sequence_out = seq;
+    }
+
     std::vector<uint8_t> encodeU64List(const std::vector<uint64_t> &ids)
     {
       std::vector<uint8_t> out;
@@ -70,6 +128,62 @@ namespace State
 
       return true;
     }
+
+    //  Fill-history keys. Two shapes, distinguished by a tag byte.
+    //
+    //    tag 0x01  pair view
+    //      [1]  tag
+    //      [32] pair_key
+    //      [8]  height BE
+    //      [4]  tx_index BE
+    //      [2]  fill_index BE
+    //      total 47 bytes
+    //
+    //    tag 0x02  order view
+    //      [1]  tag
+    //      [8]  order_id BE
+    //      [8]  height BE
+    //      [4]  tx_index BE
+    //      [2]  fill_index BE
+    //      total 23 bytes
+    //
+    //  All multi-byte fields are big-endian so lexicographic order
+    //  equals numeric order, which is what makes reverse-prefix
+    //  scans yield newest-first without a comparator.
+
+    void encodePairFillKey(const Crypto::Hash &pair_key,
+                           uint64_t height,
+                           uint32_t tx_index,
+                           uint16_t fill_index,
+                           uint8_t out[47])
+    {
+      out[0] = 0x01;
+      std::memcpy(out + 1, pair_key.data.data(), 32);
+      for (int i = 0; i < 8; ++i)
+        out[33 + i] = uint8_t(height >> ((7 - i) * 8));
+      for (int i = 0; i < 4; ++i)
+        out[41 + i] = uint8_t(tx_index >> ((3 - i) * 8));
+      out[45] = uint8_t(fill_index >> 8);
+      out[46] = uint8_t(fill_index);
+    }
+
+    void encodeOrderFillKey(uint64_t order_id,
+                            uint64_t height,
+                            uint32_t tx_index,
+                            uint16_t fill_index,
+                            uint8_t out[23])
+    {
+      out[0] = 0x02;
+      for (int i = 0; i < 8; ++i)
+        out[1 + i] = uint8_t(order_id >> ((7 - i) * 8));
+      for (int i = 0; i < 8; ++i)
+        out[9 + i] = uint8_t(height >> ((7 - i) * 8));
+      for (int i = 0; i < 4; ++i)
+        out[17 + i] = uint8_t(tx_index >> ((3 - i) * 8));
+      out[21] = uint8_t(fill_index >> 8);
+      out[22] = uint8_t(fill_index);
+    }
+
   } // anonymous namespace
 
   //  Construction
@@ -1235,6 +1349,202 @@ namespace State
   }
 
   // ===========================================================================
+  //  Order book
+  // ===========================================================================
+
+  void StateAccess::addToOrderBook(const Core::Order &order, uint64_t sequence)
+  {
+    if (order.id == INVALID_ID)
+      return;
+    if (order.isFullyFilled())
+      return;
+
+    const Crypto::Hash pair_key =
+        Core::OrderBook::pairKey(order.sell_token, order.buy_token);
+    const uint8_t side = Core::OrderBook::sideOf(order);
+
+    uint64_t canonical_price = 0;
+    if (!Core::OrderBook::canonicalPrice(order, canonical_price))
+      return;
+
+    uint8_t key[49];
+    encodeBookKey(pair_key, side, canonical_price, sequence, key);
+
+    //  Book row: order_id in the value.
+    putU64Row(StateDB::TBL_INDEX_ORDER_BOOK,
+              key, sizeof(key), static_cast<uint64_t>(order.id));
+
+    //  Companion sequence key in the SMT, so removeFromOrderBook can
+    //  recover the sequence without scanning. This is an SMT write,
+    //  not a table write, so it participates in the dry-run/apply
+    //  invariant.
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash seq_key = Keys::orderSequence(order.id);
+    std::vector<uint8_t> seq_bytes(8);
+    Common::writeU64(seq_bytes.data(), sequence);
+    smt_.update(seq_key, seq_bytes, version_);
+  }
+
+  void StateAccess::removeFromOrderBook(const Core::Order &order)
+  {
+    if (order.id == INVALID_ID)
+      return;
+
+    //  We do not know the sequence that was used when the order
+    //  entered the book — sequence is not part of the Order record
+    //  (it is derivable from the book key, but not from the record).
+    //  To remove the row we must find it. The only stable prefix is
+    //  (pair_key || side); the price and sequence are unknown.
+    //
+    //  Two options:
+    //    (a) store the sequence on the Order record (adds 8 bytes to
+    //        the wire format and to every historical read)
+    //    (b) scan the (pair_key || side) prefix and match on price
+    //        and order_id — but the book row's value is a sentinel,
+    //        not the order_id, so we cannot match on order_id from
+    //        the row alone. We would have to read every candidate
+    //        order and compare ids. Expensive.
+    //
+    //  We take option (a) but keep it out of the wire format: the
+    //  sequence is derivable from the order's price, and a separate
+    //  in-memory map is not durable. The clean solution is to store
+    //  the sequence in the SMT alongside the order, in a companion
+    //  key. That companion key is written and removed together with
+    //  the order itself, and the matcher never has to scan.
+    //
+    //  Key:   Keys::orderSequence(order.id)
+    //  Value: 8-byte LE sequence
+    //
+    //  This is strictly a book concern; it is written by
+    //  addToOrderBook and removed by removeFromOrderBook. It is not
+    //  visible to RPC or to the state codec.
+    //
+    //  Implementation lives below; this method reads the companion
+    //  key to recover the sequence, then deletes both the book row
+    //  and the companion key.
+
+    Crypto::Hash seq_key = Keys::orderSequence(order.id);
+    auto seq_bytes = smt_.get(seq_key);
+    if (!seq_bytes.has_value() || seq_bytes->size() != 8)
+      return; // no book row was ever written, or it was already removed
+
+    const uint64_t sequence = Common::readU64(seq_bytes->data());
+
+    const Crypto::Hash pair_key =
+        Core::OrderBook::pairKey(order.sell_token, order.buy_token);
+    const uint8_t side = Core::OrderBook::sideOf(order);
+
+    uint64_t canonical_price = 0;
+    if (!Core::OrderBook::canonicalPrice(order, canonical_price))
+      return;
+
+    uint8_t key[49];
+    encodeBookKey(pair_key, side, canonical_price, sequence, key);
+
+    deleteRow(StateDB::TBL_INDEX_ORDER_BOOK, key, sizeof(key));
+
+    //  Remove the companion key in the same call. releaseReadTxnIfHeld
+    //  is called by deleteRow; the subsequent SMT remove re-acquires
+    //  a read txn transparently if needed.
+    releaseReadTxnIfHeld();
+    smt_.remove(seq_key, version_);
+  }
+
+  void StateAccess::forEachBookLevel(
+      Id sell_token, Id buy_token, uint8_t side,
+      const std::function<void(Id order_id,
+                               uint64_t canonical_price,
+                               uint64_t sequence)> &fn) const
+  {
+    const Crypto::Hash pair_key =
+        Core::OrderBook::pairKey(sell_token, buy_token);
+
+    uint8_t prefix[33];
+    std::memcpy(prefix, pair_key.data.data(), 32);
+    prefix[32] = side;
+
+    std::vector<uint8_t> prefix_vec(prefix, prefix + sizeof(prefix));
+
+    auto visitor = [&fn](const std::vector<uint8_t> &key,
+                         const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != 49 || value.size() != 8)
+        return true;
+
+      uint64_t price = 0;
+      uint64_t seq = 0;
+      decodeBookKey(key.data(), price, seq);
+
+      const uint64_t order_id = Common::readU64(value.data());
+      fn(static_cast<Id>(order_id), price, seq);
+      return true;
+    };
+
+    readForEachWithPrefix(StateDB::TBL_INDEX_ORDER_BOOK,
+                          prefix_vec, visitor);
+  }
+
+  uint64_t StateAccess::nextOrderSequence()
+  {
+    uint64_t n = getGlobalU64("order:next_sequence");
+    ++n;
+    putGlobalU64("order:next_sequence", n);
+    return n;
+  }
+
+  void StateAccess::refundOrder(const Core::Order &order, bool charge_fee)
+  {
+    if (order.id == INVALID_ID)
+      return;
+    if (order.owner.isNull())
+      return;
+
+    const uint64_t remaining = order.remainingAmount();
+    if (remaining == 0)
+      return;
+
+    uint64_t refund = remaining;
+    if (charge_fee)
+    {
+      if (refund > Core::ORDER_CANCEL_FEE_ATOMIC)
+        refund -= Core::ORDER_CANCEL_FEE_ATOMIC;
+      else
+        refund = 0;
+    }
+
+    //  Credit the sell token back to the owner. The sell token is
+    //  the asset the order locked at creation.
+    if (order.sell_token == NATIVE_TOKEN_ID)
+    {
+      Core::Account acct = getAccount(order.owner);
+      acct.balance += refund;
+      putAccount(order.owner, acct);
+    }
+    else
+    {
+      const uint64_t cur = getTokenBalance(order.owner, order.sell_token);
+      putTokenBalance(order.owner, order.sell_token, cur + refund);
+    }
+
+    //  Remove from the expiry index. removeOrderExpiry is idempotent.
+    if (order.order_expires_at_height != 0)
+      removeOrderExpiry(order.order_expires_at_height, order.id);
+
+    //  Remove from the book. Only the matcher's self-trade path
+    //  calls refundOrder on a currently-resting order; the condition
+    //  evaluator's cancellations go through deleteOrder, which does
+    //  not touch the book because the evaluator's orders may or may
+    //  not be resting. To keep this helper safe from both callers,
+    //  we remove the book row unconditionally — removeFromOrderBook
+    //  is a no-op when no companion sequence key is present.
+    removeFromOrderBook(order);
+
+    //  Finally, drop the order record and its state mirror indexes.
+    deleteOrder(order.id);
+  }
+
+  // ===========================================================================
   //  Order expiry index
   // ===========================================================================
 
@@ -1299,6 +1609,223 @@ namespace State
     smt_.remove(key, version_);
   }
 
+  void StateAccess::deleteRestingOrder(const Core::Order &order)
+  {
+    if (order.id == INVALID_ID)
+      return;
+
+    //  Book row and companion sequence key. No-op if the order
+    //  never rested (no companion key present).
+    removeFromOrderBook(order);
+
+    //  Expiry index. Zero means the order was created with
+    //  "never expires" and was never indexed; skip.
+    if (order.order_expires_at_height != 0)
+      removeOrderExpiry(order.order_expires_at_height, order.id);
+
+    //  SMT record + owner index + pair index + pool index.
+    deleteOrder(order.id);
+  }
+
+  void StateAccess::indexFill(const Core::Fill &fill,
+                              uint64_t height,
+                              uint32_t tx_index_in_block,
+                              uint16_t fill_index)
+  {
+    const auto bytes = fill.serializeState();
+
+    //  Pair view.
+    const Crypto::Hash pair_key =
+        Core::OrderBook::pairKey(fill.base_token, fill.quote_token);
+
+    uint8_t pair_key_bytes[47];
+    encodePairFillKey(pair_key, height, tx_index_in_block,
+                      fill_index, pair_key_bytes);
+
+    putBlobRow(StateDB::TBL_FILL_HISTORY,
+               pair_key_bytes, sizeof(pair_key_bytes),
+               bytes.data(), bytes.size());
+
+    //  Order view — one row per side.
+    uint8_t maker_key[23];
+    encodeOrderFillKey(fill.maker_order_id, height, tx_index_in_block,
+                       fill_index, maker_key);
+    putBlobRow(StateDB::TBL_FILL_HISTORY,
+               maker_key, sizeof(maker_key),
+               bytes.data(), bytes.size());
+
+    uint8_t taker_key[23];
+    encodeOrderFillKey(fill.taker_order_id, height, tx_index_in_block,
+                       fill_index, taker_key);
+    putBlobRow(StateDB::TBL_FILL_HISTORY,
+               taker_key, sizeof(taker_key),
+               bytes.data(), bytes.size());
+  }
+
+  void StateAccess::forEachRecentFillForPair(
+      uint32_t base_token,
+      uint32_t quote_token,
+      size_t max_results,
+      const std::function<void(const Core::Fill &,
+                               uint64_t,
+                               uint32_t)> &fn) const
+  {
+    //  Prefix = tag(0x01) || pair_key. 33 bytes.
+    const Crypto::Hash pair_key = Core::OrderBook::pairKey(base_token, quote_token);
+
+    uint8_t prefix_bytes[33];
+    prefix_bytes[0] = 0x01;
+    std::memcpy(prefix_bytes + 1, pair_key.data.data(), 32);
+    std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + sizeof(prefix_bytes));
+
+    size_t emitted = 0;
+
+    auto visitor = [&](const std::vector<uint8_t> &key,
+                       const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != 47 || value.size() != Core::Fill::STATE_SIZE)
+        return true;
+      if (emitted >= max_results)
+        return false;
+
+      //  key[33..41) is height BE, key[41..45) is tx_index BE.
+      const uint64_t height = Common::readU64BE(key.data() + 33);
+      const uint32_t tx_index = Common::readU32BE(key.data() + 41);
+
+      Core::Fill f;
+      if (!Core::Fill::deserializeState(value.data(), value.size(), f))
+        return true;
+
+      fn(f, height, tx_index);
+      ++emitted;
+      return true;
+    };
+
+    readForEachWithPrefixReverse(StateDB::TBL_FILL_HISTORY,
+                                 prefix, visitor);
+  }
+
+  void StateAccess::forEachRecentFillForOrder(
+      uint64_t order_id,
+      size_t max_results,
+      const std::function<void(const Core::Fill &,
+                               uint64_t,
+                               uint32_t)> &fn) const
+  {
+    uint8_t prefix_bytes[9];
+    prefix_bytes[0] = 0x02;
+    for (int i = 0; i < 8; ++i)
+      prefix_bytes[1 + i] = uint8_t(order_id >> ((7 - i) * 8));
+    std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + sizeof(prefix_bytes));
+
+    size_t emitted = 0;
+
+    auto visitor = [&](const std::vector<uint8_t> &key,
+                       const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != 23 || value.size() != Core::Fill::STATE_SIZE)
+        return true;
+      if (emitted >= max_results)
+        return false;
+
+      const uint64_t height = Common::readU64BE(key.data() + 9);
+      const uint32_t tx_index = Common::readU32BE(key.data() + 17);
+
+      Core::Fill f;
+      if (!Core::Fill::deserializeState(value.data(), value.size(), f))
+        return true;
+
+      fn(f, height, tx_index);
+      ++emitted;
+      return true;
+    };
+
+    readForEachWithPrefixReverse(StateDB::TBL_FILL_HISTORY,
+                                 prefix, visitor);
+  }
+
+  void StateAccess::snapshotBookSide(
+      Id sell_token,
+      Id buy_token,
+      uint8_t side,
+      size_t depth,
+      const std::function<void(uint64_t, uint64_t, size_t)> &fn) const
+  {
+    //  forEachBookLevel hands us (order_id, price, sequence) one
+    //  order at a time, best-first. We aggregate consecutive
+    //  orders at the same price and invoke the callback once per
+    //  level. Depth 0 means "all"; a nonzero depth stops after
+    //  that many levels have been emitted.
+    //
+    //  We need each order's remaining base quantity, which means
+    //  a getOrder per row. This method is for RPC read paths,
+    //  not for the matcher's hot loop.
+
+    uint64_t current_price = 0;
+    uint64_t current_total_base = 0;
+    size_t current_count = 0;
+    size_t emitted_levels = 0;
+    bool have_level = false;
+
+    auto flush = [&]() -> bool
+    {
+      if (!have_level)
+        return true;
+      fn(current_price, current_total_base, current_count);
+      ++emitted_levels;
+      have_level = false;
+      current_total_base = 0;
+      current_count = 0;
+      return depth == 0 || emitted_levels < depth;
+    };
+
+    bool keep_going = true;
+
+    forEachBookLevel(
+        sell_token, buy_token, side,
+        [&](Id order_id, uint64_t price, uint64_t) -> bool
+        {
+          if (!keep_going)
+            return false;
+
+          if (have_level && price != current_price)
+          {
+            keep_going = flush();
+            if (!keep_going)
+              return false;
+          }
+
+          Core::Order o;
+          if (!getOrder(order_id, o))
+            return true; // stale index row; skip
+
+          //  Convert the order's remaining amount into base units.
+          //  If the order sells base, its remaining is already in
+          //  base. If it sells quote, convert at the execution
+          //  price (the order's canonical price).
+          const bool sells_base = (o.sell_token < o.buy_token);
+          uint64_t rem = o.remainingAmount();
+          if (!sells_base)
+          {
+            //  rem is quote. base = rem * SCALE / price.
+            const unsigned __int128 prod =
+                static_cast<unsigned __int128>(rem) *
+                static_cast<unsigned __int128>(Core::OrderBook::BOOK_PRICE_SCALE);
+            rem = static_cast<uint64_t>(prod / price);
+          }
+
+          current_price = price;
+          current_total_base += rem;
+          current_count += 1;
+          have_level = true;
+
+          return true;
+        });
+
+    if (keep_going)
+      flush();
+  }
+  
   // ===========================================================================
   //  AMM Pools
   // ===========================================================================
@@ -1882,6 +2409,18 @@ namespace State
   size_t StateAccess::tableEntryCount(uint32_t table_id) const
   {
     return readTableCount(table_id);
+  }
+
+  bool StateAccess::getMeta(const std::string &key,
+                            std::vector<uint8_t> &out) const
+  {
+    return getMetaImpl(key, out);
+  }
+
+  void StateAccess::putMeta(const std::string &key,
+                            const std::vector<uint8_t> &value)
+  {
+    putMetaImpl(key, value);
   }
 
 } // namespace State

@@ -17,6 +17,7 @@ namespace Tests
     static State::StateDB &stateDb(Node::Node &n) { return *n.state_db_; }
     static Consensus::BftConsensus *consensus(Node::Node &n) { return n.consensus_.get(); }
     static P2P::P2PManager *p2p(Node::Node &n) { return n.p2p_.get(); }
+    static Consensus::Dependencies buildConsensusDeps(Node::Node &n) { return n.buildConsensusDeps(); }
 
     // True if consensus has been started on this node. Used by
     // tests that need to know when the node has enough peers to

@@ -1462,18 +1462,19 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    // Payload layout:
-    //   [4]  buy_token
-    //   [8]  min_buy_amount
-    //   [1]  mode
-    //   [8]  expires_at_height
-    //   [1]  condition_count
-    //   [N]  conditions (13 bytes each)
-    if (tx.payload.size() < 22)
+    //  Structural validation. This is the same check the mempool
+    //  runs on admission, applied again here so a block built from
+    //  an unvalidated source cannot smuggle a malformed order into
+    //  state.
+    if (!validateCreateOrderStructure(tx))
       return failure;
 
+    //  Re-parse the payload now that we know it is well-formed.
     size_t off = 0;
-    uint32_t buy_token = uint32_t(tx.payload[off]) | (uint32_t(tx.payload[off + 1]) << 8) | (uint32_t(tx.payload[off + 2]) << 16) | (uint32_t(tx.payload[off + 3]) << 24);
+    uint32_t buy_token = uint32_t(tx.payload[off]) |
+                         (uint32_t(tx.payload[off + 1]) << 8) |
+                         (uint32_t(tx.payload[off + 2]) << 16) |
+                         (uint32_t(tx.payload[off + 3]) << 24);
     off += 4;
 
     uint64_t min_buy_amount = 0;
@@ -1490,36 +1491,34 @@ namespace Core
 
     uint8_t condition_count = tx.payload[off++];
 
-    if (condition_count > ORDER_MAX_CONDITIONS)
-      return failure;
-
-    // Load conditions.
     OrderCondition conditions[ORDER_MAX_CONDITIONS]{};
     for (uint8_t i = 0; i < condition_count; ++i)
     {
-      if (!OrderCondition::deserializeState(
-              tx.payload.data(), tx.payload.size(), off, conditions[i]))
-      {
-        return failure;
-      }
+      OrderCondition::deserializeState(
+          tx.payload.data(), tx.payload.size(), off, conditions[i]);
     }
 
-    // Lock the sell amount in the order (held by the pool).
     Id sell_token = tx.token_id;
     uint64_t sell_amount = tx.amount;
 
-    // Build the order struct and validate BEFORE locking funds.
-    // Allocate a new order ID.
+    //  Allocate the order ID.
     std::vector<uint8_t> id_bytes;
     state.getGlobal("next_order_id", id_bytes);
-    uint64_t next_id = 1;
-    for (int i = 0; i < 8 && i < (int)id_bytes.size(); ++i)
-    {
-      next_id |= uint64_t(id_bytes[i]) << (i * 8);
-    }
-    if (id_bytes.empty())
-      next_id = 1;
 
+    uint64_t next_id = 0;
+    if (id_bytes.empty())
+    {
+      next_id = 1;
+    }
+    else
+    {
+      for (int i = 0; i < 8 && i < (int)id_bytes.size(); ++i)
+      {
+        next_id |= uint64_t(id_bytes[i]) << (i * 8);
+      }
+    }
+
+    //  Build the order record.
     Order order;
     order.id = next_id;
     order.owner = tx.from;
@@ -1540,7 +1539,8 @@ namespace Core
     if (!order.isValid())
       return failure;
 
-    // Check the balance BEFORE deducting.
+    //  Balance check. All other structural checks have already
+    //  passed in validateCreateOrderStructure.
     if (sell_token == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1554,8 +1554,10 @@ namespace Core
         return failure;
     }
 
-    // ---- All checks passed. Apply state changes. ----
+    //  ---- All checks passed. Apply state changes. ----
 
+    //  Take the sell-token lock. The matcher's precondition is
+    //  that the lock is in place before it runs.
     if (sell_token == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1568,24 +1570,41 @@ namespace Core
       state.putTokenBalance(tx.from, sell_token, bal - sell_amount);
     }
 
+    //  Persist the record. The matcher may overwrite or delete it.
     state.putOrder(order);
 
-    // Add to the expiry index. An expiry height of zero means "never
-    // expires", which is a valid state — such orders are not indexed
-    // and are only removed by explicit CancelOrder.
-    if (expires_at_height != 0)
+    //  Match Passive orders.
+    std::vector<Fill> fills;
+
+    if (order.mode == OrderExecutionMode::Passive)
+    {
+      MatchOutcome outcome = matchPassiveOrder(
+          state, order, ctx.current_height, ctx.tx_index_in_block);
+      fills = std::move(outcome.fills);
+    }
+
+    //  Expiry index. Only if the order still exists after matching.
+    //  A taker fully filled by the matcher was deleted by it, and
+    //  indexing a deleted order would leave an expiry row pointing
+    //  at nothing.
+    Order still_exists;
+    if (state.getOrder(order.id, still_exists) &&
+        expires_at_height != 0)
     {
       state.addOrderExpiry(expires_at_height, order.id);
     }
 
-    // Bump next order ID.
+    //  Bump the next-order-id counter.
     uint64_t new_next = next_id + 1;
     std::vector<uint8_t> new_id_bytes(8);
     for (int i = 0; i < 8; ++i)
       new_id_bytes[i] = uint8_t(new_next >> (i * 8));
     state.putGlobal("next_order_id", new_id_bytes);
 
-    return {ReceiptStatus::Success, tx.fee};
+    //  Receipt with fills.
+    Receipt receipt{ReceiptStatus::Success, tx.fee};
+    receipt.fills = std::move(fills);
+    return receipt;
   }
 
   //  Cancel Order
@@ -1596,7 +1615,6 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    // Payload: [8] order_id
     if (tx.payload.size() < 8)
       return failure;
 
@@ -1610,7 +1628,7 @@ namespace Core
     if (order.owner != tx.from)
       return failure;
 
-    // Refund any remaining sell amount.
+    //  Refund the remaining sell amount.
     uint64_t refund = order.remainingAmount();
     if (refund > 0)
     {
@@ -1627,14 +1645,9 @@ namespace Core
       }
     }
 
-    // Remove from the expiry index. Only indexed orders were added
-    // with a non-zero expiry height.
-    if (order.order_expires_at_height != 0)
-    {
-      state.removeOrderExpiry(order.order_expires_at_height, order_id);
-    }
-
-    state.deleteOrder(order_id);
+    //  Single call removes the book row, the companion sequence
+    //  key, the expiry entry, the SMT record, and every index row.
+    state.deleteRestingOrder(order);
 
     return {ReceiptStatus::Success, tx.fee};
   }
@@ -1705,5 +1718,85 @@ namespace Core
     }
 
     return {ReceiptStatus::Success, 0};
+  }
+
+  bool TransactionExecutor::activeOrdersEnabled()
+  {
+    //  Toggle to true when MatchingEngine's AMM routing lands.
+    return false;
+  }
+
+  bool TransactionExecutor::validateCreateOrderStructure(const Transaction &tx)
+  {
+    if (tx.payload.size() < 22)
+      return false;
+
+    size_t off = 0;
+    uint32_t buy_token = uint32_t(tx.payload[off]) |
+                         (uint32_t(tx.payload[off + 1]) << 8) |
+                         (uint32_t(tx.payload[off + 2]) << 16) |
+                         (uint32_t(tx.payload[off + 3]) << 24);
+    off += 4;
+
+    uint64_t min_buy_amount = 0;
+    for (int i = 0; i < 8; ++i)
+      min_buy_amount |= uint64_t(tx.payload[off + i]) << (i * 8);
+    off += 8;
+
+    uint8_t mode = tx.payload[off++];
+
+    uint64_t expires_at_height = 0;
+    for (int i = 0; i < 8; ++i)
+      expires_at_height |= uint64_t(tx.payload[off + i]) << (i * 8);
+    off += 8;
+
+    uint8_t condition_count = tx.payload[off++];
+
+    if (condition_count > ORDER_MAX_CONDITIONS)
+      return false;
+
+    if (mode != static_cast<uint8_t>(OrderExecutionMode::Passive) &&
+        mode != static_cast<uint8_t>(OrderExecutionMode::Active))
+      return false;
+
+    if (mode == static_cast<uint8_t>(OrderExecutionMode::Active) &&
+        !activeOrdersEnabled())
+      return false;
+
+    OrderCondition conditions[ORDER_MAX_CONDITIONS]{};
+    for (uint8_t i = 0; i < condition_count; ++i)
+    {
+      if (!OrderCondition::deserializeState(
+              tx.payload.data(), tx.payload.size(), off, conditions[i]))
+      {
+        return false;
+      }
+    }
+
+    //  Cheap structural checks that mirror Order::isValid without
+    //  needing a full Order record.
+    if (tx.token_id == buy_token)
+      return false;
+    if (tx.amount == 0)
+      return false;
+    if (min_buy_amount == 0)
+      return false;
+
+    //  Overflow guard: an order whose canonical price cannot fit in
+    //  u64 cannot enter the book, so reject it up front rather than
+    //  creating a lock the matcher will never release.
+    if (mode == static_cast<uint8_t>(OrderExecutionMode::Passive))
+    {
+      Order probe;
+      probe.sell_token = tx.token_id;
+      probe.buy_token = buy_token;
+      probe.sell_amount = tx.amount;
+      probe.min_buy_amount = min_buy_amount;
+      uint64_t canonical_price = 0;
+      if (!OrderBook::canonicalPrice(probe, canonical_price))
+        return false;
+    }
+
+    return true;
   }
 } // namespace Core

@@ -13,6 +13,11 @@
 
 #include "TransactionBuilder.h"
 #include "Utils.h"
+#include "Tests/Temp.h"
+
+using namespace Core;
+using namespace State;
+using namespace Tests;
 
 namespace Tests
 {
@@ -333,18 +338,28 @@ namespace Tests
 
       for (size_t i = 0; i < receipts.size(); ++i)
       {
+        //  Leaf layout matches BlockProcessor::verifyReceiptsRoot:
+        //    "rcpt" || txid(32) || Receipt::serializeState()
+        //
+        //  Receipt::serializeState() is
+        //    status(1) || fee_paid(8 LE) || fill_count(4 LE) || fills
+        //
+        //  A receipt with no fills therefore contributes four extra
+        //  zero bytes compared to the pre-fill layout. That is the
+        //  change that made every block test fail the receipts_root
+        //  check until this helper was updated to match.
+        const auto receipt_bytes = receipts[i].serializeState();
+
         std::vector<uint8_t> buf;
-        buf.reserve(4 + 32 + 1 + 8);
+        buf.reserve(4 + 32 + receipt_bytes.size());
         buf.push_back('r');
         buf.push_back('c');
         buf.push_back('p');
         buf.push_back('t');
+
         const auto &th = tx_hashes[i];
         buf.insert(buf.end(), th.data.begin(), th.data.end());
-        buf.push_back(static_cast<uint8_t>(receipts[i].status));
-        uint64_t fee = receipts[i].fee_paid;
-        for (int j = 0; j < 8; ++j)
-          buf.push_back(uint8_t(fee >> (j * 8)));
+        buf.insert(buf.end(), receipt_bytes.begin(), receipt_bytes.end());
 
         Crypto::Hash h;
         Crypto::blake2b(buf.data(), buf.size(), h.data.data(), 32);
@@ -354,7 +369,7 @@ namespace Tests
       return Core::computeMerkleRoot(leaves);
     }
 
-    // ---- Transaction helper ----
+    // ---- Transaction helpers ----
 
     Core::Transaction makeSignedTransfer(const Crypto::KeyPair &from,
                                          const Crypto::Address &to,
@@ -370,6 +385,82 @@ namespace Tests
           .fee(fee)
           .nonce(nonce)
           .chainId(genesis_config_.chain_id)
+          .build();
+    }
+
+    //  Build the payload bytes for a CreateOrder transaction.
+    //
+    //  Layout, matching TransactionExecutor::validateCreateOrderStructure
+    //  and executeCreateOrder:
+    //
+    //    [4]  buy_token (LE)
+    //    [8]  min_buy_amount (LE)
+    //    [1]  mode
+    //    [8]  expires_at_height (LE)
+    //    [1]  condition_count
+    //    [N]  conditions (13 bytes each)
+    //
+    //  This helper is intentionally separate from makeSignedCreateOrder
+    //  so a test that wants to inspect or corrupt the payload can build
+    //  it without building a full transaction.
+    static std::vector<uint8_t> encodeCreateOrderPayload(
+        Id buy_token,
+        uint64_t min_buy_amount,
+        Core::OrderExecutionMode mode,
+        uint64_t expires_at_height)
+    {
+      std::vector<uint8_t> payload;
+      payload.reserve(22);
+
+      //  buy_token, u32 LE
+      payload.push_back(uint8_t(buy_token));
+      payload.push_back(uint8_t(buy_token >> 8));
+      payload.push_back(uint8_t(buy_token >> 16));
+      payload.push_back(uint8_t(buy_token >> 24));
+
+      //  min_buy_amount, u64 LE
+      for (int i = 0; i < 8; ++i)
+        payload.push_back(uint8_t(min_buy_amount >> (i * 8)));
+
+      //  mode, u8
+      payload.push_back(static_cast<uint8_t>(mode));
+
+      //  expires_at_height, u64 LE
+      for (int i = 0; i < 8; ++i)
+        payload.push_back(uint8_t(expires_at_height >> (i * 8)));
+
+      //  condition_count, u8
+      payload.push_back(0);
+
+      return payload;
+    }
+
+    //  Build a signed CreateOrder transaction.
+    //
+    //  Parameter order mirrors the fields a caller usually thinks
+    //  about: who is selling, what they are selling, for what, and
+    //  under what conditions. The two token ids are named by the
+    //  order's own frame (sell_token, buy_token), not the canonical
+    //  pair frame; the executor handles the canonicalization.
+    Core::Transaction makeSignedCreateOrder(
+        const Crypto::KeyPair &from,
+        Id sell_token, uint64_t sell_amount,
+        Id buy_token, uint64_t min_buy_amount,
+        Core::OrderExecutionMode mode,
+        uint64_t expires_at_height,
+        uint64_t nonce)
+    {
+      return TransactionBuilder()
+          .type(Core::TxType::CreateOrder)
+          .from(from)
+          .to(Crypto::Address{})
+          .amount(sell_amount)
+          .fee(1)
+          .nonce(nonce)
+          .tokenId(sell_token)
+          .chainId(genesis_config_.chain_id)
+          .payload(encodeCreateOrderPayload(
+              buy_token, min_buy_amount, mode, expires_at_height))
           .build();
     }
 
@@ -751,6 +842,92 @@ namespace Tests
                                /*is_seed=*/false, /*is_active=*/false);
     }
 
+    //  Build a block for the two matching-engine tests. Runs a
+    //  dry-run simulation to fill in the header's state_root and
+    //  receipts_root, then re-signs so the quorum signatures cover
+    //  the final header. The resulting block has a well-formed
+    //  header and roots that match what the non-dry-run apply path
+    //  will compute.
+    Core::Block buildSignedBlockForTest(
+        uint64_t height,
+        const Crypto::Hash &parent,
+        const std::vector<Core::Transaction> &txs,
+        const std::vector<Id> &active_set)
+    {
+      Core::Block block;
+      block.header.version = GlobalConfig::CURRENT_BLOCK_VERSION;
+      block.header.chain_id = genesis_config_.chain_id;
+      block.header.height = height;
+      block.header.parent_hash = parent;
+      block.header.timestamp_ms = 1'700'000'000'000ULL + height * 1000;
+      block.header.proposer =
+          active_set.empty() ? Crypto::Address{}
+                             : validatorAddress(active_set[0]);
+      block.header.epoch = height / Core::ROTATION_INTERVAL;
+      block.header.rotation_index = height / Core::ROTATION_INTERVAL;
+      block.header.commit_round = 0;
+      block.header.emergency_rotation = 0;
+      block.header.tx_root = computeTxRoot(txs);
+      block.header.validator_set_root =
+          Core::computeValidatorSetRoot(active_set);
+      block.header.total_fees = 0;
+      for (const auto &tx : txs)
+      {
+        if (!isSystemTx(tx.tx_type))
+          block.header.total_fees += tx.fee;
+      }
+      block.header.tx_count = static_cast<uint32_t>(txs.size());
+      block.header.active_validator_count =
+          static_cast<uint32_t>(active_set.size());
+
+      block.transactions = txs;
+      block.participants = active_set;
+
+      //  Non-null placeholder roots so isWellFormed passes during
+      //  simulation. They are overwritten below with the values the
+      //  dry-run actually computes.
+      block.header.state_root.data[0] = 0x01;
+
+      //  Sign with the placeholder roots so the block hash is
+      //  well-defined for the simulation. The signature is
+      //  provisional and is replaced after the real roots are
+      //  written in.
+      block.quorum_signatures =
+          makeQuorumForBlock(block, quorumKeysFor(active_set));
+
+      //  Dry-run to compute the real roots. Aborts; nothing persists.
+      {
+        auto txn = db_->beginWrite();
+        State::StateAccess st(*db_, txn, 0);
+
+        Core::BlockContext ctx = makeContext(height, /*dry_run=*/true);
+        Core::BlockResult r =
+            Core::BlockProcessor::applyBlock(st, block, ctx);
+
+        EXPECT_TRUE(r.valid) << "dry-run failed: " << r.error;
+
+        block.header.state_root = r.new_state_root;
+
+        if (!r.tx_hashes.empty())
+        {
+          block.header.receipts_root =
+              computeReceiptsRootForTest(r.tx_hashes, r.receipts);
+        }
+        else
+        {
+          block.header.receipts_root = Crypto::Hash{};
+        }
+
+        txn.abort();
+      }
+
+      //  Re-sign: both roots are part of the block hash.
+      block.quorum_signatures =
+          makeQuorumForBlock(block, quorumKeysFor(active_set));
+
+      return block;
+    }
+
     // ---- Members ----
 
     std::filesystem::path test_dir_;
@@ -1056,5 +1233,191 @@ namespace Tests
     Crypto::KeyPair alice_;
     Crypto::KeyPair bob_;
     Crypto::KeyPair carol_;
+  };
+
+  //  Member order matters: temp_ is declared first so it is
+  //  destroyed last. state_ and txn_ must be destroyed before
+  //  temp_'s destructor closes the DB, because StateAccess holds
+  //  a StateDB::ReadTxn and a reference to txn_, and Txn holds a
+  //  live MDBX_txn. If temp_ were declared last, its destructor
+  //  would run first and close the env out from under the other
+  //  two, which aborts inside MDBX.
+
+  class Core_MatchingEngineTest : public testing::Test
+  {
+  protected:
+    void SetUp() override
+    {
+      txn_ = std::make_unique<StateDB::Txn>(temp_.db().beginWrite());
+      state_ = std::make_unique<StateAccess>(
+          temp_.db(), *txn_, /*version=*/1);
+
+      alice_ = makeAddress(0xA1);
+      bob_ = makeAddress(0xB0);
+      carol_ = makeAddress(0xC0);
+      dave_ = makeAddress(0xD0);
+
+      //  Fund both sides. Native CLRTY (id 0) lives in
+      //  Account.balance; token 1 and token 2 live in the
+      //  token-balance table.
+      Account a;
+      a.balance = 1'000'000;
+      state_->putAccount(alice_, a);
+
+      Account b;
+      b.balance = 1'000'000;
+      state_->putAccount(bob_, b);
+
+      Account c;
+      c.balance = 1'000'000;
+      state_->putAccount(carol_, c);
+
+      Account d;
+      d.balance = 1'000'000;
+      state_->putAccount(dave_, d);
+
+      //  Two tokens. Token 1 is the pair's base (lower id),
+      //  token 2 is the quote (higher id).
+      TokenInfo t1;
+      t1.id = 1;
+      t1.symbol = "T1";
+      t1.decimals = 8;
+      t1.maxSupply = 0;
+      state_->putToken(t1);
+
+      TokenInfo t2;
+      t2.id = 2;
+      t2.symbol = "T2";
+      t2.decimals = 8;
+      t2.maxSupply = 0;
+      state_->putToken(t2);
+
+      state_->putTokenBalance(alice_, 1, 1'000'000);
+      state_->putTokenBalance(bob_, 1, 1'000'000);
+      state_->putTokenBalance(carol_, 1, 1'000'000);
+      state_->putTokenBalance(dave_, 1, 1'000'000);
+
+      state_->putTokenBalance(alice_, 2, 1'000'000);
+      state_->putTokenBalance(bob_, 2, 1'000'000);
+      state_->putTokenBalance(carol_, 2, 1'000'000);
+      state_->putTokenBalance(dave_, 2, 1'000'000);
+
+      //  Seed the sequence counter so the first test order gets
+      //  sequence 1 and the second gets 2. Without an explicit
+      //  seed, nextOrderSequence() reads 0 from a missing global
+      //  and returns 1 on the first call; either way the tests
+      //  below do not depend on the absolute value, only on the
+      //  ordering, so leaving this comment is enough.
+    }
+
+    void TearDown() override
+    {
+      //  Destroy the txn-bound StateAccess first, so its
+      //  ReadTxn (if any) is released. Then abort the txn if it is
+      //  still open. Txn's destructor would abort anyway, but
+      //  being explicit means a test failure inside a test body
+      //  cannot leave a half-committed txn behind that confuses
+      //  the next test.
+      state_.reset();
+
+      if (txn_ && txn_->isOpen())
+        txn_->abort();
+      txn_.reset();
+
+      //  temp_ goes out of scope last and cleans up the DB
+      //  directory. Its destructor calls db_->close() and
+      //  remove_all(path_).
+    }
+
+    //  Build a Passive order. The caller is responsible for
+    //  charging the sell-token lock separately when the test
+    //  needs the lock to have been taken (which is what the real
+    //  TransactionExecutor does before calling the matcher).
+    Order makeOrder(Id id, const Crypto::Address &owner,
+                    uint32_t sell, uint32_t buy,
+                    uint64_t sell_amount, uint64_t min_buy_amount)
+    {
+      Order o;
+      o.id = id;
+      o.owner = owner;
+      o.mode = OrderExecutionMode::Passive;
+      o.sell_token = sell;
+      o.buy_token = buy;
+      o.sell_amount = sell_amount;
+      o.min_buy_amount = min_buy_amount;
+      o.created_at_height = 1;
+      o.order_expires_at_height = 0;
+      o.filled_amount = 0;
+      o.condition_count = 0;
+      return o;
+    }
+
+    //  Place a resting maker: persist the record, allocate a
+    //  sequence, add to the book. Mirrors what TransactionExecutor
+    //  does for a Passive order that did not cross.
+    void restOrder(Order &o)
+    {
+      state_->putOrder(o);
+      const uint64_t seq = state_->nextOrderSequence();
+      state_->addToOrderBook(o, seq);
+    }
+
+    //  Debit the sell-token lock, mirroring TransactionExecutor's
+    //  lock step. Tests that care about balance invariants call
+    //  this; tests that only care about book mechanics can skip it.
+    void lockSellToken(const Crypto::Address &owner,
+                       uint32_t sell_token,
+                       uint64_t amount)
+    {
+      if (sell_token == NATIVE_TOKEN_ID)
+      {
+        Account a = state_->getAccount(owner);
+        a.balance -= amount;
+        state_->putAccount(owner, a);
+      }
+      else
+      {
+        const uint64_t cur = state_->getTokenBalance(owner, sell_token);
+        state_->putTokenBalance(owner, sell_token, cur - amount);
+      }
+    }
+
+    //  Sum of spendable + locked across all four accounts and both
+    //  tokens. Used to assert the supply invariant after every
+    //  fill. The test fixtures never mint or burn mid-test, so this
+    //  is constant modulo fees, and the matcher charges no fee on a
+    //  fill (only on cancellation).
+    uint64_t totalSupply() const
+    {
+      uint64_t sum = 0;
+
+      for (const auto &addr : {alice_, bob_, carol_, dave_})
+      {
+        //  Native
+        sum += state_->getAccount(addr).balance;
+
+        //  Tokens 1 and 2
+        sum += state_->getTokenBalance(addr, 1);
+        sum += state_->getTokenBalance(addr, 2);
+      }
+
+      //  Locked amounts live on the order records themselves.
+      //  Every open order has (sell_amount - filled_amount) of its
+      //  sell token still locked.
+      state_->forEachOrder([&](const Order &o)
+                           { sum += o.remainingAmount(); });
+
+      return sum;
+    }
+
+    //  Member order is load-bearing. Do not reorder.
+    TempDB temp_;
+    std::unique_ptr<StateDB::Txn> txn_;
+    std::unique_ptr<StateAccess> state_;
+
+    Crypto::Address alice_;
+    Crypto::Address bob_;
+    Crypto::Address carol_;
+    Crypto::Address dave_;
   };
 }

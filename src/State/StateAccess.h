@@ -37,6 +37,13 @@ namespace State
     // The txn is NOT owned by StateAccess. Caller commits or aborts.
     StateAccess(StateDB &db, StateDB::Txn &txn, uint64_t version);
 
+    //  Generic byte-blob access to the meta table. Meta values do
+    //  not participate in the state root; they are node-local
+    //  aggregation and configuration. Use these for values that
+    //  cannot be expressed as a uint64.
+    bool getMeta(const std::string &key, std::vector<uint8_t> &out) const;
+    void putMeta(const std::string &key, const std::vector<uint8_t> &value);
+
     // =================================================================
     //  Accounts
     // =================================================================
@@ -149,6 +156,155 @@ namespace State
     void forEachOrderForPair(
         Id sell_token, Id buy_token,
         const std::function<void(const Core::Order &)> &fn) const;
+
+    // =================================================================
+    //  Order book (placement index)
+    //
+    //  The book index is pair-symmetric and price-sorted. It is the
+    //  structure the matching engine iterates; it is not a mirror of
+    //  the order record and it is not touched by putOrder/deleteOrder.
+    //
+    //  Write discipline:
+    //    addToOrderBook      once, when an order first rests
+    //    removeFromOrderBook once, when an order leaves the book
+    //    (fill, cancel, expiry, or condition failure)
+    //
+    //  A partial fill does NOT call either. The order's price and
+    //  sequence are unchanged by a fill, so the book row stays put;
+    //  the next getOrder at that order_id returns the updated
+    //  filled_amount.
+    //
+    //  Both methods are idempotent against the txn: calling
+    //  addToOrderBook twice for the same order writes the same key
+    //  twice, and removeFromOrderBook for a nonexistent key is a
+    //  no-op. This matches the behavior of every other index helper
+    //  in this class.
+    // =================================================================
+
+    void addToOrderBook(const Core::Order &order, uint64_t sequence);
+    void removeFromOrderBook(const Core::Order &order);
+
+    //  Iterate one side of one pair's book, best price first.
+    //
+    //  The callback receives the order_id, the canonical price
+    //  (quote per base, scaled by Core::OrderBook::BOOK_PRICE_SCALE),
+    //  and the sequence. Return false to stop iteration early.
+    //
+    //  Ordering: ascending by ~price, then ascending by sequence.
+    //  Because the key stores ~price, ascending key order is
+    //  descending real price for side 0 (sellers want high prices,
+    //  so best = highest) and descending real price for side 1
+    //  (buyers want low prices, so best = lowest). The two sides
+    //  therefore both present best-first under a single forward
+    //  cursor walk. The matcher relies on this: it stops at the
+    //  first non-crossing order and never re-scans.
+    //
+    //  The callback must not write through the same txn: MDBX
+    //  invalidates a cursor on any write. The matcher's pattern is
+    //  to collect order_ids in this visitor, then process them in
+    //  a second loop. See Core/MatchingEngine.cpp.
+    void forEachBookLevel(
+        Id sell_token, Id buy_token, uint8_t side,
+        const std::function<void(Id order_id,
+                                 uint64_t canonical_price,
+                                 uint64_t sequence)> &fn) const;
+
+    //  Allocate the next order sequence. Reads the SMT global
+    //  "order:next_sequence", increments it, writes it back, and
+    //  returns the new value. Monotonic within a chain; the value
+    //  is part of the order's book key and is what makes price-time
+    //  priority deterministic across nodes.
+    //
+    //  This is an SMT write, not a TBL_META write. The block
+    //  processor's dry-run path aborts its transaction, so any
+    //  TBL_META write would be discarded there and re-issued
+    //  differently on the apply path — different sequences, different
+    //  book order, different state roots. Keeping the counter in the
+    //  SMT means both paths see the same value.
+    uint64_t nextOrderSequence();
+
+    //  Refund a cancelled order's remaining lock to its owner,
+    //  optionally charging ORDER_CANCEL_FEE_ATOMIC from the refund.
+    //  Clears the owner, pair, pool, and expiry indexes, removes the
+    //  order from the SMT, and removes it from the book. Does not
+    //  touch the book row directly — the caller is responsible for
+    //  knowing whether the order is currently resting.
+    //
+    //  This is the single refund path shared by the condition
+    //  evaluator and the matcher's self-trade cancellation. Any
+    //  change to the refund policy belongs here, not in the callers.
+    void refundOrder(const Core::Order &order, bool charge_fee);
+
+    //  Remove a resting order from the book and from the state
+    //  tables in one call. This is the single entry point every
+    //  cancel path should use; it does the three things a cancel
+    //  must do and nothing else:
+    //
+    //    1. removeFromOrderBook(order)  — book row + companion
+    //       sequence key.
+    //    2. removeOrderExpiry(...)      — if the order was indexed.
+    //    3. deleteOrder(order.id)       — SMT record, owner index,
+    //       pair index, pool index.
+    //
+    //  The caller is responsible for the *refund* (credit the
+    //  sell-token remainder back to the owner, minus any cancel
+    //  fee). Splitting the refund out means the matcher's
+    //  self-trade path can reuse refundOrder (which does refund +
+    //  delete) while the user-cancel path can refund explicitly
+    //  and then call deleteRestingOrder.
+    //
+    //  Passing the full Order (not just the id) is required: the
+    //  book row is keyed by (pair, side, price, sequence), and the
+    //  price is derivable only from the order's fields.
+    void deleteRestingOrder(const Core::Order &order);
+
+    //  Write the two fill-history rows for a single fill:
+    //  the pair-view row and the two order-view rows (maker and
+    //  taker). Called by the matching engine once per fill, inside
+    //  the block processor's write txn.
+    //
+    //  height and tx_index_in_block identify the transaction that
+    //  produced the fill. fill_index is the fill's position in the
+    //  taker's fill list (0-based). Together they form a unique
+    //  key, so two fills with identical maker/taker/price/qty
+    //  still get distinct rows.
+    void indexFill(const Core::Fill &fill,
+                   uint64_t height,
+                   uint32_t tx_index_in_block,
+                   uint16_t fill_index);
+
+    //  Newest-first fill history for a pair. Walks the pair view
+    //  in reverse, resolving each row to a Fill.
+    void forEachRecentFillForPair(
+        uint32_t base_token,
+        uint32_t quote_token,
+        size_t max_results,
+        const std::function<void(const Core::Fill &,
+                                 uint64_t height,
+                                 uint32_t tx_index_in_block)> &fn) const;
+
+    //  Newest-first fill history for an order (either side).
+    void forEachRecentFillForOrder(
+        uint64_t order_id,
+        size_t max_results,
+        const std::function<void(const Core::Fill &,
+                                 uint64_t height,
+                                 uint32_t tx_index_in_block)> &fn) const;
+
+    //  Snapshot the top-N levels of one side of the book. The
+    //  callback is invoked once per level in best-first order with
+    //  the aggregated quantity at that price. Depth 0 means "all".
+    //
+    //  Used by the RPC layer's getOrderBook. The matcher does not
+    //  use this; it iterates order-by-order via forEachBookLevel.
+    void snapshotBookSide(
+        Id sell_token,
+        Id buy_token,
+        uint8_t side,
+        size_t depth,
+        const std::function<void(uint64_t price,
+                                 uint64_t total_base,
+                                 size_t order_count)> &fn) const;
 
     //  Every order whose conditions reference the given AMM pool.
     //  Uses TBL_INDEX_ORDERS_BY_POOL. Ordered by order_id.

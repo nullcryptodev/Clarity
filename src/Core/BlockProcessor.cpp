@@ -88,6 +88,67 @@ namespace Core
       return blocks;
     }
 
+    //  ---- Rolling 24h fee window ----
+    //
+    //  A fixed-size ring of per-block fee totals, plus a running
+    //  sum. The ring is sized for 24 h at the nominal block interval.
+    //  Reading the window is O(1): the sum is maintained
+    //  incrementally as blocks are appended and evicted.
+    //
+    //  Storage is the meta table; see the comment on
+    //  BlockProcessor::updateFeeWindow in the header.
+
+    constexpr uint64_t FEE_WINDOW_BLOCKS =
+        24ULL * 60 * 60 / NOMINAL_BLOCK_SECONDS;
+
+    void updateFeeWindowImpl(State::StateAccess &state, uint64_t block_fees)
+    {
+      //  Read the current ring state. On a fresh chain all three
+      //  keys are absent, which the getters report as 0; the ring
+      //  vector is also empty, which we grow to FEE_WINDOW_BLOCKS.
+      std::vector<uint8_t> ring_bytes;
+      state.getMeta("fees_window_ring", ring_bytes);
+
+      const size_t expected_bytes = FEE_WINDOW_BLOCKS * sizeof(uint64_t);
+      if (ring_bytes.size() != expected_bytes)
+      {
+        //  Fresh chain, or an upgrade from a build before the
+        //  window existed. Start a new ring. Preserving the old
+        //  window across an upgrade would require a migration; a
+        //  fresh start is acceptable for an aggregation counter
+        //  that the next 24 h will refill anyway.
+        ring_bytes.assign(expected_bytes, 0);
+        state.putMeta("fees_window_ring", ring_bytes);
+        state.putMetaU64("fees_window_sum", 0);
+        state.putMetaU64("fees_window_ring_head", 0);
+        state.putMetaU64("fees_window_block_count", 0);
+      }
+
+      const uint64_t head = state.getMetaU64("fees_window_ring_head");
+      const uint64_t count = state.getMetaU64("fees_window_block_count");
+      const uint64_t sum = state.getMetaU64("fees_window_sum");
+
+      //  The slot we are about to overwrite holds the value that
+      //  falls out of the window when we write the new one.
+      uint64_t evicted = 0;
+      std::memcpy(&evicted, ring_bytes.data() + head * sizeof(uint64_t),
+                  sizeof(uint64_t));
+
+      //  Write the new value into that slot.
+      std::memcpy(ring_bytes.data() + head * sizeof(uint64_t),
+                  &block_fees, sizeof(uint64_t));
+
+      const uint64_t new_sum = sum - evicted + block_fees;
+      const uint64_t new_head = (head + 1) % FEE_WINDOW_BLOCKS;
+      const uint64_t new_count =
+          (count < FEE_WINDOW_BLOCKS) ? count + 1 : FEE_WINDOW_BLOCKS;
+
+      state.putMeta("fees_window_ring", ring_bytes);
+      state.putMetaU64("fees_window_sum", new_sum);
+      state.putMetaU64("fees_window_ring_head", new_head);
+      state.putMetaU64("fees_window_block_count", new_count);
+    }
+
     //  Increment the running lifetime counters by this block's
     //  contribution. Called from applyBlock after transactions and
     //  rewards have run, so tx_counter reflects only successfully
@@ -121,6 +182,10 @@ namespace Core
       uint64_t fees = state.getMetaU64("total_fees_lifetime");
       fees += block.header.total_fees;
       state.putMetaU64("total_fees_lifetime", fees);
+
+      //  Rolling 24 h window. Same category as the lifetime
+      //  counters, so same table.
+      updateFeeWindowImpl(state, block.header.total_fees);
     }
   } // anonymous namespace
 
@@ -376,17 +441,6 @@ namespace Core
   bool BlockProcessor::checkTimeoutCertificateHash(const Block &block,
                                                    std::string &error)
   {
-    //  Recompute the certificate hash from the certificate bytes that
-    //  were transmitted alongside the block. Compare against the value
-    //  the header committed to. A mismatch means either the header's
-    //  hash is wrong (a Byzantine proposer claiming a certificate
-    //  they didn't carry) or the certificate bytes were altered in
-    //  transit (a MITM on the plaintext P2P channel). Either way, the
-    //  block is not the block the proposer signed.
-    //
-    //  This is a wire-integrity check, separate from the consensus
-    //  check that verifies the certificate's signatures. Both must
-    //  pass. See checkTimeoutCertificate.
     const Crypto::Hash computed =
         computeTimeoutCertificateHash(block.header.timeout_certificate);
 
@@ -408,10 +462,6 @@ namespace Core
       uint64_t current_height,
       std::string &error)
   {
-    //  Signature verification for the certificate. The wire-integrity
-    //  check (certificate bytes match the header's hash) is done
-    //  separately in checkTimeoutCertificateHash; that function must
-    //  have been called first (checkHeader does it).
     auto lookup = [&state](Id vid, ValidatorInfo &out) -> bool
     {
       return state.getValidator(vid, out);
@@ -539,7 +589,6 @@ namespace Core
 
     for (const auto &vs : block.quorum_signatures)
     {
-      // Resolve validator id from active_set[signer_index].
       Id vid = active_set[vs.signer_index];
 
       ValidatorInfo v;
@@ -593,11 +642,6 @@ namespace Core
 
       if (isSystemTx(tx.tx_type))
       {
-        //  Slash is the only system tx that carries semantic content
-        //  today. It must be verified and applied. Every other system
-        //  type (BlockReward, OrderExpired) is a marker: their effects
-        //  are computed by the block processor itself, not carried in
-        //  the tx. Those fall through to the no-op receipt.
         if (tx.tx_type == TxType::Slash)
         {
           std::string slash_err;
@@ -675,25 +719,18 @@ namespace Core
         }
       }
 
-      state.deleteOrder(order_id);
+      //  deleteRestingOrder removes the book row, the companion
+      //  sequence key, the expiry entry, the SMT record, and every
+      //  index row. Previously this call was state.deleteOrder(id),
+      //  which left the book index row dangling — harmless for the
+      //  matcher (it skips stale rows) but a slow leak.
+      state.deleteRestingOrder(order);
     }
 
     state.clearOrderExpiry(current_height);
   }
 
   //  Order condition evaluation
-  //
-  //  Called once per epoch (see applyBlock). Walks every outstanding
-  //  order and cancels any whose conditions have failed.
-  //
-  //  This is O(n) in the number of orders, once per epoch. At v1
-  //  scale that's fine. The pool_id -> order_id index
-  //  (TBL_INDEX_ORDERS_BY_POOL) exists so a future version can
-  //  switch to per-pool evaluation, triggered when a pool's
-  //  reserves change, without a state-format change.
-  //
-  //  Design rationale and the semantics of each condition type live
-  //  in Order.h.
 
   std::optional<uint64_t> BlockProcessor::poolSpotPrice(
       State::StateAccess &state,
@@ -705,18 +742,6 @@ namespace Core
     if (!state.getAmmPool(pool_id, pool))
       return std::nullopt;
 
-    //  Determine which side of the pool each token is on.
-    //
-    //  The pool's canonical ordering is token_a < token_b. The
-    //  order's pair is (sell_token, buy_token), in whatever order
-    //  the owner chose. We need to compute the price in the
-    //  direction the owner asked for, so:
-    //
-    //    - if the pool is (sell, buy) in canonical order:
-    //        price = reserve_b / reserve_a
-    //    - if the pool is (buy, sell) in canonical order:
-    //        price = reserve_a / reserve_b
-    //    - otherwise: the pool doesn't pair these tokens
     bool sell_is_a = false;
     bool sell_is_b = false;
 
@@ -733,21 +758,9 @@ namespace Core
       return std::nullopt;
     }
 
-    //  Both reserves must be positive for the price to be defined.
     if (pool.reserve_a == 0 || pool.reserve_b == 0)
       return std::nullopt;
 
-    //  price = (buy per sell) * PRICE_SCALE
-    //
-    //  If sell_token is token_a:
-    //      one unit of token_a buys reserve_b / reserve_a of token_b
-    //      → price = reserve_b * PRICE_SCALE / reserve_a
-    //
-    //  If sell_token is token_b:
-    //      one unit of token_b buys reserve_a / reserve_b of token_a
-    //      → price = reserve_a * PRICE_SCALE / reserve_b
-    //
-    //  Use 128-bit arithmetic to avoid overflow in the intermediate.
     __uint128_t num = 0;
     uint64_t den = 0;
 
@@ -756,7 +769,7 @@ namespace Core
       num = static_cast<__uint128_t>(pool.reserve_b) * Core::PRICE_SCALE;
       den = pool.reserve_a;
     }
-    else // sell_is_b
+    else
     {
       num = static_cast<__uint128_t>(pool.reserve_a) * Core::PRICE_SCALE;
       den = pool.reserve_b;
@@ -779,9 +792,6 @@ namespace Core
       switch (c.type)
       {
       case OrderConditionType::Invalid:
-        //  Should never appear: order creation rejects it. If it
-        //  somehow does, treat it as failed — an order with an
-        //  invalid condition should not remain live.
         return false;
 
       case OrderConditionType::ExpiresAtHeight:
@@ -796,7 +806,7 @@ namespace Core
         auto price = poolSpotPrice(state, c.param2,
                                    order.sell_token, order.buy_token);
         if (!price.has_value())
-          break; // unevaluable: condition holds
+          break;
         if (*price > c.param1)
           return false;
         break;
@@ -807,7 +817,7 @@ namespace Core
         auto price = poolSpotPrice(state, c.param2,
                                    order.sell_token, order.buy_token);
         if (!price.has_value())
-          break; // unevaluable: condition holds
+          break;
         if (*price < c.param1)
           return false;
         break;
@@ -817,7 +827,7 @@ namespace Core
       {
         Core::AmmPool pool;
         if (!state.getAmmPool(c.param2, pool))
-          break; // unevaluable: condition holds
+          break;
         const uint64_t vol = pool.reportedVolume(current_height);
         if (vol < c.param1)
           return false;
@@ -845,13 +855,6 @@ namespace Core
     if (!state.getOrder(order_id, order))
       return;
 
-    //  Refund the remaining sell amount, minus the cancellation fee.
-    //
-    //  The fee is charged in the sell token, so the refund always
-    //  covers it. If the remaining amount is smaller than the fee —
-    //  which cannot happen in practice, but the code handles it
-    //  defensively — the refund is zero and the fee is
-    //  correspondingly smaller.
     const uint64_t remaining = order.remainingAmount();
     const uint64_t fee =
         std::min(remaining, Core::ORDER_CANCEL_FEE_ATOMIC);
@@ -874,29 +877,16 @@ namespace Core
       }
     }
 
-    //  Remove from the expiry index if present. This is the same
-    //  bookkeeping that processOrderExpiries and executeCancelOrder
-    //  do; without it, the expiry index retains a stale entry that
-    //  points at a deleted order, and a later expiry pass would try
-    //  to cancel the same order twice.
-    if (order.order_expires_at_height != 0)
-    {
-      state.removeOrderExpiry(order.order_expires_at_height, order_id);
-    }
-
-    //  deleteOrder removes the order record from the SMT and from
-    //  the owner, pair, and pool indexes via the StateAccess
-    //  implementation.
-    state.deleteOrder(order_id);
+    //  Single call does the book row, companion sequence key,
+    //  expiry entry, SMT record, and every index. Replaces the
+    //  previous two-step (removeOrderExpiry + deleteOrder) which
+    //  missed the book index.
+    state.deleteRestingOrder(order);
   }
 
   void BlockProcessor::evaluateOrderConditions(State::StateAccess &state,
                                                const BlockContext &ctx)
   {
-    //  Collect the orders to cancel first, then cancel them. Mutating
-    //  the order table while iterating it is not safe: the visitor
-    //  runs under the iteration's read txn, and a delete would open
-    //  a write txn on the same thread, which MDBX refuses.
     std::vector<Id> to_cancel;
 
     state.forEachOrder([&](const Core::Order &order)
@@ -918,9 +908,6 @@ namespace Core
   void BlockProcessor::processUnbondExpiries(State::StateAccess &state,
                                              uint64_t current_height)
   {
-    // Collect expired unbondings first, then mutate. Mutating while
-    // iterating is not safe, and forEachValidator explicitly
-    // documents that the visitor should not modify state.
     std::vector<Id> expired;
 
     state.forEachValidator([&](const ValidatorInfo &v)
@@ -934,22 +921,11 @@ namespace Core
       if (!state.getValidator(vid, v))
         continue;
 
-      // Return the stake to the owner. The account may have been
-      // touched since the request; recalculateStaked brings the
-      // cached staked value in line with the new balance.
       Account acct = state.getAccount(v.owner);
       acct.balance += v.stake;
       acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
       state.putAccount(v.owner, acct);
 
-      // Remove the address index and the record, in that order.
-      // If the process crashes between the two, the index entry
-      // points at a missing record; getValidatorByAddress will
-      // return the id, and the subsequent getValidator will fail,
-      // and the caller treats that as "not registered". The
-      // alternative (deleting the record first) would leave a
-      // dangling address index that resolves to a non-existent
-      // validator — the same failure mode, but harder to diagnose.
       state.deleteValidatorByAddress(v.reward_address);
       state.deleteValidator(v.id);
     }
@@ -969,10 +945,6 @@ namespace Core
 
     reward_ctx.total_staked = readU64Global(state, "total_staked");
 
-    //  Rewards are paid to the set that actually produced this block.
-    //  For an emergency block, that's the derived set written to state
-    //  above. Re-reading here gives us the same value, since the write
-    //  happened earlier in applyBlock.
     std::vector<Id> active_set = loadActiveSet(state);
 
     ValidatorRegistry registry;
@@ -997,30 +969,6 @@ namespace Core
 
     uint64_t total_redistributed = 0;
 
-    //  ---- Seed-only special case ----
-    //
-    //  When every validator in the active set is a seed, the normal
-    //  reward split is replaced by a "seed stipend" model:
-    //
-    //    - The producer bonus (20% of the validator pool) is split
-    //      evenly across all seeds, regardless of which seed proposed
-    //      the block. Seeds are operated as a single entity, so the
-    //      distinction between producing and signing is bookkeeping
-    //      noise.
-    //
-    //    - The set share (80% of the validator pool) is routed to the
-    //      pot rather than paid to the seeds. Paying a seed the full
-    //      validator pool on a chain with no other validators would
-    //      concentrate wealth and provide no incentive for new
-    //      validators to register.
-    //
-    //  When the active set contains even one non-seed, the normal
-    //  distribution resumes. This preserves the incentive to register:
-    //  a validator that joins a seed-heavy chain starts earning
-    //  immediately.
-    //
-    //  Degenerate case: with one seed, the seed earns the full
-    //  producer bonus and the set share goes to the pot.
     const bool seed_only = !active_set.empty() &&
                            std::all_of(active_set.begin(), active_set.end(),
                                        [&](Id vid)
@@ -1048,16 +996,10 @@ namespace Core
         ValidatorInfo v;
         if (!state.getValidator(vid, v))
         {
-          //  Should not happen — the caller loaded the set from state.
-          //  If it does, the amount is routed to the pot.
           total_redistributed += amount;
           continue;
         }
 
-        //  Apply the reward multiplier, matching the normal path.
-        //  In practice a seed's multiplier is always START, so this
-        //  is a no-op, but keeping it makes the code consistent and
-        //  handles any future policy that penalizes a seed.
         const uint64_t adjusted = amount * v.reward_multiplier / 10'000;
         const uint64_t difference = amount - adjusted;
 
@@ -1074,12 +1016,8 @@ namespace Core
         total_redistributed += difference;
       }
 
-      //  Route the entire set share to the pot.
       total_redistributed += rewards.set_amount;
 
-      //  Credit the pot and return. The normal producer loop and
-      //  per-validator set-share loop are skipped — the seed stipend
-      //  above replaces both.
       uint64_t pot = readU64Global(state, "pot");
       pot += total_redistributed;
 
@@ -1087,13 +1025,6 @@ namespace Core
           applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::STAKER_SHARE_BPS);
       pot += staker_pool;
 
-      //  Track the lifetime total credited to the pot. Slashing
-      //  proceeds also route here via executeSystemSlash; those are
-      //  written by the executor, not by this path.
-      //
-      //  total_to_pot is aggregation, not consensus — it lives in
-      //  meta, not the SMT. pot is consensus state and stays on the
-      //  SMT.
       uint64_t total_to_pot = state.getMetaU64("total_to_pot");
       total_to_pot += total_redistributed + staker_pool;
       state.putMetaU64("total_to_pot", total_to_pot);
@@ -1101,8 +1032,6 @@ namespace Core
       writeU64Global(state, "pot", pot);
       return;
     }
-
-    //  ---- Normal (non-seed-only) distribution ----
 
     if (rewards.producer_amount > 0 && !active_set.empty())
     {
@@ -1203,18 +1132,6 @@ namespace Core
                                             const Block &block,
                                             const BlockContext &ctx)
   {
-    //  Runs at the last block of each epoch. Reads the pot, computes the
-    //  target staker payout, credits each staker their proportional
-    //  share, and adjusts the pot.
-    //
-    //  The epoch's staker pool has already been added to the pot on a
-    //  per-block basis by distributeRewards. Here we distribute from the
-    //  pot, not from a fresh pool.
-    //
-    //  Stakers who joined mid-epoch receive a partial share proportional
-    //  to the number of blocks in the epoch for which they were staked
-    //  (tracked via Account::staker_since_height).
-
     const uint64_t pot = readU64Global(state, "pot");
     const uint64_t total_staked = readU64Global(state, "total_staked");
     const uint64_t staker_count = readU64Global(state, "staker_count");
@@ -1231,11 +1148,6 @@ namespace Core
 
     const uint64_t pool_baseline = epoch_pool;
 
-    //  Activity metric. The epoch's total transaction count divided
-    //  by the number of blocks in the epoch. The counters are the
-    //  chain-lifetime tx_counter and a snapshot of it taken at the
-    //  previous epoch boundary — the delta is this epoch's
-    //  contribution.
     const uint64_t tx_counter_now = readU64Meta(state, "tx_counter");
     const uint64_t tx_counter_at_start = readU64Meta(state, "tx_counter_at_epoch_start");
     const uint64_t txs_this_epoch =
@@ -1264,24 +1176,9 @@ namespace Core
 
     const uint16_t effective_apy = computeEffectiveApy(rctx, SECONDS_PER_EPOCH);
 
-    //  Record the APY this epoch actually used. The RPC reads this
-    //  to answer "what is the current APY" without recomputing it —
-    //  the inputs (pot, activity) change between epoch boundaries,
-    //  but the value that governs staker payouts is the one computed
-    //  here, once per epoch.
-    //
-    //  This is display-only aggregation, so it lives in meta, not
-    //  the SMT. Writing it to the SMT would make the epoch-boundary
-    //  state root depend on a value that no verifier needs to
-    //  reproduce.
     state.putMetaU64("last_effective_apy_bps",
                      static_cast<uint64_t>(effective_apy));
 
-    //  Snapshot the tx counter so the next epoch can compute its own
-    //  activity delta. Written unconditionally, before any of the
-    //  early-return paths below, so the next epoch's reading is
-    //  always correct regardless of whether this epoch distributed
-    //  any rewards.
     state.putMetaU64("tx_counter_at_epoch_start", tx_counter_now);
 
     const uint64_t target_payout =
@@ -1308,12 +1205,6 @@ namespace Core
 
     writeU64Global(state, "pot", static_cast<uint64_t>(new_pot));
 
-    //  Track the lifetime total actually paid to stakers from the
-    //  pot. Not the same as total_to_pot: the pot can also be burned
-    //  when it exceeds the cap, and can accumulate without being
-    //  distributed if there are no stakers.
-    //
-    //  Aggregation, so it lives in meta, not the SMT.
     uint64_t total_pot_distributed = state.getMetaU64("total_pot_distributed");
     total_pot_distributed += adj.distributed;
     state.putMetaU64("total_pot_distributed", total_pot_distributed);
@@ -1494,8 +1385,18 @@ namespace Core
 
     for (size_t i = 0; i < receipts.size(); ++i)
     {
+      //  Receipt leaf = Blake2b("rcpt" || txid || status || fee ||
+      //                          fill_count || fills_bytes)
+      //
+      //  The fills section is part of the leaf, so a block whose
+      //  receipts commit to a different set of fills than the
+      //  verifier computes produces a different receipts_root and
+      //  is rejected. This is what binds fills into consensus
+      //  without adding a new header field.
+      const auto receipt_bytes = receipts[i].serializeState();
+
       std::vector<uint8_t> buf;
-      buf.reserve(4 + 32 + 1 + 8);
+      buf.reserve(4 + 32 + receipt_bytes.size());
       buf.push_back('r');
       buf.push_back('c');
       buf.push_back('p');
@@ -1504,11 +1405,7 @@ namespace Core
       const auto &th = tx_hashes[i];
       buf.insert(buf.end(), th.data.begin(), th.data.end());
 
-      buf.push_back(static_cast<uint8_t>(receipts[i].status));
-
-      uint64_t fee = receipts[i].fee_paid;
-      for (int j = 0; j < 8; ++j)
-        buf.push_back(uint8_t(fee >> (j * 8)));
+      buf.insert(buf.end(), receipt_bytes.begin(), receipt_bytes.end());
 
       Crypto::Hash h;
       Crypto::blake2b(buf.data(), buf.size(), h.data.data(), 32);
@@ -1619,19 +1516,6 @@ namespace Core
                                   const BlockContext &ctx,
                                   std::string &error)
   {
-    //  The proof resolves the signer by id, and the policy check
-    //  ("is this signer still slashable?") is enforced by
-    //  executeSystemSlash against the validator record: it rejects
-    //  seeds, rejects a validator that has been fully removed, and
-    //  succeeds for one that is merely rotated out or pending
-    //  unbond. Passing an empty active_set disables the verifier's
-    //  set-membership check, which would otherwise reject a proof
-    //  against a validator that rotated out between the vote and
-    //  the block — a legitimate slash that must not be lost.
-    //
-    //  The set-membership check in verifyEquivocationProof remains
-    //  useful for callers that want it (tests, migration tooling);
-    //  the on-chain path does not need it.
     auto decoded = verifyEquivocationProof(tx.payload,
                                            /*active_set=*/{},
                                            state);
@@ -1739,5 +1623,18 @@ namespace Core
           tokens,
           static_cast<uint8_t>(tx.tx_type));
     }
+  }
+
+  //  Public wrapper for the fee-window updater. The header declares
+  //  updateFeeWindow as a private static member for symmetry with
+  //  the rest of the class; the actual work is done by
+  //  updateFeeWindowImpl in the anonymous namespace, which is what
+  //  bumpLifetimeCounters calls directly. This definition exists so
+  //  the symbol is present if some future caller wants to invoke it
+  //  through the class interface.
+  void BlockProcessor::updateFeeWindow(State::StateAccess &state,
+                                       uint64_t block_fees)
+  {
+    updateFeeWindowImpl(state, block_fees);
   }
 } // namespace Core

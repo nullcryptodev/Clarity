@@ -262,4 +262,26 @@ namespace Rpc
       const std::vector<Core::ValidatorInfo> &validators,
       uint64_t current_height,
       const std::string &hrp);
+
+  //  Fill -> JSON
+  //
+  //  Fields:
+  //    maker_order_id      (hex)
+  //    taker_order_id      (hex)
+  //    base_token          (hex)
+  //    quote_token         (hex)
+  //    qty_base            (hex)
+  //    qty_quote           (hex)
+  //    price               (hex; canonical, quote per base, scaled
+  //                         by OrderBook::BOOK_PRICE_SCALE)
+  //    height              (hex; the block that produced the fill)
+  //    tx_index_in_block   (number)
+  //
+  //  Height and tx_index are not fields of Fill; they are the
+  //  identity of the transaction that produced the fill, passed
+  //  alongside so the client can locate the receipt if it wants to.
+  Common::Json encodeFill(const Core::Fill &fill,
+                          uint64_t height,
+                          uint32_t tx_index_in_block,
+                          const std::string &hrp);
 } // namespace Rpc

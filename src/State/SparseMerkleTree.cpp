@@ -746,6 +746,14 @@ namespace State
     {
       return hashDomain("rcpt", tx_hash.data.data(), 32);
     }
+
+    Crypto::Hash orderSequence(uint64_t order_id) noexcept
+    {
+      uint8_t buf[8];
+      for (int i = 0; i < 8; ++i)
+        buf[i] = uint8_t(order_id >> (i * 8));
+      return hashDomain("oseq", buf, 8);
+    }
   } // namespace Keys
 
 } // namespace State

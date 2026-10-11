@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "Fill.h"
 #include "Crypto/Types.h"
 #include "Serialization/ISerializer.h"
 
@@ -43,6 +44,17 @@ namespace Core
   {
     ReceiptStatus status{ReceiptStatus::Success};
     uint64_t fee_paid{0};
+
+    //  Fills produced by this transaction, if it was a LimitOrder
+    //  that crossed one or more resting orders. Empty for every
+    //  other transaction type, and for a LimitOrder that rested
+    //  without crossing.
+    //
+    //  The vector is serialized as a 4-byte LE count followed by
+    //  each fill's STATE_SIZE bytes. A receipt with an empty fills
+    //  vector writes a zero count and no further bytes, which keeps
+    //  the wire format stable for existing receipts.
+    std::vector<Fill> fills;
 
     // ---- Validation ----
     bool isValid() const noexcept

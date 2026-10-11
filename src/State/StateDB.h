@@ -76,7 +76,56 @@ namespace State
       //  full order table.
       TBL_INDEX_ORDERS_BY_POOL = 32,
 
-      TBL_COUNT = 33,
+      //  Order book: resting orders keyed by
+      //    pair_key(32) || side(1) || ~price(8 BE) || sequence(8 BE)
+      //  and valued with a sentinel byte. The pair_key is
+      //  Blake2b(min(sell,buy)(4 LE) || max(sell,buy)(4 LE)) so a
+      //  buy-A-for-B order and a sell-B-for-A order share a book.
+      //  The side byte is 0 if the order sells the pair's min
+      //  token, 1 otherwise. The ~price byte order makes ascending
+      //  MDBX iteration yield best-price-first on both sides; the
+      //  sequence byte is the price-time tiebreaker. See
+      //  Core/OrderBook.h for the full key derivation.
+      //
+      //  This table is a *placement* index, not a state mirror.
+      //  It is written by MatchingEngine when an order first rests
+      //  and deleted when the order leaves the book. It is NOT
+      //  rewritten on every partial fill: a fill changes the
+      //  order's filled_amount, not its price or its sequence, so
+      //  the book row is stable across the order's resting life.
+      //  See StateAccess::addToOrderBook / removeFromOrderBook.
+      TBL_INDEX_ORDER_BOOK = 33,
+
+      //  Fill history. One row per fill produced by a taker
+      //  crossing a resting maker. Written by the matching engine
+      //  at fill time. Two key shapes share the table, distinguished
+      //  by a leading tag byte:
+      //
+      //    tag 0x01  pair view
+      //      key = 0x01 || pair_key(32) || height(8 BE) ||
+      //            tx_index(4 BE) || fill_index(2 BE)
+      //      value = Fill::serializeState() (55 bytes)
+      //
+      //    tag 0x02  order view
+      //      key = 0x02 || order_id(8 BE) || height(8 BE) ||
+      //            tx_index(4 BE) || fill_index(2 BE)
+      //      value = Fill::serializeState() (55 bytes)
+      //
+      //  The order-view rows are written twice per fill: once with
+      //  the maker's id and once with the taker's. That is what
+      //  makes getOrderFills(order_id) a single prefix scan.
+      //
+      //  The pair view is ordered by height ascending, so a
+      //  reverse-prefix scan yields the newest trades first. The
+      //  order view is the same shape with a different prefix.
+      //
+      //  Nothing removes rows from this table today. History is
+      //  cheap (55 bytes + a 47/23-byte key per fill) and the table
+      //  grows with fills, not with block count. A retention policy
+      //  can be added later without a schema change.
+      TBL_FILL_HISTORY = 34,
+
+      TBL_COUNT = 35,
     };
 
     using EntryVisitor = std::function<bool(const std::vector<uint8_t> &key,

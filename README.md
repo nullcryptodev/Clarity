@@ -2,7 +2,7 @@
 
 # Clarity - Authority rotates, the chain doesn't.
 
-![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C861-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
+![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C903-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
 
 #### Documents
 
@@ -44,6 +44,15 @@
   - [Limit Orders](#limit-orders)
   - [Claim Rewards](#claim-rewards)
   - [System Transactions](#system-transactions)
+- [**Matching engine**: how Passive orders are filled](#matching-engine-how-passive-orders-are-filled)
+  - [Canonical book frame](#canonical-book-frame)
+  - [Book index](#book-index)
+  - [Matching](#matching)
+  - [Self-trade](#self-trade)
+  - [Determinism](#determinism)
+  - [Fill history](#fill-history)
+  - [Consensus relevance](#consensus-relevance)
+  - [Limits and invariants](#limits-and-invariants)
 - [**Validator identity**: two keys, two roles](#validator-identity-two-keys-two-roles)
   - [Consensus Key](#consensus-key)
   - [Reward Address](#reward-address)
@@ -75,11 +84,11 @@
 
 ## What it is
 
-Clarity is a **single-chain, Byzantine-fault-tolerant proof-of-stake network** with a native currency ($CLRTY), a general-purpose token system, an automated market maker, a limit-order book, validator rewards with a pot mechanism, and a growing feature set around staking, validator rotation, and on-chain governance of validator sets.
+Clarity is a **single-chain, Byzantine-fault-tolerant proof-of-stake network** with a native currency ($CLRTY), a general-purpose token system, an automated market maker, a **price-time-priority limit-order book with an in-process matching engine**, validator rewards with a pot mechanism, and a growing feature set around staking, validator rotation, and on-chain governance of validator sets.
 
-It's not a direct fork of anything. The block format, consensus protocol, state model, and reward math are original. It uses well-known primitives (Ed25519, X25519, Blake2b, SHA-512, XChaCha20-Poly1305) from Monocypher, the Argon2 reference implementation for keystore KDF, the BLAKE2 reference code, and a project-internal Keccak implementation verified against the official Keccak test vectors.
+It's not a direct fork of anything. The block format, consensus protocol, state model, matching engine, and reward math are original. It uses well-known primitives (Ed25519, X25519, Blake2b, SHA-512, XChaCha20-Poly1305) from Monocypher, the Argon2 reference implementation for keystore KDF, the BLAKE2 reference code, and a project-internal Keccak implementation verified against the official Keccak test vectors.
 
-The project is at the code-complete, pre-launch stage. The daemon builds, the full test suite passes, and the end-to-end path (from transaction submission through consensus through block application through state persistence through restart) has been exercised on a live two-validator regtest network. The RPC surface is complete and tested. The wallet layer (keystores, HD derivation, signing, address encoding) is complete and tested, and there is an interactive CLI wallet client. The P2P layer has authentication, session encryption, sync, block relay, transaction relay, proof serving, per-peer and node-wide rate limiting, and periodic refresh. A Prometheus-compatible metrics endpoint exposes node, P2P, mempool, storage, reward, and consensus state. It has not been deployed to a public network.
+The project is at the code-complete, pre-launch stage. The daemon builds, the full test suite passes, and the end-to-end path (from transaction submission through consensus through block application through matching through state persistence through restart) has been exercised on a live two-validator regtest network. The RPC surface is complete and tested. The wallet layer (keystores, HD derivation, signing, address encoding) is complete and tested, and there is an interactive CLI wallet client. The P2P layer has authentication, session encryption, sync, block relay, transaction relay, proof serving, per-peer and node-wide rate limiting, and periodic refresh. A Prometheus-compatible metrics endpoint exposes node, P2P, mempool, storage, reward, and consensus state. It has not been deployed to a public network.
 
 ## The architecture
 
@@ -90,7 +99,8 @@ Crypto           hashes, signatures, AEAD, key exchange, key types
 Common           encodings (Base58, Base64, hex), CRC32, JSON, varint, rate limiter, wire codec
 Serialization    binary, KV-binary, JSON serializers
 State            MDBX storage, sparse Merkle tree, state access, proofs, historical reads
-Core             blocks, transactions, execution, block processing, rewards, equivocation proofs
+Core             blocks, transactions, execution, block processing, rewards,
+                 order book, matching engine, equivocation proofs
 Consensus        BFT state machine, proposer selection, message encoding
 P2P              TCP transport, peer management, message framing, auth, session encryption,
                  sync, relay, proof serving, rate limiting
@@ -213,6 +223,8 @@ The block processor distinguishes between *simulating* a block (the proposer nee
 
 A subtle invariant: **every state change that touches the SMT must happen on both paths.** Only writes to the meta table (`TBL_META`) and to the non-SMT index tables may be gated on `!ctx.dry_run`. The dry-run path aborts its transaction, so the change is discarded; the apply path commits it. If a change is gated, the two paths produce different state roots and the proposer's block is rejected on apply. This was a source of a hard-to-diagnose bug where blocks 1 and 2 were committed by consensus but rejected by every node that tried to apply them.
 
+The matching engine obeys this invariant. Its book rows, fill-history rows, and order-sequence counter all go through the SMT unconditionally, and the `MatchingSimulateAndApplyProduceSameRoot` test is the canary that catches a future gated write.
+
 #### Commit failure handling
 The `on_block_committed` callback returns a `bool`. `BftConsensus::tryApplyCommit` checks the return value, and on failure the engine retries the apply **in place**, with a linear backoff. Up to `max_commit_retries` retries are attempted. Each retry is driven by `pollTimers`, which compares `deps_.now_ms()` against `next_commit_attempt_ms_`.
 
@@ -227,7 +239,7 @@ Before this change, the callback returned `void`, and a failed apply still fired
 ## State: how the chain is stored
 
 #### Storage
-MDBX, a memory-mapped key-value store. Thirty-two tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, index tables (stakers, validators, order expiry), receipts, tx index, blocks by hash, blocks by height, the persistent mempool, the consensus WAL, and four historical SMT tables (nodes-history, leaves-history, nodes-by-version, leaves-by-version), plus the application index tables used by the RPC and metrics layers (AMM pools and positions, by-owner position and order indexes, by-token balances and pools, tx-by-address/token/type, blocks-by-producer, orders-by-pair).
+MDBX, a memory-mapped key-value store. Thirty-five tables: SMT nodes, SMT leaves, meta, accounts, token balances, tokens, validators, orders, index tables (stakers, validators, order expiry, orders by owner, orders by pair, orders by pool), receipts, tx index, blocks by hash, blocks by height, the persistent mempool, the consensus WAL, four historical SMT tables (nodes-history, leaves-history, nodes-by-version, leaves-by-version), the application index tables used by the RPC and metrics layers (AMM pools and positions, by-owner position and order indexes, by-token balances and pools, tx-by-address/token/type, blocks-by-producer), the price-sorted order book placement index, and the fill-history index.
 
 For v1, all of these live in a single MDBX database file at `<data_dir>/state`. Chain data — block indices, block bodies, receipts, the transaction index — shares the same file as state data. There is no separate chain DB directory. This is a storage-layout decision, not a consensus-relevant one: the atomic commit discipline that writes state, block index, and head together in one transaction relies on the two being in the same MDBX instance.
 
@@ -238,6 +250,8 @@ A **sparse Merkle tree** of depth 256. Each key is a 32-byte hash (derived from 
 A `StateAccess` object wraps the DB and provides typed getters and setters for accounts, token balances, token metadata, validators, orders, AMM pools, AMM positions, receipts, and global state. Reads and writes go through the SMT so every change updates the root.
 
 `StateAccess` exists in two modes. **Txn-bound mode** is used by the block processor and consensus paths: every read and write goes through a single MDBX write transaction that the caller opened and owns. **Autocommit mode** is used by the RPC layer, the metrics handler, and the various `Node` helpers: the `StateAccess` owns a single MDBX *read* transaction for its lifetime, and read methods route through it. The autocommit mode is what makes a 256-level SMT walk — hundreds of individual node lookups — cheap in reader-slot terms: the walk holds one reader, not one per lookup.
+
+The matching engine is a txn-bound caller: it runs inside the block processor's write transaction, and every read it makes (`getOrder`, `forEachBookLevel`) and every write it makes (`putOrder`, `deleteOrder`, `addToOrderBook`, `removeFromOrderBook`, `indexFill`) goes through the same `StateAccess` that the executor uses. This is why a fill's balances, records, book rows, and fill-history rows all commit or abort together with the block.
 
 #### Read transactions
 MDBX permits multiple read transactions across threads but exactly one read transaction per thread. A second `mdbx_txn_begin(RDONLY)` on a thread that already has a read transaction open returns `MDBX_BUSY`. This is a hard constraint that shapes the code.
@@ -254,7 +268,7 @@ MDBX also refuses to open a write transaction on a thread that has a read transa
 
 Every write method on `StateAccess` calls `releaseReadTxnIfHeld()` before delegating to the underlying `rawPut`/`rawDel`. This destroys the held `ReadTxn` (if any) and unbinds it from the SMT. The next read after the write transparently opens a fresh read transaction. This makes a `StateAccess` that interleaves reads and writes — which is most of the block-application path — safe without the caller having to know about the ordering.
 
-The write paths that call `releaseReadTxnIfHeld()` include `putAccount`, `deleteAccount`, `putTokenBalance`, `deleteTokenBalance`, `putToken`, `putTokenSupply`, `putValidator`, `deleteValidator`, `putValidatorByAddress`, `deleteValidatorByAddress`, `putOrder`, `deleteOrder`, `putAmmPool`, `deleteAmmPool`, `putAmmPosition`, `deleteAmmPosition`, `putPositionIndex`, `deletePositionIndex`, `putReceipt`, `putGlobal`, `putMetaImpl`, `putRaw`, `deleteRaw`, `commit`, and the four low-level row helpers `putSentinel`/`putU64Row`/`putBlobRow`/`deleteRow`.
+The write paths that call `releaseReadTxnIfHeld()` include `putAccount`, `deleteAccount`, `putTokenBalance`, `deleteTokenBalance`, `putToken`, `putTokenSupply`, `putValidator`, `deleteValidator`, `putValidatorByAddress`, `deleteValidatorByAddress`, `putOrder`, `deleteOrder`, `addToOrderBook`, `removeFromOrderBook`, `refundOrder`, `deleteRestingOrder`, `indexFill`, `putAmmPool`, `deleteAmmPool`, `putAmmPosition`, `deleteAmmPosition`, `putPositionIndex`, `deletePositionIndex`, `putReceipt`, `putGlobal`, `putMetaImpl`, `putRaw`, `deleteRaw`, `commit`, and the four low-level row helpers `putSentinel`/`putU64Row`/`putBlobRow`/`deleteRow`.
 
 #### Proofs
 Inclusion and non-inclusion proofs can be generated for any key. A proof is a list of sibling hashes down to the leaf; verification recomputes the root from the proof and compares. Proofs are a pure-function construction: `verifyProof(expected_root, proof)` performs no DB access and no signature checks, so a caller that holds only a state root can verify a proof without trusting the server that produced it. Proof generation is exposed over P2P via the `GetProof`/`Proof` message pair (see [Proof Serving](#proof-serving)), over RPC via `clrty_getProof`, and in-process by tests and diagnostic tooling.
@@ -293,13 +307,93 @@ Register as a validator (requires a minimum stake). **Unregister** -- starts an 
 Create a pool for a pair of tokens (or a token and native CLRTY). Add liquidity (mints LP position). Remove liquidity (burns the position and returns the reserves) -- **removing the last LP's full share closes the pool**: the record is deleted from state, and the pool no longer exists for swaps or further liquidity additions. Swap through the pool with a constant-product formula and a fee.
 
 #### Limit orders
-Create an order that locks funds, specifying which token to buy, how much of it, and a minimum acceptable amount. Orders expire at a specified height. Cancel an order returns the locked funds. There is also an expiry index that tracks which orders expire at which heights.
+Two modes: `Passive` and `Active`. A Passive order rests in a price-time-priority book and is matched by the in-process matching engine. An Active order is reserved for future AMM routing and is rejected at validation until that ships.
+
+A Passive order has a directional pair (`sell_token`, `buy_token`), a sell amount, a minimum buy amount (which encodes the limit price as `min_buy_amount / sell_amount`), a `mode`, an optional expiry height, and up to eight conditions. Creating the order takes a lock on the sell amount in the same transaction. The order is then matched against the resting book: the incoming order is the taker, the resting orders are makers, and each resting order is executed at the *maker's* price.
+
+A fill has a maker side and a taker side. The maker receives the counter-asset, the taker receives the counter-asset, and both sides' `filled_amount` is updated. Partial fills are supported on both sides. A taker that is only partially filled rests its remainder in the book with a fresh sequence number.
+
+**Price-time priority.** Orders are keyed in a `pair_key || side || ~canonical_price || sequence` index. The canonical frame is `base = min(sell, buy)`, `quote = max(sell, buy)`, and the canonical price is stored in `quote per base`, scaled by `BOOK_PRICE_SCALE`. Side 0 (sellers) store the price directly so ascending key order puts the best ask first; side 1 (buyers) store `~price` so ascending key order puts the best bid first. Sequence is a monotonic u64 from `nextOrderSequence()` (an SMT global, so it is dry-run/apply-consistent) and breaks ties at the same price in FIFO order.
+
+**Self-trade.** If the taker's owner matches the maker's, the resting order is cancelled (charging `ORDER_CANCEL_FEE_ATOMIC`) and the taker continues to the next resting order. Cancelled-resting is the only self-trade policy.
+
+**Cancellation, expiry, and condition failure.** All three remove the order from every index — owner, pair, pool, expiry, and the book — and refund the remaining lock minus `ORDER_CANCEL_FEE_ATOMIC`. All three go through the same `deleteRestingOrder` path, so a cancel cannot accidentally leave a book row behind.
+
+**Fill history.** Every fill writes three rows to `TBL_FILL_HISTORY`: one pair-view row (keyed by pair, height, tx index, fill index) and two order-view rows (one for the maker, one for the taker). This is what makes `getPairTrades` and `getOrderFills` a single prefix scan instead of a receipt walk.
+
+**Receipts.** A `CreateOrder` transaction that crosses at least one maker returns a receipt whose `fills` vector carries the fills in execution order. The receipt's `serializeState()` includes the fill section, so the block's `receipts_root` commits to the fills and a block whose receipts disagree on fills is rejected. Adding or removing a field from the receipt format is a hard fork.
+
+**Book levels cap.** A single taker crosses at most `MAX_BOOK_LEVELS_PER_TAKER` (256) resting orders in one transaction. This bounds block-apply time; the taker's remainder rests if the cap is hit.
 
 #### Claim rewards
 Move an account's pending rewards into its balance. Recomputes staked amount after the transfer.
 
 #### System transactions
 `BlockReward`, `OrderExpired`, `Slash` -- used internally by the block processor to record events. Users cannot submit these.
+
+## Matching engine: how Passive orders are filled
+
+The matching engine is a pure function of `(StateAccess, Order, height, tx_index)` and runs inside the block processor's write transaction. It is Passive-only; `OrderExecutionMode::Active` is reserved for AMM routing and rejected before the sell-token lock is taken until that ships.
+
+#### Canonical book frame
+
+Orders are created directionally: "sell A, buy B, receive at least M of B for N of A." That gives a rational limit price `M/N` in `B per A`. Two orders on opposite sides of the same pair are the same market with reciprocal limit prices.
+
+The book canonicalizes to a single direction: `quote per base`, where `base = min(sell_token, buy_token)` and `quote = max(sell_token, buy_token)`. The canonical price is scaled by `BOOK_PRICE_SCALE = 10^10` and is stored on the book key so iteration is exact-integer and never divides in the hot loop.
+
+Rounding is direction-preserving: a seller's limit floors (`floor(min_buy_amount * SCALE / sell_amount)`), a buyer's limit ceils (`ceil(sell_amount * SCALE / min_buy_amount)`). Both round toward the "harder to cross" side, so rounding never invents a fill that the exact rationals would have forbidden.
+
+#### Book index
+
+The book index is a separate table (`TBL_INDEX_ORDER_BOOK`) keyed by
+
+```
+pair_key(32) || side(1) || ~canonical_price(8 BE) || sequence(8 BE)
+```
+
+with the order id in the value. Pair key is `Blake2b("obok" || LE(min(sell,buy)) || LE(max(sell,buy)))`, so the index is pair-symmetric. The side byte disambiguates the two sides of one pair. The `~price` byte order makes ascending iteration yield best-price-first on both sides: sellers (side 0) store the price directly, buyers (side 1) store the complement, so ascending key order yields ascending ask prices and descending bid prices. The sequence is a monotonic u64 from `nextOrderSequence()`, an SMT global. A partial fill does not move the book row, because the row's price and sequence are unchanged.
+
+#### Matching
+
+The matcher is called from `executeCreateOrder` after the taker's sell-token lock has been taken and the taker's record has been written. The taker is `Passive` by construction (the caller dispatches). The steps are:
+
+1. Canonicalize the taker.
+2. Compute the taker's canonical limit price.
+3. Collect candidate `(order_id, price)` pairs from the opposite side's book, best-first, capped at `MAX_BOOK_LEVELS_PER_TAKER`.
+4. Process candidates in order. Because the book is price-sorted and the crossing check is monotone in price, the loop stops at the first candidate that does not cross.
+5. For each crossing candidate: reject stale rows, cancel self-trades, recompute the maker's canonical price from its record (which is authoritative), compute the fill quantity in base units, execute the fill, and persist.
+6. Persist the taker: delete it if fully filled, otherwise re-write it and add a book row with a fresh sequence.
+
+The execution price is the resting (maker's) price. The fill is the minimum of the two sides' remaining quantities, converted to base units at the maker's price. Rounding is maker-favorable throughout, so neither side's lock is ever under-covered.
+
+#### Self-trade
+
+If the taker and the maker share an owner, the maker is cancelled (charging `ORDER_CANCEL_FEE_ATOMIC`) and the taker continues to the next resting order. The taker's own order is not removed; the taker is expected to be at a different price point.
+
+#### Determinism
+
+The matcher reads nothing from wall-clock time, hardware entropy, or peer state. Every sequence it draws comes from an SMT global, every write it makes goes through `StateAccess`, and every state change it produces is SMT-unconditional on both the dry-run and the apply paths. The simulate-vs-apply test in `Tests/Core/BlockProcessor.cpp` runs the same block through both paths and asserts the state roots match; if a future change to the matcher gates a write on `!ctx.dry_run`, that test fails first.
+
+#### Fill history
+
+Every fill writes three rows to `TBL_FILL_HISTORY`:
+
+- **Pair view.** Key = `0x01 || pair_key(32) || height(8 BE) || tx_index(4 BE) || fill_index(2 BE)`. Value = `Fill::serializeState()`.
+- **Order view (maker).** Key = `0x02 || maker_order_id(8 BE) || height(8 BE) || tx_index(4 BE) || fill_index(2 BE)`. Value = the same fill bytes.
+- **Order view (taker).** Same shape, keyed by the taker's id.
+
+The pair view is ordered by height ascending, so a reverse prefix scan yields trades newest-first. The order view answers `getOrderFills` in a single prefix scan. Nothing removes rows from `TBL_FILL_HISTORY` today; the table grows with fills, not with block count.
+
+#### Consensus relevance
+
+Fills are part of the consensus commitment. The `Receipt::serializeState()` codec emits `status(1) || fee_paid(8 LE) || fill_count(4 LE) || fills(N * 55 bytes)`, and `verifyReceiptsRoot` feeds the whole receipt bytes into the leaf. A block whose receipts disagree with the applied fills produces a different `receipts_root` and is rejected. This is what makes a fill a first-class state event rather than a node-local annotation.
+
+#### Limits and invariants
+
+- `MAX_BOOK_LEVELS_PER_TAKER = 256`. A single taker crosses at most 256 resting orders in one block. When the cap is hit, the taker rests its remainder.
+- `BOOK_PRICE_SCALE = 10^10`. Chosen to match `PRICE_SCALE` and to leave four digits of headroom above CLRTY's native granularity.
+- Order ids are assigned by `executeCreateOrder` from the SMT global `next_order_id`. Order sequences are assigned by the matcher from a *different* SMT global, `order:next_sequence`. The two counters never collide.
+- The matcher never holds a MDBX cursor across a write: it collects candidates in a `std::vector`, then processes them. MDBX invalidates cursors on any write through the same transaction, and the fill loop writes.
 
 ## Validator identity: two keys, two roles
 
@@ -445,9 +539,11 @@ Validator objects returned by the consensus methods expose both `reward_address`
 - **Mempool:** `getMempoolStats`, `getMempoolTx`, `getMempoolList`.
 - **Consensus:** `getValidators`, `getValidator`, `getValidatorByAddress`, `getValidatorStats`, `getActiveSet`, `getConsensusState`.
 - **AMM:** `getPool`, `getPosition`, `getPositionByOwner`, `getAllPools`, `getPoolsForToken`, `getPositionsForPool`.
-- **Orders:** `getOrder`, `getOrdersExpiringAt`, `getAllOrders`, `getOrdersByPair`.
+- **Orders:** `getOrder`, `getOrdersExpiringAt`, `getAllOrders`, `getOrdersByPair`, `getOrderBook`, `getOrderFills`, `getPairTrades`.
 - **Metrics (server-side aggregates):** `getFeeStats`, `getPotInfo`.
 - **Node / utility:** `ping`, `status`, `health`, `getPeers`, `getConfig`, `getMethods`, `web3_clientVersion`, `net_version`, `net_peerCount`, `net_listening`.
+
+**Order book methods.** `getOrderBook(base, quote, depth)` returns aggregated bids and asks, best-first, up to `depth` levels. Prices are in the canonical frame (`quote per base`, scaled by `BOOK_PRICE_SCALE`), which is exposed alongside the levels so a client can convert to a human price. `getOrderFills(order_id)` returns the newest fills for one order (either side) from the order-view of `TBL_FILL_HISTORY`. `getPairTrades(base, quote, limit)` returns the newest fills on a pair from the pair-view. All three are read-only and can be served from an autocommit `StateAccess`.
 
 **Error responses** use JSON-RPC standard codes for `InvalidRequest`, `MethodNotFound`, `InvalidParams`, `InternalError`, plus a project-specific range (`BlockNotFound`, `TransactionNotFound`, `ReceiptNotFound`, `PoolNotFound`, `OrderNotFound`, `ValidatorNotFound`, `TokenNotFound`, `TxMalformed`, `ChainReadInternal`, `StateReadInternal`, `Unauthorized`, `ProofVersionUnavailable`, `ProofNotAvailable`, etc.). The `InternalError` catch path in the dispatcher swallows exception text -- a deliberate v1 choice documented in the code.
 
@@ -507,9 +603,9 @@ The wallet layer supports the operations you'd need for an address book -- multi
 
 ## What's notably absent
 
-**No divergence detection or repair.** With the atomic commit discipline (state writes, block index writes, and head update in one MDBX transaction), divergence shouldn't be possible. But if it happened -- from a bug, or from a partially-written restart -- the node has no detection or recovery path.
+**No AMM routing for Active orders.** `OrderExecutionMode::Active` is defined and reserved, and `TransactionExecutor::activeOrdersEnabled()` returns `false`, so an Active-mode order is rejected before the sell-token lock is taken. The routing path that would execute an Active order against an AMM pool when its conditions trigger does not exist. Designing it requires answering four questions first — whether the condition evaluator executes in place or enqueues a system transaction; how the fill is recorded when there is no user tx to attach a receipt to; what Active mode means for an order with no conditions; and what the fill record looks like for a maker-less AMM swap. Until those are answered the code cannot be written.
 
-**No order matching engine.** Orders are stored, indexed by expiry, and can be cancelled -- but nothing *fills* them. There is no code that matches buys against sells, no partial-fill logic, no price-time priority queue. The order book exists in the state model but not in the execution model. This is the single largest feature gap.
+**No divergence detection or repair.** With the atomic commit discipline (state writes, block index writes, and head update in one MDBX transaction), divergence shouldn't be possible. But if it happened -- from a bug, or from a partially-written restart -- the node has no detection or recovery path.
 
 **No RPC authentication beyond the admin token.** Read methods are unauthenticated. If the RPC endpoint is exposed to the public internet, anyone can query balances, blocks, and state roots. That's usually fine for a public node; it becomes a problem if the RPC endpoint is also used as a control plane. The metrics endpoint is bound to loopback by default for the same reason, but has no authentication at all -- the design assumes that a scrape endpoint on a private interface is not a secret.
 
@@ -533,11 +629,19 @@ The wallet layer supports the operations you'd need for an address book -- multi
 
 **Validator rotation is bounded by BFT safety.** `computeRotationCount` never removes more validators than would keep the remaining set above quorum. A validator set of 4 can rotate at most 1 per epoch; the cap is `n - bftQuorum(n)`, which for n=100 is 33, but the epoch-proportional bound `ceil(n/21)` gives 5 for n=100. Both bounds are applied and the smaller one wins.
 
-**State transitions are pure functions of the block and the state they run against.** Nothing inside `applyBlock` reads wall-clock time, local peer state, or hardware entropy. This is why the emergency rotation decision lives in the block header rather than a per-node timer: a node can look at its own clock to decide *whether* to stamp the flag, but only the *value* it stamped goes into the block, and only the block feeds the state.
+**State transitions are pure functions of the block and the state they run against.** Nothing inside `applyBlock` reads wall-clock time, local peer state, or hardware entropy. This is why the emergency rotation decision lives in the block header rather than a per-node timer: a node can look at its own clock to decide *whether* to stamp the flag, but only the *value* it stamped goes into the block, and only the block feeds the state. The matching engine is held to the same rule: it reads nothing but its arguments.
 
 **Wire codec is a codec, not a validator.** `BlockHeader::deserialize` round-trips bytes without applying consensus rules. `isWellFormed` is a separate, explicit step the acceptance path runs. This matters for three reasons: historical blocks remain readable if rules change, diagnostic tools can inspect malformed blocks without satisfying consensus rules, and test fixtures can construct blocks whose fields aren't all populated yet.
 
-**Dry-run block application.** `BlockContext::dry_run` skips structural header checks, quorum verification, and the state-root comparison. The proposer relies on this to simulate a candidate block before populating the state root and collecting signatures. The non-dry path runs every check.
+**Dry-run block application.** `BlockContext::dry_run` skips structural header checks, quorum verification, and the state-root comparison. The proposer relies on this to simulate a candidate block before populating the state root and collecting signatures. The non-dry path runs every check. The invariant that makes this safe is that **every state change that touches the SMT happens on both paths**; only writes to the meta table and to non-SMT index tables may be gated on `!ctx.dry_run`. The matching engine obeys this: it writes its book rows, its fill-history rows, and its sequence counter through the SMT unconditionally, and the simulate-vs-apply test in `Tests/Core/BlockProcessor.cpp` is the canary.
+
+**The book is canonicalized, not directional.** The order wire format is directional — "sell A, buy B" — because that is what the user means. The book index is pair-symmetric: base is `min(sell, buy)`, quote is `max(sell, buy)`, and the side byte captures the direction. A sell-A-buy-B order and a sell-B-buy-A order end up in the same index range, on different sides, at reciprocal prices. This is what makes the matcher's crossing check a single comparison with no division in the hot loop.
+
+**The book index is a placement index, not a state mirror.** `putOrder` writes the order record and the owner, pair, and pool indexes. It does **not** touch the book index. The book index is written by `addToOrderBook` when an order first rests and removed by `removeFromOrderBook` when the order leaves the book. A partial fill does not move the book row, because the order's price and sequence are unchanged. This split keeps the write path cheap and the book index's semantics clear: it says "this order is currently resting at this price and this sequence", nothing more.
+
+**Fill history is a node-local index, but the fills themselves are consensus state.** The `TBL_FILL_HISTORY` rows are non-SMT, so a node that never wrote them would still agree with one that did. The fills carried on the receipt are SMT-relevant because the receipt's bytes feed into `receipts_root`. The distinction matters: a node can prune `TBL_FILL_HISTORY` or rebuild it without a fork, but it cannot change the fill fields on a receipt without one.
+
+**Order ids and order sequences are separate counters.** `next_order_id` is allocated by the executor and identifies the order globally. `order:next_sequence` is allocated by the matcher and orders book rows at the same price. They are distinct SMT globals and they never collide. The first is part of every receipt and every index row. The second is internal to the book index and never appears in a receipt.
 
 **Genesis timestamps are fixed constants.** `GENESIS_TIMESTAMP_MS = 1767225600000ULL` (2026-01-01T00:00:00Z) is written into every network's genesis. Block timestamps are proposer-set and validated against `now + 2 seconds`.
 
@@ -600,4 +704,3 @@ Proofs can be requested against historical versions because the SMT keeps histor
 **Genesis is one atomic write.** The entire genesis state, the genesis block, and the chain head all live in a single MDBX write transaction opened at the start of `Node::initGenesis`. Either all of it commits or none of it does. Autocommit `StateAccess` was previously used on this path, which meant genesis was written one row at a time — a crash partway through left a partially-applied genesis that a restart couldn't detect or repair.
 
 **Historical pruning is throttled.** `pruneHistoryBefore` runs after every block commit when `smt_history_blocks > 0`, but only when the current height has advanced at least 100 blocks past the last prune. The throttle bounds the per-commit latency cost: without it, a chain with a lot of history would prune on every block, which is expensive and unnecessary (the window moves by one block per commit, so pruning once per 100 blocks removes 100 versions at a time). A failed prune is logged and skipped; the next attempt happens 100 blocks later.
-```
