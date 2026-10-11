@@ -150,6 +150,19 @@ namespace State
         Id sell_token, Id buy_token,
         const std::function<void(const Core::Order &)> &fn) const;
 
+    //  Every order whose conditions reference the given AMM pool.
+    //  Uses TBL_INDEX_ORDERS_BY_POOL. Ordered by order_id.
+    //
+    //  Used by the condition evaluator to iterate the orders that
+    //  would be affected by a change to this pool's reserves. A
+    //  single order may appear in this index more than once if
+    //  multiple conditions reference the same pool; the caller
+    //  should be prepared to see duplicates and handle them (the
+    //  v1 evaluator deduplicates by order_id).
+    void forEachOrderForPool(
+        Id pool_id,
+        const std::function<void(const Core::Order &)> &fn) const;
+
     // =================================================================
     //  Order expiry index
     // =================================================================
@@ -405,6 +418,14 @@ namespace State
 
     void indexOrderRow(Id order_id, const Crypto::Address &owner, Id sell_token, Id buy_token);
     void unindexOrderRow(Id order_id, const Crypto::Address &owner, Id sell_token, Id buy_token);
+
+    //  Write / remove the pool-index rows for an order. Called from
+    //  putOrder and deleteOrder. Walks the order's conditions,
+    //  collects the distinct pool IDs they reference, and writes one
+    //  sentinel row per pool. Conditions with no pool reference are
+    //  skipped.
+    void indexOrderPoolRows(const Core::Order &order);
+    void unindexOrderPoolRows(const Core::Order &order);
 
     // Low-level: put a row with a sentinel value.
     void putSentinel(uint32_t table_id, const void *key, size_t key_len);

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <unordered_set>
 
 namespace State
 {
@@ -500,6 +501,58 @@ namespace State
     Common::writeU64(pair_key + 8, order_id);
     deleteRow(StateDB::TBL_INDEX_ORDERS_BY_PAIR,
               pair_key, sizeof(pair_key));
+  }
+
+  void StateAccess::indexOrderPoolRows(const Core::Order &order)
+  {
+    //  Collect the distinct pool IDs referenced by the order's
+    //  conditions, then write one index row per pool.
+    //
+    //  An order can reference the same pool in multiple conditions
+    //  (e.g. PriceAbove + VolumeBelow on the same pool). The
+    //  `unordered_set` deduplicates so we write the row once.
+    std::unordered_set<uint32_t> pools;
+    for (uint8_t i = 0; i < order.condition_count; ++i)
+    {
+      const auto &c = order.conditions[i];
+      if (c.type == Core::OrderConditionType::PriceAbove ||
+          c.type == Core::OrderConditionType::PriceBelow ||
+          c.type == Core::OrderConditionType::VolumeBelow)
+      {
+        pools.insert(c.param2);
+      }
+    }
+
+    for (uint32_t pool_id : pools)
+    {
+      uint8_t key[12];
+      Common::writeU32(key, pool_id);
+      Common::writeU64(key + 4, order.id);
+      putSentinel(StateDB::TBL_INDEX_ORDERS_BY_POOL, key, sizeof(key));
+    }
+  }
+
+  void StateAccess::unindexOrderPoolRows(const Core::Order &order)
+  {
+    std::unordered_set<uint32_t> pools;
+    for (uint8_t i = 0; i < order.condition_count; ++i)
+    {
+      const auto &c = order.conditions[i];
+      if (c.type == Core::OrderConditionType::PriceAbove ||
+          c.type == Core::OrderConditionType::PriceBelow ||
+          c.type == Core::OrderConditionType::VolumeBelow)
+      {
+        pools.insert(c.param2);
+      }
+    }
+
+    for (uint32_t pool_id : pools)
+    {
+      uint8_t key[12];
+      Common::writeU32(key, pool_id);
+      Common::writeU64(key + 4, order.id);
+      deleteRow(StateDB::TBL_INDEX_ORDERS_BY_POOL, key, sizeof(key));
+    }
   }
 
   // ===========================================================================
@@ -1069,7 +1122,9 @@ namespace State
     auto value = order.serializeState();
     smt_.update(key, value, version_);
 
-    indexOrderRow(order.id, order.owner, order.sell_token, order.buy_token);
+    indexOrderRow(order.id, order.owner,
+                  order.sell_token, order.buy_token);
+    indexOrderPoolRows(order);
   }
 
   void StateAccess::deleteOrder(Id order_id)
@@ -1083,7 +1138,11 @@ namespace State
     smt_.remove(key, version_);
 
     if (have_order)
-      unindexOrderRow(order_id, order.owner, order.sell_token, order.buy_token);
+    {
+      unindexOrderRow(order_id, order.owner,
+                      order.sell_token, order.buy_token);
+      unindexOrderPoolRows(order);
+    }
   }
 
   void StateAccess::forEachOrder(
@@ -1149,6 +1208,30 @@ namespace State
     };
 
     readForEachWithPrefix(StateDB::TBL_INDEX_ORDERS_BY_PAIR, prefix, visitor);
+  }
+
+  void StateAccess::forEachOrderForPool(
+      Id pool_id,
+      const std::function<void(const Core::Order &)> &fn) const
+  {
+    uint8_t prefix_bytes[4];
+    Common::writeU32(prefix_bytes, static_cast<uint32_t>(pool_id));
+    std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 4);
+
+    auto visitor = [this, &fn](const std::vector<uint8_t> &key,
+                               const std::vector<uint8_t> &) -> bool
+    {
+      if (key.size() != 12)
+        return true;
+      Id order_id = Common::readU64(key.data() + 4);
+      Core::Order order;
+      if (getOrder(order_id, order))
+        fn(order);
+      return true;
+    };
+
+    readForEachWithPrefix(StateDB::TBL_INDEX_ORDERS_BY_POOL,
+                          prefix, visitor);
   }
 
   // ===========================================================================

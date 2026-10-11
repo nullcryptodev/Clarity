@@ -88,6 +88,8 @@ namespace State
       return "index_blocks_by_producer";
     case TBL_INDEX_ORDERS_BY_PAIR:
       return "index_orders_by_pair";
+    case TBL_INDEX_ORDERS_BY_POOL:
+      return "index_orders_by_pool";
     default:
       return "<unknown>";
     }

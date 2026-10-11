@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.12)
 
 # Set policy to allow linking to targets in other directories
 cmake_policy(SET CMP0079 NEW)

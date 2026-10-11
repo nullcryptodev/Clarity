@@ -7,16 +7,31 @@
 
 #include "Common/Wire.h"
 
+#include <cstring>
+
 namespace Core
 {
   //  OrderCondition
 
   void OrderCondition::serializeState(std::vector<uint8_t> &out) const
   {
-    Common::Writer w(out);
-    w.writeU8(static_cast<uint8_t>(type));
-    w.writeU64(param1);
-    w.writeU32(param2);
+    //  Write into a local buffer first so a caller whose `out` is
+    //  shared (e.g. an Order serializing multiple conditions) does
+    //  not observe a half-written condition if anything throws.
+    //  The format is fixed-size and cannot throw today, but the
+    //  discipline is worth keeping.
+    uint8_t buf[STATE_SIZE];
+    size_t off = 0;
+
+    buf[off++] = static_cast<uint8_t>(type);
+
+    for (int i = 0; i < 8; ++i)
+      buf[off++] = uint8_t(param1 >> (i * 8));
+
+    for (int i = 0; i < 4; ++i)
+      buf[off++] = uint8_t(param2 >> (i * 8));
+
+    out.insert(out.end(), buf, buf + STATE_SIZE);
   }
 
   bool OrderCondition::deserializeState(const uint8_t *data, size_t len,
@@ -25,19 +40,23 @@ namespace Core
     if (offset + STATE_SIZE > len)
       return false;
 
-    Common::Reader r(data + offset, STATE_SIZE);
+    const uint8_t *p = data + offset;
 
-    out.type = static_cast<OrderConditionType>(r.readU8());
-    out.param1 = r.readU64();
-    out.param2 = r.readU32();
+    out.type = static_cast<OrderConditionType>(p[0]);
 
-    if (!r.ok())
-      return false;
+    uint64_t p1 = 0;
+    for (int i = 0; i < 8; ++i)
+      p1 |= uint64_t(p[1 + i]) << (i * 8);
+    out.param1 = p1;
 
-    //  Only advance the caller's offset on success. On failure the
-    //  caller's cursor is left untouched, so it can decide whether to
-    //  retry, skip, or abort without having to unwind a half-consumed
-    //  read.
+    uint32_t p2 = 0;
+    for (int i = 0; i < 4; ++i)
+      p2 |= uint32_t(p[9 + i]) << (i * 8);
+    out.param2 = p2;
+
+    //  Only advance the caller's offset on success, so a caller that
+    //  gets false back can inspect the cursor without having to
+    //  unwind a half-consumed read.
     offset += STATE_SIZE;
 
     return out.isValid();
@@ -47,6 +66,7 @@ namespace Core
 
   std::vector<uint8_t> Order::serializeState() const
   {
+    //  Reserve enough for the max so we never reallocate mid-write.
     std::vector<uint8_t> out;
     out.reserve(STATE_SIZE_FIXED + condition_count * OrderCondition::STATE_SIZE);
 
@@ -73,6 +93,7 @@ namespace Core
 
   bool Order::deserializeState(const uint8_t *data, size_t len, Order &out)
   {
+    //  A well-formed order has at least the fixed header.
     if (len < STATE_SIZE_FIXED)
       return false;
 
@@ -96,10 +117,16 @@ namespace Core
     if (out.condition_count > ORDER_MAX_CONDITIONS)
       return false;
 
-    //  Conditions are fixed-size and follow the fixed-size header
-    //  immediately. Track the cursor manually because
-    //  OrderCondition::deserializeState takes a raw byte offset, not a
-    //  Reader — see the note in that function.
+    //  Conditions follow the fixed header immediately. The expected
+    //  total length is known, so we can reject a buffer with trailing
+    //  bytes before doing any further work.
+    const size_t expected_len =
+        STATE_SIZE_FIXED +
+        static_cast<size_t>(out.condition_count) * OrderCondition::STATE_SIZE;
+
+    if (len != expected_len)
+      return false;
+
     size_t off = STATE_SIZE_FIXED;
 
     for (uint8_t i = 0; i < out.condition_count; ++i)
@@ -110,41 +137,13 @@ namespace Core
       }
     }
 
+    //  Belt-and-braces: the length check above already guarantees
+    //  off == len after a successful loop, but the invariant is
+    //  load-bearing and worth asserting explicitly.
+    if (off != len)
+      return false;
+
     return out.isValid();
-  }
-
-  //  Framework serialization
-
-  void Order::serialize(Serialization::ISerializer &s)
-  {
-    s(id, "id");
-    s(owner, "owner");
-    s(mode, "mode");
-    s(sell_token, "sell_token");
-    s(buy_token, "buy_token");
-    s(sell_amount, "sell_amount");
-    s(min_buy_amount, "min_buy_amount");
-    s(created_at_height, "created_at_height");
-    s(order_expires_at_height, "order_expires_at_height");
-    s(filled_amount, "filled_amount");
-    s(condition_count, "condition_count");
-    // Note: conditions array is not serialized via framework, use state
-    // codec for full fidelity.
-  }
-
-  void Order::serialize(Serialization::ISerializer &s) const
-  {
-    s(id, "id");
-    s(owner, "owner");
-    s(mode, "mode");
-    s(sell_token, "sell_token");
-    s(buy_token, "buy_token");
-    s(sell_amount, "sell_amount");
-    s(min_buy_amount, "min_buy_amount");
-    s(created_at_height, "created_at_height");
-    s(order_expires_at_height, "order_expires_at_height");
-    s(filled_amount, "filled_amount");
-    s(condition_count, "condition_count");
   }
 
 } // namespace Core

@@ -11,6 +11,7 @@
 #include "Crypto/Types.h"
 #include "Serialization/ISerializer.h"
 #include "GlobalConfig.h"
+#include "RewardTypes.h"
 
 namespace Core
 {
@@ -50,6 +51,34 @@ namespace Core
     uint64_t created_at_height{0};
     bool active{true};
 
+    //  ---- Rolling volume (tumbling window) ----
+    //
+    //  Volume tracking for OrderConditionType::VolumeBelow.
+    //
+    //  Each swap contributes its CLRTY-equivalent amount to
+    //  `volume_current`. When the current height reaches
+    //  `volume_window_height + ROTATION_INTERVAL`, the window rolls:
+    //  `volume_last` becomes the previous window's total, and
+    //  `volume_current` resets to zero for the new window.
+    //
+    //  `VolumeBelow` conditions read `volume_last` — the total
+    //  volume of the previous complete epoch. This means the value
+    //  lags by up to one epoch (ROTATION_INTERVAL blocks, ~1 minute).
+    //  That is deliberate: a rolling per-block ring buffer would
+    //  cost 960 bytes per pool versus 24 for these three fields, and
+    //  a one-epoch lag is acceptable for limit-order conditions.
+    //
+    //  A swap in a pool with no CLRTY side contributes zero (the
+    //  volume unit is CLRTY; there is no way to denominate a
+    //  token-only trade in CLRTY without an oracle).
+    //
+    //  Initialization: all three fields are zero on a freshly created
+    //  pool. The first swap starts the first window at
+    //  `current_height` and adds its amount to `volume_current`.
+    uint64_t volume_window_height{0};
+    uint64_t volume_current{0};
+    uint64_t volume_last{0};
+
     // ---- Helpers ----
 
     bool isValid() const noexcept
@@ -73,14 +102,6 @@ namespace Core
 
     // True when the pool has been fully drained: every LP has
     // withdrawn, both reserves are zero, and no liquidity remains.
-    // A pool in this state is functionally inert — you can't swap
-    // through it (division by zero), and AddLiquidity rejects it —
-    // and RemoveLiquidity deletes the record when this becomes true.
-    //
-    // Historical reads still see the pool at any version where it
-    // existed: the historical SMT row is written when the pool is
-    // created and updated on every swap and liquidity change, and
-    // deleting the current record does not remove those rows.
     bool isClosed() const noexcept
     {
       return total_liquidity == 0 &&
@@ -89,10 +110,33 @@ namespace Core
     }
 
     // Constant product invariant.
-    // Uses 128-bit intermediate to avoid overflow.
     __uint128_t k() const noexcept
     {
       return static_cast<__uint128_t>(reserve_a) * reserve_b;
+    }
+
+    //  Return the current "reported volume" for condition evaluation.
+    //
+    //  If a full window has elapsed since `volume_window_height`, the
+    //  previous window's total is `volume_current` (the roll happens
+    //  lazily on the next swap, so between the window boundary and
+    //  the next swap we must report the in-progress window as the
+    //  most-recent complete one).
+    uint64_t reportedVolume(uint64_t current_height) const noexcept
+    {
+      if (volume_window_height == 0)
+        return 0;
+
+      if (current_height >= volume_window_height + ROTATION_INTERVAL)
+      {
+        //  The window has ended but no swap has rolled it yet.
+        //  Report the in-progress total, which is now a complete
+        //  window.
+        return volume_current;
+      }
+
+      //  Mid-window: report the previous complete window.
+      return volume_last;
     }
 
     // ---- State serialization ----
@@ -108,13 +152,16 @@ namespace Core
     //   [2]  fee_bps
     //   [8]  created_at_height
     //   [1]  active
-    // Total: 83 bytes
+    //   [8]  volume_window_height
+    //   [8]  volume_current
+    //   [8]  volume_last
+    // Total: 107 bytes
 
     std::vector<uint8_t> serializeState() const;
     static bool deserializeState(const uint8_t *data, size_t len, AmmPool &out);
 
     static constexpr size_t STATE_SIZE =
-        8 + 32 + 4 + 4 + 8 + 8 + 8 + 2 + 8 + 1;
+        8 + 32 + 4 + 4 + 8 + 8 + 8 + 2 + 8 + 1 + 8 + 8 + 8;
 
     // ---- Framework serialization ----
     void serialize(Serialization::ISerializer &s);

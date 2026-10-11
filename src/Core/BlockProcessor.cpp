@@ -261,6 +261,24 @@ namespace Core
     processOrderExpiries(state, ctx.current_height);
     processUnbondExpiries(state, ctx.current_height);
 
+    //  Condition evaluation runs once per epoch, at the same
+    //  boundary as processEpochBoundary and processRotation. It is
+    //  placed after transactions and expiries (so it sees the
+    //  post-transaction state of this block), and before rewards
+    //  (so cancelled orders don't participate in this block's
+    //  reward distribution).
+    //
+    //  Every state mutation performed here — the refund, the fee,
+    //  the order deletion — runs on BOTH the dry-run and apply
+    //  paths. The rule is unchanged: SMT writes happen
+    //  unconditionally, only the meta-table and non-SMT index
+    //  writes may be gated on !ctx.dry_run. Nothing in
+    //  evaluateOrderConditions is gated.
+    if ((ctx.current_height + 1) % ROTATION_INTERVAL == 0)
+    {
+      evaluateOrderConditions(state, ctx);
+    }
+
     distributeRewards(state, block, ctx);
 
     //  Increment the producer's own counter. This is a state change:
@@ -661,6 +679,240 @@ namespace Core
     }
 
     state.clearOrderExpiry(current_height);
+  }
+
+  //  Order condition evaluation
+  //
+  //  Called once per epoch (see applyBlock). Walks every outstanding
+  //  order and cancels any whose conditions have failed.
+  //
+  //  This is O(n) in the number of orders, once per epoch. At v1
+  //  scale that's fine. The pool_id -> order_id index
+  //  (TBL_INDEX_ORDERS_BY_POOL) exists so a future version can
+  //  switch to per-pool evaluation, triggered when a pool's
+  //  reserves change, without a state-format change.
+  //
+  //  Design rationale and the semantics of each condition type live
+  //  in Order.h.
+
+  std::optional<uint64_t> BlockProcessor::poolSpotPrice(
+      State::StateAccess &state,
+      uint32_t pool_id,
+      uint32_t sell_token,
+      uint32_t buy_token)
+  {
+    Core::AmmPool pool;
+    if (!state.getAmmPool(pool_id, pool))
+      return std::nullopt;
+
+    //  Determine which side of the pool each token is on.
+    //
+    //  The pool's canonical ordering is token_a < token_b. The
+    //  order's pair is (sell_token, buy_token), in whatever order
+    //  the owner chose. We need to compute the price in the
+    //  direction the owner asked for, so:
+    //
+    //    - if the pool is (sell, buy) in canonical order:
+    //        price = reserve_b / reserve_a
+    //    - if the pool is (buy, sell) in canonical order:
+    //        price = reserve_a / reserve_b
+    //    - otherwise: the pool doesn't pair these tokens
+    bool sell_is_a = false;
+    bool sell_is_b = false;
+
+    if (pool.token_a == sell_token && pool.token_b == buy_token)
+    {
+      sell_is_a = true;
+    }
+    else if (pool.token_b == sell_token && pool.token_a == buy_token)
+    {
+      sell_is_b = true;
+    }
+    else
+    {
+      return std::nullopt;
+    }
+
+    //  Both reserves must be positive for the price to be defined.
+    if (pool.reserve_a == 0 || pool.reserve_b == 0)
+      return std::nullopt;
+
+    //  price = (buy per sell) * PRICE_SCALE
+    //
+    //  If sell_token is token_a:
+    //      one unit of token_a buys reserve_b / reserve_a of token_b
+    //      → price = reserve_b * PRICE_SCALE / reserve_a
+    //
+    //  If sell_token is token_b:
+    //      one unit of token_b buys reserve_a / reserve_b of token_a
+    //      → price = reserve_a * PRICE_SCALE / reserve_b
+    //
+    //  Use 128-bit arithmetic to avoid overflow in the intermediate.
+    __uint128_t num = 0;
+    uint64_t den = 0;
+
+    if (sell_is_a)
+    {
+      num = static_cast<__uint128_t>(pool.reserve_b) * Core::PRICE_SCALE;
+      den = pool.reserve_a;
+    }
+    else // sell_is_b
+    {
+      num = static_cast<__uint128_t>(pool.reserve_a) * Core::PRICE_SCALE;
+      den = pool.reserve_b;
+    }
+
+    if (den == 0)
+      return std::nullopt;
+
+    return static_cast<uint64_t>(num / den);
+  }
+
+  bool BlockProcessor::conditionsAllHold(State::StateAccess &state,
+                                         const Core::Order &order,
+                                         uint64_t current_height)
+  {
+    for (uint8_t i = 0; i < order.condition_count; ++i)
+    {
+      const auto &c = order.conditions[i];
+
+      switch (c.type)
+      {
+      case OrderConditionType::Invalid:
+        //  Should never appear: order creation rejects it. If it
+        //  somehow does, treat it as failed — an order with an
+        //  invalid condition should not remain live.
+        return false;
+
+      case OrderConditionType::ExpiresAtHeight:
+      {
+        if (current_height >= c.param1)
+          return false;
+        break;
+      }
+
+      case OrderConditionType::PriceAbove:
+      {
+        auto price = poolSpotPrice(state, c.param2,
+                                   order.sell_token, order.buy_token);
+        if (!price.has_value())
+          break; // unevaluable: condition holds
+        if (*price > c.param1)
+          return false;
+        break;
+      }
+
+      case OrderConditionType::PriceBelow:
+      {
+        auto price = poolSpotPrice(state, c.param2,
+                                   order.sell_token, order.buy_token);
+        if (!price.has_value())
+          break; // unevaluable: condition holds
+        if (*price < c.param1)
+          return false;
+        break;
+      }
+
+      case OrderConditionType::VolumeBelow:
+      {
+        Core::AmmPool pool;
+        if (!state.getAmmPool(c.param2, pool))
+          break; // unevaluable: condition holds
+        const uint64_t vol = pool.reportedVolume(current_height);
+        if (vol < c.param1)
+          return false;
+        break;
+      }
+
+      case OrderConditionType::BalanceBelow:
+      {
+        const Core::Account acct = state.getAccount(order.owner);
+        if (acct.balance < c.param1)
+          return false;
+        break;
+      }
+      }
+    }
+
+    return true;
+  }
+
+  void BlockProcessor::cancelOrderByCondition(State::StateAccess &state,
+                                              Id order_id,
+                                              uint64_t /*current_height*/)
+  {
+    Core::Order order;
+    if (!state.getOrder(order_id, order))
+      return;
+
+    //  Refund the remaining sell amount, minus the cancellation fee.
+    //
+    //  The fee is charged in the sell token, so the refund always
+    //  covers it. If the remaining amount is smaller than the fee —
+    //  which cannot happen in practice, but the code handles it
+    //  defensively — the refund is zero and the fee is
+    //  correspondingly smaller.
+    const uint64_t remaining = order.remainingAmount();
+    const uint64_t fee =
+        std::min(remaining, Core::ORDER_CANCEL_FEE_ATOMIC);
+    const uint64_t refund = remaining - fee;
+
+    if (refund > 0)
+    {
+      if (order.sell_token == NATIVE_TOKEN_ID)
+      {
+        Core::Account acct = state.getAccount(order.owner);
+        acct.balance += refund;
+        state.putAccount(order.owner, acct);
+      }
+      else
+      {
+        const uint64_t bal =
+            state.getTokenBalance(order.owner, order.sell_token);
+        state.putTokenBalance(order.owner, order.sell_token,
+                              bal + refund);
+      }
+    }
+
+    //  Remove from the expiry index if present. This is the same
+    //  bookkeeping that processOrderExpiries and executeCancelOrder
+    //  do; without it, the expiry index retains a stale entry that
+    //  points at a deleted order, and a later expiry pass would try
+    //  to cancel the same order twice.
+    if (order.order_expires_at_height != 0)
+    {
+      state.removeOrderExpiry(order.order_expires_at_height, order_id);
+    }
+
+    //  deleteOrder removes the order record from the SMT and from
+    //  the owner, pair, and pool indexes via the StateAccess
+    //  implementation.
+    state.deleteOrder(order_id);
+  }
+
+  void BlockProcessor::evaluateOrderConditions(State::StateAccess &state,
+                                               const BlockContext &ctx)
+  {
+    //  Collect the orders to cancel first, then cancel them. Mutating
+    //  the order table while iterating it is not safe: the visitor
+    //  runs under the iteration's read txn, and a delete would open
+    //  a write txn on the same thread, which MDBX refuses.
+    std::vector<Id> to_cancel;
+
+    state.forEachOrder([&](const Core::Order &order)
+                       {
+      if (order.condition_count == 0)
+        return;
+
+      if (conditionsAllHold(state, order, ctx.current_height))
+        return;
+
+      to_cancel.push_back(order.id); });
+
+    for (Id order_id : to_cancel)
+    {
+      cancelOrderByCondition(state, order_id, ctx.current_height);
+    }
   }
 
   void BlockProcessor::processUnbondExpiries(State::StateAccess &state,

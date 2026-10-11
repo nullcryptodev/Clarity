@@ -1263,9 +1263,11 @@ namespace Core
 
   //  Swap
 
+  //  Swap
+
   Receipt TransactionExecutor::executeSwap(State::StateAccess &state,
                                            const Transaction &tx,
-                                           const TxExecutionContext & /*ctx*/)
+                                           const TxExecutionContext &ctx)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
@@ -1367,7 +1369,76 @@ namespace Core
       state.putTokenBalance(tx.to, token_out, bal + amount_out);
     }
 
-    // Update pool reserves.
+    //  ---- Rolling volume update ----
+    //
+    //  Compute the CLRTY-equivalent value of the swap from the
+    //  PRE-swap reserves, so the price used is the one the trader
+    //  actually executed against. If neither side of the pool is
+    //  CLRTY, the contribution is zero — there is no way to
+    //  denominate a token-vs-token trade in CLRTY without an
+    //  oracle.
+    //
+    //  This block must run BEFORE the reserves are updated below,
+    //  because it reads reserve_a / reserve_b.
+    uint64_t clrty_volume = 0;
+
+    if (token_in == NATIVE_TOKEN_ID)
+    {
+      //  Native input: its amount IS the CLRTY value.
+      clrty_volume = amount_in;
+    }
+    else if (pool.token_a == NATIVE_TOKEN_ID && pool.reserve_b > 0)
+    {
+      //  CLRTY is the A side. The pool's spot price of token_b in
+      //  CLRTY is reserve_a / reserve_b, so `amount_in` of token_b
+      //  is worth (amount_in * reserve_a / reserve_b) CLRTY.
+      clrty_volume = static_cast<uint64_t>(
+          static_cast<__uint128_t>(amount_in) *
+          pool.reserve_a / pool.reserve_b);
+    }
+    else if (pool.token_b == NATIVE_TOKEN_ID && pool.reserve_a > 0)
+    {
+      //  CLRTY is the B side. Symmetric.
+      clrty_volume = static_cast<uint64_t>(
+          static_cast<__uint128_t>(amount_in) *
+          pool.reserve_b / pool.reserve_a);
+    }
+
+    //  Roll the tumbling window.
+    //
+    //  Three cases:
+    //    - First swap ever on this pool (window_height == 0):
+    //      start a new window at this height.
+    //    - The current window has ended (height >= start + ROTATION_INTERVAL):
+    //      snapshot the old window's total into volume_last, and
+    //      start a new window with this swap's contribution.
+    //    - Mid-window: add this swap's contribution to the current
+    //      window.
+    //
+    //  `reportedVolume()` in AmmPool handles the fourth case, which
+    //  is "the window has ended but no swap has rolled it yet" — it
+    //  reports the stale window's total, because that's the most
+    //  recent complete window we have data for.
+    if (pool.volume_window_height == 0)
+    {
+      pool.volume_window_height = ctx.current_height;
+      pool.volume_current = clrty_volume;
+      pool.volume_last = 0;
+    }
+    else if (ctx.current_height >=
+             pool.volume_window_height + ROTATION_INTERVAL)
+    {
+      pool.volume_last = pool.volume_current;
+      pool.volume_current = clrty_volume;
+      pool.volume_window_height = ctx.current_height;
+    }
+    else
+    {
+      pool.volume_current += clrty_volume;
+    }
+
+    // Update pool reserves. Done AFTER the volume computation so
+    // the CLRTY-equivalent price is the pre-swap price.
     if (token_in == pool.token_a)
     {
       pool.reserve_a += amount_in;

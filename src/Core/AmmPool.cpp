@@ -27,6 +27,9 @@ namespace Core
     w.writeU16(fee_bps);
     w.writeU64(created_at_height);
     w.writeU8(active ? 1 : 0);
+    w.writeU64(volume_window_height);
+    w.writeU64(volume_current);
+    w.writeU64(volume_last);
 
     return out;
   }
@@ -51,6 +54,9 @@ namespace Core
     out.fee_bps = r.readU16();
     out.created_at_height = r.readU64();
     out.active = (r.readU8() != 0);
+    out.volume_window_height = r.readU64();
+    out.volume_current = r.readU64();
+    out.volume_last = r.readU64();
 
     if (!r.ok())
       return false;
@@ -70,6 +76,9 @@ namespace Core
     s(fee_bps, "fee_bps");
     s(created_at_height, "created_at_height");
     s(active, "active");
+    s(volume_window_height, "volume_window_height");
+    s(volume_current, "volume_current");
+    s(volume_last, "volume_last");
   }
 
   void AmmPool::serialize(Serialization::ISerializer &s) const
@@ -84,6 +93,9 @@ namespace Core
     s(fee_bps, "fee_bps");
     s(created_at_height, "created_at_height");
     s(active, "active");
+    s(volume_window_height, "volume_window_height");
+    s(volume_current, "volume_current");
+    s(volume_last, "volume_last");
   }
 
 } // namespace Core

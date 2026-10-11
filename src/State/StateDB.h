@@ -68,7 +68,15 @@ namespace State
       TBL_INDEX_BLOCKS_BY_PRODUCER = 30,
       TBL_INDEX_ORDERS_BY_PAIR = 31,
 
-      TBL_COUNT = 32,
+      //  Orders indexed by the AMM pool their conditions reference.
+      //  Key = pool_id (4 LE) || order_id (8 LE). Value = sentinel.
+      //  Written when an order is created, removed on cancel or
+      //  condition-triggered cancellation. Used by the condition
+      //  evaluator to enumerate orders per pool without scanning the
+      //  full order table.
+      TBL_INDEX_ORDERS_BY_POOL = 32,
+
+      TBL_COUNT = 33,
     };
 
     using EntryVisitor = std::function<bool(const std::vector<uint8_t> &key,

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "Block.h"
+#include "Order.h"
 #include "Receipt.h"
 #include "ValidatorTypes.h"
 
@@ -77,6 +78,17 @@ namespace Core
         uint64_t current_height,
         bool force_rotation);
 
+    //  Evaluate every outstanding order's conditions. Called once
+    //  per epoch, at the same boundary as processEpochBoundary and
+    //  processRotation. Orders whose conditions have failed are
+    //  cancelled and refunded, in the same way as a manual
+    //  CancelOrder (fee deducted from the refund, order removed
+    //  from all indexes).
+    //
+    //  See Order.h for the full semantics of each condition type.
+    static void evaluateOrderConditions(State::StateAccess &state,
+                                        const BlockContext &ctx);
+
   private:
     // ---- Pre-checks (before any state mutation) ----
 
@@ -120,6 +132,38 @@ namespace Core
 
     static void processOrderExpiries(State::StateAccess &state,
                                      uint64_t current_height);
+
+    //  Return the spot price of the pool, expressed as
+    //  (amount of buy_token per unit of sell_token) * PRICE_SCALE.
+    //
+    //  Returns std::nullopt if:
+    //    - the pool does not exist,
+    //    - the pool's reserves do not contain both sell_token and
+    //      buy_token, or
+    //    - either reserve is zero.
+    //
+    //  A caller that gets nullopt treats the condition as
+    //  unevaluable: the condition holds, the order is not cancelled.
+    static std::optional<uint64_t> poolSpotPrice(
+        State::StateAccess &state,
+        uint32_t pool_id,
+        uint32_t sell_token,
+        uint32_t buy_token);
+
+    //  True if every condition on `order` holds. Called by the
+    //  evaluator.
+    static bool conditionsAllHold(State::StateAccess &state,
+                                  const Core::Order &order,
+                                  uint64_t current_height);
+
+    //  Cancel an order whose conditions have failed. Refunds the
+    //  remaining sell amount minus ORDER_CANCEL_FEE_ATOMIC, removes
+    //  the expiry-index entry if any, and deletes the order record
+    //  (which also removes it from the pool index, owner index, and
+    //  pair index via StateAccess::deleteOrder).
+    static void cancelOrderByCondition(State::StateAccess &state,
+                                       Id order_id,
+                                       uint64_t current_height);
 
     static void processUnbondExpiries(State::StateAccess &state,
                                       uint64_t current_height);
