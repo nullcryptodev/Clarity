@@ -196,7 +196,8 @@ namespace Tests
       uint64_t min_buy_amount,
       uint8_t mode,
       uint64_t expires_at,
-      const std::vector<uint8_t> &condition_bytes = {});
+      const std::vector<uint8_t> &condition_bytes = {},
+      uint32_t pool_id = 0);
   Crypto::KeyPair makeKeyPair();
   Core::TokenInfo makeToken();
 

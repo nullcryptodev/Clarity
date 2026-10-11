@@ -11,15 +11,8 @@
 
 namespace Core
 {
-  //  OrderCondition
-
   void OrderCondition::serializeState(std::vector<uint8_t> &out) const
   {
-    //  Write into a local buffer first so a caller whose `out` is
-    //  shared (e.g. an Order serializing multiple conditions) does
-    //  not observe a half-written condition if anything throws.
-    //  The format is fixed-size and cannot throw today, but the
-    //  discipline is worth keeping.
     uint8_t buf[STATE_SIZE];
     size_t off = 0;
 
@@ -54,19 +47,13 @@ namespace Core
       p2 |= uint32_t(p[9 + i]) << (i * 8);
     out.param2 = p2;
 
-    //  Only advance the caller's offset on success, so a caller that
-    //  gets false back can inspect the cursor without having to
-    //  unwind a half-consumed read.
     offset += STATE_SIZE;
 
     return out.isValid();
   }
 
-  //  Order
-
   std::vector<uint8_t> Order::serializeState() const
   {
-    //  Reserve enough for the max so we never reallocate mid-write.
     std::vector<uint8_t> out;
     out.reserve(STATE_SIZE_FIXED + condition_count * OrderCondition::STATE_SIZE);
 
@@ -74,6 +61,7 @@ namespace Core
     w.writeU64(id);
     w.writeBytes(owner.data.data(), owner.data.size());
     w.writeU8(static_cast<uint8_t>(mode));
+    w.writeU32(pool_id);
     w.writeU32(sell_token);
     w.writeU32(buy_token);
     w.writeU64(sell_amount);
@@ -93,7 +81,6 @@ namespace Core
 
   bool Order::deserializeState(const uint8_t *data, size_t len, Order &out)
   {
-    //  A well-formed order has at least the fixed header.
     if (len < STATE_SIZE_FIXED)
       return false;
 
@@ -102,6 +89,7 @@ namespace Core
     out.id = r.readU64();
     r.readBytes(out.owner.data.data(), out.owner.data.size());
     out.mode = static_cast<OrderExecutionMode>(r.readU8());
+    out.pool_id = r.readU32();
     out.sell_token = r.readU32();
     out.buy_token = r.readU32();
     out.sell_amount = r.readU64();
@@ -117,9 +105,6 @@ namespace Core
     if (out.condition_count > ORDER_MAX_CONDITIONS)
       return false;
 
-    //  Conditions follow the fixed header immediately. The expected
-    //  total length is known, so we can reject a buffer with trailing
-    //  bytes before doing any further work.
     const size_t expected_len =
         STATE_SIZE_FIXED +
         static_cast<size_t>(out.condition_count) * OrderCondition::STATE_SIZE;
@@ -132,14 +117,9 @@ namespace Core
     for (uint8_t i = 0; i < out.condition_count; ++i)
     {
       if (!OrderCondition::deserializeState(data, len, off, out.conditions[i]))
-      {
         return false;
-      }
     }
 
-    //  Belt-and-braces: the length check above already guarantees
-    //  off == len after a successful loop, but the invariant is
-    //  load-bearing and worth asserting explicitly.
     if (off != len)
       return false;
 

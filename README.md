@@ -2,7 +2,7 @@
 
 # Clarity - Authority rotates, the chain doesn't.
 
-![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C903-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
+![Known Tests](https://img.shields.io/badge/Known_Tests-1%2C960-blue) ![Stage](https://img.shields.io/badge/Stage-Development-orange) ![Net](https://img.shields.io/badge/Network-REGTEST-blue) <a href="https://discord.gg/gGjnyvxwFp" target="_blank">![Discord](https://img.shields.io/badge/Discord-Join-purple)</a>
 
 #### Documents
 
@@ -53,6 +53,13 @@
   - [Fill history](#fill-history)
   - [Consensus relevance](#consensus-relevance)
   - [Limits and invariants](#limits-and-invariants)
+- [**Active routing**: how Active orders reach the AMM](#active-routing-how-active-orders-reach-the-amm)
+  - [When routing happens](#when-routing-happens)
+  - [The limit math](#the-limit-math)
+  - [Routed, rested, unroutable](#routed-rested-unroutable)
+  - [Fill accounting](#fill-accounting)
+  - [Epoch fills commitment](#epoch-fills-commitment)
+  - [Cancellation policy](#cancellation-policy)
 - [**Validator identity**: two keys, two roles](#validator-identity-two-keys-two-roles)
   - [Consensus Key](#consensus-key)
   - [Reward Address](#reward-address)
@@ -84,11 +91,11 @@
 
 ## What it is
 
-Clarity is a **single-chain, Byzantine-fault-tolerant proof-of-stake network** with a native currency ($CLRTY), a general-purpose token system, an automated market maker, a **price-time-priority limit-order book with an in-process matching engine**, validator rewards with a pot mechanism, and a growing feature set around staking, validator rotation, and on-chain governance of validator sets.
+Clarity is a **single-chain, Byzantine-fault-tolerant proof-of-stake network** with a native currency ($CLRTY), a general-purpose token system, an automated market maker, a **price-time-priority limit-order book with an in-process matching engine and AMM routing for Active orders**, validator rewards with a pot mechanism, and a growing feature set around staking, validator rotation, and on-chain governance of validator sets.
 
-It's not a direct fork of anything. The block format, consensus protocol, state model, matching engine, and reward math are original. It uses well-known primitives (Ed25519, X25519, Blake2b, SHA-512, XChaCha20-Poly1305) from Monocypher, the Argon2 reference implementation for keystore KDF, the BLAKE2 reference code, and a project-internal Keccak implementation verified against the official Keccak test vectors.
+It's not a direct fork of anything. The block format, consensus protocol, state model, matching engine, Active-order routing, and reward math are original. It uses well-known primitives (Ed25519, X25519, Blake2b, SHA-512, XChaCha20-Poly1305) from Monocypher, the Argon2 reference implementation for keystore KDF, the BLAKE2 reference code, and a project-internal Keccak implementation verified against the official Keccak test vectors.
 
-The project is at the code-complete, pre-launch stage. The daemon builds, the full test suite passes, and the end-to-end path (from transaction submission through consensus through block application through matching through state persistence through restart) has been exercised on a live two-validator regtest network. The RPC surface is complete and tested. The wallet layer (keystores, HD derivation, signing, address encoding) is complete and tested, and there is an interactive CLI wallet client. The P2P layer has authentication, session encryption, sync, block relay, transaction relay, proof serving, per-peer and node-wide rate limiting, and periodic refresh. A Prometheus-compatible metrics endpoint exposes node, P2P, mempool, storage, reward, and consensus state. It has not been deployed to a public network.
+The project is at the code-complete, pre-launch stage. The daemon builds, the full test suite passes, and the end-to-end path (from transaction submission through consensus through block application through matching and Active-order routing through state persistence through restart) has been exercised on a live two-validator regtest network. The RPC surface is complete and tested. The wallet layer (keystores, HD derivation, signing, address encoding) is complete and tested, and there is an interactive CLI wallet client. The P2P layer has authentication, session encryption, sync, block relay, transaction relay, proof serving, per-peer and node-wide rate limiting, and periodic refresh. A Prometheus-compatible metrics endpoint exposes node, P2P, mempool, storage, reward, and consensus state. It has not been deployed to a public network.
 
 ## The architecture
 
@@ -100,7 +107,8 @@ Common           encodings (Base58, Base64, hex), CRC32, JSON, varint, rate limi
 Serialization    binary, KV-binary, JSON serializers
 State            MDBX storage, sparse Merkle tree, state access, proofs, historical reads
 Core             blocks, transactions, execution, block processing, rewards,
-                 order book, matching engine, equivocation proofs
+                 order book, matching engine, Active-order AMM router,
+                 equivocation proofs
 Consensus        BFT state machine, proposer selection, message encoding
 P2P              TCP transport, peer management, message framing, auth, session encryption,
                  sync, relay, proof serving, rate limiting
@@ -223,7 +231,7 @@ The block processor distinguishes between *simulating* a block (the proposer nee
 
 A subtle invariant: **every state change that touches the SMT must happen on both paths.** Only writes to the meta table (`TBL_META`) and to the non-SMT index tables may be gated on `!ctx.dry_run`. The dry-run path aborts its transaction, so the change is discarded; the apply path commits it. If a change is gated, the two paths produce different state roots and the proposer's block is rejected on apply. This was a source of a hard-to-diagnose bug where blocks 1 and 2 were committed by consensus but rejected by every node that tried to apply them.
 
-The matching engine obeys this invariant. Its book rows, fill-history rows, and order-sequence counter all go through the SMT unconditionally, and the `MatchingSimulateAndApplyProduceSameRoot` test is the canary that catches a future gated write.
+The matching engine and the Active-order router both obey this invariant. Their book rows, fill-history rows, order-sequence counter, and pool reserve updates all go through the SMT unconditionally, and the `MatchingSimulateAndApplyProduceSameRoot` and `MatchingRootIdenticalAcrossFreshInstances` tests are the canaries that catch a future gated write.
 
 #### Commit failure handling
 The `on_block_committed` callback returns a `bool`. `BftConsensus::tryApplyCommit` checks the return value, and on failure the engine retries the apply **in place**, with a linear backoff. Up to `max_commit_retries` retries are attempted. Each retry is driven by `pollTimers`, which compares `deps_.now_ms()` against `next_commit_attempt_ms_`.
@@ -251,7 +259,7 @@ A `StateAccess` object wraps the DB and provides typed getters and setters for a
 
 `StateAccess` exists in two modes. **Txn-bound mode** is used by the block processor and consensus paths: every read and write goes through a single MDBX write transaction that the caller opened and owns. **Autocommit mode** is used by the RPC layer, the metrics handler, and the various `Node` helpers: the `StateAccess` owns a single MDBX *read* transaction for its lifetime, and read methods route through it. The autocommit mode is what makes a 256-level SMT walk — hundreds of individual node lookups — cheap in reader-slot terms: the walk holds one reader, not one per lookup.
 
-The matching engine is a txn-bound caller: it runs inside the block processor's write transaction, and every read it makes (`getOrder`, `forEachBookLevel`) and every write it makes (`putOrder`, `deleteOrder`, `addToOrderBook`, `removeFromOrderBook`, `indexFill`) goes through the same `StateAccess` that the executor uses. This is why a fill's balances, records, book rows, and fill-history rows all commit or abort together with the block.
+The matching engine and the Active-order router are txn-bound callers: they run inside the block processor's write transaction, and every read they make (`getOrder`, `forEachBookLevel`, `getAmmPool`) and every write they make (`putOrder`, `deleteOrder`, `addToOrderBook`, `removeFromOrderBook`, `indexFill`, `putAmmPool`) goes through the same `StateAccess` that the executor uses. This is why a fill's balances, records, book rows, fill-history rows, and pool reserve changes all commit or abort together with the block.
 
 #### Read transactions
 MDBX permits multiple read transactions across threads but exactly one read transaction per thread. A second `mdbx_txn_begin(RDONLY)` on a thread that already has a read transaction open returns `MDBX_BUSY`. This is a hard constraint that shapes the code.
@@ -307,11 +315,13 @@ Register as a validator (requires a minimum stake). **Unregister** -- starts an 
 Create a pool for a pair of tokens (or a token and native CLRTY). Add liquidity (mints LP position). Remove liquidity (burns the position and returns the reserves) -- **removing the last LP's full share closes the pool**: the record is deleted from state, and the pool no longer exists for swaps or further liquidity additions. Swap through the pool with a constant-product formula and a fee.
 
 #### Limit orders
-Two modes: `Passive` and `Active`. A Passive order rests in a price-time-priority book and is matched by the in-process matching engine. An Active order is reserved for future AMM routing and is rejected at validation until that ships.
+Two modes: `Passive` and `Active`.
 
-A Passive order has a directional pair (`sell_token`, `buy_token`), a sell amount, a minimum buy amount (which encodes the limit price as `min_buy_amount / sell_amount`), a `mode`, an optional expiry height, and up to eight conditions. Creating the order takes a lock on the sell amount in the same transaction. The order is then matched against the resting book: the incoming order is the taker, the resting orders are makers, and each resting order is executed at the *maker's* price.
+A **Passive** order rests in a price-time-priority book and is matched by the in-process matching engine. It has a directional pair (`sell_token`, `buy_token`), a sell amount, a minimum buy amount (which encodes the limit price as `min_buy_amount / sell_amount`), an optional expiry height, and up to eight conditions. Creating the order takes a lock on the sell amount in the same transaction. The order is then matched against the resting book: the incoming order is the taker, the resting orders are makers, and each resting order is executed at the *maker's* price.
 
-A fill has a maker side and a taker side. The maker receives the counter-asset, the taker receives the counter-asset, and both sides' `filled_amount` is updated. Partial fills are supported on both sides. A taker that is only partially filled rests its remainder in the book with a fresh sequence number.
+An **Active** order routes against an AMM pool instead of resting in the book. It has a `pool_id` naming the pool, a `(sell_token, buy_token)` pair matching that pool's two tokens, and the same limit-amount fields as a Passive order (`sell_amount`, `min_buy_amount`). If it has **no conditions**, it routes immediately on creation: the executor takes the sell-token lock, calls the router, and the router either fills against the pool at a price at least as good as the limit or leaves the order resting for the next epoch. If it has **conditions**, it does not route on creation; it waits for the epoch boundary, where the condition evaluator either routes it (conditions hold) or cancels it (conditions fail). A partial fill at either point leaves the order resting for a retry at the next epoch. See [Active routing](#active-routing-how-active-orders-reach-the-amm) for the full semantics.
+
+A fill has a maker side and a taker side for a Passive order, or just a taker side for an Active order (the "maker" is the pool). A Passive fill executes at the resting maker's price; an Active fill executes at the pool's effective price for the executed amount. Both record the same `Fill` shape, distinguished by a `source` field (`FillSource::Limit` or `FillSource::Amm`). Partial fills are supported on both sides. A taker that is only partially filled rests its remainder in the book with a fresh sequence number.
 
 **Price-time priority.** Orders are keyed in a `pair_key || side || ~canonical_price || sequence` index. The canonical frame is `base = min(sell, buy)`, `quote = max(sell, buy)`, and the canonical price is stored in `quote per base`, scaled by `BOOK_PRICE_SCALE`. Side 0 (sellers) store the price directly so ascending key order puts the best ask first; side 1 (buyers) store `~price` so ascending key order puts the best bid first. Sequence is a monotonic u64 from `nextOrderSequence()` (an SMT global, so it is dry-run/apply-consistent) and breaks ties at the same price in FIFO order.
 
@@ -319,9 +329,9 @@ A fill has a maker side and a taker side. The maker receives the counter-asset, 
 
 **Cancellation, expiry, and condition failure.** All three remove the order from every index — owner, pair, pool, expiry, and the book — and refund the remaining lock minus `ORDER_CANCEL_FEE_ATOMIC`. All three go through the same `deleteRestingOrder` path, so a cancel cannot accidentally leave a book row behind.
 
-**Fill history.** Every fill writes three rows to `TBL_FILL_HISTORY`: one pair-view row (keyed by pair, height, tx index, fill index) and two order-view rows (one for the maker, one for the taker). This is what makes `getPairTrades` and `getOrderFills` a single prefix scan instead of a receipt walk.
+**Fill history.** Every fill — from the matcher or from the router — writes three rows to `TBL_FILL_HISTORY`: one pair-view row (keyed by pair, height, tx index, fill index) and two order-view rows (one for the maker, one for the taker; for an AMM fill, the maker slot is written with the taker's order id and the `source` field distinguishes the two). This is what makes `getPairTrades` and `getOrderFills` a single prefix scan instead of a receipt walk.
 
-**Receipts.** A `CreateOrder` transaction that crosses at least one maker returns a receipt whose `fills` vector carries the fills in execution order. The receipt's `serializeState()` includes the fill section, so the block's `receipts_root` commits to the fills and a block whose receipts disagree on fills is rejected. Adding or removing a field from the receipt format is a hard fork.
+**Receipts.** A `CreateOrder` transaction that produces at least one fill returns a receipt whose `fills` vector carries the fills in execution order. This is true for both Passive (matcher) and Active-without-conditions (router on creation) orders. An Active order that routes at the *epoch boundary* has no transaction to attach its fills to, so those fills are committed to the header via `epoch_fills_root` instead (see [Epoch fills commitment](#epoch-fills-commitment)). Adding or removing a field from the receipt format, or from the `epoch_fills_root` leaf format, is a hard fork.
 
 **Book levels cap.** A single taker crosses at most `MAX_BOOK_LEVELS_PER_TAKER` (256) resting orders in one transaction. This bounds block-apply time; the taker's remainder rests if the cap is hit.
 
@@ -333,7 +343,7 @@ Move an account's pending rewards into its balance. Recomputes staked amount aft
 
 ## Matching engine: how Passive orders are filled
 
-The matching engine is a pure function of `(StateAccess, Order, height, tx_index)` and runs inside the block processor's write transaction. It is Passive-only; `OrderExecutionMode::Active` is reserved for AMM routing and rejected before the sell-token lock is taken until that ships.
+The matching engine is a pure function of `(StateAccess, Order, height, tx_index)` and runs inside the block processor's write transaction. It handles `OrderExecutionMode::Passive`; `OrderExecutionMode::Active` is dispatched to the router (see [Active routing](#active-routing-how-active-orders-reach-the-amm)) before the matcher is invoked.
 
 #### Canonical book frame
 
@@ -382,11 +392,15 @@ Every fill writes three rows to `TBL_FILL_HISTORY`:
 - **Order view (maker).** Key = `0x02 || maker_order_id(8 BE) || height(8 BE) || tx_index(4 BE) || fill_index(2 BE)`. Value = the same fill bytes.
 - **Order view (taker).** Same shape, keyed by the taker's id.
 
+For an AMM fill produced by the router, `maker_order_id` is zero and the pair view is written under the taker's id — the reader distinguishes the two by inspecting the `Fill::source` field.
+
 The pair view is ordered by height ascending, so a reverse prefix scan yields trades newest-first. The order view answers `getOrderFills` in a single prefix scan. Nothing removes rows from `TBL_FILL_HISTORY` today; the table grows with fills, not with block count.
 
 #### Consensus relevance
 
 Fills are part of the consensus commitment. The `Receipt::serializeState()` codec emits `status(1) || fee_paid(8 LE) || fill_count(4 LE) || fills(N * 55 bytes)`, and `verifyReceiptsRoot` feeds the whole receipt bytes into the leaf. A block whose receipts disagree with the applied fills produces a different `receipts_root` and is rejected. This is what makes a fill a first-class state event rather than a node-local annotation.
+
+Fills produced at the *epoch boundary* by the Active-order router have no transaction to attach to, so they cannot flow through the per-transaction `receipts_root`. They are committed separately via the header's `epoch_fills_root`, computed over the fills' serialized bytes with an `"efil"` domain tag. The `applyBlock` path computes that root from the fills the router produced and compares it to the header; a mismatch rejects the block. The dry-run path skips the comparison, because the caller doesn't know the real value until the dry-run returns.
 
 #### Limits and invariants
 
@@ -394,6 +408,86 @@ Fills are part of the consensus commitment. The `Receipt::serializeState()` code
 - `BOOK_PRICE_SCALE = 10^10`. Chosen to match `PRICE_SCALE` and to leave four digits of headroom above CLRTY's native granularity.
 - Order ids are assigned by `executeCreateOrder` from the SMT global `next_order_id`. Order sequences are assigned by the matcher from a *different* SMT global, `order:next_sequence`. The two counters never collide.
 - The matcher never holds a MDBX cursor across a write: it collects candidates in a `std::vector`, then processes them. MDBX invalidates cursors on any write through the same transaction, and the fill loop writes.
+
+## Active routing: how Active orders reach the AMM
+
+The Active-order router is a pure function of `(StateAccess, Order, height, tx_index)` and runs inside the block processor's write transaction, the same as the matcher. It handles `OrderExecutionMode::Active`. There are two entry points:
+
+- **On creation**, from `executeCreateOrder`, for an Active order with no conditions. The router runs immediately after the sell-token lock is taken and the order record is written.
+- **At the epoch boundary**, from `evaluateOrderConditions`, for an Active order whose conditions hold. The evaluator walks every order in state once per epoch and dispatches Active orders with conditions to the router.
+
+Both entry points call `BlockProcessor::executeActiveOrder`, which returns one of three outcomes.
+
+#### When routing happens
+
+A single Active order can be routed at most once per block: either at the transaction that created it (if it has no conditions) or at an epoch boundary (if it does). An order that partially fills leaves a remainder; the remainder is not re-routed until the *next* epoch boundary, even if the same block contains later transactions that would have made a second fill possible. This keeps per-block cost bounded and matches the "condition evaluated once per epoch" model.
+
+The evaluator runs when `(current_height + 1) % ROTATION_INTERVAL == 0` — the same boundary as `processEpochBoundary` and `processRotation`. It runs after transactions and expiries (so it sees the post-transaction state of the block) and before rewards (so routed fills don't participate in that block's reward distribution).
+
+#### The limit math
+
+An Active order's limit price is `min_buy_amount / sell_amount`, expressed in the order's own directional frame (`buy_token` per `sell_token`). The router converts this to the canonical frame (`quote per base`, `quote = max(sell, buy)`, `base = min(sell, buy)`) using the same `OrderBook::canonicalPrice` function the matcher uses, so an Active order and a Passive order at the same limit compare identically against the pool.
+
+The maximum input that satisfies the limit in a fee-bearing constant-product pool is:
+
+```
+y_max = reserve_out * SCALE / limit_price_scaled
+      - reserve_in * 10000 / (10000 - fee_bps)
+```
+
+The first term is `b / L` (how much input produces the target output at price `L` if the pool had no fee). The second is `a / (1 - f)` (the reserve amount adjusted for the fee — the fee makes the effective input smaller, so you need a larger gross input to reach the same net). The derivation is closed-form: setting the pool's effective price equal to the limit and solving for the gross input. Both divisions are floored, which biases the result slightly *below* the true maximum, ensuring the effective price at the returned input is at or above the limit.
+
+If the pool's current spot price is already at or below the limit — `reserve_out * SCALE <= limit_price_scaled * reserve_in` — the pool cannot fill at the limit, and the router returns `Rested` rather than a positive amount.
+
+#### Routed, rested, unroutable
+
+`executeActiveOrder` returns one of three outcomes:
+
+- **`Filled`**. At least one fill was produced. The order may be fully filled (record deleted) or have a remainder (record updated with a new `filled_amount` and re-persisted). The fills are appended to the caller's fill vector. The pool reserves, the counterparty balance, the order record, and the fill-history rows are all written in the same call.
+- **`Rested`**. Nothing was written. The pool exists and contains the order's pair, but its current price does not permit a fill at the order's limit. The caller leaves the order in state; the next epoch boundary will retry it.
+- **`Unroutable`**. Nothing was written. The order can never fill against this pool: the pool does not exist, is not active, does not contain both of the order's tokens, has zero reserves on one side, or the order's canonical price overflows. The caller (the evaluator, or the executor's pre-route check) cancels the order.
+
+The distinction between `Rested` and `Unroutable` is load-bearing: a pool that is temporarily unfavorable should not cause the order to be cancelled, but a pool that is gone should. `executeActiveOrder` does not cancel on its own; it reports the condition and lets the caller decide.
+
+#### Fill accounting
+
+A fill produced by the router updates four things in one call:
+
+1. **The pool reserves.** The direction is determined by which of the pool's two tokens the order sells. If `sell_token == pool.token_a`, the fill increments `reserve_a` by `amount_in` and decrements `reserve_b` by `amount_out`; otherwise it does the reverse.
+2. **The counterparty balance.** The order's sell-token lock was taken at order creation, so the only balance movement is the incoming token: the owner's `buy_token` balance increases by `amount_out`.
+3. **The order record.** `filled_amount` increases by `amount_in` (denominated in the order's own sell token, same convention as the matcher).
+4. **The fill-history rows.** Same three-row shape as a matcher fill, with `Fill::source = FillSource::Amm`, `maker_order_id = 0`, and `pool_id` set.
+
+The `Fill` record uses the canonical frame: `qty_base` is `min(sell, buy)` units and `qty_quote` is `max(sell, buy)` units, regardless of which direction the order is going. `price` is the effective execution price (`out_per_in * BOOK_PRICE_SCALE`) at the executed amount.
+
+The pool's volume tracker is deliberately not updated by a routed fill. The tracker expects CLRTY-equivalent volume that only a user `Swap` transaction produces; a routed order fill has no such measure. A consequence is that Active-order fills do not contribute to the `VolumeBelow` condition's window.
+
+#### Epoch fills commitment
+
+Fills produced by the router *on creation* (an Active order with no conditions) are attached to the `CreateOrder` transaction's receipt, exactly like matcher fills, and are committed to via `receipts_root`.
+
+Fills produced by the router *at the epoch boundary* have no transaction to attach to. They are committed to via a dedicated header field, `epoch_fills_root`, computed as a Merkle root over the serialized fill bytes with an `"efil"` domain tag (as opposed to the `"rcpt"` tag used by `receipts_root`, so a fill and a receipt with identical bytes cannot collide across the two trees).
+
+`BlockProcessor::applyBlock` collects the fills produced by `evaluateOrderConditions` into a local vector, passes it to the caller via `BlockResult::epoch_fills`, and (on the non-dry-run path) verifies that `block.header.epoch_fills_root` matches the computed root. Two failure modes are rejected:
+
+- **Non-null root, mismatched fills.** The header claims a root, but the fills don't produce it. This catches a proposer that built the header from a different set of fills than the ones the block actually applies.
+- **Null root, non-empty fills.** The block produced epoch fills but the header does not commit to them. This catches a proposer that omitted the field.
+
+An empty `epoch_fills_root` (the null hash) means "no epoch fills" and is the correct value for every non-epoch-boundary block. The dry-run path skips both checks, because the caller uses a placeholder non-null root while computing the real one.
+
+The `epoch_fills_root` field is part of the block hash, so a header whose root disagrees with the fills it actually produced is rejected before any state mutation.
+
+#### Cancellation policy
+
+An Active order that becomes unroutable is cancelled by the evaluator, using the same `cancelOrderByCondition` path used for a condition failure. The refund is `remainingAmount() - ORDER_CANCEL_FEE_ATOMIC`, and the cancel removes the order from every index (owner, pool, expiry) and from the book if it was resting there.
+
+The three cases:
+
+- **Conditions fail.** Cancel, regardless of whether the pool exists. A condition failure is the user's stated gate; it takes precedence over routing.
+- **Conditions hold, pool unroutable.** Cancel. The pool is gone or incompatible, and the order can never fill.
+- **Conditions hold, pool routable but unfavorable.** Rest. The pool exists and could fill at a different price; the order waits for the next epoch.
+
+The same policy applies to the route-on-creation path: an Active order with no conditions that is unroutable at creation is rejected by the executor, not left in state. `executeCreateOrder` performs a pre-route check (pool exists, is active, contains both tokens, has non-zero reserves) before taking the sell-token lock, so a rejection cannot leave a lock or an order record behind.
 
 ## Validator identity: two keys, two roles
 
@@ -545,6 +639,9 @@ Validator objects returned by the consensus methods expose both `reward_address`
 
 **Order book methods.** `getOrderBook(base, quote, depth)` returns aggregated bids and asks, best-first, up to `depth` levels. Prices are in the canonical frame (`quote per base`, scaled by `BOOK_PRICE_SCALE`), which is exposed alongside the levels so a client can convert to a human price. `getOrderFills(order_id)` returns the newest fills for one order (either side) from the order-view of `TBL_FILL_HISTORY`. `getPairTrades(base, quote, limit)` returns the newest fills on a pair from the pair-view. All three are read-only and can be served from an autocommit `StateAccess`.
 
+**Fill encoder.** A `Fill` on the wire carries its `source` field (`"limit"` or `"amm"`), the `maker_order_id` (zero for an AMM fill), the `taker_order_id`, the `pool_id` (zero for a limit fill), the `qty_base` and `qty_quote` in the canonical frame, the `price` (scaled by `BOOK_PRICE_SCALE`), and the `base_token` and `quote_token` ids. A client that wants to know whether a fill was a book match or an AMM route reads `source`, not the presence or absence of a maker id.
+<!-- VERIFY: confirm the exact JSON field names, whether AMM fills carry a synthetic maker_order_id of zero or omit the field, and whether the encoder emits `source` as a string or an integer. -->
+
 **Error responses** use JSON-RPC standard codes for `InvalidRequest`, `MethodNotFound`, `InvalidParams`, `InternalError`, plus a project-specific range (`BlockNotFound`, `TransactionNotFound`, `ReceiptNotFound`, `PoolNotFound`, `OrderNotFound`, `ValidatorNotFound`, `TokenNotFound`, `TxMalformed`, `ChainReadInternal`, `StateReadInternal`, `Unauthorized`, `ProofVersionUnavailable`, `ProofNotAvailable`, etc.). The `InternalError` catch path in the dispatcher swallows exception text -- a deliberate v1 choice documented in the code.
 
 **Admin methods** require a bearer token in the `Authorization` header. The token is threaded through a thread-local set by `HttpConnection` before dispatch, since `JsonRpcRequest` doesn't carry transport-level data. An empty `admin_token` in the config means admin methods aren't registered at all.
@@ -603,13 +700,11 @@ The wallet layer supports the operations you'd need for an address book -- multi
 
 ## What's notably absent
 
-**No AMM routing for Active orders.** `OrderExecutionMode::Active` is defined and reserved, and `TransactionExecutor::activeOrdersEnabled()` returns `false`, so an Active-mode order is rejected before the sell-token lock is taken. The routing path that would execute an Active order against an AMM pool when its conditions trigger does not exist. Designing it requires answering four questions first — whether the condition evaluator executes in place or enqueues a system transaction; how the fill is recorded when there is no user tx to attach a receipt to; what Active mode means for an order with no conditions; and what the fill record looks like for a maker-less AMM swap. Until those are answered the code cannot be written.
+**No consensus key rotation.** A validator's consensus key is set at registration and immutable. Rotating it means unregistering and re-registering, which forfeits uptime history. This is a deliberate choice -- mutable consensus keys would invalidate every prior signature by the same validator and complicate equivocation proofs -- but it means a validator with a compromised consensus key has no recovery path short of full re-registration.
 
 **No divergence detection or repair.** With the atomic commit discipline (state writes, block index writes, and head update in one MDBX transaction), divergence shouldn't be possible. But if it happened -- from a bug, or from a partially-written restart -- the node has no detection or recovery path.
 
 **No RPC authentication beyond the admin token.** Read methods are unauthenticated. If the RPC endpoint is exposed to the public internet, anyone can query balances, blocks, and state roots. That's usually fine for a public node; it becomes a problem if the RPC endpoint is also used as a control plane. The metrics endpoint is bound to loopback by default for the same reason, but has no authentication at all -- the design assumes that a scrape endpoint on a private interface is not a secret.
-
-**No consensus key rotation.** A validator's consensus key is set at registration and immutable. Rotating it means unregistering and re-registering, which forfeits uptime history. This is a deliberate choice -- mutable consensus keys would invalidate every prior signature by the same validator and complicate equivocation proofs -- but it means a validator with a compromised consensus key has no recovery path short of full re-registration.
 
 **No wallet CLI for address-book operations.** The `clarity-wallet` client covers balance, transfer, staking, and validator operations, but not multi-account management, address labels, or key rotation from the CLI. Integrators still drive those through the library.
 
@@ -629,19 +724,21 @@ The wallet layer supports the operations you'd need for an address book -- multi
 
 **Validator rotation is bounded by BFT safety.** `computeRotationCount` never removes more validators than would keep the remaining set above quorum. A validator set of 4 can rotate at most 1 per epoch; the cap is `n - bftQuorum(n)`, which for n=100 is 33, but the epoch-proportional bound `ceil(n/21)` gives 5 for n=100. Both bounds are applied and the smaller one wins.
 
-**State transitions are pure functions of the block and the state they run against.** Nothing inside `applyBlock` reads wall-clock time, local peer state, or hardware entropy. This is why the emergency rotation decision lives in the block header rather than a per-node timer: a node can look at its own clock to decide *whether* to stamp the flag, but only the *value* it stamped goes into the block, and only the block feeds the state. The matching engine is held to the same rule: it reads nothing but its arguments.
+**State transitions are pure functions of the block and the state they run against.** Nothing inside `applyBlock` reads wall-clock time, local peer state, or hardware entropy. This is why the emergency rotation decision lives in the block header rather than a per-node timer: a node can look at its own clock to decide *whether* to stamp the flag, but only the *value* it stamped goes into the block, and only the block feeds the state. The matching engine and the Active-order router are held to the same rule: they read nothing but their arguments.
 
 **Wire codec is a codec, not a validator.** `BlockHeader::deserialize` round-trips bytes without applying consensus rules. `isWellFormed` is a separate, explicit step the acceptance path runs. This matters for three reasons: historical blocks remain readable if rules change, diagnostic tools can inspect malformed blocks without satisfying consensus rules, and test fixtures can construct blocks whose fields aren't all populated yet.
 
-**Dry-run block application.** `BlockContext::dry_run` skips structural header checks, quorum verification, and the state-root comparison. The proposer relies on this to simulate a candidate block before populating the state root and collecting signatures. The non-dry path runs every check. The invariant that makes this safe is that **every state change that touches the SMT happens on both paths**; only writes to the meta table and to non-SMT index tables may be gated on `!ctx.dry_run`. The matching engine obeys this: it writes its book rows, its fill-history rows, and its sequence counter through the SMT unconditionally, and the simulate-vs-apply test in `Tests/Core/BlockProcessor.cpp` is the canary.
+**Dry-run block application.** `BlockContext::dry_run` skips structural header checks, quorum verification, and the state-root comparison. The proposer relies on this to simulate a candidate block before populating the state root and collecting signatures. The non-dry path runs every check. The invariant that makes this safe is that **every state change that touches the SMT happens on both paths**; only writes to the meta table and to non-SMT index tables may be gated on `!ctx.dry_run`. The matching engine and the Active-order router both obey this: they write their book rows, their fill-history rows, their sequence counter, and their pool updates through the SMT unconditionally, and the simulate-vs-apply test in `Tests/Core/BlockProcessor.cpp` is the canary.
 
 **The book is canonicalized, not directional.** The order wire format is directional — "sell A, buy B" — because that is what the user means. The book index is pair-symmetric: base is `min(sell, buy)`, quote is `max(sell, buy)`, and the side byte captures the direction. A sell-A-buy-B order and a sell-B-buy-A order end up in the same index range, on different sides, at reciprocal prices. This is what makes the matcher's crossing check a single comparison with no division in the hot loop.
 
 **The book index is a placement index, not a state mirror.** `putOrder` writes the order record and the owner, pair, and pool indexes. It does **not** touch the book index. The book index is written by `addToOrderBook` when an order first rests and removed by `removeFromOrderBook` when the order leaves the book. A partial fill does not move the book row, because the order's price and sequence are unchanged. This split keeps the write path cheap and the book index's semantics clear: it says "this order is currently resting at this price and this sequence", nothing more.
 
-**Fill history is a node-local index, but the fills themselves are consensus state.** The `TBL_FILL_HISTORY` rows are non-SMT, so a node that never wrote them would still agree with one that did. The fills carried on the receipt are SMT-relevant because the receipt's bytes feed into `receipts_root`. The distinction matters: a node can prune `TBL_FILL_HISTORY` or rebuild it without a fork, but it cannot change the fill fields on a receipt without one.
+**Fill history is a node-local index, but the fills themselves are consensus state.** The `TBL_FILL_HISTORY` rows are non-SMT, so a node that never wrote them would still agree with one that did. The fills carried on the receipt (and on the epoch-fills root) are SMT-relevant because the receipt's bytes feed into `receipts_root` and the epoch fills feed into `epoch_fills_root`. The distinction matters: a node can prune `TBL_FILL_HISTORY` or rebuild it without a fork, but it cannot change the fill fields on a receipt or in the epoch-fills root without one.
 
 **Order ids and order sequences are separate counters.** `next_order_id` is allocated by the executor and identifies the order globally. `order:next_sequence` is allocated by the matcher and orders book rows at the same price. They are distinct SMT globals and they never collide. The first is part of every receipt and every index row. The second is internal to the book index and never appears in a receipt.
+
+**Active fills commit through one of two channels, depending on when they happen.** A fill produced at order creation rides the transaction's receipt (`receipts_root`). A fill produced at an epoch boundary has no transaction, so it commits through the block header's `epoch_fills_root`. Both channels use the same `Fill::serializeState()` bytes; only the Merkle leaf domain tag differs (`"rcpt"` vs `"efil"`). This is what makes an epoch-boundary fill a first-class consensus event while leaving the per-transaction receipt format unchanged.
 
 **Genesis timestamps are fixed constants.** `GENESIS_TIMESTAMP_MS = 1767225600000ULL` (2026-01-01T00:00:00Z) is written into every network's genesis. Block timestamps are proposer-set and validated against `now + 2 seconds`.
 
@@ -658,6 +755,10 @@ The wallet layer supports the operations you'd need for an address book -- multi
 **Policy rejection is not a block-level error.** A system transaction whose target is ineligible for the operation -- a Slash tx against a seed, an unregistered validator, or a validator with nothing left to slash -- is a no-op at the transaction level, not a block rejection. The distinction is load-bearing: if ineligibility rejected the block, a proposer could halt the chain by including one such transaction in every block it produced. Validity of the *evidence* is enforced upstream (`verifyEquivocationProof`); the executor only applies policy. The same principle applies to every future system-tx type.
 
 **AMM pools auto-close on full drain.** When the last LP withdraws and both reserves reach zero, the pool record is deleted rather than left in a zero-reserve state. A pool in that state is functionally inert -- `Swap` divides by a zero reserve, `AddLiquidity` rejects it -- and leaving the record behind would make callers special-case a state they can never usefully act on. Removing the record is what makes "remove all liquidity" mean "the pool no longer exists." Historical reads are unaffected: `getAtVersion` on a closed pool's key still returns the pool at any version where it existed, so a block explorer can ask "what did pool 7 look like at block 1000?" after the pool has been closed.
+
+**Active orders are cancelled, not abandoned, when their pool disappears.** An Active order whose pool is gone or incompatible cannot ever fill; leaving it resting forever would waste state and confuse any client that later tried to cancel it. The evaluator cancels it with the same code path used for a condition failure -- refund minus the cancel fee, all indexes cleared. This is the counterpart to "AMM pools auto-close on full drain": a pool going away is a state that the router cannot ignore, and the order is cleaned up rather than left to rot.
+
+**An Active order's limit is enforced at the AMM, not just declared.** The router computes the maximum input whose *effective execution price* -- output over gross input, including the fee -- satisfies the order's canonical limit, and clamps the fill quantity to that maximum. An order can never fill at a price worse than it asked for, even when the pool has moved partway between the order's creation and the epoch-boundary routing. The math is closed-form and does not iterate: for a constant-product pool, the maximum input is `b / L - a / (1 - f)` where `b` and `a` are the pool's reserves in the direction of the swap, `L` is the limit price, and `f` is the fee fraction. The result is floored, which biases slightly *below* the true maximum; the effective price at the returned amount is at or above the limit, never below.
 
 **Proof serving is a pure additive protocol.** A `GetProof` request carries a typed descriptor rather than a raw SMT key -- a wallet knows an address, not a `Blake2b("acct" || address)` digest -- so the server does the key derivation. The reply carries the proof *and* the root it was proven against, so the client's `verifyProof(expected_root, proof)` call is self-contained: no DB access, no signature checks, no trust in the server's choice of root beyond what the proof itself establishes. A wrong root produces a failing verification, not a false acceptance.
 

@@ -14,6 +14,7 @@
 #include "ValidatorRotation.h"
 #include "ValidatorTypes.h"
 #include "EquivocationProof.h"
+#include "ActiveRouter.h"
 
 #include "Crypto/Blake2b.h"
 #include "Crypto/Ed25519.h"
@@ -201,6 +202,41 @@ namespace Core
                                   current_height, force_rotation);
   }
 
+  Crypto::Hash BlockProcessor::computeEpochFillsRoot(
+      const std::vector<Fill> &fills)
+  {
+    if (fills.empty())
+      return Crypto::Hash{};
+
+    std::vector<Crypto::Hash> leaves;
+    leaves.reserve(fills.size());
+
+    for (const auto &f : fills)
+    {
+      //  Leaf layout matches verifyEpochFillsRoot:
+      //    "efil" || Fill::serializeState()
+      //
+      //  The "efil" tag distinguishes this leaf domain from the
+      //  receipts_root's "rcpt" tag, so a fill and a receipt with
+      //  identical bytes cannot collide across the two trees.
+      const auto fill_bytes = f.serializeState();
+
+      std::vector<uint8_t> buf;
+      buf.reserve(4 + fill_bytes.size());
+      buf.push_back('e');
+      buf.push_back('f');
+      buf.push_back('i');
+      buf.push_back('l');
+      buf.insert(buf.end(), fill_bytes.begin(), fill_bytes.end());
+
+      Crypto::Hash h;
+      Crypto::blake2b(buf.data(), buf.size(), h.data.data(), 32);
+      leaves.push_back(h);
+    }
+
+    return computeMerkleRoot(leaves);
+  }
+
   BlockResult BlockProcessor::applyBlock(State::StateAccess &state,
                                          const Block &block,
                                          const BlockContext &ctx)
@@ -334,14 +370,18 @@ namespace Core
     //  reward distribution).
     //
     //  Every state mutation performed here — the refund, the fee,
-    //  the order deletion — runs on BOTH the dry-run and apply
-    //  paths. The rule is unchanged: SMT writes happen
-    //  unconditionally, only the meta-table and non-SMT index
-    //  writes may be gated on !ctx.dry_run. Nothing in
-    //  evaluateOrderConditions is gated.
+    //  the order deletion, and the Active-order fills — runs on
+    //  BOTH the dry-run and apply paths. The rule is unchanged:
+    //  SMT writes happen unconditionally, only the meta-table and
+    //  non-SMT index writes may be gated on !ctx.dry_run.
+    //
+    //  Active-order fills produced at the epoch boundary are not
+    //  attached to any transaction; they are collected here and
+    //  committed to the header via epoch_fills_root below.
+    std::vector<Fill> epoch_fills;
     if ((ctx.current_height + 1) % ROTATION_INTERVAL == 0)
     {
-      evaluateOrderConditions(state, ctx);
+      evaluateOrderConditions(state, ctx, epoch_fills);
     }
 
     distributeRewards(state, block, ctx);
@@ -415,9 +455,43 @@ namespace Core
       }
     }
 
+    //  Epoch-fills commitment.
+    //
+    //  Skipped entirely on the dry-run path. The block builder uses
+    //  a placeholder non-null value in the header while computing
+    //  the real root, and only knows the real root after this call
+    //  returns. Checking the placeholder against the computed value
+    //  would reject every dry-run that produced no epoch fills.
+    //
+    //  On the apply path, both directions are checked:
+    //    - non-null root  →  must match the computed root
+    //    - null root      →  must have produced no epoch fills
+    //
+    //  The second direction is the important one: a proposer that
+    //  produced epoch fills without committing to them is a
+    //  consensus hazard and is rejected.
+    if (!ctx.dry_run)
+    {
+      if (!block.header.epoch_fills_root.isNull())
+      {
+        if (!verifyEpochFillsRoot(epoch_fills,
+                                  block.header.epoch_fills_root, error))
+        {
+          result.error = error;
+          return result;
+        }
+      }
+      else if (!epoch_fills.empty())
+      {
+        result.error = "epoch fills present but epoch_fills_root is null";
+        return result;
+      }
+    }
+
     result.valid = true;
     result.receipts = std::move(receipts);
     result.tx_hashes = std::move(tx_hashes);
+    result.epoch_fills = std::move(epoch_fills);
 
     return result;
   }
@@ -761,6 +835,11 @@ namespace Core
     if (pool.reserve_a == 0 || pool.reserve_b == 0)
       return std::nullopt;
 
+    //  Note: this uses PRICE_SCALE, not BOOK_PRICE_SCALE. The two
+    //  constants have the same numeric value today but are
+    //  conceptually distinct (see the comment in OrderBook.h).
+    //  This comparison is a condition evaluation, so it uses the
+    //  condition scale.
     __uint128_t num = 0;
     uint64_t den = 0;
 
@@ -884,24 +963,255 @@ namespace Core
     state.deleteRestingOrder(order);
   }
 
-  void BlockProcessor::evaluateOrderConditions(State::StateAccess &state,
-                                               const BlockContext &ctx)
+  ActiveRouteOutcome BlockProcessor::executeActiveOrder(
+      State::StateAccess &state,
+      Order &order,
+      uint64_t height,
+      uint32_t tx_index_in_block,
+      std::vector<Fill> &fills_out)
+  {
+    if (order.mode != OrderExecutionMode::Active)
+      return ActiveRouteOutcome::Unroutable;
+    if (order.pool_id == 0)
+      return ActiveRouteOutcome::Unroutable;
+    if (order.owner.isNull())
+      return ActiveRouteOutcome::Unroutable;
+
+    //  Fully filled is a caller bug: the evaluator only routes
+    //  orders with a remainder. Report Unroutable so the caller
+    //  cleans up.
+    if (order.isFullyFilled())
+      return ActiveRouteOutcome::Unroutable;
+
+    AmmPool pool;
+    if (!state.getAmmPool(order.pool_id, pool))
+      return ActiveRouteOutcome::Unroutable; // pool gone
+    if (!pool.active)
+      return ActiveRouteOutcome::Unroutable; // pool closed
+
+    //  Determine swap direction. The pool's reserves are in
+    //  canonical token order (token_a < token_b). The order sells
+    //  `order.sell_token`. Either the sell token is token_a (so
+    //  the order sells into reserve_a and receives reserve_b) or
+    //  it is token_b (the reverse). Anything else is a pool/order
+    //  mismatch and the order cannot route.
+    uint64_t reserve_in = 0;
+    uint64_t reserve_out = 0;
+
+    if (order.sell_token == pool.token_a && order.buy_token == pool.token_b)
+    {
+      reserve_in = pool.reserve_a;
+      reserve_out = pool.reserve_b;
+    }
+    else if (order.sell_token == pool.token_b && order.buy_token == pool.token_a)
+    {
+      reserve_in = pool.reserve_b;
+      reserve_out = pool.reserve_a;
+    }
+    else
+    {
+      return ActiveRouteOutcome::Unroutable; // pair mismatch
+    }
+
+    if (reserve_in == 0 || reserve_out == 0)
+      return ActiveRouteOutcome::Unroutable; // empty pool
+
+    //  Canonical limit price in quote-per-base, scaled.
+    //
+    //  The order's limit is `min_buy_amount / sell_amount` in
+    //  buy-token per sell-token. Convert to the canonical frame
+    //  (quote per base) by inverting if the order sells quote.
+    //
+    //  Canonical:
+    //    base  = min(sell, buy)
+    //    quote = max(sell, buy)
+    //
+    //  If the order sells base, its limit price is already
+    //  min_buy_amount / sell_amount in quote per base.
+    //  If the order sells quote, its limit is
+    //  min_buy_amount / sell_amount in base per quote, which
+    //  inverts to sell_amount / min_buy_amount in quote per base.
+    //
+    //  Computed with the same rounding policy OrderBook uses, so
+    //  an Active order and a Passive order at the same limit
+    //  compare identically against the AMM.
+    uint64_t canonical_limit = 0;
+    if (!OrderBook::canonicalPrice(order, canonical_limit))
+      return ActiveRouteOutcome::Unroutable; // overflow
+
+    //  No positive input satisfies the limit. The pool is real,
+    //  the pair is real, but the current price is unfavorable.
+    //  Rest and retry next epoch.
+    const auto max_in = ActiveRouter::maxInputWithinLimit(
+        reserve_in, reserve_out, pool.fee_bps, canonical_limit);
+
+    if (!max_in.has_value() || *max_in == 0)
+      return ActiveRouteOutcome::Rested;
+
+    const uint64_t amount_in = std::min(*max_in, order.remainingAmount());
+    if (amount_in == 0)
+      return ActiveRouteOutcome::Rested;
+
+    const uint64_t amount_out = ActiveRouter::computeOutput(
+        reserve_in, reserve_out, pool.fee_bps, amount_in);
+    if (amount_out == 0)
+      return ActiveRouteOutcome::Rested;
+
+    const uint64_t effective_price = ActiveRouter::computeEffectivePrice(
+        reserve_in, reserve_out, pool.fee_bps, amount_in);
+
+    //  Update the pool. Mirror AmmPool::executeSwap's reserve update
+    //  so a subsequent swap sees a consistent state. The volume
+    //  tracker is deliberately not updated here: the order path is
+    //  not a user Swap tx and does not carry the CLRTY-equivalent
+    //  volume the tracker expects. This means an Active-order fill
+    //  does not contribute to a VolumeBelow condition's window.
+    if (order.sell_token == pool.token_a)
+    {
+      pool.reserve_a += amount_in;
+      pool.reserve_b -= amount_out;
+    }
+    else
+    {
+      pool.reserve_b += amount_in;
+      pool.reserve_a -= amount_out;
+    }
+    state.putAmmPool(pool);
+
+    //  Credit the counterparty. The order's sell-token lock was
+    //  taken at creation, so the only balance movement here is the
+    //  incoming token.
+    if (order.buy_token == NATIVE_TOKEN_ID)
+    {
+      Account acct = state.getAccount(order.owner);
+      acct.balance += amount_out;
+      state.putAccount(order.owner, acct);
+    }
+    else
+    {
+      const uint64_t cur = state.getTokenBalance(order.owner, order.buy_token);
+      state.putTokenBalance(order.owner, order.buy_token, cur + amount_out);
+    }
+
+    //  Record the fill in the order's sell token.
+    order.filled_amount += amount_in;
+
+    //  Build the Fill. qty_base and qty_quote are in the canonical
+    //  frame: base is min(sell, buy), quote is max(sell, buy).
+    const bool sells_base = (order.sell_token < order.buy_token);
+    const uint32_t base_token =
+        sells_base ? order.sell_token : order.buy_token;
+    const uint32_t quote_token =
+        sells_base ? order.buy_token : order.sell_token;
+
+    Fill fill;
+    fill.source = FillSource::Amm;
+    fill.maker_order_id = 0;
+    fill.taker_order_id = order.id;
+    fill.pool_id = order.pool_id;
+    fill.qty_base = sells_base ? amount_in : amount_out;
+    fill.qty_quote = sells_base ? amount_out : amount_in;
+    fill.price = effective_price;
+    fill.base_token = base_token;
+    fill.quote_token = quote_token;
+
+    //  Persist the order.
+    if (order.isFullyFilled())
+    {
+      state.deleteOrder(order.id);
+    }
+    else
+    {
+      state.putOrder(order);
+    }
+
+    //  Write the fill history. The fill index is the position of
+    //  this fill within the caller's accumulating vector, so a
+    //  caller that routes several orders in one epoch gets
+    //  distinct fill indexes.
+    state.indexFill(fill, height, tx_index_in_block,
+                    static_cast<uint16_t>(fills_out.size()));
+
+    fills_out.push_back(fill);
+    return ActiveRouteOutcome::Filled;
+  }
+
+  void BlockProcessor::evaluateOrderConditions(
+      State::StateAccess &state,
+      const BlockContext &ctx,
+      std::vector<Fill> &epoch_fills_out)
   {
     std::vector<Id> to_cancel;
+    std::vector<Id> to_route;
 
     state.forEachOrder([&](const Core::Order &order)
                        {
+      if (order.condition_count == 0 &&
+          order.mode != OrderExecutionMode::Active)
+        return;
+
+      const bool holds = conditionsAllHold(state, order, ctx.current_height);
+
+      if (order.mode == OrderExecutionMode::Active)
+      {
+        //  Conditions decide whether to route now or cancel. A
+        //  condition-failure cancels; a condition-pass routes, and
+        //  a partial or zero fill leaves the order in state for the
+        //  next epoch.
+        if (!holds)
+          to_cancel.push_back(order.id);
+        else
+          to_route.push_back(order.id);
+        return;
+      }
+
+      //  Passive: unchanged behaviour.
       if (order.condition_count == 0)
         return;
-
-      if (conditionsAllHold(state, order, ctx.current_height))
+      if (holds)
         return;
-
       to_cancel.push_back(order.id); });
 
+    //  Cancellations first. An order whose conditions failed is
+    //  not routed even if it would have filled; the condition is
+    //  the gate, and a failed condition cancels.
     for (Id order_id : to_cancel)
     {
       cancelOrderByCondition(state, order_id, ctx.current_height);
+    }
+
+    //  Then routing. Each routed order appends its fills to
+    //  epoch_fills_out. A partial fill leaves the order in state;
+    //  a full fill deletes it; an unroutable order is cancelled
+    //  here.
+    for (Id order_id : to_route)
+    {
+      Core::Order order;
+      if (!state.getOrder(order_id, order))
+        continue;
+
+      //  The pseudo-index for an epoch-boundary fill. There is no
+      //  transaction, so the caller has no tx_index_in_block to
+      //  pass. We use the order's own id, which is unique within a
+      //  block and therefore yields a unique fill-history key. Any
+      //  reader correlating a fill back to a transaction must first
+      //  check whether the block height falls on a rotation
+      //  boundary; if so, the "tx_index" is an order id, not a
+      //  transaction index.
+      const auto outcome = executeActiveOrder(
+          state, order, ctx.current_height,
+          static_cast<uint32_t>(order_id),
+          epoch_fills_out);
+
+      if (outcome == ActiveRouteOutcome::Unroutable)
+      {
+        //  Pool gone, pair mismatch, empty reserves, or overflow.
+        //  Cancel with the standard fee, matching the condition-
+        //  failure policy.
+        cancelOrderByCondition(state, order_id, ctx.current_height);
+      }
+      //  Filled: executeActiveOrder already wrote everything.
+      //  Rested: nothing to do; retry next epoch.
     }
   }
 
@@ -1417,6 +1727,22 @@ namespace Core
     if (computed != expected)
     {
       error = "receipts_root mismatch";
+      return false;
+    }
+    return true;
+  }
+
+  bool BlockProcessor::verifyEpochFillsRoot(
+      const std::vector<Fill> &epoch_fills,
+      const Crypto::Hash &expected,
+      std::string &error)
+  {
+    const Crypto::Hash computed = computeEpochFillsRoot(epoch_fills);
+
+    if (computed != expected)
+    {
+      error = "epoch_fills_root mismatch: expected " +
+              expected.toString() + ", got " + computed.toString();
       return false;
     }
     return true;

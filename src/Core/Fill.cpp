@@ -15,8 +15,10 @@ namespace Core
     out.reserve(STATE_SIZE);
 
     Common::Writer w(out);
+    w.writeU8(static_cast<uint8_t>(source));
     w.writeU64(maker_order_id);
     w.writeU64(taker_order_id);
+    w.writeU32(pool_id);
     w.writeU64(qty_base);
     w.writeU64(qty_quote);
     w.writeU64(price);
@@ -32,8 +34,10 @@ namespace Core
       return false;
 
     Common::Reader r(data, len);
+    out.source = static_cast<FillSource>(r.readU8());
     out.maker_order_id = r.readU64();
     out.taker_order_id = r.readU64();
+    out.pool_id = r.readU32();
     out.qty_base = r.readU64();
     out.qty_quote = r.readU64();
     out.price = r.readU64();

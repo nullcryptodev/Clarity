@@ -72,15 +72,6 @@ namespace Core
                                       uint64_t slash_height,
                                       const TxExecutionContext &ctx);
 
-    //  Reject Active-mode orders until AMM routing ships. Called
-    //  from the tx validator and, defensively, from
-    //  executeCreateOrder. An Active order that silently no-ops is
-    //  worse than a rejected one: the owner's sell-token lock has
-    //  already been taken, and there is no way for the owner to
-    //  recover it short of an explicit CancelOrder. Rejecting early
-    //  makes the failure visible and cheap.
-    static bool activeOrdersEnabled();
-
   private:
     // Per-type handlers. Each returns Success on success, and reports
     // failure by returning a Failure receipt (without exception).

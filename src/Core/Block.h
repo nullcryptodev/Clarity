@@ -38,6 +38,7 @@ namespace Core
   //    [32] state_root
   //    [32] tx_root
   //    [32] receipts_root
+  //    [32] epoch_fills_root
   //    [32] validator_set_root
   //    [8]  total_fees
   //    [4]  tx_count
@@ -45,7 +46,7 @@ namespace Core
   //    [4]  timeout_cert_len       // length of the encoded certificate
   //    [..] timeout_cert_bytes     // encoded TimeoutCertificate
   //
-  //  Total: 270 bytes + certificate size.
+  //  Total: 302 bytes + certificate size.
   //
   //  commit_round is the round in which the precommit quorum formed. It
   //  may differ from the round the block was proposed in when the round
@@ -132,6 +133,7 @@ namespace Core
     Crypto::Hash state_root{};
     Crypto::Hash tx_root{};
     Crypto::Hash receipts_root{};
+    Crypto::Hash epoch_fills_root{};
     Crypto::Hash validator_set_root{};
 
     // ---- Accounting ----

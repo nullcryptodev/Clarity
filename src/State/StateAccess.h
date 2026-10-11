@@ -205,7 +205,7 @@ namespace State
     //  a second loop. See Core/MatchingEngine.cpp.
     void forEachBookLevel(
         Id sell_token, Id buy_token, uint8_t side,
-        const std::function<void(Id order_id,
+        const std::function<bool(Id order_id,
                                  uint64_t canonical_price,
                                  uint64_t sequence)> &fn) const;
 

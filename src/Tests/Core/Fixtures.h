@@ -369,6 +369,12 @@ namespace Tests
       return Core::computeMerkleRoot(leaves);
     }
 
+    static Crypto::Hash computeEpochFillsRootForTest(
+        const std::vector<Core::Fill> &fills)
+    {
+      return Core::BlockProcessor::computeEpochFillsRoot(fills);
+    }
+
     // ---- Transaction helpers ----
 
     Core::Transaction makeSignedTransfer(const Crypto::KeyPair &from,
@@ -396,21 +402,29 @@ namespace Tests
     //    [4]  buy_token (LE)
     //    [8]  min_buy_amount (LE)
     //    [1]  mode
+    //    [4]  pool_id (LE)
     //    [8]  expires_at_height (LE)
     //    [1]  condition_count
     //    [N]  conditions (13 bytes each)
     //
-    //  This helper is intentionally separate from makeSignedCreateOrder
-    //  so a test that wants to inspect or corrupt the payload can build
-    //  it without building a full transaction.
+    //  `pool_id` is meaningful only for Active orders and must be
+    //  zero for Passive orders. The validator enforces this; the
+    //  helper does not, so a test that wants to construct an
+    //  invalid order can do so.
+    //
+    //  This helper is intentionally separate from
+    //  makeSignedCreateOrder so a test that wants to inspect or
+    //  corrupt the payload can build it without building a full
+    //  transaction.
     static std::vector<uint8_t> encodeCreateOrderPayload(
         Id buy_token,
         uint64_t min_buy_amount,
         Core::OrderExecutionMode mode,
+        uint32_t pool_id,
         uint64_t expires_at_height)
     {
       std::vector<uint8_t> payload;
-      payload.reserve(22);
+      payload.reserve(26);
 
       //  buy_token, u32 LE
       payload.push_back(uint8_t(buy_token));
@@ -424,6 +438,12 @@ namespace Tests
 
       //  mode, u8
       payload.push_back(static_cast<uint8_t>(mode));
+
+      //  pool_id, u32 LE
+      payload.push_back(uint8_t(pool_id));
+      payload.push_back(uint8_t(pool_id >> 8));
+      payload.push_back(uint8_t(pool_id >> 16));
+      payload.push_back(uint8_t(pool_id >> 24));
 
       //  expires_at_height, u64 LE
       for (int i = 0; i < 8; ++i)
@@ -442,13 +462,18 @@ namespace Tests
     //  under what conditions. The two token ids are named by the
     //  order's own frame (sell_token, buy_token), not the canonical
     //  pair frame; the executor handles the canonicalization.
+    //
+    //  `pool_id` names the AMM pool for an Active order and must be
+    //  zero for a Passive order. It defaults to zero so existing
+    //  Passive-order call sites do not need to change.
     Core::Transaction makeSignedCreateOrder(
         const Crypto::KeyPair &from,
         Id sell_token, uint64_t sell_amount,
         Id buy_token, uint64_t min_buy_amount,
         Core::OrderExecutionMode mode,
         uint64_t expires_at_height,
-        uint64_t nonce)
+        uint64_t nonce,
+        uint32_t pool_id = 0)
     {
       return TransactionBuilder()
           .type(Core::TxType::CreateOrder)
@@ -460,7 +485,7 @@ namespace Tests
           .tokenId(sell_token)
           .chainId(genesis_config_.chain_id)
           .payload(encodeCreateOrderPayload(
-              buy_token, min_buy_amount, mode, expires_at_height))
+              buy_token, min_buy_amount, mode, pool_id, expires_at_height))
           .build();
     }
 
@@ -703,6 +728,7 @@ namespace Tests
       Crypto::Hash sim_state_root;
       std::vector<Core::Receipt> sim_receipts;
       std::vector<Crypto::Hash> sim_tx_hashes;
+      std::vector<Core::Fill> sim_epoch_fills;
       bool sim_valid = false;
 
       {
@@ -717,6 +743,7 @@ namespace Tests
         sim_state_root = sim_result.new_state_root;
         sim_receipts = sim_result.receipts;
         sim_tx_hashes = sim_result.tx_hashes;
+        sim_epoch_fills = sim_result.epoch_fills;
 
         // If the simulation failed, use the state root *before* the txs
         // ran. This produces a block whose header is well-formed and
@@ -742,6 +769,11 @@ namespace Tests
       {
         b.header.receipts_root = Crypto::Hash{};
       }
+
+      //  Epoch-fills commitment. Empty vector yields the null hash,
+      //  which is the "no epoch fills" marker for non-epoch blocks.
+      b.header.epoch_fills_root =
+          Core::BlockProcessor::computeEpochFillsRoot(sim_epoch_fills);
 
       b.quorum_signatures = makeQuorumForBlock(b, quorumKeysFor(active_set));
 
@@ -887,6 +919,7 @@ namespace Tests
       //  simulation. They are overwritten below with the values the
       //  dry-run actually computes.
       block.header.state_root.data[0] = 0x01;
+      block.header.epoch_fills_root.data[0] = 0x01;
 
       //  Sign with the placeholder roots so the block hash is
       //  well-defined for the simulation. The signature is
@@ -917,6 +950,9 @@ namespace Tests
         {
           block.header.receipts_root = Crypto::Hash{};
         }
+
+        block.header.epoch_fills_root =
+            Core::BlockProcessor::computeEpochFillsRoot(r.epoch_fills);
 
         txn.abort();
       }
@@ -1411,7 +1447,16 @@ namespace Tests
     }
 
     //  Member order is load-bearing. Do not reorder.
-    TempDB temp_;
+    //  Member order is load-bearing. Do not reorder.
+    //
+    //  TempDB is constructed with 1 GB. The default 64 MB is not
+    //  enough for TakerStopsAtMaxBookLevels, which seeds
+    //  MAX_BOOK_LEVELS_PER_TAKER + 2 resting orders and then crosses
+    //  most of them: each order is an SMT write (256 levels of
+    //  historical rows), each fill writes two order records, and the
+    //  book index adds a row plus a companion sequence key per
+    //  resting order. 64 MB fills up around order 100.
+    TempDB temp_{1ULL * 1024 * 1024 * 1024};
     std::unique_ptr<StateDB::Txn> txn_;
     std::unique_ptr<StateAccess> state_;
 

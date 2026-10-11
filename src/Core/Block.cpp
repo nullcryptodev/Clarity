@@ -116,7 +116,7 @@ namespace Core
   std::vector<uint8_t> BlockHeader::serialize() const
   {
     std::vector<uint8_t> out;
-    out.reserve(258 + 4 + timeout_certificate.serialize().size());
+    out.reserve(290 + 4 + timeout_certificate.serialize().size());
 
     Common::Writer w(out);
     w.writeU16(version);
@@ -132,6 +132,7 @@ namespace Core
     w.writeBytes(state_root.data.data(), state_root.data.size());
     w.writeBytes(tx_root.data.data(), tx_root.data.size());
     w.writeBytes(receipts_root.data.data(), receipts_root.data.size());
+    w.writeBytes(epoch_fills_root.data.data(), epoch_fills_root.data.size());
     w.writeBytes(validator_set_root.data.data(), validator_set_root.data.size());
     w.writeU64(total_fees);
     w.writeU32(tx_count);
@@ -179,6 +180,7 @@ namespace Core
     w.writeBytes(state_root.data.data(), state_root.data.size());
     w.writeBytes(tx_root.data.data(), tx_root.data.size());
     w.writeBytes(receipts_root.data.data(), receipts_root.data.size());
+    w.writeBytes(epoch_fills_root.data.data(), epoch_fills_root.data.size());
     w.writeBytes(validator_set_root.data.data(), validator_set_root.data.size());
     w.writeU64(total_fees);
     w.writeU32(tx_count);
@@ -208,8 +210,8 @@ namespace Core
     r.readBytes(out.state_root.data.data(), out.state_root.data.size());
     r.readBytes(out.tx_root.data.data(), out.tx_root.data.size());
     r.readBytes(out.receipts_root.data.data(), out.receipts_root.data.size());
-    r.readBytes(out.validator_set_root.data.data(),
-                out.validator_set_root.data.size());
+    r.readBytes(out.epoch_fills_root.data.data(), out.epoch_fills_root.data.size());
+    r.readBytes(out.validator_set_root.data.data(), out.validator_set_root.data.size());
     out.total_fees = r.readU64();
     out.tx_count = r.readU32();
     out.active_validator_count = r.readU32();

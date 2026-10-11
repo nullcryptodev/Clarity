@@ -14,6 +14,7 @@
 #include "Order.h"
 #include "Receipt.h"
 #include "ValidatorTypes.h"
+#include "Fill.h"
 
 namespace State
 {
@@ -58,6 +59,51 @@ namespace Core
     std::vector<Receipt> receipts;
     std::vector<Crypto::Hash> tx_hashes;
     Crypto::Hash block_hash;
+
+    //  Fills produced at the epoch boundary by the Active-order
+    //  router. These are not attached to any transaction — there
+    //  is no transaction at the epoch boundary — so they cannot
+    //  go into the per-transaction receipts. They are committed
+    //  to separately via the header's epoch_fills_root.
+    //
+    //  Populated on both the dry-run and apply paths. The
+    //  commitment check for the root is skipped on dry_run, same
+    //  rule as every other commitment.
+    std::vector<Fill> epoch_fills;
+  };
+
+  //  Outcome of attempting to route an Active order against its
+  //  AMM pool. The caller switches on this to decide whether to
+  //  leave the order in state for a retry, or cancel it.
+  //
+  //  Distinguishing Rested from Unroutable is load-bearing: a pool
+  //  whose current price is unfavorable should not cause the order
+  //  to be cancelled, but a pool that is gone should.
+  enum class ActiveRouteOutcome
+  {
+    //  One or more fills were produced. The order may be fully
+    //  filled (record deleted) or have a remainder (record
+    //  updated and still resting). Check order.isFullyFilled()
+    //  to distinguish.
+    Filled,
+
+    //  The order is still valid and still resting, but the pool's
+    //  current price does not permit a fill at the order's limit.
+    //  The caller should leave the order in state and retry at
+    //  the next epoch.
+    Rested,
+
+    //  The order can never fill against this pool:
+    //    - the pool does not exist,
+    //    - the pool is inactive,
+    //    - the pool's reserves do not contain the order's pair,
+    //    - the pool has zero reserves on one side, or
+    //    - the order's canonical price overflows.
+    //  The caller should cancel the order. executeActiveOrder has
+    //  NOT cancelled it; it has only reported the condition. The
+    //  caller decides whether to charge the cancel fee and what
+    //  policy applies.
+    Unroutable,
   };
 
   class BlockProcessor
@@ -86,9 +132,59 @@ namespace Core
     //  CancelOrder (fee deducted from the refund, order removed
     //  from all indexes).
     //
+    //  Active orders whose conditions hold are routed against
+    //  their AMM pool. The fills produced by that routing are
+    //  appended to `epoch_fills_out` in execution order. A
+    //  partial fill leaves the order in state for a retry at the
+    //  next epoch; an unroutable order (pool gone, pair mismatch,
+    //  empty reserves) is cancelled.
+    //
     //  See Order.h for the full semantics of each condition type.
     static void evaluateOrderConditions(State::StateAccess &state,
-                                        const BlockContext &ctx);
+                                        const BlockContext &ctx,
+                                        std::vector<Fill> &epoch_fills_out);
+
+    //  Route an Active order against its AMM pool.
+    //
+    //  Preconditions:
+    //    - order.mode == Active
+    //    - order.pool_id != 0
+    //    - the caller has already taken the sell-token lock at order
+    //      creation
+    //
+    //  Postconditions on Filled:
+    //    - One Fill is appended to `fills_out`. Its source is
+    //      FillSource::Amm, its maker_order_id is 0, its pool_id
+    //      is order.pool_id.
+    //    - The order's filled_amount is updated. If it is now fully
+    //      filled, its record is deleted; otherwise it is
+    //      rewritten.
+    //    - The pool's reserves are updated, the counterparty
+    //      balance is credited, and the fill is written to
+    //      TBL_FILL_HISTORY.
+    //
+    //  Postconditions on Rested:
+    //    - Nothing was written to state. The caller leaves the
+    //      order in place and retries next epoch.
+    //
+    //  Postconditions on Unroutable:
+    //    - Nothing was written to state. The caller cancels the
+    //      order.
+    static ActiveRouteOutcome executeActiveOrder(
+        State::StateAccess &state,
+        Order &order,
+        uint64_t height,
+        uint32_t tx_index_in_block,
+        std::vector<Fill> &fills_out);
+
+    //  Compute the Merkle root over a list of fills. Used both for
+    //  the block header's epoch_fills_root and by tests.
+    //
+    //  Leaf layout: Blake2b("efil" || Fill::serializeState()).
+    //  Empty vector yields the null hash, matching receipts_root's
+    //  treatment of an empty receipt list.
+    static Crypto::Hash computeEpochFillsRoot(
+        const std::vector<Fill> &fills);
 
   private:
     // ---- Pre-checks (before any state mutation) ----
@@ -107,17 +203,6 @@ namespace Core
                                       const std::vector<Id> &active_set,
                                       std::string &error);
 
-    //  Verify that the certificate carried in the header matches the
-    //  hash committed to in timeout_certificate_hash. Called from
-    //  checkHeader (via checkTimeoutCertificateHash) and from
-    //  checkTimeoutCertificate (which additionally verifies the
-    //  signatures in the certificate).
-    //
-    //  These are two separate checks: the hash binding is a wire
-    //  integrity check (the certificate bytes we received match what
-    //  the header committed to), and the signature check is a
-    //  consensus check (the certificate's votes are valid and come
-    //  from the right set). A block must pass both.
     static bool checkTimeoutCertificateHash(const Block &block,
                                             std::string &error);
 
@@ -134,34 +219,16 @@ namespace Core
     static void processOrderExpiries(State::StateAccess &state,
                                      uint64_t current_height);
 
-    //  Return the spot price of the pool, expressed as
-    //  (amount of buy_token per unit of sell_token) * PRICE_SCALE.
-    //
-    //  Returns std::nullopt if:
-    //    - the pool does not exist,
-    //    - the pool's reserves do not contain both sell_token and
-    //      buy_token, or
-    //    - either reserve is zero.
-    //
-    //  A caller that gets nullopt treats the condition as
-    //  unevaluable: the condition holds, the order is not cancelled.
     static std::optional<uint64_t> poolSpotPrice(
         State::StateAccess &state,
         uint32_t pool_id,
         uint32_t sell_token,
         uint32_t buy_token);
 
-    //  True if every condition on `order` holds. Called by the
-    //  evaluator.
     static bool conditionsAllHold(State::StateAccess &state,
                                   const Core::Order &order,
                                   uint64_t current_height);
 
-    //  Cancel an order whose conditions have failed. Refunds the
-    //  remaining sell amount minus ORDER_CANCEL_FEE_ATOMIC, removes
-    //  the expiry-index entry if any, and deletes the order record
-    //  (which also removes it from the pool index, owner index, and
-    //  pair index via StateAccess::deleteOrder).
     static void cancelOrderByCondition(State::StateAccess &state,
                                        Id order_id,
                                        uint64_t current_height);
@@ -197,6 +264,10 @@ namespace Core
                                    const Crypto::Hash &expected,
                                    std::string &error);
 
+    static bool verifyEpochFillsRoot(const std::vector<Fill> &epoch_fills,
+                                     const Crypto::Hash &expected,
+                                     std::string &error);
+
     // ---- Helpers ----
 
     static std::vector<Id> loadActiveSet(State::StateAccess &state);
@@ -220,20 +291,6 @@ namespace Core
                                         uint64_t current_height,
                                         std::string &error);
 
-    //  Write the block's per-block index rows: the producer index
-    //  (one row per block) and the transaction indexes (one row per
-    //  address, token, and type per transaction).
-    //
-    //  Called from applyBlock after every state mutation has
-    //  succeeded, so the indexes only record blocks that actually
-    //  applied. Skipped during dry-run.
-    //
-    //  These are pure index writes — they don't affect the state
-    //  root, and a node that never wrote them would still agree
-    //  with a node that did. They exist so the RPC layer can answer
-    //  queries like "which blocks did this validator produce" and
-    //  "what's the transaction history for this address" without
-    //  walking the chain.
     static void indexBlockProducer(State::StateAccess &state,
                                    const Block &block);
 
@@ -241,30 +298,6 @@ namespace Core
                                   const Block &block,
                                   const BlockContext &ctx);
 
-    //  Update the rolling 24-hour fee window. Called from
-    //  bumpLifetimeCounters on the non-dry-run path only, because
-    //  the window is an aggregation counter (meta table) and has no
-    //  effect on the state root.
-    //
-    //  The window is stored as a small ring buffer in the meta
-    //  table:
-    //    fees_window_sum        (uint64, running sum of the
-    //                            currently-retained blocks)
-    //    fees_window_ring       (512 * 8 bytes, one entry per block
-    //                            slot, most-recent-first modulo)
-    //    fees_window_ring_head  (uint64, index of the next slot to
-    //                            write)
-    //    fees_window_block_count(uint64, how many slots are populated;
-    //                            saturates at the ring size)
-    //
-    //  At ~6 s per block (NOMINAL_BLOCK_SECONDS), 24 h is 14,400
-    //  blocks. The ring is sized to 14,400 exactly; the value read
-    //  by the RPC is a strict trailing window, not a padded one.
-    //
-    //  Storing the ring in the meta table rather than in the SMT is
-    //  what keeps this a display-only counter. A verifier that
-    //  never runs this function still agrees on every committed
-    //  state root.
     static void updateFeeWindow(State::StateAccess &state,
                                 uint64_t block_fees);
   };

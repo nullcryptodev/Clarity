@@ -362,6 +362,57 @@ namespace Tests
     return p;
   }
 
+  //  Build the payload bytes for a CreateOrder transaction.
+  //
+  //  Layout, matching TransactionExecutor::validateCreateOrderStructure
+  //  and executeCreateOrder:
+  //
+  //    [4]  buy_token (LE)
+  //    [8]  min_buy_amount (LE)
+  //    [1]  mode
+  //    [4]  pool_id (LE)             — always 0 here; Passive only
+  //    [8]  expires_at_height (LE)
+  //    [1]  condition_count
+  //    [N]  conditions (13 bytes each)
+  //
+  //  `condition_bytes` is a pre-serialized concatenation of
+  //  OrderCondition::STATE_SIZE-byte records. An empty vector means
+  //  a Passive order with no conditions. Use appendOrderCondition()
+  //  to build it.
+  //
+  //  pool_id is fixed at 0 because this helper only builds Passive
+  //  orders, and the validator rejects a Passive order with a
+  //  non-zero pool_id. A test that needs an Active order must build
+  //  the payload by hand (or add a variant helper).
+  std::vector<uint8_t> makeCreateOrderPayload(
+      uint32_t buy_token,
+      uint64_t min_buy_amount,
+      uint8_t mode,
+      uint64_t expires_at,
+      const std::vector<uint8_t> &condition_bytes,
+      uint32_t pool_id)
+  {
+    EXPECT_EQ(condition_bytes.size() % Core::OrderCondition::STATE_SIZE, 0u)
+        << "condition_bytes must be a whole number of "
+        << Core::OrderCondition::STATE_SIZE << "-byte records";
+
+    const uint8_t condition_count = static_cast<uint8_t>(
+        condition_bytes.size() / Core::OrderCondition::STATE_SIZE);
+
+    std::vector<uint8_t> p;
+    p.reserve(26 + condition_bytes.size());
+
+    Common::putU32(p, buy_token);
+    Common::putU64(p, min_buy_amount);
+    p.push_back(mode);
+    Common::putU32(p, pool_id); // <-- the new field
+    Common::putU64(p, expires_at);
+    p.push_back(condition_count);
+    p.insert(p.end(), condition_bytes.begin(), condition_bytes.end());
+
+    return p;
+  }
+
   // Single order condition, encoded as [1] type, [8] param1, [4] param2.
   void appendOrderCondition(std::vector<uint8_t> &p,
                             Core::OrderConditionType type,
@@ -373,22 +424,55 @@ namespace Tests
     Common::putU32(p, param2);
   }
 
-  std::vector<uint8_t> makeCreateOrderPayload(
+  //  In Core_ExecutorFixture's Fixtures.h (or wherever makeCreateOrderPayload
+  //  lives). The 26-byte minimum layout is:
+  //
+  //    [4]  buy_token
+  //    [8]  min_buy_amount
+  //    [1]  mode
+  //    [4]  pool_id
+  //    [8]  expires_at_height
+  //    [1]  condition_count
+  //
+  //  pool_id defaults to 0 because a Passive order must carry 0 there,
+  //  and every existing call site builds a Passive order.
+  static std::vector<uint8_t> makeCreateOrderPayload(
       uint32_t buy_token,
       uint64_t min_buy_amount,
       uint8_t mode,
       uint64_t expires_at,
-      const std::vector<uint8_t> &condition_bytes)
+      uint32_t pool_id = 0)
   {
-    std::vector<uint8_t> p;
-    Common::putU32(p, buy_token);
-    Common::putU64(p, min_buy_amount);
-    p.push_back(mode);
-    Common::putU64(p, expires_at);
-    p.push_back(static_cast<uint8_t>(condition_bytes.size() /
-                                     Core::OrderCondition::STATE_SIZE));
-    p.insert(p.end(), condition_bytes.begin(), condition_bytes.end());
-    return p;
+    std::vector<uint8_t> payload;
+    payload.reserve(26);
+
+    //  buy_token, u32 LE.
+    payload.push_back(uint8_t(buy_token));
+    payload.push_back(uint8_t(buy_token >> 8));
+    payload.push_back(uint8_t(buy_token >> 16));
+    payload.push_back(uint8_t(buy_token >> 24));
+
+    //  min_buy_amount, u64 LE.
+    for (int i = 0; i < 8; ++i)
+      payload.push_back(uint8_t(min_buy_amount >> (i * 8)));
+
+    //  mode, u8.
+    payload.push_back(mode);
+
+    //  pool_id, u32 LE. Zero for Passive.
+    payload.push_back(uint8_t(pool_id));
+    payload.push_back(uint8_t(pool_id >> 8));
+    payload.push_back(uint8_t(pool_id >> 16));
+    payload.push_back(uint8_t(pool_id >> 24));
+
+    //  expires_at_height, u64 LE.
+    for (int i = 0; i < 8; ++i)
+      payload.push_back(uint8_t(expires_at >> (i * 8)));
+
+    //  condition_count, u8.
+    payload.push_back(0);
+
+    return payload;
   }
 
   //  Formula mirrors

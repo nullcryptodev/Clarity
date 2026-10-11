@@ -51,8 +51,6 @@ namespace Core
       return "pool-full";
     case MempoolAddResult::Rejected_OrderMalformed:
       return "order-malformed";
-    case MempoolAddResult::Rejected_OrderDisabledMode:
-      return "order-disabled-mode";
     case MempoolAddResult::Rejected_OrderPriceOverflow:
       return "order-price-overflow";
     }
@@ -84,6 +82,7 @@ namespace Core
 
   std::string Mempool::nonceKey(const Crypto::Address &from, uint64_t nonce)
   {
+    // Key = (32-byte address || 8-byte LE nonce).
     std::string key;
     key.resize(40);
     std::memcpy(&key[0], from.data.data(), 32);
@@ -101,6 +100,8 @@ namespace Core
       return 0;
 
     uint64_t effective_fee = tx.fee;
+    // Priority txs are ranked by tier, not by an inflated fee rate.
+    // The surcharge is accounted for separately by the block processor.
     (void)tier;
 
     return effective_fee / size;
@@ -122,7 +123,9 @@ namespace Core
   {
     if (tx.tx_type == TxType::CreateOrder)
     {
-      if (tx.payload.size() < 22)
+      //  Minimum length: buy_token(4) + min_buy_amount(8) + mode(1)
+      //  + pool_id(4) + expires_at_height(8) + condition_count(1) = 26.
+      if (tx.payload.size() < 26)
         return MempoolAddResult::Rejected_OrderMalformed;
 
       size_t off = 0;
@@ -138,6 +141,12 @@ namespace Core
       off += 8;
 
       uint8_t mode = tx.payload[off++];
+
+      uint32_t pool_id = uint32_t(tx.payload[off]) |
+                         (uint32_t(tx.payload[off + 1]) << 8) |
+                         (uint32_t(tx.payload[off + 2]) << 16) |
+                         (uint32_t(tx.payload[off + 3]) << 24);
+      off += 4;
 
       uint64_t expires_at_height = 0;
       for (int i = 0; i < 8; ++i)
@@ -155,14 +164,20 @@ namespace Core
         return MempoolAddResult::Rejected_OrderMalformed;
       }
 
-      //  Active mode is disabled until AMM routing ships. Reject
-      //  it at admission rather than letting it reach the executor
-      //  and fail there, where the fee would still be charged but
-      //  the mempool slot was wasted.
-      if (mode == static_cast<uint8_t>(OrderExecutionMode::Active) &&
-          !TransactionExecutor::activeOrdersEnabled())
+      //  pool_id is meaningful only for Active orders and must be
+      //  set if and only if the order is Active. The same rule is
+      //  enforced by Order::isValid and by the executor's structural
+      //  validator; duplicating it here keeps a structurally
+      //  invalid order out of the mempool.
+      if (mode == static_cast<uint8_t>(OrderExecutionMode::Active))
       {
-        return MempoolAddResult::Rejected_OrderDisabledMode;
+        if (pool_id == 0)
+          return MempoolAddResult::Rejected_OrderMalformed;
+      }
+      else
+      {
+        if (pool_id != 0)
+          return MempoolAddResult::Rejected_OrderMalformed;
       }
 
       //  Parse conditions. Each one has a fixed 13-byte layout; the
@@ -187,7 +202,9 @@ namespace Core
       //  Canonical-price overflow check. A Passive order whose
       //  price cannot be represented as a u64 cannot enter the
       //  book; rejecting it here keeps the caller from paying a fee
-      //  for an order the matcher would refuse to hold.
+      //  for an order the matcher would refuse to hold. Active
+      //  orders do not go through the book and do not need this
+      //  check.
       if (mode == static_cast<uint8_t>(OrderExecutionMode::Passive))
       {
         Order probe;
@@ -215,6 +232,17 @@ namespace Core
   }
 
   //  Entry serialization
+  //
+  //  Wire format (little-endian):
+  //    [4]  tx_size
+  //    [N]  tx serialized bytes
+  //    [1]  tier
+  //    [8]  fee_rate
+  //    [8]  sequence
+  //    [8]  added_at_ms
+  //    [4]  cached tx_size
+  //
+  //  Total: 33 + N bytes.
 
   std::vector<uint8_t> Mempool::serializeEntry(const Entry &e)
   {
@@ -335,6 +363,10 @@ namespace Core
     if (!db_)
       return;
 
+    // Collect persisted entries under the mutex, then release it
+    // before re-adding. `add` takes the mutex again, so we cannot hold
+    // it across the re-add loop. This also means we must collect first
+    // because the callback runs while StateDB holds its own lock.
     std::vector<Entry> persisted;
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -350,6 +382,14 @@ namespace Core
           });
     }
 
+    // Re-add through the normal validation path. Entries that fail
+    // (nonce too low, insufficient funds, expired, already on chain)
+    // are silently dropped and their persisted rows are deleted.
+    //
+    // `add` persists an accepted entry with a fresh sequence number,
+    // so a successful re-add leaves the persisted row overwritten with
+    // a current version. A failed re-add leaves the stale row, which
+    // we delete here.
     std::vector<Crypto::Hash> stale;
     for (const auto &e : persisted)
     {
@@ -385,7 +425,7 @@ namespace Core
     // ---- Size cap ----
     uint32_t size = static_cast<uint32_t>(tx.serializedSize());
     if (size > 1024 * 1024)
-    {
+    { // hard cap: 1 MiB per tx
       return MempoolAddResult::Rejected_TooLarge;
     }
     out_tx_size = size;
@@ -422,9 +462,7 @@ namespace Core
     //
     //  Placed before the state reads (nonce, balance) because a
     //  malformed payload rejects the tx on its own merits,
-    //  regardless of the sender's state. This is also where
-    //  Active-mode orders are rejected while the feature is
-    //  disabled; see validateOrderPayload.
+    //  regardless of the sender's state.
     if (tx.tx_type == TxType::CreateOrder ||
         tx.tx_type == TxType::CancelOrder)
     {
@@ -448,11 +486,6 @@ namespace Core
 
     if (tx.token_id == NATIVE_TOKEN_ID)
     {
-      //  CreateOrder locks the sell amount, same as a Transfer
-      //  would move it. The pool's structural check cannot see
-      //  the lock, so the balance check has to cover it here.
-      //  fee + amount is the full debit the sender is committing
-      //  to at admission time.
       if (acct.balance < tx.amount + tx.fee)
       {
         return MempoolAddResult::Rejected_InsufficientFunds;
@@ -476,6 +509,10 @@ namespace Core
                                 const StateView &state,
                                 FeeTier tier)
   {
+    //  addImpl does the work and returns the result exactly once at
+    //  a single exit point (its own return statement). This wrapper
+    //  is the only place the result is counted, so the counter array
+    //  is always consistent with the return value the caller sees.
     const MempoolAddResult result = addImpl(tx, state, tier);
 
     const size_t idx = static_cast<size_t>(result);
@@ -493,6 +530,7 @@ namespace Core
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // ---- Validate first ----
     uint64_t fee_rate = 0;
     uint32_t tx_size = 0;
     MempoolAddResult result = validate(tx, state, tier, fee_rate, tx_size);
@@ -503,6 +541,15 @@ namespace Core
 
     Crypto::Hash txid = tx.txid();
 
+    // ---- Nonce conflict check comes FIRST ----
+    //
+    // Even if this exact txid isn't in the pool, a different tx with the
+    // same (from, nonce) might be. Replacement rules apply:
+    //   - Priority tier beats Standard tier
+    //   - Within same tier, strictly higher fee rate replaces
+    //   - Otherwise, reject with NonceConflict
+    //
+    // Same txid case (rebroadcast) is treated as idempotent Accept.
     std::string nk = nonceKey(tx.from, tx.nonce);
     {
       auto it = nonce_index_.find(nk);
@@ -512,10 +559,12 @@ namespace Core
         auto existing_it = entries_.find(existing_txid);
         if (existing_it == entries_.end())
         {
+          // Stale index entry — clean it up and proceed.
           nonce_index_.erase(it);
         }
         else
         {
+          // Exact same tx already in pool: idempotent accept.
           if (existing_txid == txid)
           {
             return MempoolAddResult::Accepted;
@@ -523,6 +572,7 @@ namespace Core
 
           const Entry &existing = existing_it->second;
 
+          // Priority beats Standard: replace.
           if (tier == FeeTier::Priority && existing.tier == FeeTier::Standard)
           {
             total_bytes_ -= existing.tx_size;
@@ -530,6 +580,7 @@ namespace Core
             nonce_index_.erase(it);
             unpersistEntry(existing_txid);
           }
+          // Same tier, strictly higher fee rate: replace.
           else if (tier == existing.tier && fee_rate > existing.fee_rate)
           {
             total_bytes_ -= existing.tx_size;
@@ -537,6 +588,7 @@ namespace Core
             nonce_index_.erase(it);
             unpersistEntry(existing_txid);
           }
+          // Otherwise: reject with conflict.
           else
           {
             return MempoolAddResult::Rejected_NonceConflict;
@@ -545,6 +597,7 @@ namespace Core
       }
     }
 
+    // ---- Build the entry ----
     Entry e;
     e.tx = tx;
     e.tier = tier;
@@ -553,6 +606,7 @@ namespace Core
     e.added_at_ms = nowMs();
     e.tx_size = tx_size;
 
+    // ---- Pool size check + eviction ----
     if (entries_.size() >= MAX_MEMPOOL_TXS ||
         total_bytes_ + tx_size > MAX_MEMPOOL_BYTES)
     {
@@ -562,11 +616,13 @@ namespace Core
       }
     }
 
+    // ---- Insert ----
     uint64_t seq = e.sequence;
     entries_.emplace(txid, std::move(e));
     nonce_index_.emplace(std::move(nk), txid);
     total_bytes_ += tx_size;
 
+    // Push onto the selection heap.
     HeapItem item;
     item.tier = tier;
     item.fee_rate = fee_rate;
@@ -574,6 +630,7 @@ namespace Core
     item.txid = txid;
     heap_.push(item);
 
+    // Write through to persistence.
     persistEntry(txid, entries_.at(txid));
 
     return MempoolAddResult::Accepted;
@@ -654,6 +711,9 @@ namespace Core
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // Wipe persisted rows. Collect the txids first — the forEachEntry
+    // callback runs while StateDB holds its own lock, and rawDel would
+    // try to take it again.
     if (db_)
     {
       std::vector<Crypto::Hash> all;
@@ -735,11 +795,17 @@ namespace Core
 
     const uint64_t priority_cap = max_block_bytes * PRIORITY_BLOCK_SHARE / 100;
 
+    // Per-sender next expected nonce. Initialized from state on first sight.
     std::unordered_map<Crypto::Address, uint64_t> next_nonce;
 
+    // Copy the heap so we can pop without mutating the pool.
     MaxHeap heap = heap_;
 
-    //  Pass 1: priority txs.
+    // ---- Pass 1: priority txs, up to priority_cap bytes ----
+    //
+    // Within this pass, we retry skipped txs until no new progress is made.
+    // This handles the case where a nonce-2 tx is at the top of the heap
+    // but nonce 1 hasn't been processed yet.
     {
       uint64_t bytes_used = 0;
       bool progress = true;
@@ -758,6 +824,7 @@ namespace Core
                bytes_used < priority_cap)
         {
 
+          // Check tier BEFORE popping so we don't lose the item.
           if (heap.top().tier != FeeTier::Priority)
           {
             break;
@@ -769,7 +836,7 @@ namespace Core
           auto it = entries_.find(item.txid);
           if (it == entries_.end())
           {
-            continue;
+            continue; // stale
           }
 
           const Entry &entry = it->second;
@@ -779,6 +846,7 @@ namespace Core
             continue;
           }
 
+          // Nonce ordering.
           uint64_t &expected = next_nonce[entry.tx.from];
           if (expected == 0)
           {
@@ -788,22 +856,29 @@ namespace Core
 
           if (entry.tx.nonce != expected)
           {
+            // Nonce gap — defer to next pass.
             deferred.push(item);
             continue;
           }
 
+          // Select.
           result.push_back(entry.tx);
           bytes_used += entry.tx_size;
           expected = entry.tx.nonce + 1;
           progress = true;
         }
 
+        // Move deferred items back into the heap for the next pass.
+        // Any remaining priority items (below the break) also need to
+        // stay in the heap.
         while (!deferred.empty())
         {
           heap.push(deferred.top());
           deferred.pop();
         }
 
+        // If we broke out because we hit a standard item, we're done with
+        // Pass 1 — the standard items will be handled in Pass 2.
         if (!heap.empty() && heap.top().tier != FeeTier::Priority)
         {
           break;
@@ -811,7 +886,11 @@ namespace Core
       }
     }
 
-    //  Pass 2: standard txs.
+    // ---- Pass 2: standard txs, filling up to max_block_bytes ----
+    //
+    // Same retry-until-progress pattern. A tx may be deferred because its
+    // nonce isn't the next expected, but a later pass (after the expected
+    // tx is selected) will pick it up.
     {
       uint64_t bytes_used = 0;
       for (const auto &tx : result)
@@ -870,6 +949,7 @@ namespace Core
           progress = true;
         }
 
+        // Move deferred items back for the next pass.
         while (!deferred.empty())
         {
           heap.push(deferred.top());
@@ -895,6 +975,7 @@ namespace Core
         continue;
       }
 
+      // Priority beats standard.
       if (entry.tier != lowest->tier)
       {
         if (entry.tier == FeeTier::Standard)
@@ -904,10 +985,12 @@ namespace Core
         continue;
       }
 
+      // Same tier: lower fee rate is lower priority.
       if (entry.fee_rate < lowest->fee_rate)
       {
         lowest = &entry;
       }
+      // Tie: later sequence is lower priority (FIFO eviction).
       else if (entry.fee_rate == lowest->fee_rate &&
                entry.sequence > lowest->sequence)
       {
@@ -931,6 +1014,7 @@ namespace Core
       return true;
     }
 
+    // Would the new entry beat the victim?
     bool new_beats_victim = false;
     if (new_entry.tier == FeeTier::Priority &&
         victim->tier == FeeTier::Standard)
@@ -948,6 +1032,7 @@ namespace Core
       return false;
     }
 
+    // Find the victim's txid by scanning entries_ again.
     Crypto::Hash victim_txid;
     bool found = false;
     for (const auto &[txid, entry] : entries_)

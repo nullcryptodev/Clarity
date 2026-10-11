@@ -13,59 +13,46 @@
 
 namespace Core
 {
-  //  Order — DEX order with conditional logic
+  //  Order — DEX order
   //
-  //  [design spec comment from above goes here verbatim]
+  //  Two execution modes:
+  //
+  //    Passive   rests in the price-time-priority book and is matched
+  //              by MatchingEngine against incoming takers.
+  //
+  //    Active    routes against an AMM pool. `pool_id` names the pool.
+  //              An Active order with no conditions executes on
+  //              creation; an Active order with conditions executes at
+  //              an epoch boundary when they hold. A partial execution
+  //              leaves the order in state and it reattempts at the
+  //              next epoch until fully filled.
+  //
+  //  `pool_id` is meaningful only for Active orders. It must be zero
+  //  for Passive orders. `isValid()` enforces this.
 
-  //  How the order executes when conditions are met.
   enum class OrderExecutionMode : uint8_t
   {
-    Passive = 0, // limit order in the book, waits for a taker
-    Active = 1,  // executes against AMM when triggered
+    Passive = 0,
+    Active = 1,
   };
 
-  //  The type of predicate in a condition.
   enum class OrderConditionType : uint8_t
   {
     Invalid = 0x00,
-    ExpiresAtHeight = 0x01, // invalid when height >= param1
-    PriceAbove = 0x02,      // invalid when pool price > param1
-    PriceBelow = 0x03,      // invalid when pool price < param1
-    VolumeBelow = 0x04,     // invalid when rolling-epoch volume < param1
-    BalanceBelow = 0x05,    // invalid when owner's CLRTY balance < param1
+    ExpiresAtHeight = 0x01,
+    PriceAbove = 0x02,
+    PriceBelow = 0x03,
+    VolumeBelow = 0x04,
+    BalanceBelow = 0x05,
   };
 
-  //  Price scaling. param1 for PriceAbove/PriceBelow is a price
-  //  expressed as (amount_of_buy_token_per_unit_of_sell_token) ×
-  //  PRICE_SCALE. The scale factor is chosen to preserve the smallest
-  //  meaningful price granularity: 5 decimals of CLRTY plus 4 digits
-  //  of headroom for tiny prices.
-  inline constexpr uint64_t PRICE_SCALE = 10'000'000'000ULL; // 10^10
-
-  //  Cancellation fee, in the sell token's atomic units. Charged when a
-  //  condition fails and the order is cancelled by the evaluator. Also
-  //  charged on explicit CancelOrder — same fee, one constant.
+  inline constexpr uint64_t PRICE_SCALE = 10'000'000'000ULL;
   inline constexpr uint64_t ORDER_CANCEL_FEE_ATOMIC = 1;
 
-  //  A single condition. All conditions in an order must hold for the
-  //  order to remain valid. If any condition becomes false, the order
-  //  is cancelled and refunded.
   struct OrderCondition
   {
     OrderConditionType type{OrderConditionType::Invalid};
-
-    //  Primary threshold. Interpretation depends on `type`:
-    //    ExpiresAtHeight:  the block height threshold
-    //    PriceAbove/Below: price × PRICE_SCALE (amount of buy token per
-    //                      unit of sell token)
-    //    VolumeBelow:      volume threshold in atomic CLRTY units
-    //    BalanceBelow:     balance threshold in atomic CLRTY units
     uint64_t param1{0};
-
-    //  Secondary parameter.
-    //    PriceAbove/Below: pool_id
-    //    VolumeBelow:      pool_id
-    //    Others:           unused (0)
     uint32_t param2{0};
 
     bool isValid() const noexcept
@@ -73,7 +60,6 @@ namespace Core
       if (type == OrderConditionType::Invalid)
         return false;
 
-      //  Price and volume conditions must reference a pool.
       if (type == OrderConditionType::PriceAbove ||
           type == OrderConditionType::PriceBelow ||
           type == OrderConditionType::VolumeBelow)
@@ -82,7 +68,6 @@ namespace Core
           return false;
       }
 
-      //  Non-pool conditions must not carry a pool id.
       if (type == OrderConditionType::ExpiresAtHeight ||
           type == OrderConditionType::BalanceBelow)
       {
@@ -90,9 +75,6 @@ namespace Core
           return false;
       }
 
-      //  A threshold of zero would make PriceAbove/Below or BalanceBelow
-      //  evaluate as "always invalid" or "always valid" respectively,
-      //  which is never what the user means.
       if (type == OrderConditionType::PriceAbove ||
           type == OrderConditionType::PriceBelow ||
           type == OrderConditionType::BalanceBelow)
@@ -101,21 +83,8 @@ namespace Core
           return false;
       }
 
-      //  ExpiresAtHeight = 0 is a valid sentinel meaning "no expiry".
-      //  VolumeBelow = 0 means "always valid", which is legal but useless;
-      //  we accept it and let the user sort out their intent.
-
       return true;
     }
-
-    //  ---- State codec ----
-    //
-    //  Fixed size on the wire: 1 + 8 + 4 = 13 bytes.
-    //
-    //  Layout:
-    //    [1] type
-    //    [8] param1, little-endian
-    //    [4] param2, little-endian
 
     void serializeState(std::vector<uint8_t> &out) const;
     static bool deserializeState(const uint8_t *data, size_t len,
@@ -124,8 +93,6 @@ namespace Core
     static constexpr size_t STATE_SIZE = 1 + 8 + 4;
   };
 
-  //  Maximum number of conditions per order. 8 is generous for anything
-  //  realistic; more than that becomes a policy/complexity concern.
   inline constexpr size_t ORDER_MAX_CONDITIONS = 8;
 
   struct Order
@@ -134,30 +101,22 @@ namespace Core
     Crypto::Address owner{};
     OrderExecutionMode mode{OrderExecutionMode::Passive};
 
-    //  ---- What is being traded ----
-    //
-    //  Token IDs are u32 because the wire format stores them as u32
-    //  and the pool_id in OrderCondition::param2 is also u32. Keeping
-    //  the struct field the same width as the wire eliminates a class
-    //  of silent truncation.
+    //  AMM pool targeted by an Active order. Zero for Passive.
+    uint32_t pool_id{0};
+
     uint32_t sell_token{0};
     uint32_t buy_token{0};
 
-    uint64_t sell_amount{0};    // total amount to sell
-    uint64_t min_buy_amount{0}; // minimum acceptable buy amount
+    uint64_t sell_amount{0};
+    uint64_t min_buy_amount{0};
 
-    //  ---- Lifecycle ----
     uint64_t created_at_height{0};
     uint64_t order_expires_at_height{0};
 
-    //  ---- Fill state ----
-    uint64_t filled_amount{0}; // amount already filled
+    uint64_t filled_amount{0};
 
-    //  ---- Conditions ----
     uint8_t condition_count{0};
     OrderCondition conditions[ORDER_MAX_CONDITIONS]{};
-
-    //  ---- Validation ----
 
     bool isValid() const noexcept
     {
@@ -179,6 +138,18 @@ namespace Core
           mode != OrderExecutionMode::Active)
         return false;
 
+      //  pool_id is meaningful only for Active orders.
+      if (mode == OrderExecutionMode::Active)
+      {
+        if (pool_id == 0)
+          return false;
+      }
+      else
+      {
+        if (pool_id != 0)
+          return false;
+      }
+
       for (uint8_t i = 0; i < condition_count; ++i)
       {
         if (!conditions[i].isValid())
@@ -198,12 +169,11 @@ namespace Core
       return filled_amount >= sell_amount;
     }
 
-    //  ---- State codec ----
-    //
-    //  Layout:
+    //  State codec layout (all multi-byte little-endian):
     //    [8]  id
     //    [32] owner
     //    [1]  mode
+    //    [4]  pool_id
     //    [4]  sell_token
     //    [4]  buy_token
     //    [8]  sell_amount
@@ -212,16 +182,16 @@ namespace Core
     //    [8]  order_expires_at_height
     //    [8]  filled_amount
     //    [1]  condition_count
-    //    [N]  conditions (each 13 bytes)
+    //    [N]  conditions
     //
-    //  deserializeState rejects trailing bytes: the total length must
-    //  equal STATE_SIZE_FIXED + condition_count * OrderCondition::STATE_SIZE.
+    //  deserializeState rejects any length other than the exact
+    //  size implied by condition_count.
 
     std::vector<uint8_t> serializeState() const;
     static bool deserializeState(const uint8_t *data, size_t len, Order &out);
 
     static constexpr size_t STATE_SIZE_FIXED =
-        8 + 32 + 1 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 1;
+        8 + 32 + 1 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 1;
     static constexpr size_t STATE_SIZE_MAX =
         STATE_SIZE_FIXED + ORDER_MAX_CONDITIONS * OrderCondition::STATE_SIZE;
   };

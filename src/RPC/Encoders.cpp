@@ -459,6 +459,7 @@ namespace Rpc
     w.setAddress("owner", order.owner, hrp);
     w.setString("mode", modeName(order.mode));
     w.setNumber("mode_code", static_cast<uint64_t>(order.mode));
+    w.setHexU64("pool_id", order.pool_id);
 
     w.setHexU64("sell_token", order.sell_token);
     w.setHexU64("buy_token", order.buy_token);
@@ -673,8 +674,12 @@ namespace Rpc
     Common::Json j = Common::Json::object();
     JsonWriter w(j);
 
+    w.setString("source",
+                f.source == Core::FillSource::Limit ? "limit" : "amm");
+    w.setNumber("source_code", static_cast<uint64_t>(f.source));
     w.setHexU64("maker_order_id", f.maker_order_id);
     w.setHexU64("taker_order_id", f.taker_order_id);
+    w.setHexU64("pool_id", f.pool_id);
     w.setHexU64("base_token", f.base_token);
     w.setHexU64("quote_token", f.quote_token);
     w.setHexU64("qty_base", f.qty_base);

@@ -1453,7 +1453,7 @@ namespace State
 
   void StateAccess::forEachBookLevel(
       Id sell_token, Id buy_token, uint8_t side,
-      const std::function<void(Id order_id,
+      const std::function<bool(Id order_id,
                                uint64_t canonical_price,
                                uint64_t sequence)> &fn) const
   {
@@ -1477,8 +1477,13 @@ namespace State
       decodeBookKey(key.data(), price, seq);
 
       const uint64_t order_id = Common::readU64(value.data());
-      fn(static_cast<Id>(order_id), price, seq);
-      return true;
+
+      //  Propagate the caller's return value so the matcher can stop
+      //  iteration early. A void callback here is what let
+      //  MAX_BOOK_LEVELS_PER_TAKER be bypassed: the matcher's visitor
+      //  returned false at the cap, this lambda discarded it, and the
+      //  underlying MDBX cursor walked the whole side regardless.
+      return fn(static_cast<Id>(order_id), price, seq);
     };
 
     readForEachWithPrefix(StateDB::TBL_INDEX_ORDER_BOOK,

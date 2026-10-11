@@ -40,13 +40,20 @@ namespace Tests
   class TempDB
   {
   public:
-    TempDB()
+    //  Default 64 MB is enough for most fixtures, but a test that
+    //  seeds hundreds of orders and runs the matcher against them
+    //  blows through it: every order write is an SMT update, which
+    //  walks the full path to the root and writes a historical row
+    //  at each changed level, and the matcher writes two order
+    //  records plus a book row and a sequence key per fill. Callers
+    //  that need more headroom pass an explicit map_size.
+    explicit TempDB(uint64_t map_size = 64ULL * 1024 * 1024)
     {
       static std::atomic<uint64_t> counter{0};
       path_ = std::filesystem::temp_directory_path() /
               ("clrty_state_test_" + std::to_string(counter.fetch_add(1)));
       std::filesystem::remove_all(path_);
-      db_ = std::make_unique<State::StateDB>(path_.string(), 64ULL * 1024 * 1024);
+      db_ = std::make_unique<State::StateDB>(path_.string(), map_size);
     }
 
     ~TempDB()

@@ -5,8 +5,10 @@
 
 #include "TransactionExecutor.h"
 
+#include "ActiveRouter.h"
 #include "AmmPool.h"
 #include "AmmPosition.h"
+#include "BlockProcessor.h"
 #include "Order.h"
 #include "TokenTypes.h"
 #include "ValidatorTypes.h"
@@ -159,10 +161,7 @@ namespace Core
 
   bool TransactionExecutor::verifySignature(const Transaction &tx)
   {
-    // Compute the signing hash.
     Crypto::Hash hash = tx.signingHash();
-
-    // Verify against tx.from as the public key.
     return Crypto::verify(hash, tx.from, tx.signature);
   }
 
@@ -177,19 +176,18 @@ namespace Core
                                         const TxExecutionContext &ctx)
   {
     if (tx.valid_until_height == 0)
-      return true; // no expiry
+      return true;
     return ctx.current_height <= tx.valid_until_height;
   }
 
   bool TransactionExecutor::chargeFee(State::StateAccess &state,
                                       const Transaction &tx)
   {
-    // Fee is charged in native CLRTY, regardless of the transaction's token.
     Account sender = state.getAccount(tx.from);
 
     if (sender.balance < tx.fee)
     {
-      return false; // insufficient balance
+      return false;
     }
 
     sender.balance -= tx.fee;
@@ -262,7 +260,6 @@ namespace Core
     if (tx.to.isNull())
       return failure;
 
-    // Native CLRTY transfer.
     if (tx.token_id == NATIVE_TOKEN_ID)
     {
       Account sender = state.getAccount(tx.from);
@@ -277,7 +274,6 @@ namespace Core
       receiver.balance += tx.amount;
       if (receiver.created_at_height == 0)
       {
-        // First time we've seen this account. Mark its creation height.
         receiver.created_at_height = ctx.current_height;
       }
       state.putAccount(tx.to, receiver);
@@ -285,7 +281,6 @@ namespace Core
       return {ReceiptStatus::Success, tx.fee};
     }
 
-    // Custom token transfer.
     uint64_t sender_balance = state.getTokenBalance(tx.from, tx.token_id);
     if (sender_balance < tx.amount)
       return failure;
@@ -304,7 +299,6 @@ namespace Core
                                                    const Transaction &tx,
                                                    const TxExecutionContext & /*ctx*/)
   {
-    // Opt-in to staking simply clears the opt-out flag.
     Account acct = state.getAccount(tx.from);
     acct.staking_opted_out = false;
     acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
@@ -333,24 +327,11 @@ namespace Core
                                                    const Transaction &tx,
                                                    const TxExecutionContext & /*ctx*/)
   {
-    // Claiming moves the account's accrued pending_rewards into its
-    // spendable balance. It is a bookkeeping move within the account:
-    // the rewards were already issued (and counted in total_supply) at
-    // the moment they were credited to pending_rewards, so claiming
-    // does not touch total_supply.
-    //
-    // The account's totalValue() is unchanged by a claim.
-    //
-    // A claim with zero pending rewards succeeds trivially. The fee
-    // discourages spamming empty claims.
-
     Account acct = state.getAccount(tx.from);
 
     acct.balance += acct.pending_rewards;
     acct.pending_rewards = 0;
 
-    // The balance grew; recompute the staked amount to reflect the new
-    // balance under the auto-stake rule.
     acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
 
     state.putAccount(tx.from, acct);
@@ -368,24 +349,19 @@ namespace Core
 
     Account acct = state.getAccount(tx.from);
 
-    // Must meet minimum stake requirement.
     if (acct.balance < GlobalConfig::VALIDATOR_MIN_STAKE)
       return failure;
 
-    // The payload contains the node public key (32 bytes).
     if (tx.payload.size() != 32)
       return failure;
 
-    // A reward address can only be registered once.
     uint64_t existing_id = 0;
     if (state.getValidatorByAddress(tx.from, existing_id))
       return failure;
 
-    // Allocate a new validator ID.
     std::vector<uint8_t> id_bytes;
     if (!state.getGlobal("next_validator_id", id_bytes))
     {
-      // First validator — start at 1.
       id_bytes.resize(8, 0);
       id_bytes[0] = 1;
     }
@@ -403,7 +379,7 @@ namespace Core
     validator.id = next_id;
     validator.reward_address = tx.from;
     validator.owner = tx.from;
-    validator.stake = acct.balance; // stake = full balance for now
+    validator.stake = acct.balance;
     validator.registered_at_height = ctx.current_height;
     validator.uptime_score = 10'000;
     validator.is_seed = false;
@@ -411,12 +387,8 @@ namespace Core
     std::memcpy(validator.consensus_key.data.data(), tx.payload.data(), 32);
 
     state.putValidator(validator);
-
-    // Write the validator-by-address index so reward distribution and
-    // any other address-based lookup can find this validator.
     state.putValidatorByAddress(validator.reward_address, validator.id);
 
-    // Bump next ID.
     uint64_t new_next = next_id + 1;
     std::vector<uint8_t> new_id_bytes(8);
     for (int i = 0; i < 8; ++i)
@@ -430,11 +402,10 @@ namespace Core
 
   Receipt TransactionExecutor::executeUnregisterValidator(State::StateAccess &state,
                                                           const Transaction &tx,
-                                                          const TxExecutionContext & ctx)
+                                                          const TxExecutionContext &ctx)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    // Look up the validator by the sender's address.
     uint64_t validator_id = 0;
     if (!state.getValidatorByAddress(tx.from, validator_id))
       return failure;
@@ -443,12 +414,9 @@ namespace Core
     if (!state.getValidator(validator_id, validator))
       return failure;
 
-    // Seeds cannot unregister. They're the bootstrap set.
     if (validator.is_seed)
       return failure;
 
-    // If the validator is active, removing them must not drop the
-    // active set below quorum. Compute what the set would look like.
     std::vector<Id> active_set = loadActiveSet(state);
     const bool was_active =
         std::find(active_set.begin(), active_set.end(), validator_id) !=
@@ -464,39 +432,15 @@ namespace Core
           new_set.push_back(vid);
       }
 
-      // The remaining set must still be at least ACTIVE_SET_MIN strong.
-      // This is a policy floor, not a safety check: the set can
-      // theoretically form quorum at any size >= 4, but the chain's
-      // design keeps a floor to bound coordination cost and preserve
-      // censorship resistance. A validator that wants to leave when
-      // the set is at the floor must wait for rotation to promote
-      // replacements first.
       if (new_set.size() < GlobalConfig::ACTIVE_SET_MIN)
         return failure;
 
       saveActiveSet(state, new_set);
     }
 
-    // Already unbonding — reject a second request. The caller must
-    // wait for the first to expire. This keeps the state machine
-    // single-shot and prevents a validator from resetting its own
-    // unbond clock (which would extend the slashable window
-    // indefinitely, but also prevent the stake from ever being
-    // returned).
     if (validator.pending_unbond_height != 0)
       return failure;
 
-    // Do NOT delete the record, refund the stake, or remove the
-    // address index. All three happen at the unbond expiry, in
-    // BlockProcessor::processUnbondExpiries. The record must
-    // remain present and findable so an equivocation proof
-    // landing between now and the expiry can still resolve the
-    // signer and slash the stake.
-    //
-    // The active-set removal above is the only immediate effect.
-    // The validator is now inactive; it cannot be re-promoted
-    // (canBeActive() requires pending_unbond_height == 0), and it
-    // will not appear in any future rotation plan.
     validator.is_active = false;
     validator.last_active_at = ctx.current_height;
     validator.pending_unbond_height = ctx.current_height + UNBONDING_PERIOD;
@@ -513,7 +457,6 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    // The payload is the new reward address (32 bytes).
     if (tx.payload.size() != 32)
       return failure;
 
@@ -523,7 +466,6 @@ namespace Core
     if (new_address.isNull())
       return failure;
 
-    // Look up the sender's validator.
     uint64_t validator_id = 0;
     if (!state.getValidatorByAddress(tx.from, validator_id))
       return failure;
@@ -532,7 +474,6 @@ namespace Core
     if (!state.getValidator(validator_id, validator))
       return failure;
 
-    // The new address must not already be registered.
     if (new_address != tx.from)
     {
       uint64_t collision = 0;
@@ -540,18 +481,12 @@ namespace Core
         return failure;
     }
 
-    // Capture the current effective signing key before the reward
-    // address changes, so future updates don't implicitly rotate it.
     if (validator.consensus_key.isNull())
       validator.consensus_key = validator.effectiveConsensusKey();
 
-    // Update the index: remove the old, add the new.
     state.deleteValidatorByAddress(validator.reward_address);
     state.putValidatorByAddress(new_address, validator.id);
 
-    // Update the validator record. We keep owner in sync with
-    // reward_address because that's the current invariant: registration
-    // sets both to tx.from, and nothing else changes them.
     validator.reward_address = new_address;
     validator.owner = new_address;
     state.putValidator(validator);
@@ -566,18 +501,6 @@ namespace Core
                                                   const TxExecutionContext &ctx)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
-
-    // Payload layout:
-    //   [1]  decimals
-    //   [1]  backing_model
-    //   [1]  name_len
-    //   [N]  name
-    //   [1]  symbol_len
-    //   [M]  symbol
-    //   [8]  max_supply
-    //   [2]  royalty_bps
-    //   [1]  has_fingerprint
-    //   [32] fingerprint (optional)
 
     if (tx.payload.size() < 3)
       return failure;
@@ -618,7 +541,6 @@ namespace Core
       fingerprint = fp;
     }
 
-    // Allocate a new token ID.
     std::vector<uint8_t> id_bytes;
     state.getGlobal("next_token_id", id_bytes);
     uint64_t next_id = 1;
@@ -644,14 +566,8 @@ namespace Core
       return failure;
 
     state.putToken(token);
-
-    // Initialize the cumulative supply counter to zero. The counter is
-    // separate from the token's metadata so mint can check the cap
-    // without loading the record, and so burn can decrement without
-    // touching the metadata. A supply of 0 removes the entry.
     state.putTokenSupply(token.id, 0);
 
-    // Bump next token ID.
     uint64_t new_next = next_id + 1;
     std::vector<uint8_t> new_id_bytes(8);
     for (int i = 0; i < 8; ++i)
@@ -672,9 +588,6 @@ namespace Core
     if (tx.amount == 0)
       return failure;
 
-    // The native token cannot be minted through a transaction. Its
-    // supply is controlled by the block reward path, and allowing mint
-    // would break the total_supply invariant.
     if (tx.token_id == NATIVE_TOKEN_ID)
       return failure;
 
@@ -682,24 +595,17 @@ namespace Core
     if (!state.getToken(tx.token_id, token))
       return failure;
 
-    // Only the creator can mint.
     if (token.creator != tx.from)
       return failure;
 
-    // Enforce max supply against the cumulative minted supply, not the
-    // minter's current balance. This is the fix for the previous soft
-    // cap, which allowed a minter to transfer away their balance and
-    // then mint past the cap.
     uint64_t current_supply = state.getTokenSupply(tx.token_id);
 
     if (token.maxSupply > 0 && current_supply + tx.amount > token.maxSupply)
       return failure;
 
-    // Credit the recipient.
     uint64_t recipient_balance = state.getTokenBalance(tx.to, tx.token_id);
     state.putTokenBalance(tx.to, tx.token_id, recipient_balance + tx.amount);
 
-    // Bump the cumulative supply.
     state.putTokenSupply(tx.token_id, current_supply + tx.amount);
 
     return {ReceiptStatus::Success, tx.fee};
@@ -716,9 +622,6 @@ namespace Core
     if (tx.amount == 0)
       return failure;
 
-    // The native token cannot be burned through a transaction. Burning
-    // it would break the total_supply invariant maintained by the
-    // reward path.
     if (tx.token_id == NATIVE_TOKEN_ID)
       return failure;
 
@@ -728,9 +631,6 @@ namespace Core
 
     state.putTokenBalance(tx.from, tx.token_id, sender_balance - tx.amount);
 
-    // Decrement the cumulative supply. If the burn exceeds the tracked
-    // supply (which shouldn't happen, since supply >= sum of balances),
-    // clamp at zero rather than underflow.
     uint64_t current_supply = state.getTokenSupply(tx.token_id);
     uint64_t new_supply = (current_supply >= tx.amount)
                               ? current_supply - tx.amount
@@ -748,22 +648,9 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    // Payload layout:
-    //   [1]  new_name_len
-    //   [N]  new_name
-    //   [1]  new_symbol_len
-    //   [M]  new_symbol
-    //   [2]  new_royalty_bps
-    //
-    // An empty name or symbol (len 0) means "don't change this field".
-    // maxSupply and decimals cannot be changed: changing maxSupply
-    // would undermine the supply cap guarantee, and changing decimals
-    // would change the meaning of every existing balance.
-
     if (tx.payload.size() < 4)
       return failure;
 
-    // The native token cannot be modified.
     if (tx.token_id == NATIVE_TOKEN_ID)
       return failure;
 
@@ -771,7 +658,6 @@ namespace Core
     if (!state.getToken(tx.token_id, token))
       return failure;
 
-    // Only the creator can update.
     if (token.creator != tx.from)
       return failure;
 
@@ -795,10 +681,6 @@ namespace Core
     uint16_t new_royalty = uint16_t(tx.payload[off]) |
                            (uint16_t(tx.payload[off + 1]) << 8);
 
-    // Apply updates. Empty string means "leave unchanged". Zero royalty
-    // means "leave unchanged" too — a token with royalty 0 is the
-    // default, and users can't distinguish "set to 0" from "don't
-    // change" otherwise.
     TokenInfo updated = token;
     if (name_len > 0)
       updated.name = new_name;
@@ -823,10 +705,6 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    // Payload layout:
-    //   [4]  token_b
-    //   [8]  amount_b
-    //   [2]  fee_bps
     if (tx.payload.size() < 14)
       return failure;
 
@@ -841,7 +719,6 @@ namespace Core
 
     uint16_t fee_bps = uint16_t(tx.payload[off]) | (uint16_t(tx.payload[off + 1]) << 8);
 
-    // tx.token_id is token_a, tx.amount is amount_a.
     uint32_t token_a = tx.token_id;
     uint64_t amount_a = tx.amount;
 
@@ -852,15 +729,12 @@ namespace Core
     if (fee_bps > AMM_MAX_FEE_BPS)
       return failure;
 
-    // Canonical ordering: token_a < token_b.
     if (token_a > token_b)
     {
       std::swap(token_a, token_b);
       std::swap(amount_a, amount_b);
     }
 
-    // Build the pool struct and validate BEFORE deducting anything.
-    // Allocate a new pool ID.
     std::vector<uint8_t> id_bytes;
     state.getGlobal("next_pool_id", id_bytes);
     uint64_t next_id = 1;
@@ -871,7 +745,6 @@ namespace Core
     if (id_bytes.empty())
       next_id = 1;
 
-    // Create the pool (in memory).
     AmmPool pool;
     pool.id = next_id;
     pool.creator = tx.from;
@@ -883,7 +756,6 @@ namespace Core
     pool.created_at_height = ctx.current_height;
     pool.active = true;
 
-    // Initial liquidity = sqrt(amount_a * amount_b).
     __uint128_t prod = static_cast<__uint128_t>(amount_a) * amount_b;
     uint64_t initial_liq = 1;
     while (initial_liq <= prod / (initial_liq + 1))
@@ -893,7 +765,6 @@ namespace Core
     if (!pool.isValid())
       return failure;
 
-    // Check BOTH balances before deducting either token.
     if (token_a == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -920,9 +791,6 @@ namespace Core
         return failure;
     }
 
-    // ---- All checks passed. Apply state changes. ----
-
-    // Deduct both tokens from the creator.
     if (token_a == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -949,14 +817,12 @@ namespace Core
 
     state.putAmmPool(pool);
 
-    // Bump next pool ID.
     uint64_t new_next = next_id + 1;
     std::vector<uint8_t> new_id_bytes(8);
     for (int i = 0; i < 8; ++i)
       new_id_bytes[i] = uint8_t(new_next >> (i * 8));
     state.putGlobal("next_pool_id", new_id_bytes);
 
-    // Allocate a position ID (same pattern as executeAddLiquidity).
     std::vector<uint8_t> pos_id_bytes;
     state.getGlobal("next_position_id", pos_id_bytes);
     uint64_t next_pos_id = 1;
@@ -967,7 +833,6 @@ namespace Core
     if (pos_id_bytes.empty())
       next_pos_id = 1;
 
-    // Create LP position for the creator.
     AmmPosition pos;
     pos.id = next_pos_id;
     pos.owner = tx.from;
@@ -976,11 +841,8 @@ namespace Core
     pos.created_at_height = ctx.current_height;
     state.putAmmPosition(pos);
 
-    // Write the position index so future AddLiquidity calls can find
-    // and merge into this position rather than creating a new one.
     state.putPositionIndex(tx.from, pool.id, next_pos_id);
 
-    // Bump next position ID.
     uint64_t new_pos_next = next_pos_id + 1;
     std::vector<uint8_t> new_pos_id_bytes(8);
     for (int i = 0; i < 8; ++i)
@@ -998,7 +860,6 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    // Payload: [8] pool_id, [8] amount_b
     if (tx.payload.size() < 16)
       return failure;
 
@@ -1018,7 +879,6 @@ namespace Core
     if (!pool.active)
       return failure;
 
-    // tx.token_id must be one of the pool's tokens.
     Id token_in = tx.token_id;
     Id token_other = (token_in == pool.token_a) ? pool.token_b : pool.token_a;
     if (token_in != pool.token_a && token_in != pool.token_b)
@@ -1026,14 +886,9 @@ namespace Core
 
     uint64_t amount_in = tx.amount;
 
-    // Validate the empty-reserve condition BEFORE deducting anything.
     if (pool.reserve_a == 0 || pool.reserve_b == 0)
-    {
-      // Empty pool — shouldn't happen for an existing active pool.
       return failure;
-    }
 
-    // Check BOTH balances before deducting either token.
     if (token_in == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1060,9 +915,6 @@ namespace Core
         return failure;
     }
 
-    // ---- All checks passed. Apply state changes. ----
-
-    // Deduct both tokens from sender.
     if (token_in == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1087,12 +939,10 @@ namespace Core
       state.putTokenBalance(tx.from, token_other, bal - amount_b);
     }
 
-    // Compute LP tokens to mint.
     uint64_t share_a = (amount_in * pool.total_liquidity) / pool.reserve_a;
     uint64_t share_b = (amount_b * pool.total_liquidity) / pool.reserve_b;
     uint64_t liquidity_minted = std::min(share_a, share_b);
 
-    // Update pool reserves.
     if (token_in == pool.token_a)
     {
       pool.reserve_a += amount_in;
@@ -1106,13 +956,6 @@ namespace Core
     pool.total_liquidity += liquidity_minted;
     state.putAmmPool(pool);
 
-    // ---- Position handling ----
-    //
-    // One position per (owner, pool). If the owner already has a
-    // position for this pool, merge the newly minted liquidity into it
-    // and keep the original created_at_height. Otherwise, allocate a
-    // fresh position and index it.
-
     uint64_t existing_pos_id = 0;
 
     if (state.getPositionIndex(tx.from, pool_id, existing_pos_id))
@@ -1121,17 +964,11 @@ namespace Core
       if (state.getAmmPosition(existing_pos_id, pos))
       {
         pos.liquidity += liquidity_minted;
-        // created_at_height is preserved — the position was created
-        // when the LP first provided liquidity.
         state.putAmmPosition(pos);
         return {ReceiptStatus::Success, tx.fee};
       }
-      // Index points at a missing position — that's an inconsistency.
-      // Treat it as "no existing position" and fall through to create
-      // a fresh one, overwriting the stale index entry.
     }
 
-    // No existing position: allocate a new one.
     std::vector<uint8_t> id_bytes;
     state.getGlobal("next_position_id", id_bytes);
     uint64_t next_pos_id = 1;
@@ -1169,7 +1006,6 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    // Payload: [8] position_id
     if (tx.payload.size() < 8)
       return failure;
 
@@ -1177,7 +1013,6 @@ namespace Core
     for (int i = 0; i < 8; ++i)
       position_id |= uint64_t(tx.payload[i]) << (i * 8);
 
-    // All lookups and ownership checks happen before any mutation.
     AmmPosition pos;
     if (!state.getAmmPosition(position_id, pos))
       return failure;
@@ -1190,19 +1025,14 @@ namespace Core
     if (!state.getAmmPool(pos.pool_id, pool))
       return failure;
 
-    // Compute share of each reserve.
     uint64_t share_a = (pos.liquidity * pool.reserve_a) / pool.total_liquidity;
     uint64_t share_b = (pos.liquidity * pool.reserve_b) / pool.total_liquidity;
 
-    // ---- All checks passed. Apply state changes. ----
-
-    // Update pool.
     pool.reserve_a -= share_a;
     pool.reserve_b -= share_b;
     pool.total_liquidity -= pos.liquidity;
     state.putAmmPool(pool);
 
-    // Credit LP.
     if (pool.token_a == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1227,32 +1057,11 @@ namespace Core
       state.putTokenBalance(tx.from, pool.token_b, bal + share_b);
     }
 
-    // Zero the position.
     pos.liquidity = 0;
     state.putAmmPosition(pos);
 
-    // The position is drained. Remove the index entry so a future
-    // AddLiquidity creates a fresh position rather than merging into
-    // a zeroed one.
     state.deletePositionIndex(pos.owner, pos.pool_id);
 
-    //  Auto-close. If this was the last position and the pool's
-    //  reserves are now zero, delete the pool record.
-    //
-    //  A pool in this state is functionally inert: Swap divides by
-    //  reserve_a and reserve_b, both zero; AddLiquidity rejects a
-    //  pool with a zero reserve; nothing else can act on it. Leaving
-    //  the record behind would create a zombie state that callers
-    //  would have to special-case, and that a block explorer would
-    //  have to filter out. Deleting it here is what makes "remove all
-    //  liquidity" mean "the pool no longer exists."
-    //
-    //  Historical reads are unaffected: getAtVersion on the pool's
-    //  SMT key still returns the pool at any version where it
-    //  existed, because historical rows are written independently of
-    //  the current-record deletion. A block explorer can ask "what
-    //  did pool 7 look like at block 1000?" and get an answer even
-    //  after the pool closed at block 1050.
     if (pool.isClosed())
     {
       state.deleteAmmPool(pool.id);
@@ -1263,15 +1072,12 @@ namespace Core
 
   //  Swap
 
-  //  Swap
-
   Receipt TransactionExecutor::executeSwap(State::StateAccess &state,
                                            const Transaction &tx,
                                            const TxExecutionContext &ctx)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    // Payload: [8] pool_id, [8] min_amount_out
     if (tx.payload.size() < 16)
       return failure;
 
@@ -1291,7 +1097,6 @@ namespace Core
     if (!pool.active)
       return failure;
 
-    // Determine input/output tokens.
     Id token_in = tx.token_id;
     Id token_out;
     uint64_t reserve_in, reserve_out;
@@ -1315,9 +1120,6 @@ namespace Core
 
     uint64_t amount_in = tx.amount;
 
-    // ---- Precondition checks BEFORE any state mutation ----
-
-    // Sender must have enough input.
     if (token_in == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1331,7 +1133,6 @@ namespace Core
         return failure;
     }
 
-    // Compute expected output using constant product formula with fee.
     uint64_t amount_in_with_fee = amount_in * (10'000 - pool.fee_bps) / 10'000;
 
     __uint128_t numerator = static_cast<__uint128_t>(reserve_out) * amount_in_with_fee;
@@ -1341,9 +1142,6 @@ namespace Core
     if (amount_out < min_amount_out)
       return failure;
 
-    // ---- All checks passed. Apply state changes. ----
-
-    // Deduct input from sender.
     if (token_in == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1356,7 +1154,6 @@ namespace Core
       state.putTokenBalance(tx.from, token_in, bal - amount_in);
     }
 
-    // Credit output to receiver.
     if (token_out == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.to);
@@ -1369,56 +1166,25 @@ namespace Core
       state.putTokenBalance(tx.to, token_out, bal + amount_out);
     }
 
-    //  ---- Rolling volume update ----
-    //
-    //  Compute the CLRTY-equivalent value of the swap from the
-    //  PRE-swap reserves, so the price used is the one the trader
-    //  actually executed against. If neither side of the pool is
-    //  CLRTY, the contribution is zero — there is no way to
-    //  denominate a token-vs-token trade in CLRTY without an
-    //  oracle.
-    //
-    //  This block must run BEFORE the reserves are updated below,
-    //  because it reads reserve_a / reserve_b.
     uint64_t clrty_volume = 0;
 
     if (token_in == NATIVE_TOKEN_ID)
     {
-      //  Native input: its amount IS the CLRTY value.
       clrty_volume = amount_in;
     }
     else if (pool.token_a == NATIVE_TOKEN_ID && pool.reserve_b > 0)
     {
-      //  CLRTY is the A side. The pool's spot price of token_b in
-      //  CLRTY is reserve_a / reserve_b, so `amount_in` of token_b
-      //  is worth (amount_in * reserve_a / reserve_b) CLRTY.
       clrty_volume = static_cast<uint64_t>(
           static_cast<__uint128_t>(amount_in) *
           pool.reserve_a / pool.reserve_b);
     }
     else if (pool.token_b == NATIVE_TOKEN_ID && pool.reserve_a > 0)
     {
-      //  CLRTY is the B side. Symmetric.
       clrty_volume = static_cast<uint64_t>(
           static_cast<__uint128_t>(amount_in) *
           pool.reserve_b / pool.reserve_a);
     }
 
-    //  Roll the tumbling window.
-    //
-    //  Three cases:
-    //    - First swap ever on this pool (window_height == 0):
-    //      start a new window at this height.
-    //    - The current window has ended (height >= start + ROTATION_INTERVAL):
-    //      snapshot the old window's total into volume_last, and
-    //      start a new window with this swap's contribution.
-    //    - Mid-window: add this swap's contribution to the current
-    //      window.
-    //
-    //  `reportedVolume()` in AmmPool handles the fourth case, which
-    //  is "the window has ended but no swap has rolled it yet" — it
-    //  reports the stale window's total, because that's the most
-    //  recent complete window we have data for.
     if (pool.volume_window_height == 0)
     {
       pool.volume_window_height = ctx.current_height;
@@ -1437,8 +1203,6 @@ namespace Core
       pool.volume_current += clrty_volume;
     }
 
-    // Update pool reserves. Done AFTER the volume computation so
-    // the CLRTY-equivalent price is the pre-swap price.
     if (token_in == pool.token_a)
     {
       pool.reserve_a += amount_in;
@@ -1470,6 +1234,15 @@ namespace Core
       return failure;
 
     //  Re-parse the payload now that we know it is well-formed.
+    //
+    //  Layout:
+    //    [4]  buy_token (LE)
+    //    [8]  min_buy_amount (LE)
+    //    [1]  mode
+    //    [4]  pool_id (LE)
+    //    [8]  expires_at_height (LE)
+    //    [1]  condition_count
+    //    [N]  conditions (13 bytes each)
     size_t off = 0;
     uint32_t buy_token = uint32_t(tx.payload[off]) |
                          (uint32_t(tx.payload[off + 1]) << 8) |
@@ -1483,6 +1256,12 @@ namespace Core
     off += 8;
 
     uint8_t mode = tx.payload[off++];
+
+    uint32_t pool_id = uint32_t(tx.payload[off]) |
+                       (uint32_t(tx.payload[off + 1]) << 8) |
+                       (uint32_t(tx.payload[off + 2]) << 16) |
+                       (uint32_t(tx.payload[off + 3]) << 24);
+    off += 4;
 
     uint64_t expires_at_height = 0;
     for (int i = 0; i < 8; ++i)
@@ -1501,7 +1280,8 @@ namespace Core
     Id sell_token = tx.token_id;
     uint64_t sell_amount = tx.amount;
 
-    //  Allocate the order ID.
+    //  Allocate the order ID. The counter lives in the SMT under
+    //  "next_order_id"; the same key Genesis writes.
     std::vector<uint8_t> id_bytes;
     state.getGlobal("next_order_id", id_bytes);
 
@@ -1523,6 +1303,7 @@ namespace Core
     order.id = next_id;
     order.owner = tx.from;
     order.mode = static_cast<OrderExecutionMode>(mode);
+    order.pool_id = pool_id;
     order.sell_token = sell_token;
     order.buy_token = buy_token;
     order.sell_amount = sell_amount;
@@ -1554,10 +1335,44 @@ namespace Core
         return failure;
     }
 
+    //  ---- Pre-route validation for Active orders ----
+    //
+    //  An Active order with no conditions routes immediately on
+    //  creation. If the pool is missing, closed, or does not
+    //  contain the order's pair, the order can never fill and must
+    //  be rejected. This check has to happen BEFORE the sell-token
+    //  lock is taken and BEFORE the order record is written,
+    //  because a failure after those points would leave state
+    //  modified under a rejected transaction — the executor has no
+    //  rollback primitive, so "modify then fail" is a leak.
+    //
+    //  Active orders WITH conditions do not route on creation; they
+    //  wait for the epoch boundary. For them, the pool may not exist
+    //  yet, or may be created later, so we do NOT pre-validate.
+    if (order.mode == OrderExecutionMode::Active &&
+        order.condition_count == 0)
+    {
+      AmmPool pool;
+      if (!state.getAmmPool(order.pool_id, pool))
+        return failure;
+      if (!pool.active)
+        return failure;
+
+      const bool sells_a = (order.sell_token == pool.token_a &&
+                            order.buy_token == pool.token_b);
+      const bool sells_b = (order.sell_token == pool.token_b &&
+                            order.buy_token == pool.token_a);
+      if (!sells_a && !sells_b)
+        return failure;
+
+      if (pool.reserve_a == 0 || pool.reserve_b == 0)
+        return failure;
+    }
+
     //  ---- All checks passed. Apply state changes. ----
 
-    //  Take the sell-token lock. The matcher's precondition is
-    //  that the lock is in place before it runs.
+    //  Take the sell-token lock. Both the matcher and the router
+    //  require the lock to be in place before they run.
     if (sell_token == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1570,10 +1385,11 @@ namespace Core
       state.putTokenBalance(tx.from, sell_token, bal - sell_amount);
     }
 
-    //  Persist the record. The matcher may overwrite or delete it.
+    //  Persist the record. The matcher or the router may overwrite
+    //  or delete it.
     state.putOrder(order);
 
-    //  Match Passive orders.
+    //  Execute.
     std::vector<Fill> fills;
 
     if (order.mode == OrderExecutionMode::Passive)
@@ -1582,11 +1398,43 @@ namespace Core
           state, order, ctx.current_height, ctx.tx_index_in_block);
       fills = std::move(outcome.fills);
     }
+    else // Active
+    {
+      //  No conditions: route immediately against the order's pool.
+      //  The pre-route validation above guarantees the pool is
+      //  usable, so executeActiveOrder cannot return Unroutable for
+      //  a structural reason. It can still return Rested if the
+      //  pool's current price is unfavorable — that's fine, the
+      //  order rests.
+      //
+      //  With conditions: leave the order in state. The condition
+      //  evaluator, running at the next epoch boundary, will route
+      //  it if the conditions hold or cancel it if they do not.
+      if (order.condition_count == 0)
+      {
+        const auto outcome = BlockProcessor::executeActiveOrder(
+            state, order, ctx.current_height, ctx.tx_index_in_block, fills);
 
-    //  Expiry index. Only if the order still exists after matching.
-    //  A taker fully filled by the matcher was deleted by it, and
-    //  indexing a deleted order would leave an expiry row pointing
-    //  at nothing.
+        //  Defensive: the pre-route check should have caught any
+        //  structural reason for Unroutable, but if the state
+        //  changed between the check and here (it can't within a
+        //  single tx, but the invariant is worth asserting),
+        //  reject rather than leave a partially-applied state.
+        if (outcome == ActiveRouteOutcome::Unroutable)
+        {
+          return failure;
+        }
+
+        //  Filled: fills already contains the fill(s).
+        //  Rested: the order is in state with a remainder. The
+        //  expiry index below will pick it up if it has one.
+      }
+    }
+
+    //  Expiry index. Only if the order still exists after execution.
+    //  A fully filled order was deleted by the matcher or the
+    //  router, and indexing a deleted order would leave an expiry
+    //  row pointing at nothing.
     Order still_exists;
     if (state.getOrder(order.id, still_exists) &&
         expires_at_height != 0)
@@ -1594,7 +1442,9 @@ namespace Core
       state.addOrderExpiry(expires_at_height, order.id);
     }
 
-    //  Bump the next-order-id counter.
+    //  Bump the next-order-id counter. The counter is advanced once
+    //  per successful CreateOrder, regardless of whether the order
+    //  rested or executed.
     uint64_t new_next = next_id + 1;
     std::vector<uint8_t> new_id_bytes(8);
     for (int i = 0; i < 8; ++i)
@@ -1628,7 +1478,6 @@ namespace Core
     if (order.owner != tx.from)
       return failure;
 
-    //  Refund the remaining sell amount.
     uint64_t refund = order.remainingAmount();
     if (refund > 0)
     {
@@ -1645,36 +1494,18 @@ namespace Core
       }
     }
 
-    //  Single call removes the book row, the companion sequence
-    //  key, the expiry entry, the SMT record, and every index row.
     state.deleteRestingOrder(order);
 
     return {ReceiptStatus::Success, tx.fee};
   }
 
-  // Applies a consensus-generated slash. Bypasses the user-tx prechecks
-  // (signature, nonce, fee) because the proof has already been verified
-  // by the consensus layer that produced it.
-  //
-  // Returns Success if the slash was applied OR if the target was
-  // ineligible for slashing (seed, unregistered, or nothing left to
-  // slash). Ineligibility is a policy outcome, not a block-level
-  // error: a proposer that includes a Slash tx against an
-  // ineligible target is not malicious, and rejecting the block
-  // would give an attacker a liveness lever (include an
-  // ineligible-target Slash in every block and halt the chain).
-  //
-  // The receipt's fee_paid is zero: the Slash tx pays no fee, and
-  // no fee is charged on a no-op.
+  //  System Slash
+
   Receipt TransactionExecutor::executeSystemSlash(State::StateAccess &state,
                                                   uint64_t validator_id,
                                                   uint64_t slash_height,
                                                   const TxExecutionContext & /*ctx*/)
   {
-    //  Ineligibility is a no-op, not a failure. See the header for
-    //  why: a Slash tx that cannot be applied must not reject the
-    //  block, or an attacker can halt the chain by including one
-    //  such tx in every block it proposes.
     const Receipt no_op{ReceiptStatus::Success, 0};
 
     ValidatorInfo validator;
@@ -1687,22 +1518,9 @@ namespace Core
     const uint64_t slash_amount =
         applyBps(validator.stake, SLASH_AMOUNT_BPS);
 
-    // Stake is uint64_t and slash_amount <= stake, so this cannot
-    // underflow. Guard anyway — a future change to SLASH_AMOUNT_BPS
-    // or to how stake is computed could break the invariant, and a
-    // silent underflow here would be a consensus split.
     if (slash_amount <= validator.stake)
       validator.stake -= slash_amount;
 
-    // The multiplier penalty is applied unconditionally. The proof is
-    // valid; the infraction is recorded even if there was nothing left
-    // to slash from the stake. This is deliberate — the persistent
-    // reduction in future earnings is part of the punishment, and a
-    // validator with zero stake should not be able to re-register
-    // with a clean multiplier.
-    //
-    // Note: applyInfractionPenalty is the member function, not the
-    // free function in ValidatorRotation.h. See Change D.
     validator.applyInfractionPenalty(slash_height);
 
     state.putValidator(validator);
@@ -1720,15 +1538,13 @@ namespace Core
     return {ReceiptStatus::Success, 0};
   }
 
-  bool TransactionExecutor::activeOrdersEnabled()
-  {
-    //  Toggle to true when MatchingEngine's AMM routing lands.
-    return false;
-  }
+  //  Validate Create Order Structure
 
   bool TransactionExecutor::validateCreateOrderStructure(const Transaction &tx)
   {
-    if (tx.payload.size() < 22)
+    //  Minimum length: buy_token(4) + min_buy_amount(8) + mode(1)
+    //  + pool_id(4) + expires_at_height(8) + condition_count(1) = 26.
+    if (tx.payload.size() < 26)
       return false;
 
     size_t off = 0;
@@ -1745,6 +1561,12 @@ namespace Core
 
     uint8_t mode = tx.payload[off++];
 
+    uint32_t pool_id = uint32_t(tx.payload[off]) |
+                       (uint32_t(tx.payload[off + 1]) << 8) |
+                       (uint32_t(tx.payload[off + 2]) << 16) |
+                       (uint32_t(tx.payload[off + 3]) << 24);
+    off += 4;
+
     uint64_t expires_at_height = 0;
     for (int i = 0; i < 8; ++i)
       expires_at_height |= uint64_t(tx.payload[off + i]) << (i * 8);
@@ -1759,9 +1581,17 @@ namespace Core
         mode != static_cast<uint8_t>(OrderExecutionMode::Active))
       return false;
 
-    if (mode == static_cast<uint8_t>(OrderExecutionMode::Active) &&
-        !activeOrdersEnabled())
-      return false;
+    //  pool_id is meaningful only for Active orders.
+    if (mode == static_cast<uint8_t>(OrderExecutionMode::Active))
+    {
+      if (pool_id == 0)
+        return false;
+    }
+    else
+    {
+      if (pool_id != 0)
+        return false;
+    }
 
     OrderCondition conditions[ORDER_MAX_CONDITIONS]{};
     for (uint8_t i = 0; i < condition_count; ++i)
@@ -1782,9 +1612,11 @@ namespace Core
     if (min_buy_amount == 0)
       return false;
 
-    //  Overflow guard: an order whose canonical price cannot fit in
-    //  u64 cannot enter the book, so reject it up front rather than
-    //  creating a lock the matcher will never release.
+    //  Overflow guard for Passive orders: an order whose canonical
+    //  price cannot fit in u64 cannot enter the book, so reject it
+    //  up front rather than creating a lock the matcher will never
+    //  release. Active orders do not go through the book and so do
+    //  not need this check.
     if (mode == static_cast<uint8_t>(OrderExecutionMode::Passive))
     {
       Order probe;

@@ -1505,3 +1505,229 @@ TEST_F(Core_BlockProcessorFixture, MatchingEndToEndThroughBlock)
     EXPECT_EQ(side0, 0u);
     EXPECT_EQ(side1, 0u); });
 }
+
+TEST_F(Core_BlockProcessorFixture, ProcessOrderExpiriesRefundsPartialFillRemainder)
+{
+  const Id base = 1;
+  const Id quote = 2;
+
+  //  Fund Bob and Alice with both custom tokens.
+  withState([&](State::StateAccess &s)
+            {
+    s.putTokenBalance(bob_.publicKey, base,  1'000'000);
+    s.putTokenBalance(bob_.publicKey, quote, 1'000'000);
+    s.putTokenBalance(alice_.publicKey, base,  1'000'000);
+    s.putTokenBalance(alice_.publicKey, quote, 1'000'000); });
+
+  //  Bob rests: sell 200 base, want >= 5000 quote (25 quote/base).
+  //  expires_at_height = 2, so it expires at height 2, not 1.
+  {
+    Core::Transaction maker_tx = makeSignedCreateOrder(
+        bob_, base, 200, quote, 5000,
+        Core::OrderExecutionMode::Passive,
+        /*expires_at_height=*/2,
+        /*nonce=*/0);
+
+    BlockResult r1 = applyBlock(1, genesis_hash_, {maker_tx});
+    ASSERT_TRUE(r1.valid) << r1.error;
+  }
+
+  //  Find the maker's id. The fixture doesn't return it from
+  //  applyBlock, so scan for it.
+  Id maker_id = 0;
+  readState([&](State::StateAccess &s)
+            {
+    for (uint64_t oid = 1; oid <= 16; ++oid)
+    {
+      Order o;
+      if (s.getOrder(oid, o))
+      {
+        maker_id = oid;
+        break;
+      }
+    } });
+  ASSERT_NE(maker_id, 0u);
+
+  //  Alice takes half of it: sell 2500 quote, want >= 100 base.
+  //  Fills 100 base for 2500 quote.
+  {
+    Core::Transaction taker_tx = makeSignedCreateOrder(
+        alice_, quote, 2500, base, 100,
+        Core::OrderExecutionMode::Passive,
+        /*expires_at_height=*/0,
+        /*nonce=*/0);
+
+    BlockResult r2 = applyBlock(2, genesis_hash_, {taker_tx});
+    ASSERT_TRUE(r2.valid) << r2.error;
+  }
+
+  //  At this point Bob's order has filled_amount = 100,
+  //  remainingAmount = 100. It hasn't expired yet (height 2 is
+  //  the expiry height, and we just applied height 2 — the
+  //  expiry sweep runs after txs, so it may have already expired
+  //  it. If so, the next block confirms nothing is left.)
+
+  //  Apply one more block to run the expiry sweep for height 2.
+  BlockResult r3 = applyBlock(3, genesis_hash_, {});
+  ASSERT_TRUE(r3.valid) << r3.error;
+
+  //  The maker must be gone.
+  Order gone;
+  readState([&](State::StateAccess &s)
+            { ASSERT_FALSE(s.getOrder(maker_id, gone)); });
+
+  //  And its book row must be gone too.
+  readState([&](State::StateAccess &s)
+            {
+    size_t side0 = 0, side1 = 0;
+    s.forEachBookLevel(base, quote, 0,
+        [&](Id, uint64_t, uint64_t) { ++side0; return true; });
+    s.forEachBookLevel(base, quote, 1,
+        [&](Id, uint64_t, uint64_t) { ++side1; return true; });
+    ASSERT_EQ(side0, 0u);
+    ASSERT_EQ(side1, 0u); });
+}
+
+TEST_F(Core_BlockProcessorFixture, MatchingRootIdenticalAcrossFreshInstances)
+{
+  const Id sell_token = 1;
+  const Id buy_token = 2;
+
+  //  Fund the custom tokens once, on the shared DB.
+  {
+    auto txn = db_->beginWrite();
+    State::StateAccess st(*db_, txn, 0);
+    st.putTokenBalance(bob_.publicKey, sell_token, 1'000'000);
+    st.putTokenBalance(bob_.publicKey, buy_token, 1'000'000);
+    st.putTokenBalance(alice_.publicKey, sell_token, 1'000'000);
+    st.putTokenBalance(alice_.publicKey, buy_token, 1'000'000);
+    st.commit(0);
+    txn.commit();
+  }
+
+  //  Seed the maker.
+  {
+    auto txn = db_->beginWrite();
+    State::StateAccess st(*db_, txn, 0);
+
+    Core::Order maker;
+    maker.id = 1;
+    maker.owner = bob_.publicKey;
+    maker.mode = Core::OrderExecutionMode::Passive;
+    maker.sell_token = sell_token;
+    maker.buy_token = buy_token;
+    maker.sell_amount = 100;
+    maker.min_buy_amount = 2500;
+    maker.created_at_height = 0;
+    maker.filled_amount = 0;
+
+    st.putTokenBalance(bob_.publicKey, sell_token,
+                       st.getTokenBalance(bob_.publicKey, sell_token) - 100);
+    st.putOrder(maker);
+    st.addToOrderBook(maker, st.nextOrderSequence());
+    st.putGlobalU64("next_order_id", 2);
+
+    st.commit(0);
+    txn.commit();
+  }
+
+  Core::Transaction taker_tx = makeSignedCreateOrder(
+      alice_, buy_token, 2500, sell_token, 100,
+      Core::OrderExecutionMode::Passive, 0, 0);
+
+  Core::Block block = buildSignedBlockForTest(
+      1, genesis_hash_, {taker_tx}, activeSet());
+
+  //  Run the same block twice, each time on a fresh StateAccess
+  //  created against the same DB. The DB state between the two
+  //  runs is unchanged because the first run aborts.
+  Crypto::Hash root_a, root_b;
+  {
+    auto txn = db_->beginWrite();
+    State::StateAccess st(*db_, txn, 0);
+    BlockContext ctx = makeContext(1);
+    BlockResult r = BlockProcessor::applyBlock(st, block, ctx);
+    ASSERT_TRUE(r.valid) << r.error;
+    root_a = r.new_state_root;
+    txn.abort();
+  }
+  {
+    auto txn = db_->beginWrite();
+    State::StateAccess st(*db_, txn, 0);
+    BlockContext ctx = makeContext(1);
+    BlockResult r = BlockProcessor::applyBlock(st, block, ctx);
+    ASSERT_TRUE(r.valid) << r.error;
+    root_b = r.new_state_root;
+    txn.abort();
+  }
+
+  ASSERT_EQ(root_a, root_b);
+}
+
+TEST_F(Core_BlockProcessorFixture, MatchingApplyTwiceIsRejectedOrNoOp)
+{
+  const Id sell_token = 1;
+  const Id buy_token = 2;
+
+  withState([&](State::StateAccess &s)
+            {
+    s.putTokenBalance(bob_.publicKey, sell_token, 1'000'000);
+    s.putTokenBalance(bob_.publicKey, buy_token,  1'000'000);
+    s.putTokenBalance(alice_.publicKey, sell_token, 1'000'000);
+    s.putTokenBalance(alice_.publicKey, buy_token,  1'000'000); });
+
+  {
+    auto txn = db_->beginWrite();
+    State::StateAccess st(*db_, txn, 0);
+
+    Core::Order maker;
+    maker.id = 1;
+    maker.owner = bob_.publicKey;
+    maker.mode = Core::OrderExecutionMode::Passive;
+    maker.sell_token = sell_token;
+    maker.buy_token = buy_token;
+    maker.sell_amount = 100;
+    maker.min_buy_amount = 2500;
+    maker.created_at_height = 0;
+
+    st.putTokenBalance(bob_.publicKey, sell_token,
+                       st.getTokenBalance(bob_.publicKey, sell_token) - 100);
+    st.putOrder(maker);
+    st.addToOrderBook(maker, st.nextOrderSequence());
+    st.putGlobalU64("next_order_id", 2);
+
+    st.commit(0);
+    txn.commit();
+  }
+
+  Core::Transaction taker_tx = makeSignedCreateOrder(
+      alice_, buy_token, 2500, sell_token, 100,
+      Core::OrderExecutionMode::Passive, 0, 0);
+
+  Core::Block block = buildSignedBlockForTest(
+      1, genesis_hash_, {taker_tx}, activeSet());
+
+  //  First apply: succeeds, commits.
+  {
+    BlockResult r = applyPrebuiltBlock(block);
+    ASSERT_TRUE(r.valid) << r.error;
+  }
+
+  //  Second apply of the same block: the state has moved on, so
+  //  the header's state_root no longer matches. The processor must
+  //  reject it. A no-op acceptance would be a consensus hazard
+  //  because a peer could replay a block and double-spend a fill.
+  {
+    BlockResult r = applyPrebuiltBlock(block);
+    EXPECT_FALSE(r.valid);
+  }
+
+  //  And the balances must be exactly what a single apply produced:
+  //  Bob +2500 quote, -100 base; Alice +100 base, -2500 quote.
+  readState([&](State::StateAccess &s)
+            {
+    EXPECT_EQ(s.getTokenBalance(bob_.publicKey, buy_token), 1'000'000u + 2500u);
+    EXPECT_EQ(s.getTokenBalance(bob_.publicKey, sell_token), 1'000'000u - 100u);
+    EXPECT_EQ(s.getTokenBalance(alice_.publicKey, sell_token), 1'000'000u + 100u);
+    EXPECT_EQ(s.getTokenBalance(alice_.publicKey, buy_token), 1'000'000u - 2500u); });
+}
