@@ -57,6 +57,13 @@ namespace Core
     //  pre-split convention where a validator's signing key was its
     //  reward address. Networks that want a distinct consensus key set
     //  this explicitly.
+    //
+    //  applyGenesis also writes a single-entry consensus-key history
+    //  for each validator, covering from height 0 onward, using the
+    //  resolved key (consensus_key when set, reward_address as
+    //  fallback). This is the seed of the rotation mechanism; a
+    //  validator that never rotates has a history of exactly this one
+    //  entry.
     Crypto::PublicKey consensus_key{};
   };
 

@@ -18,6 +18,7 @@
 #include "Core/Receipt.h"
 #include "Core/TokenTypes.h"
 #include "Core/ValidatorTypes.h"
+#include "Core/KeyRotation.h"
 #include "Crypto/Types.h"
 #include "SparseMerkleTree.h"
 #include "StateDB.h"
@@ -45,6 +46,30 @@ namespace State
     void putMeta(const std::string &key, const std::vector<uint8_t> &value);
 
     // =================================================================
+    //  Callback return-value convention
+    // =================================================================
+    //
+    //  The forEach* methods below fall into two categories:
+    //
+    //    (a) Exhaustive walks. The callback returns void. The
+    //        implementation visits every entry; there is no way for
+    //        the caller to stop early. Use these when you want the
+    //        whole set (pagination, full-scan aggregates).
+    //
+    //    (b) Early-exit walks. The callback returns bool. Return
+    //        false to stop iteration; return true to continue. The
+    //        early-exit walks also carry a max_results bound in
+    //        some cases, which is a separate ceiling the iterator
+    //        enforces on itself regardless of what the callback
+    //        does.
+    //
+    //  forEachBookLevel and the "recent" iterators are category (b).
+    //  Everything else is category (a). If a forEach* method's
+    //  signature does not say `std::function<bool(...)>`, it is an
+    //  exhaustive walk and the callback's return value (if any) is
+    //  ignored.
+
+    // =================================================================
     //  Accounts
     // =================================================================
 
@@ -64,6 +89,8 @@ namespace State
     // the SMT); each callback invocation therefore does one SMT read
     // per account. For a large account set this is expensive — use
     // for pagination, not for full scans on every poll.
+    //
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachAccount(
         const std::function<void(const Crypto::Address &, const Core::Account &)> &fn) const;
 
@@ -79,19 +106,23 @@ namespace State
     // token_id ascending. Uses TBL_TOKEN_BALANCES with an address
     // prefix scan; each entry's balance is read directly from the
     // table, not the SMT.
+    //
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachTokenBalanceForOwner(
         const Crypto::Address &owner,
         const std::function<void(Id token_id, uint64_t balance)> &fn) const;
 
-    // Every (address, balance) pair for a token. Order is by address.
-    // Uses TBL_INDEX_BALANCES_BY_TOKEN.
+    // Every (address, balance) pair for a token. Order is by address,
+    // not by balance — MDBX has no native ordering by value, so a
+    // caller that wants "top N holders" must collect all pairs and
+    // sort, or pass a max_results small enough that the address-ordered
+    // prefix is a reasonable proxy. The early-exit contract lets such
+    // a caller stop once its own bound is hit.
     //
-    // This is the query behind "top holders of a token". Callers that
-    // want the top N by balance should collect all pairs and sort,
-    // because MDBX has no native ordering by value.
+    // Early-exit walk: return false from the callback to stop.
     void forEachHolderOfToken(
         Id token_id,
-        const std::function<void(const Crypto::Address &, uint64_t balance)> &fn) const;
+        const std::function<bool(const Crypto::Address &, uint64_t balance)> &fn) const;
 
     // =================================================================
     //  Token metadata
@@ -101,6 +132,8 @@ namespace State
     void putToken(const Core::TokenInfo &token);
 
     // Enumerate every registered token, ordered by token_id.
+    //
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachToken(
         const std::function<void(const Core::TokenInfo &)> &fn) const;
 
@@ -119,7 +152,9 @@ namespace State
     void putValidator(const Core::ValidatorInfo &validator);
     void deleteValidator(uint64_t validator_id);
 
-    // Already present — iterates TBL_INDEX_VALIDATORS.
+    // Iterates TBL_INDEX_VALIDATORS.
+    //
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachValidator(
         const std::function<void(const Core::ValidatorInfo &)> &fn) const;
 
@@ -134,6 +169,49 @@ namespace State
     void deleteValidatorByAddress(const Crypto::Address &address);
 
     // =================================================================
+    //  Validator consensus-key history
+    //
+    //  A companion to the validator record that describes which
+    //  signing key was authoritative at each height the validator
+    //  was registered. Not part of ValidatorInfo's wire format;
+    //  stored under Keys::validatorKeyHistory.
+    //
+    //  Invariants:
+    //    - The list is ordered by valid_from_height ascending.
+    //    - The last entry's valid_until_height is 0 (current).
+    //    - Every other entry's valid_until_height equals the next
+    //      entry's valid_from_height (gapless, non-overlapping).
+    //    - For a validator that has never rotated, the list has one
+    //      entry covering [registered_at_height, 0).
+    // =================================================================
+
+    //  Read a validator's key history. Returns false if no history
+    //  exists. A validator registered before this feature existed
+    //  has no history; callers should treat that as "the current
+    //  effective key, valid for all heights" — the same answer the
+    //  pre-feature code would have given.
+    bool getValidatorKeyHistory(uint64_t validator_id,
+                                std::vector<Core::KeyRotation> &out) const;
+
+    //  Write a validator's key history. Idempotent. Removing the
+    //  history is done by passing an empty list, which deletes the
+    //  SMT leaf.
+    void putValidatorKeyHistory(uint64_t validator_id,
+                                const std::vector<Core::KeyRotation> &history);
+
+    //  Resolve the consensus key authoritative at a given height.
+    //  Returns nullopt if the validator has no history and no
+    //  record (unknown validator), or if the history has a gap at
+    //  the queried height (a corrupted history — shouldn't happen).
+    //
+    //  Fast path: a single-entry history whose valid_until_height
+    //  is zero returns the entry's key for any height >=
+    //  valid_from_height. This covers every validator that has
+    //  never rotated and is the common case.
+    std::optional<Crypto::PublicKey> validatorKeyAtHeight(
+        uint64_t validator_id, uint64_t height) const;
+
+    // =================================================================
     //  Orders
     // =================================================================
 
@@ -142,17 +220,23 @@ namespace State
     void deleteOrder(Id order_id);
 
     // Enumerate every order, ordered by order_id.
+    //
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachOrder(
         const std::function<void(const Core::Order &)> &fn) const;
 
     // Every order owned by a given address, ordered by order_id.
     // Uses TBL_INDEX_ORDERS_BY_OWNER.
+    //
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachOrderForOwner(
         const Crypto::Address &owner,
         const std::function<void(const Core::Order &)> &fn) const;
 
     // Every order for a specific (sell_token, buy_token) pair, ordered
     // by order_id. Uses TBL_INDEX_ORDERS_BY_PAIR.
+    //
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachOrderForPair(
         Id sell_token, Id buy_token,
         const std::function<void(const Core::Order &)> &fn) const;
@@ -275,19 +359,24 @@ namespace State
 
     //  Newest-first fill history for a pair. Walks the pair view
     //  in reverse, resolving each row to a Fill.
+    //
+    //  Early-exit walk: return false from the callback to stop
+    //  iteration early. max_results is a separate ceiling the
+    //  iterator enforces regardless of what the callback does.
     void forEachRecentFillForPair(
         uint32_t base_token,
         uint32_t quote_token,
         size_t max_results,
-        const std::function<void(const Core::Fill &,
+        const std::function<bool(const Core::Fill &,
                                  uint64_t height,
                                  uint32_t tx_index_in_block)> &fn) const;
 
-    //  Newest-first fill history for an order (either side).
+    //  Newest-first fill history for an order (either side). Same
+    //  early-exit contract as forEachRecentFillForPair.
     void forEachRecentFillForOrder(
         uint64_t order_id,
         size_t max_results,
-        const std::function<void(const Core::Fill &,
+        const std::function<bool(const Core::Fill &,
                                  uint64_t height,
                                  uint32_t tx_index_in_block)> &fn) const;
 
@@ -297,6 +386,11 @@ namespace State
     //
     //  Used by the RPC layer's getOrderBook. The matcher does not
     //  use this; it iterates order-by-order via forEachBookLevel.
+    //
+    //  Exhaustive-ish: the depth bound terminates the iteration, and
+    //  the callback's return value is ignored. This is a presentation
+    //  helper, not a primitive; a caller that wants to stop before
+    //  depth is exhausted should use forEachBookLevel directly.
     void snapshotBookSide(
         Id sell_token,
         Id buy_token,
@@ -315,6 +409,8 @@ namespace State
     //  multiple conditions reference the same pool; the caller
     //  should be prepared to see duplicates and handle them (the
     //  v1 evaluator deduplicates by order_id).
+    //
+    //  Exhaustive walk; the callback's return value is ignored.
     void forEachOrderForPool(
         Id pool_id,
         const std::function<void(const Core::Order &)> &fn) const;
@@ -337,11 +433,15 @@ namespace State
     void deleteAmmPool(Id pool_id);
 
     // Enumerate every pool, ordered by pool_id.
+    //
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachAmmPool(
         const std::function<void(const Core::AmmPool &)> &fn) const;
 
     // Every pool containing a given token (as either token_a or
     // token_b), ordered by pool_id. Uses TBL_INDEX_POOLS_BY_TOKEN.
+    //
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachPoolForToken(
         Id token_id,
         const std::function<void(const Core::AmmPool &)> &fn) const;
@@ -355,11 +455,15 @@ namespace State
     void deleteAmmPosition(Id pos_id);
 
     // Enumerate every position, ordered by position_id.
+    //
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachAmmPosition(
         const std::function<void(const Core::AmmPosition &)> &fn) const;
 
     // Every position owned by a given address, ordered by position_id.
     // Uses TBL_INDEX_POSITIONS_BY_OWNER.
+    //
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachPositionForOwner(
         const Crypto::Address &owner,
         const std::function<void(const Core::AmmPosition &)> &fn) const;
@@ -414,26 +518,30 @@ namespace State
     // The `txid` in the callback is the transaction's hash; the block
     // height and index are passed alongside so the caller can locate
     // the transaction without a second index lookup.
+    //
+    // Early-exit walk: return false from the callback to stop.
     void forEachRecentTxForAddress(
         const Crypto::Address &address,
         size_t max_results,
-        const std::function<void(const Crypto::Hash &txid,
+        const std::function<bool(const Crypto::Hash &txid,
                                  uint64_t block_height,
                                  uint32_t tx_index)> &fn) const;
 
     // Recent transactions touching a given token, newest first.
+    // Same early-exit contract.
     void forEachRecentTxForToken(
         Id token_id,
         size_t max_results,
-        const std::function<void(const Crypto::Hash &txid,
+        const std::function<bool(const Crypto::Hash &txid,
                                  uint64_t block_height,
                                  uint32_t tx_index)> &fn) const;
 
     // Recent transactions of a given type, newest first.
+    // Same early-exit contract.
     void forEachRecentTxOfType(
         uint8_t tx_type,
         size_t max_results,
-        const std::function<void(const Crypto::Hash &txid,
+        const std::function<bool(const Crypto::Hash &txid,
                                  uint64_t block_height,
                                  uint32_t tx_index)> &fn) const;
 
@@ -449,10 +557,11 @@ namespace State
                             const Crypto::Hash &block_hash);
 
     // Recent blocks produced by a given proposer address, newest first.
+    // Same early-exit contract as the recent-tx iterators.
     void forEachBlockByProducer(
         const Crypto::Address &proposer,
         size_t max_results,
-        const std::function<void(uint64_t block_height,
+        const std::function<bool(uint64_t block_height,
                                  const Crypto::Hash &block_hash)> &fn) const;
 
     // =================================================================
@@ -504,6 +613,8 @@ namespace State
 
     void indexStaker(const Crypto::Address &address);
     void unindexStaker(const Crypto::Address &address);
+
+    // Exhaustive walk; the callback's return value is ignored.
     void forEachStaker(const std::function<void(const Crypto::Address &)> &fn) const;
 
     // =================================================================

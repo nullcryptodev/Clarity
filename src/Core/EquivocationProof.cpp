@@ -191,16 +191,24 @@ namespace Core
     //  Codebase convention: a validator's signing key is its
     //  reward_address. Same convention as BlockProcessor::checkQuorum
     //  and Node::getSignerPublicKey.
-    const Crypto::PublicKey pk = v.effectiveConsensusKey();
+    //  Resolve the signing key at each vote's height. The two votes
+    //  share a height (checked above), so these resolve to the same
+    //  key — but resolving them separately is the correct pattern
+    //  because it doesn't assume the invariant. A vote at height H
+    //  must verify against the key that was authoritative at H, not
+    //  against whatever key the validator has today.
+    auto key_at_height = state.validatorKeyAtHeight(validator_id, va.height);
+    if (!key_at_height.has_value())
+      return std::nullopt;
 
     Crypto::Hash ha = localVoteSigningHash(va.height, va.round,
                                            va.is_nil, va.block_hash);
-    if (!Crypto::verify(ha, pk, va.signature))
+    if (!Crypto::verify(ha, *key_at_height, va.signature))
       return std::nullopt;
 
     Crypto::Hash hb = localVoteSigningHash(vb.height, vb.round,
                                            vb.is_nil, vb.block_hash);
-    if (!Crypto::verify(hb, pk, vb.signature))
+    if (!Crypto::verify(hb, *key_at_height, vb.signature))
       return std::nullopt;
 
     return validator_id;

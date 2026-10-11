@@ -255,6 +255,35 @@ namespace Wallet
     return tx;
   }
 
+  //  ---- Rotate Consensus Key ----
+
+  std::optional<Core::Transaction> buildRotateConsensusKey(
+      const Crypto::Address &from,
+      const RotateConsensusParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.new_consensus_key.isNull())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "new consensus key is null");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::RotateConsensusKey, from, params.common);
+    // Payload carries the new consensus key (32 bytes).
+    tx.payload.resize(32);
+    std::memcpy(tx.payload.data(),
+                params.new_consensus_key.data.data(),
+                params.new_consensus_key.data.size());
+    return tx;
+  }
+
   //  ---- Sign ----
 
   std::optional<Crypto::Hash> signTransaction(

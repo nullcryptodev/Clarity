@@ -1049,7 +1049,10 @@ TEST_F(Core_ExecutorFixture, ActiveOrderFillIsIndexedForPairAndOrder)
     size_t count = 0;
     state_->forEachRecentFillForPair(0, 42, /*max=*/10,
                                      [&](const Core::Fill &, uint64_t, uint32_t)
-                                     { ++count; });
+                                     {
+                                       ++count;
+                                       return true;
+                                     });
     EXPECT_EQ(count, 1u);
   }
 
@@ -1057,7 +1060,10 @@ TEST_F(Core_ExecutorFixture, ActiveOrderFillIsIndexedForPairAndOrder)
     size_t count = 0;
     state_->forEachRecentFillForOrder(1, /*max=*/10,
                                       [&](const Core::Fill &, uint64_t, uint32_t)
-                                      { ++count; });
+                                      {
+                                        ++count;
+                                        return true;
+                                      });
     EXPECT_EQ(count, 1u);
   }
 }
@@ -1374,4 +1380,37 @@ TEST_F(Core_BlockProcessorFixture, EpochFillsRootMismatchIsRejected)
   EXPECT_FALSE(r.valid);
   EXPECT_NE(r.error.find("epoch_fills_root mismatch"), std::string::npos)
       << "got: " << r.error;
+}
+
+TEST_F(Core_ExecutorFixture, ActiveFillUpdatesPoolVolumeWindow)
+{
+  //  Fresh pool, volume window uninitialized.
+  seedPool(*state_, 1, 0, 42, 1000, 2000);
+
+  Core::AmmPool before;
+  ASSERT_TRUE(state_->getAmmPool(1, before));
+  ASSERT_EQ(before.volume_window_height, 0u);
+
+  seedActiveOrder(*state_, 1, alice_.publicKey, 1, 0, 42,
+                  100, 100, 0, {holdsAlways()});
+
+  {
+    Core::Account acct = state_->getAccount(alice_.publicKey);
+    acct.balance -= 100;
+    state_->putAccount(alice_.publicKey, acct);
+  }
+
+  std::vector<Core::Fill> fills;
+  evaluate(*state_, /*height=*/100, fills);
+  ASSERT_FALSE(fills.empty());
+
+  Core::AmmPool after;
+  ASSERT_TRUE(state_->getAmmPool(1, after));
+
+  //  The window was initialized at the fill's height, and the
+  //  volume is the CLRTY-equivalent of the amount that moved.
+  //  Order sells CLRTY, so the CLRTY volume is the fill's
+  //  qty_base.
+  EXPECT_EQ(after.volume_window_height, 100u);
+  EXPECT_EQ(after.volume_current, fills[0].qty_base);
 }

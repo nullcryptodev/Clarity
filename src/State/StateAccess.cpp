@@ -937,6 +937,9 @@ namespace State
   void StateAccess::forEachAccount(
       const std::function<void(const Crypto::Address &, const Core::Account &)> &fn) const
   {
+    //  Exhaustive walk: the visitor returns true unconditionally and
+    //  fn's return value (void) carries no signal. See the callback
+    //  convention comment in StateAccess.h.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -1003,6 +1006,7 @@ namespace State
       const Crypto::Address &owner,
       const std::function<void(Id token_id, uint64_t balance)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     std::vector<uint8_t> prefix(owner.data.begin(), owner.data.end());
 
     auto visitor = [&fn](const std::vector<uint8_t> &key,
@@ -1021,8 +1025,11 @@ namespace State
 
   void StateAccess::forEachHolderOfToken(
       Id token_id,
-      const std::function<void(const Crypto::Address &, uint64_t balance)> &fn) const
+      const std::function<bool(const Crypto::Address &, uint64_t balance)> &fn) const
   {
+    //  Early-exit walk: propagate the callback's return value so a
+    //  caller with its own bound (e.g. "stop once I have K holders")
+    //  can stop before the full set is materialized.
     uint8_t prefix_bytes[4];
     Common::writeU32(prefix_bytes, static_cast<uint32_t>(token_id));
     std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 4);
@@ -1035,8 +1042,7 @@ namespace State
       Crypto::Address addr;
       std::memcpy(addr.data.data(), key.data() + 4, 32);
       uint64_t balance = Common::readU64(value.data());
-      fn(addr, balance);
-      return true;
+      return fn(addr, balance);
     };
 
     readForEachWithPrefix(StateDB::TBL_INDEX_BALANCES_BY_TOKEN, prefix, visitor);
@@ -1069,6 +1075,7 @@ namespace State
   void StateAccess::forEachToken(
       const std::function<void(const Core::TokenInfo &)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -1163,6 +1170,7 @@ namespace State
   void StateAccess::forEachValidator(
       const std::function<void(const Core::ValidatorInfo &)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -1216,6 +1224,80 @@ namespace State
   }
 
   // ===========================================================================
+  //  Validator consensus-key history
+  // ===========================================================================
+
+  bool StateAccess::getValidatorKeyHistory(
+      uint64_t validator_id,
+      std::vector<Core::KeyRotation> &out) const
+  {
+    out.clear();
+
+    Crypto::Hash key = Keys::validatorKeyHistory(validator_id);
+    auto value = smt_.get(key);
+    if (!value.has_value())
+      return false;
+
+    return Core::decodeKeyHistory(value->data(), value->size(), out);
+  }
+
+  void StateAccess::putValidatorKeyHistory(
+      uint64_t validator_id,
+      const std::vector<Core::KeyRotation> &history)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::validatorKeyHistory(validator_id);
+
+    if (history.empty())
+    {
+      smt_.remove(key, version_);
+      return;
+    }
+
+    auto value = Core::encodeKeyHistory(history);
+    smt_.update(key, value, version_);
+  }
+
+  std::optional<Crypto::PublicKey> StateAccess::validatorKeyAtHeight(
+      uint64_t validator_id, uint64_t height) const
+  {
+    std::vector<Core::KeyRotation> history;
+    if (!getValidatorKeyHistory(validator_id, history))
+    {
+      //  No history. Fall back to the validator record's
+      //  effectiveConsensusKey — the same answer the pre-feature
+      //  code gave for a validator without a recorded history.
+      Core::ValidatorInfo v;
+      if (!getValidator(validator_id, v))
+        return std::nullopt;
+      return v.effectiveConsensusKey();
+    }
+
+    //  Fast path: single entry covering the requested height.
+    if (history.size() == 1 &&
+        history[0].valid_until_height == 0 &&
+        height >= history[0].valid_from_height)
+    {
+      return history[0].key;
+    }
+
+    //  General case: find the entry whose half-open interval
+    //  contains the height. Linear scan; the history is small.
+    for (const auto &entry : history)
+    {
+      if (height < entry.valid_from_height)
+        continue;
+      if (entry.valid_until_height != 0 &&
+          height >= entry.valid_until_height)
+        continue;
+      return entry.key;
+    }
+
+    return std::nullopt;
+  }
+
+  // ===========================================================================
   //  Orders
   // ===========================================================================
 
@@ -1262,6 +1344,7 @@ namespace State
   void StateAccess::forEachOrder(
       const std::function<void(const Core::Order &)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -1283,6 +1366,7 @@ namespace State
       const Crypto::Address &owner,
       const std::function<void(const Core::Order &)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     std::vector<uint8_t> prefix(owner.data.begin(), owner.data.end());
 
     auto visitor = [this, &fn](const std::vector<uint8_t> &key,
@@ -1304,6 +1388,7 @@ namespace State
       Id sell_token, Id buy_token,
       const std::function<void(const Core::Order &)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     uint8_t prefix_bytes[8];
     Common::writeU32(prefix_bytes, static_cast<uint32_t>(sell_token));
     Common::writeU32(prefix_bytes + 4, static_cast<uint32_t>(buy_token));
@@ -1328,6 +1413,7 @@ namespace State
       Id pool_id,
       const std::function<void(const Core::Order &)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     uint8_t prefix_bytes[4];
     Common::writeU32(prefix_bytes, static_cast<uint32_t>(pool_id));
     std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 4);
@@ -1457,6 +1543,8 @@ namespace State
                                uint64_t canonical_price,
                                uint64_t sequence)> &fn) const
   {
+    //  Early-exit walk: propagate the caller's return value so the
+    //  matcher can stop iteration at MAX_BOOK_LEVELS_PER_TAKER.
     const Crypto::Hash pair_key =
         Core::OrderBook::pairKey(sell_token, buy_token);
 
@@ -1478,11 +1566,6 @@ namespace State
 
       const uint64_t order_id = Common::readU64(value.data());
 
-      //  Propagate the caller's return value so the matcher can stop
-      //  iteration early. A void callback here is what let
-      //  MAX_BOOK_LEVELS_PER_TAKER be bypassed: the matcher's visitor
-      //  returned false at the cap, this lambda discarded it, and the
-      //  underlying MDBX cursor walked the whole side regardless.
       return fn(static_cast<Id>(order_id), price, seq);
     };
 
@@ -1671,11 +1754,13 @@ namespace State
       uint32_t base_token,
       uint32_t quote_token,
       size_t max_results,
-      const std::function<void(const Core::Fill &,
+      const std::function<bool(const Core::Fill &,
                                uint64_t,
                                uint32_t)> &fn) const
   {
-    //  Prefix = tag(0x01) || pair_key. 33 bytes.
+    //  Early-exit walk: propagate the callback's return value. The
+    //  max_results bound is a separate ceiling the iterator enforces
+    //  regardless of what the callback does.
     const Crypto::Hash pair_key = Core::OrderBook::pairKey(base_token, quote_token);
 
     uint8_t prefix_bytes[33];
@@ -1701,9 +1786,8 @@ namespace State
       if (!Core::Fill::deserializeState(value.data(), value.size(), f))
         return true;
 
-      fn(f, height, tx_index);
       ++emitted;
-      return true;
+      return fn(f, height, tx_index);
     };
 
     readForEachWithPrefixReverse(StateDB::TBL_FILL_HISTORY,
@@ -1713,10 +1797,11 @@ namespace State
   void StateAccess::forEachRecentFillForOrder(
       uint64_t order_id,
       size_t max_results,
-      const std::function<void(const Core::Fill &,
+      const std::function<bool(const Core::Fill &,
                                uint64_t,
                                uint32_t)> &fn) const
   {
+    //  Early-exit walk: propagate the callback's return value.
     uint8_t prefix_bytes[9];
     prefix_bytes[0] = 0x02;
     for (int i = 0; i < 8; ++i)
@@ -1740,9 +1825,8 @@ namespace State
       if (!Core::Fill::deserializeState(value.data(), value.size(), f))
         return true;
 
-      fn(f, height, tx_index);
       ++emitted;
-      return true;
+      return fn(f, height, tx_index);
     };
 
     readForEachWithPrefixReverse(StateDB::TBL_FILL_HISTORY,
@@ -1765,6 +1849,11 @@ namespace State
     //  We need each order's remaining base quantity, which means
     //  a getOrder per row. This method is for RPC read paths,
     //  not for the matcher's hot loop.
+    //
+    //  The caller's callback is void; this is a presentation helper
+    //  and the depth bound terminates the iteration. A caller that
+    //  wants to stop before depth is exhausted should use
+    //  forEachBookLevel directly.
 
     uint64_t current_price = 0;
     uint64_t current_total_base = 0;
@@ -1830,7 +1919,7 @@ namespace State
     if (keep_going)
       flush();
   }
-  
+
   // ===========================================================================
   //  AMM Pools
   // ===========================================================================
@@ -1872,6 +1961,7 @@ namespace State
   void StateAccess::forEachAmmPool(
       const std::function<void(const Core::AmmPool &)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -1893,6 +1983,7 @@ namespace State
       Id token_id,
       const std::function<void(const Core::AmmPool &)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     uint8_t prefix_bytes[4];
     Common::writeU32(prefix_bytes, static_cast<uint32_t>(token_id));
     std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 4);
@@ -1953,6 +2044,7 @@ namespace State
   void StateAccess::forEachAmmPosition(
       const std::function<void(const Core::AmmPosition &)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -1974,6 +2066,7 @@ namespace State
       const Crypto::Address &owner,
       const std::function<void(const Core::AmmPosition &)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     std::vector<uint8_t> prefix(owner.data.begin(), owner.data.end());
 
     auto visitor = [this, &fn](const std::vector<uint8_t> &key,
@@ -2165,6 +2258,7 @@ namespace State
   void StateAccess::forEachStaker(
       const std::function<void(const Crypto::Address &)> &fn) const
   {
+    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &) -> bool
     {
@@ -2186,10 +2280,11 @@ namespace State
   void StateAccess::forEachRecentTxForAddress(
       const Crypto::Address &address,
       size_t max_results,
-      const std::function<void(const Crypto::Hash &txid,
+      const std::function<bool(const Crypto::Hash &txid,
                                uint64_t block_height,
                                uint32_t tx_index)> &fn) const
   {
+    //  Early-exit walk: propagate the callback's return value.
     std::vector<uint8_t> prefix(address.data.begin(), address.data.end());
 
     size_t emitted = 0;
@@ -2208,9 +2303,8 @@ namespace State
       Crypto::Hash txid;
       std::memcpy(txid.data.data(), value.data(), 32);
 
-      fn(txid, height, tx_idx);
       ++emitted;
-      return true;
+      return fn(txid, height, tx_idx);
     };
 
     readForEachWithPrefixReverse(
@@ -2220,10 +2314,11 @@ namespace State
   void StateAccess::forEachRecentTxForToken(
       Id token_id,
       size_t max_results,
-      const std::function<void(const Crypto::Hash &txid,
+      const std::function<bool(const Crypto::Hash &txid,
                                uint64_t block_height,
                                uint32_t tx_index)> &fn) const
   {
+    //  Early-exit walk: propagate the callback's return value.
     uint8_t prefix_bytes[4];
     Common::writeU32(prefix_bytes, static_cast<uint32_t>(token_id));
     std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 4);
@@ -2244,9 +2339,8 @@ namespace State
       Crypto::Hash txid;
       std::memcpy(txid.data.data(), value.data(), 32);
 
-      fn(txid, height, tx_idx);
       ++emitted;
-      return true;
+      return fn(txid, height, tx_idx);
     };
 
     readForEachWithPrefixReverse(
@@ -2256,10 +2350,11 @@ namespace State
   void StateAccess::forEachRecentTxOfType(
       uint8_t tx_type,
       size_t max_results,
-      const std::function<void(const Crypto::Hash &txid,
+      const std::function<bool(const Crypto::Hash &txid,
                                uint64_t block_height,
                                uint32_t tx_index)> &fn) const
   {
+    //  Early-exit walk: propagate the callback's return value.
     std::vector<uint8_t> prefix{tx_type};
 
     size_t emitted = 0;
@@ -2278,9 +2373,8 @@ namespace State
       Crypto::Hash txid;
       std::memcpy(txid.data.data(), value.data(), 32);
 
-      fn(txid, height, tx_idx);
       ++emitted;
-      return true;
+      return fn(txid, height, tx_idx);
     };
 
     readForEachWithPrefixReverse(
@@ -2290,9 +2384,10 @@ namespace State
   void StateAccess::forEachBlockByProducer(
       const Crypto::Address &proposer,
       size_t max_results,
-      const std::function<void(uint64_t block_height,
+      const std::function<bool(uint64_t block_height,
                                const Crypto::Hash &block_hash)> &fn) const
   {
+    //  Early-exit walk: propagate the callback's return value.
     std::vector<uint8_t> prefix(proposer.data.begin(), proposer.data.end());
 
     size_t emitted = 0;
@@ -2310,9 +2405,8 @@ namespace State
       Crypto::Hash block_hash;
       std::memcpy(block_hash.data.data(), value.data(), 32);
 
-      fn(height, block_hash);
       ++emitted;
-      return true;
+      return fn(height, block_hash);
     };
 
     readForEachWithPrefixReverse(

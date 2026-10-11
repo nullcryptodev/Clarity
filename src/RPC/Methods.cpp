@@ -159,9 +159,6 @@ namespace Rpc
     //  New helpers for the added methods
     // =========================================================================
 
-    //  Pagination parameters, resolved from the request with
-    //  consistent defaults and validation. Throws InvalidParams on
-    //  a limit outside [1, max_limit].
     struct PageParams
     {
       uint64_t limit{DEFAULT_LIST_LIMIT};
@@ -201,17 +198,12 @@ namespace Rpc
       return v;
     }
 
-    //  Sort helpers for top-N queries. Sorting in memory is only
-    //  viable because every caller collects at most `limit + offset`
-    //  entries; a full-pool scan would need a different strategy.
     struct BalanceEntry
     {
       Crypto::Address address;
       uint64_t amount{0};
     };
 
-    //  cmpAmountDesc sorts largest-first; ties are broken by address
-    //  bytes so the ordering is deterministic across calls.
     bool cmpAmountDesc(const BalanceEntry &a, const BalanceEntry &b)
     {
       if (a.amount != b.amount)
@@ -220,9 +212,6 @@ namespace Rpc
                          b.address.data.data(), 32) < 0;
     }
 
-    //  Count the number of transactions in the last `window` blocks
-    //  ending at `tip`, inclusive. Used for the live APY activity
-    //  component and for fee statistics.
     uint64_t sumTxCountInWindow(Node::Node &node,
                                 uint64_t tip,
                                 uint64_t window)
@@ -246,8 +235,6 @@ namespace Rpc
       return total;
     }
 
-    //  Sum the total_fees field across the last `window` blocks
-    //  ending at `tip`, inclusive.
     uint64_t sumFeesInWindow(Node::Node &node,
                              uint64_t tip,
                              uint64_t window)
@@ -400,20 +387,6 @@ namespace Rpc
     }
 
     // ---- clrty_getAllPools ----
-    //
-    // Params:
-    //   limit   (optional, hex; default 50; max 500)
-    //   offset  (optional, hex; default 0)
-    //   active_only (optional, bool; default true)
-    //
-    // Enumerate every AMM pool. Sorted by pool_id ascending (the
-    // natural index order).
-    //
-    // active_only filters out closed pools. A pool is closed when
-    // the last LP drains it; the record is deleted at that moment,
-    // so in practice there are no closed pools in the table. The
-    // flag exists for symmetry with the token list and to leave
-    // room for a future "keep closed pools for history" mode.
 
     Common::Json method_getAllPools(Node::Node &node, const RpcConfig & /*config*/,
                                     const JsonRpcRequest &req)
@@ -449,12 +422,6 @@ namespace Rpc
     }
 
     // ---- clrty_getPoolsForToken ----
-    //
-    // Params:
-    //   token_id (required, hex)
-    //
-    // Returns every pool that contains this token as one side of the
-    // pair. Uses the pool-by-token index written by putAmmPool.
 
     Common::Json method_getPoolsForToken(Node::Node &node, const RpcConfig & /*config*/,
                                          const JsonRpcRequest &req)
@@ -477,14 +444,6 @@ namespace Rpc
     }
 
     // ---- clrty_getPositionsForPool ----
-    //
-    // Params:
-    //   pool_id (required, hex)
-    //   limit   (optional, hex; default 50; max 500)
-    //
-    // Returns LP positions in a pool, sorted by liquidity
-    // descending. Aggregates from a scan of every position; fine
-    // on chains with modest LP counts.
 
     Common::Json method_getPositionsForPool(Node::Node &node, const RpcConfig & /*config*/,
                                             const JsonRpcRequest &req)
@@ -496,7 +455,6 @@ namespace Rpc
 
       State::StateAccess state(node.stateDB(), height);
 
-      //  Collect all positions in this pool, then sort by liquidity.
       std::vector<Core::AmmPosition> matches;
 
       state.forEachAmmPosition([&](const Core::AmmPosition &pos)
@@ -520,8 +478,6 @@ namespace Rpc
         if (emitted >= page.limit)
           break;
 
-        //  Load the pool for the share calculation. Same pool for
-        //  every entry, so a fresh StateAccess is fine here.
         Core::AmmPool pool;
         const bool have_pool = state.getAmmPool(matches[i].pool_id, pool);
 
@@ -615,15 +571,6 @@ namespace Rpc
     }
 
     // ---- clrty_getRecentBlocks ----
-    //
-    // Params:
-    //   limit  (optional, hex or decimal; default 10; max 100)
-    //
-    // Returns:
-    //   { "blocks": [ <header>, <header>, ... ], "count": <number> }
-    //
-    // Headers are newest first: blocks[0] is the tip. If the chain
-    // is shorter than `limit`, returns what exists without error.
 
     Common::Json method_getRecentBlocks(Node::Node &node,
                                         const RpcConfig & /*config*/,
@@ -655,10 +602,6 @@ namespace Rpc
         auto header = node.chainDB().getHeaderByHeight(h);
         if (!header.has_value())
         {
-          //  A gap in the chain. Heights are contiguous from genesis,
-          //  so this shouldn't happen — but if it does, stop rather
-          //  than throwing. Returning fewer rows is more useful to a
-          //  client than an error.
           break;
         }
 
@@ -666,7 +609,7 @@ namespace Rpc
         ++taken;
 
         if (h == 0)
-          break; // reached genesis
+          break;
         --h;
       }
 
@@ -701,14 +644,6 @@ namespace Rpc
     }
 
     // ---- clrty_getBlocksRange ----
-    //
-    // Params:
-    //   start  (required, hex or decimal)
-    //   count  (optional, hex; default 50; max 100)
-    //   order  (optional, "asc" | "desc"; default "desc")
-    //
-    // Returns a window of block headers. Descending is the default
-    // because that's what a paginated "recent blocks" page wants.
 
     Common::Json method_getBlocksRange(Node::Node &node,
                                        const RpcConfig & /*config*/,
@@ -786,13 +721,6 @@ namespace Rpc
     }
 
     // ---- clrty_getBlocksByProducer ----
-    //
-    // Params:
-    //   address  (required, bech32m or hex)
-    //   limit    (optional, hex; default 50; max 100)
-    //
-    // Returns blocks the given address produced, newest first. Uses
-    // the block-by-producer index.
 
     Common::Json method_getBlocksByProducer(Node::Node &node,
                                             const RpcConfig & /*config*/,
@@ -827,6 +755,7 @@ namespace Rpc
             putU64(entry, "height", block_height);
             putHash(entry, "block_hash", block_hash);
             arr.push_back(std::move(entry));
+            return true;
           });
 
       Common::Json out = Common::Json::object();
@@ -837,14 +766,6 @@ namespace Rpc
     }
 
     // ---- clrty_getBlockStats ----
-    //
-    // Params:
-    //   from_height  (required, hex)
-    //   to_height    (required, hex)
-    //
-    // Returns aggregate statistics over a block range: total
-    // transactions, total fees, block count. Computed by walking
-    // headers. Capped at 10,000 blocks per call to bound the cost.
 
     Common::Json method_getBlockStats(Node::Node &node,
                                       const RpcConfig & /*config*/,
@@ -895,13 +816,6 @@ namespace Rpc
     }
 
     // ---- clrty_getChainStats ----
-    //
-    // No params.
-    //
-    // Aggregates over the whole chain: height, lifetime counters,
-    // unique counts, current supply, and the values every explorer
-    // home page wants. Every field is either an O(1) table stat or
-    // a single global read.
 
     Common::Json method_getChainStats(Node::Node &node,
                                       const RpcConfig & /*config*/,
@@ -911,10 +825,6 @@ namespace Rpc
 
       State::StateAccess state(node.stateDB(), height);
 
-      //  These two counters are aggregation, not consensus. They live
-      //  in the meta table (written by bumpLifetimeCounters) rather
-      //  than the SMT, so a node that upgrades the code does not
-      //  invalidate blocks it has already committed.
       const uint64_t tx_counter = state.getMetaU64("tx_counter");
       const uint64_t total_fees = state.getMetaU64("total_fees_lifetime");
 
@@ -955,10 +865,6 @@ namespace Rpc
     }
 
     // ---- clrty_getEpochInfo ----
-    //
-    // No params.
-    //
-    // Returns the current epoch's bounds and progress.
 
     Common::Json method_getEpochInfo(Node::Node &node,
                                      const RpcConfig & /*config*/,
@@ -981,12 +887,6 @@ namespace Rpc
     }
 
     // ---- clrty_getEpochSchedule ----
-    //
-    // No params.
-    //
-    // Returns the timing constants the epoch machinery runs on.
-    // Mostly useful for clients that want to display "next epoch
-    // in X blocks" without hardcoding the interval.
 
     Common::Json method_getEpochSchedule(Node::Node &node,
                                          const RpcConfig & /*config*/,
@@ -1026,9 +926,6 @@ namespace Rpc
           active_only ? loadActiveValidators(state)
                       : loadAllValidators(state);
 
-      //  Optional pagination. Applies after the load, which is fine
-      //  because the validator set is bounded (ACTIVE_SET_MAX = 100
-      //  active, plus a modest pool).
       const PageParams page = parsePageParams(req.params, 1000);
 
       if (page.offset >= validators.size())
@@ -1155,14 +1052,6 @@ namespace Rpc
     }
 
     // ---- clrty_getValidatorStats ----
-    //
-    // Params:
-    //   id  (required, hex)
-    //
-    // Returns summary statistics for a validator: the record plus
-    // block-production count from the producer index, and the last
-    // few blocks it produced. Lightweight enough to call from a
-    // validator page on every poll.
 
     Common::Json method_getValidatorStats(Node::Node &node,
                                           const RpcConfig & /*config*/,
@@ -1183,8 +1072,6 @@ namespace Rpc
                           {{"id", encodeU64Hex(id)}}));
       }
 
-      //  Recent blocks. Bounded to a modest window so the handler
-      //  stays cheap.
       constexpr size_t RECENT_BLOCKS = 20;
 
       Common::Json recent = Common::Json::array();
@@ -1197,6 +1084,7 @@ namespace Rpc
             putU64(entry, "height", block_height);
             putHash(entry, "block_hash", block_hash);
             recent.push_back(std::move(entry));
+            return true;
           });
 
       Common::Json out = encodeValidator(v, height, hrp);
@@ -1384,13 +1272,6 @@ namespace Rpc
     }
 
     // ---- clrty_getTokensForAddress ----
-    //
-    // Params:
-    //   address  (required, bech32m or hex)
-    //
-    // Returns every (token_id, balance) pair the address holds. The
-    // native CLRTY balance is included as token_id = 0 so the caller
-    // doesn't need a separate call.
 
     Common::Json method_getTokensForAddress(Node::Node &node,
                                             const RpcConfig & /*config*/,
@@ -1404,11 +1285,6 @@ namespace Rpc
 
       Common::Json arr = Common::Json::array();
 
-      //  Every token the address holds, including the native token
-      //  (id 0), comes from the by-token balance index. The native
-      //  balance is maintained there by StateAccess::putAccount, so
-      //  there's no separate synthesis step and no risk of a
-      //  duplicate row.
       state.forEachTokenBalanceForOwner(
           address,
           [&](Id token_id, uint64_t balance)
@@ -1427,11 +1303,6 @@ namespace Rpc
     }
 
     // ---- clrty_getPositionsForAddress ----
-    //
-    // Params:
-    //   address  (required, bech32m or hex)
-    //
-    // Returns every LP position owned by the address.
 
     Common::Json method_getPositionsForAddress(Node::Node &node,
                                                const RpcConfig & /*config*/,
@@ -1463,13 +1334,6 @@ namespace Rpc
     }
 
     // ---- clrty_getOrdersForAddress ----
-    //
-    // Params:
-    //   address  (required, bech32m or hex)
-    //   include_filled (optional, bool; default false)
-    //
-    // Returns every order owned by the address. Fully filled orders
-    // are filtered out by default.
 
     Common::Json method_getOrdersForAddress(Node::Node &node,
                                             const RpcConfig & /*config*/,
@@ -1502,13 +1366,6 @@ namespace Rpc
     }
 
     // ---- clrty_getTransactionsForAddress ----
-    //
-    // Params:
-    //   address  (required, bech32m or hex)
-    //   limit    (optional, hex; default 50; max 100)
-    //
-    // Returns the most recent transactions that touched the address,
-    // newest first. Uses the by-address transaction index.
 
     Common::Json method_getTransactionsForAddress(Node::Node &node,
                                                   const RpcConfig & /*config*/,
@@ -1540,13 +1397,11 @@ namespace Rpc
           static_cast<size_t>(limit),
           [&](const Crypto::Hash &txid, uint64_t block_height, uint32_t tx_index)
           {
-            //  Resolve the transaction from its block. This is one
-            //  block lookup per hit, bounded by `limit`.
             auto block = node.chain().getBlockByHeight(block_height);
             if (!block.has_value())
-              return;
+              return true;
             if (tx_index >= block->transactions.size())
-              return;
+              return true;
 
             Common::Json entry = Common::Json::object();
             entry["tx"] = encodeTransaction(block->transactions[tx_index], hrp);
@@ -1554,6 +1409,7 @@ namespace Rpc
             putU64(entry, "block_height", block_height);
             entry["index"] = tx_index;
             arr.push_back(std::move(entry));
+            return true;
           });
 
       Common::Json out = Common::Json::object();
@@ -1564,12 +1420,6 @@ namespace Rpc
     }
 
     // ---- clrty_getStakingInfo ----
-    //
-    // No params.
-    //
-    // Returns the current staking APY breakdown and the aggregate
-    // staking state. Reads the APY the last epoch actually used,
-    // plus live inputs that would go into the next epoch's APY.
 
     Common::Json method_getStakingInfo(Node::Node &node,
                                        const RpcConfig & /*config*/,
@@ -1582,14 +1432,9 @@ namespace Rpc
       const uint64_t staker_count = readU64Global(state, "staker_count");
       const uint64_t pot = readU64Global(state, "pot");
 
-      //  The APY the last epoch boundary computed. Zero before the
-      //  first epoch has closed (heights < ROTATION_INTERVAL).
       const uint64_t last_effective_apy_bps =
           state.getMetaU64("last_effective_apy_bps");
 
-      //  Live activity input: transactions in the last
-      //  ROTATION_INTERVAL blocks. This is what the activity
-      //  component will use at the next epoch.
       const uint64_t activity_txs =
           sumTxCountInWindow(node, height, Core::ROTATION_INTERVAL);
       const uint64_t avg_tx_per_block =
@@ -1597,15 +1442,11 @@ namespace Rpc
               ? activity_txs / Core::ROTATION_INTERVAL
               : 0;
 
-      //  APY components. The base is constant; activity and pot
-      //  are computed by the reward calculator's own functions so
-      //  the RPC and the block processor agree by construction.
       const uint16_t base_bps = GlobalConfig::APY_BASE_BPS;
       const uint16_t activity_bps = Core::computeActivityBps(avg_tx_per_block);
       const uint16_t pot_bonus_bps =
           Core::computePotBonusBps(pot, /*pool_baseline=*/0);
 
-      //  Epoch timing.
       const uint64_t epoch = height / Core::ROTATION_INTERVAL;
       const uint64_t epoch_start = epoch * Core::ROTATION_INTERVAL;
       const uint64_t next_epoch = epoch_start + Core::ROTATION_INTERVAL;
@@ -1633,13 +1474,6 @@ namespace Rpc
     }
 
     // ---- clrty_getAddressStats ----
-    //
-    // Params:
-    //   address  (required, bech32m or hex)
-    //
-    // Summary counts for an address: whether it's a validator,
-    // how many tokens it holds, how many LP positions, how many
-    // orders. Each count is a fast index lookup; no chain walk.
 
     Common::Json method_getAddressStats(Node::Node &node,
                                         const RpcConfig & /*config*/,
@@ -1651,28 +1485,23 @@ namespace Rpc
 
       State::StateAccess state(node.stateDB(), node.chain().height());
 
-      //  Account summary.
       Core::Account acct = state.getAccount(address);
 
-      //  Token holdings count.
       uint64_t token_count = 0;
       state.forEachTokenBalanceForOwner(
           address, [&](Id, uint64_t)
           { ++token_count; });
 
-      //  LP positions count.
       uint64_t position_count = 0;
       state.forEachPositionForOwner(
           address, [&](const Core::AmmPosition &)
           { ++position_count; });
 
-      //  Orders count.
       uint64_t order_count = 0;
       state.forEachOrderForOwner(
           address, [&](const Core::Order &)
           { ++order_count; });
 
-      //  Validator status.
       uint64_t validator_id = 0;
       const bool is_validator = state.getValidatorByAddress(address, validator_id);
 
@@ -1694,14 +1523,6 @@ namespace Rpc
     }
 
     // ---- clrty_getAddressList ----
-    //
-    // Params:
-    //   limit   (optional, hex; default 50; max 100)
-    //   offset  (optional, hex; default 0)
-    //
-    // Paginated list of every account. Ordered by address bytes.
-    // Useful for tooling and for building indexers; the explorer
-    // itself doesn't need this.
 
     Common::Json method_getAddressList(Node::Node &node,
                                        const RpcConfig & /*config*/,
@@ -1795,12 +1616,6 @@ namespace Rpc
     }
 
     // ---- clrty_getAllTokens ----
-    //
-    // Params:
-    //   limit   (optional, hex; default 50; max 500)
-    //   offset  (optional, hex; default 0)
-    //
-    // Enumerate every registered token, ordered by token_id.
 
     Common::Json method_getAllTokens(Node::Node &node, const RpcConfig & /*config*/,
                                      const JsonRpcRequest &req)
@@ -1835,15 +1650,6 @@ namespace Rpc
     }
 
     // ---- clrty_getTokenHolders ----
-    //
-    // Params:
-    //   token_id  (required, hex)
-    //   limit     (optional, hex; default 50; max 100)
-    //
-    // Returns the top holders of a token by balance, descending.
-    // Uses the by-token balance index. Collects all holders and
-    // sorts in memory; bounded by the total holder count of the
-    // token, which for v1 is a reasonable assumption.
 
     Common::Json method_getTokenHolders(Node::Node &node, const RpcConfig & /*config*/,
                                         const JsonRpcRequest &req)
@@ -1874,6 +1680,7 @@ namespace Rpc
           [&](const Crypto::Address &addr, uint64_t balance)
           {
             holders.push_back({addr, balance});
+            return true;
           });
 
       std::sort(holders.begin(), holders.end(), cmpAmountDesc);
@@ -1898,13 +1705,6 @@ namespace Rpc
     }
 
     // ---- clrty_getTokenTransfers ----
-    //
-    // Params:
-    //   token_id  (required, hex)
-    //   limit     (optional, hex; default 50; max 100)
-    //
-    // Returns the most recent transactions that touched this token,
-    // newest first. Uses the by-token transaction index.
 
     Common::Json method_getTokenTransfers(Node::Node &node, const RpcConfig & /*config*/,
                                           const JsonRpcRequest &req)
@@ -1935,13 +1735,11 @@ namespace Rpc
           static_cast<size_t>(limit),
           [&](const Crypto::Hash &txid, uint64_t block_height, uint32_t tx_index)
           {
-            //  Resolve the transaction from its block. This is one
-            //  block lookup per hit, bounded by `limit`.
             auto block = node.chain().getBlockByHeight(block_height);
             if (!block.has_value())
-              return;
+              return true;
             if (tx_index >= block->transactions.size())
-              return;
+              return true;
 
             Common::Json entry = Common::Json::object();
             entry["tx"] = encodeTransaction(block->transactions[tx_index], hrp);
@@ -1949,6 +1747,7 @@ namespace Rpc
             putU64(entry, "block_height", block_height);
             entry["index"] = tx_index;
             arr.push_back(std::move(entry));
+            return true;
           });
 
       Common::Json out = Common::Json::object();
@@ -1959,14 +1758,6 @@ namespace Rpc
     }
 
     // ---- clrty_getTokensByCreator ----
-    //
-    // Params:
-    //   address  (required, bech32m or hex)
-    //   limit    (optional, hex; default 50; max 500)
-    //
-    // Returns every token whose creator field matches the address.
-    // No dedicated index exists; we scan the token table and filter.
-    // Fine for the token counts that v1 can plausibly have.
 
     Common::Json method_getTokensByCreator(Node::Node &node,
                                            const RpcConfig & /*config*/,
@@ -2007,6 +1798,7 @@ namespace Rpc
       out["tokens"] = std::move(arr);
       return out;
     }
+
     // =========================================================================
     //  Order methods (existing + new)
     // =========================================================================
@@ -2053,14 +1845,6 @@ namespace Rpc
     }
 
     // ---- clrty_getAllOrders ----
-    //
-    // Params:
-    //   limit          (optional, hex; default 50; max 500)
-    //   offset         (optional, hex; default 0)
-    //   include_filled (optional, bool; default false)
-    //
-    // Enumerate every order, ordered by order_id. Fully filled
-    // orders are filtered out by default.
 
     Common::Json method_getAllOrders(Node::Node &node, const RpcConfig & /*config*/,
                                      const JsonRpcRequest &req)
@@ -2099,15 +1883,6 @@ namespace Rpc
     }
 
     // ---- clrty_getOrdersByPair ----
-    //
-    // Params:
-    //   sell_token  (required, hex)
-    //   buy_token   (required, hex)
-    //   limit       (optional, hex; default 50; max 500)
-    //   offset      (optional, hex; default 0)
-    //
-    // Returns the order book for a specific (sell, buy) pair. Uses
-    // the pair index written by putOrder.
 
     Common::Json method_getOrdersByPair(Node::Node &node, const RpcConfig & /*config*/,
                                         const JsonRpcRequest &req)
@@ -2242,9 +2017,6 @@ namespace Rpc
     {
       const Crypto::Hash hash = requireHash(req.params, "hash");
 
-      //  Step 1: is this a confirmed tx? The tx index is written
-      //  atomically with the block, so if the index row exists, the
-      //  block is committed.
       auto loc = node.chainDB().getTxLocation(hash);
       if (!loc.has_value())
       {
@@ -2255,10 +2027,6 @@ namespace Rpc
                           {{"hash", encodeHash(hash)}}));
       }
 
-      //  Step 2: read the receipt from ChainDB. Receipts are stored
-      //  in TBL_RECEIPTS, not in the SMT. The SMT path
-      //  (StateAccess::getReceipt, Keys::receipt(txid)) is not
-      //  populated by the block processor.
       std::vector<uint8_t> receipt_bytes;
       if (!node.chainDB().getReceipt(hash, receipt_bytes))
       {
@@ -2346,8 +2114,6 @@ namespace Rpc
                            {"value", encodeU64Hex(limit)}}));
       }
 
-      //  Optional type filter. When set, we walk the by-type index
-      //  instead of the header chain — far cheaper on a busy chain.
       auto type_filter = optionalU64(req.params, "type_code");
 
       const std::string hrp = hrpForNode(node);
@@ -2366,9 +2132,9 @@ namespace Rpc
             {
               auto block = node.chain().getBlockByHeight(block_height);
               if (!block.has_value())
-                return;
+                return true;
               if (tx_index >= block->transactions.size())
-                return;
+                return true;
 
               Common::Json entry = Common::Json::object();
               entry["tx"] = encodeTransaction(block->transactions[tx_index], hrp);
@@ -2376,6 +2142,7 @@ namespace Rpc
               putU64(entry, "block_height", block_height);
               entry["index"] = tx_index;
               arr.push_back(std::move(entry));
+              return true;
             });
 
         Common::Json out = Common::Json::object();
@@ -2384,7 +2151,6 @@ namespace Rpc
         return out;
       }
 
-      //  No filter: walk headers back from the tip.
       const uint64_t tip = node.chain().height();
 
       uint64_t h = tip;
@@ -2431,22 +2197,11 @@ namespace Rpc
     }
 
     // ---- clrty_getAllTransactions ----
-    //
-    // Params:
-    //   type_code  (optional, hex)
-    //   limit      (optional, hex; default 50; max 100)
-    //
-    // Unified entry point for the transaction list. When a
-    // type_code is provided, uses the by-type index. Otherwise
-    // defers to the header walk. Thin wrapper over
-    // getRecentTransactions with a different default limit.
 
     Common::Json method_getAllTransactions(Node::Node &node,
                                            const RpcConfig & /*config*/,
                                            const JsonRpcRequest &req)
     {
-      //  Reuse the getRecentTransactions logic, but default to a
-      //  larger page size.
       Common::Json params = req.params;
       if (!params.contains("limit"))
         params["limit"] = "0x32"; // 50
@@ -2457,12 +2212,6 @@ namespace Rpc
     }
 
     // ---- clrty_getTransactionsByType ----
-    //
-    // Params:
-    //   type_code  (required, hex)
-    //   limit      (optional, hex; default 50; max 100)
-    //
-    // Convenience wrapper: extracts type_code and forwards.
 
     Common::Json method_getTransactionsByType(Node::Node &node,
                                               const RpcConfig & /*config*/,
@@ -2481,13 +2230,6 @@ namespace Rpc
     }
 
     // ---- clrty_getTxCount ----
-    //
-    // No params.
-    //
-    // Returns the chain-lifetime transaction count and the count
-    // for the current epoch. The lifetime counter comes from the
-    // running global; the epoch count is computed from the last
-    // ROTATION_INTERVAL blocks.
 
     Common::Json method_getTxCount(Node::Node &node,
                                    const RpcConfig & /*config*/,
@@ -2545,14 +2287,6 @@ namespace Rpc
     }
 
     // ---- clrty_getMempoolList ----
-    //
-    // Params:
-    //   limit      (optional, hex; default 50; max 500)
-    //   order_by   (optional, "fee" | "time"; default "fee")
-    //
-    // The default sort is fee-rate descending, matching the order
-    // the block builder will use. "time" sorts by insertion time,
-    // newest first — useful for a live "just arrived" view.
 
     Common::Json method_getMempoolList(Node::Node &node,
                                        const RpcConfig & /*config*/,
@@ -2643,13 +2377,6 @@ namespace Rpc
     // =========================================================================
 
     // ---- clrty_getFeeStats ----
-    //
-    // No params.
-    //
-    // Fee aggregates at three scales: lifetime, last epoch, last
-    // 24 hours' worth of blocks (based on NOMINAL_BLOCK_SECONDS).
-    // Every number is either a running global or a bounded header
-    // walk.
 
     Common::Json method_getFeeStats(Node::Node &node,
                                     const RpcConfig & /*config*/,
@@ -2685,12 +2412,6 @@ namespace Rpc
     }
 
     // ---- clrty_getPotInfo ----
-    //
-    // No params.
-    //
-    // Everything about the staker reward pot: current balance,
-    // lifetime credits, lifetime distributions, and the timing
-    // constants that determine when the next distribution happens.
 
     Common::Json method_getPotInfo(Node::Node &node,
                                    const RpcConfig & /*config*/,
@@ -2707,9 +2428,6 @@ namespace Rpc
       const uint64_t last_apy =
           readU64Global(state, "last_effective_apy_bps");
 
-      //  Pot fill as a fraction of POT_HIGH, in basis points. The
-      //  bonus only kicks in above POT_HIGH, so this is what the
-      //  user actually wants to see.
       const uint64_t pool_baseline =
           Core::applyBps(GlobalConfig::BLOCK_REWARD,
                          GlobalConfig::STAKER_SHARE_BPS) *
@@ -2839,10 +2557,6 @@ namespace Rpc
     }
 
     // ---- clrty_getMethods ----
-    //
-    // No params. Returns the full list of registered method names,
-    // grouped by category. Useful for clients that want to discover
-    // the surface without reading the source.
 
     Common::Json method_getMethods(Node::Node & /*node*/, const RpcConfig & /*config*/,
                                    const JsonRpcRequest & /*req*/)
@@ -2990,16 +2704,6 @@ namespace Rpc
     }
 
     // ---- clrty_getOrderBook ----
-    //
-    // Params:
-    //   base_token   (required, hex)
-    //   quote_token  (required, hex)
-    //   depth        (optional, hex; default 20; max 100)
-    //
-    // Returns bids and asks, aggregated by price level, best-first
-    // on each side. Bids are the buy-base side (side 1); asks are
-    // the sell-base side (side 0). Prices are in the canonical
-    // frame (quote per base, scaled by BOOK_PRICE_SCALE).
 
     Common::Json method_getOrderBook(Node::Node &node,
                                      const RpcConfig & /*config*/,
@@ -3068,13 +2772,6 @@ namespace Rpc
     }
 
     // ---- clrty_getOrderFills ----
-    //
-    // Params:
-    //   order_id  (required, hex)
-    //   limit     (optional, hex; default 100; max 500)
-    //
-    // Returns the fills for one order (either side), newest first.
-    // Uses the order-view of the fill-history table.
 
     Common::Json method_getOrderFills(Node::Node &node,
                                       const RpcConfig & /*config*/,
@@ -3106,6 +2803,7 @@ namespace Rpc
           [&](const Core::Fill &f, uint64_t height, uint32_t tx_index)
           {
             arr.push_back(encodeFill(f, height, tx_index, hrp));
+            return true;
           });
 
       Common::Json out = Common::Json::object();
@@ -3116,14 +2814,6 @@ namespace Rpc
     }
 
     // ---- clrty_getPairTrades ----
-    //
-    // Params:
-    //   base_token   (required, hex)
-    //   quote_token  (required, hex)
-    //   limit        (optional, hex; default 100; max 500)
-    //
-    // Returns recent trades on a pair, newest first. Uses the
-    // pair-view of the fill-history table.
 
     Common::Json method_getPairTrades(Node::Node &node,
                                       const RpcConfig & /*config*/,
@@ -3166,6 +2856,7 @@ namespace Rpc
           [&](const Core::Fill &f, uint64_t height, uint32_t tx_index)
           {
             arr.push_back(encodeFill(f, height, tx_index, hrp));
+            return true;
           });
 
       Common::Json out = Common::Json::object();
@@ -3189,7 +2880,6 @@ namespace Rpc
     d.registerMethod("getPosition", method_getPosition);
     d.registerMethod("getPositionByOwner", method_getPositionByOwner);
 
-    //  pool enumeration.
     d.registerMethod("getAllPools", method_getAllPools);
     d.registerMethod("getPoolsForToken", method_getPoolsForToken);
     d.registerMethod("getPositionsForPool", method_getPositionsForPool);
@@ -3205,7 +2895,6 @@ namespace Rpc
     d.registerMethod("getRecentBlocks", method_getRecentBlocks);
     d.registerMethod("getStateRoot", method_getStateRoot);
 
-    //  ranges, per-producer queries, aggregates.
     d.registerMethod("getBlocksRange", method_getBlocksRange);
     d.registerMethod("getBlocksByProducer", method_getBlocksByProducer);
     d.registerMethod("getBlockStats", method_getBlockStats);
@@ -3242,7 +2931,6 @@ namespace Rpc
     d.registerMethod("getFeeStats", method_getFeeStats);
     d.registerMethod("getPotInfo", method_getPotInfo);
 
-    //  Ethereum-style shims.
     d.registerMethod("web3_clientVersion", method_web3_clientVersion);
     d.registerMethod("net_version", method_net_version);
     d.registerMethod("net_peerCount", method_net_peerCount);
@@ -3269,7 +2957,6 @@ namespace Rpc
     d.registerMethod("getTokenSupply", method_getTokenSupply);
     d.registerMethod("getProof", method_getProof);
 
-    //  scoped queries.
     d.registerMethod("getTokensForAddress", method_getTokensForAddress);
     d.registerMethod("getPositionsForAddress", method_getPositionsForAddress);
     d.registerMethod("getOrdersForAddress", method_getOrdersForAddress);
@@ -3278,7 +2965,6 @@ namespace Rpc
     d.registerMethod("getAddressStats", method_getAddressStats);
     d.registerMethod("getAddressList", method_getAddressList);
 
-    //  token enumeration.
     d.registerMethod("getAllTokens", method_getAllTokens);
     d.registerMethod("getTokenHolders", method_getTokenHolders);
     d.registerMethod("getTokenTransfers", method_getTokenTransfers);
@@ -3293,7 +2979,6 @@ namespace Rpc
     d.registerMethod("simulateTransaction", method_simulateTransaction);
     d.registerMethod("getRecentTransactions", method_getRecentTransactions);
 
-    //  unified list, filtered list, count.
     d.registerMethod("getAllTransactions", method_getAllTransactions);
     d.registerMethod("getTransactionsByType", method_getTransactionsByType);
     d.registerMethod("getTxCount", method_getTxCount);

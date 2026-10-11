@@ -754,6 +754,14 @@ namespace State
         buf[i] = uint8_t(order_id >> (i * 8));
       return hashDomain("oseq", buf, 8);
     }
+
+    Crypto::Hash validatorKeyHistory(uint64_t validator_id) noexcept
+    {
+      uint8_t buf[8];
+      for (int i = 0; i < 8; ++i)
+        buf[i] = uint8_t(validator_id >> (i * 8));
+      return hashDomain("vkey", buf, 8);
+    }
   } // namespace Keys
 
 } // namespace State

@@ -105,6 +105,10 @@ namespace Core
                                               const Transaction &tx,
                                               const TxExecutionContext &ctx);
 
+    static Receipt executeRotateConsensusKey(State::StateAccess &state,
+                                             const Transaction &tx,
+                                             const TxExecutionContext &ctx);
+
     static Receipt executeCreateToken(State::StateAccess &state,
                                       const Transaction &tx,
                                       const TxExecutionContext &ctx);

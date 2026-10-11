@@ -7,6 +7,7 @@
 
 #include "Account.h"
 #include "GlobalState.h"
+#include "KeyRotation.h"
 #include "RewardTypes.h"
 #include "TokenTypes.h"
 #include "ValidatorTypes.h"
@@ -340,10 +341,16 @@ namespace Core
 
     // ---- Seed validators ----
     //
-    //  For each seed, write the validator record and the index entry
-    //  that maps its reward_address back to its id. The index is what
-    //  the reward distributor uses to identify the block proposer, and
-    //  what any caller with only an address uses to find the validator.
+    //  For each seed, write the validator record, the index entry
+    //  that maps its reward_address back to its id, and a single-
+    //  entry consensus-key history.
+    //
+    //  The history entry covers from height 0 (genesis) onward and
+    //  records the key the validator will sign with until a
+    //  RotateConsensusKey transaction seals it and appends a new
+    //  entry. A validator that never rotates has a history of
+    //  exactly this one entry, and validatorKeyAtHeight returns
+    //  this key for every height.
     //
     //  Validator records do NOT touch the staker globals: a validator
     //  and a staker are different concepts (a validator's stake is
@@ -390,6 +397,20 @@ namespace Core
       state.putValidator(vi);
 
       state.putValidatorByAddress(v.reward_address, v.id);
+
+      //  Seed the consensus-key history with a single entry
+      //  covering from genesis onward. This is the anchor that
+      //  validatorKeyAtHeight resolves against for every
+      //  pre-rotation height.
+      {
+        std::vector<KeyRotation> history;
+        KeyRotation entry;
+        entry.key = vi.effectiveConsensusKey();
+        entry.valid_from_height = 0;
+        entry.valid_until_height = 0; // current
+        history.push_back(entry);
+        state.putValidatorKeyHistory(v.id, history);
+      }
     }
 
     // ---- Active set ----

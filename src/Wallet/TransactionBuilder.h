@@ -160,6 +160,29 @@ namespace Wallet
       const UpdateRewardParams &params,
       WalletStatus *error_out = nullptr);
 
+  //  ---- Rotate Consensus Key ----
+  //
+  //  Payload is the new consensus key (32 bytes). The executor
+  //  looks up the validator by `from` — the current owner — and
+  //  rewrites consensus_key, appending the previous key to the
+  //  validator's key history with the rotation height as the
+  //  boundary.
+  //
+  //  The new key must differ from the current key; that check is
+  //  in the executor, not the builder, because the builder doesn't
+  //  have chain state.
+
+  struct RotateConsensusParams
+  {
+    TxCommonParams common;
+    Crypto::PublicKey new_consensus_key{};
+  };
+
+  std::optional<Core::Transaction> buildRotateConsensusKey(
+      const Crypto::Address &from,
+      const RotateConsensusParams &params,
+      WalletStatus *error_out = nullptr);
+
   //  ---- Sign ----
 
   //  Compute the transaction's signing hash, ask the signer to sign

@@ -536,9 +536,24 @@ namespace Core
       uint64_t current_height,
       std::string &error)
   {
-    auto lookup = [&state](Id vid, ValidatorInfo &out) -> bool
+    auto lookup = [&state, cert_height = current_height](Id vid,
+                                                         ValidatorInfo &out) -> bool
     {
-      return state.getValidator(vid, out);
+      if (!state.getValidator(vid, out))
+        return false;
+
+      //  Overwrite the record's current key with the key that
+      //  was authoritative at the certificate's height. The
+      //  caller (Consensus::verifyTimeoutCertificate) reads
+      //  effectiveConsensusKey() from the returned record; by
+      //  setting consensus_key here, the verification uses the
+      //  height-appropriate key without changing the callback's
+      //  signature.
+      auto historic = state.validatorKeyAtHeight(vid, cert_height);
+      if (!historic.has_value())
+        return false;
+      out.consensus_key = *historic;
+      return true;
     };
 
     return Consensus::verifyTimeoutCertificate(
@@ -672,9 +687,18 @@ namespace Core
         return false;
       }
 
-      Crypto::PublicKey pk = v.effectiveConsensusKey();
+      //  Resolve the signing key at this block's height, not the
+      //  validator's current key. A validator that has rotated
+      //  since the vote was cast must still verify against the key
+      //  that was authoritative when they voted.
+      auto pk = state.validatorKeyAtHeight(vid, block.header.height);
+      if (!pk.has_value())
+      {
+        error = "no consensus key for signer at this height";
+        return false;
+      }
 
-      if (!Crypto::verify(signing_hash, pk, vs.signature))
+      if (!Crypto::verify(signing_hash, *pk, vs.signature))
       {
         error = "invalid quorum signature";
         return false;
@@ -991,10 +1015,9 @@ namespace Core
 
     //  Determine swap direction. The pool's reserves are in
     //  canonical token order (token_a < token_b). The order sells
-    //  `order.sell_token`. Either the sell token is token_a (so
-    //  the order sells into reserve_a and receives reserve_b) or
-    //  it is token_b (the reverse). Anything else is a pool/order
-    //  mismatch and the order cannot route.
+    //  `order.sell_token`. Either the sell token is token_a (sell
+    //  into reserve_a, receive reserve_b) or token_b (the reverse).
+    //  Anything else is a pool/order mismatch.
     uint64_t reserve_in = 0;
     uint64_t reserve_out = 0;
 
@@ -1039,6 +1062,17 @@ namespace Core
     if (!OrderBook::canonicalPrice(order, canonical_limit))
       return ActiveRouteOutcome::Unroutable; // overflow
 
+    //  Compute the max input that respects the limit.
+    //
+    //  Note on partial fills: an Active order that partially fills
+    //  moves the pool's price. The next epoch's max-input
+    //  computation runs against the post-fill pool, and if the
+    //  pool has moved past the order's limit, the order rests
+    //  rather than fills further. That's the correct behavior: the
+    //  order's limit is a price floor, not a quantity guarantee,
+    //  and a pool that no longer clears the limit cannot be used
+    //  to fill the remainder.
+    //
     //  No positive input satisfies the limit. The pool is real,
     //  the pair is real, but the current price is unfavorable.
     //  Rest and retry next epoch.
@@ -1060,12 +1094,39 @@ namespace Core
     const uint64_t effective_price = ActiveRouter::computeEffectivePrice(
         reserve_in, reserve_out, pool.fee_bps, amount_in);
 
-    //  Update the pool. Mirror AmmPool::executeSwap's reserve update
-    //  so a subsequent swap sees a consistent state. The volume
-    //  tracker is deliberately not updated here: the order path is
-    //  not a user Swap tx and does not carry the CLRTY-equivalent
-    //  volume the tracker expects. This means an Active-order fill
-    //  does not contribute to a VolumeBelow condition's window.
+    //  Compute the CLRTY-equivalent volume before the reserve
+    //  update, using the pool's pre-swap price. Matches what
+    //  AmmPool::executeSwap does for a user Swap transaction.
+    //
+    //  The tracker stores CLRTY-denominated volume so that a
+    //  VolumeBelow condition's threshold is comparable across
+    //  pools regardless of which two tokens the pool actually
+    //  trades. If the pool has CLRTY on neither side, the volume
+    //  is zero — this is the same behavior executeSwap has, and
+    //  a pool with no CLRTY side will not have a meaningful
+    //  CLRTY volume anyway.
+    uint64_t clrty_volume = 0;
+
+    if (order.sell_token == NATIVE_TOKEN_ID)
+    {
+      clrty_volume = amount_in;
+    }
+    else if (pool.token_a == NATIVE_TOKEN_ID && pool.reserve_b > 0)
+    {
+      clrty_volume = static_cast<uint64_t>(
+          static_cast<__uint128_t>(amount_in) *
+          pool.reserve_a / pool.reserve_b);
+    }
+    else if (pool.token_b == NATIVE_TOKEN_ID && pool.reserve_a > 0)
+    {
+      clrty_volume = static_cast<uint64_t>(
+          static_cast<__uint128_t>(amount_in) *
+          pool.reserve_b / pool.reserve_a);
+    }
+
+    //  Update the pool reserves. Mirror AmmPool::executeSwap's
+    //  reserve update so a subsequent swap sees a consistent
+    //  state.
     if (order.sell_token == pool.token_a)
     {
       pool.reserve_a += amount_in;
@@ -1076,6 +1137,37 @@ namespace Core
       pool.reserve_b += amount_in;
       pool.reserve_a -= amount_out;
     }
+
+    //  Update the rolling volume window, same as AmmPool::executeSwap
+    //  does for a user Swap transaction. A routed order is a trade
+    //  through the pool; a VolumeBelow condition on this pool
+    //  should see it.
+    //
+    //  The window mechanics match executeSwap exactly:
+    //    - first write initializes the window at this height
+    //    - a write at or after window_height + ROTATION_INTERVAL
+    //      rolls the current window into "last" and starts fresh
+    //    - a write within the window adds to the running total
+    //
+    //  This runs before putAmmPool so the reserve and volume
+    //  updates commit together in the same SMT write.
+    if (pool.volume_window_height == 0)
+    {
+      pool.volume_window_height = height;
+      pool.volume_current = clrty_volume;
+      pool.volume_last = 0;
+    }
+    else if (height >= pool.volume_window_height + ROTATION_INTERVAL)
+    {
+      pool.volume_last = pool.volume_current;
+      pool.volume_current = clrty_volume;
+      pool.volume_window_height = height;
+    }
+    else
+    {
+      pool.volume_current += clrty_volume;
+    }
+
     state.putAmmPool(pool);
 
     //  Credit the counterparty. The order's sell-token lock was
@@ -1238,6 +1330,13 @@ namespace Core
 
       state.deleteValidatorByAddress(v.reward_address);
       state.deleteValidator(v.id);
+
+      //  Drop the key history with the record. No reason to keep
+      //  it once the validator is gone; an equivocation proof
+      //  against a deleted validator is not actionable anyway
+      //  (executeSystemSlash looks up the record and no-ops on
+      //  absence).
+      state.putValidatorKeyHistory(v.id, {});
     }
   }
 

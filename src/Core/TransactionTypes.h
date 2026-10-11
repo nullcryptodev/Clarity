@@ -44,6 +44,7 @@ namespace Core
     RegisterValidator = 0x20,
     UnregisterValidator = 0x21,
     UpdateRewardAddress = 0x22,
+    RotateConsensusKey = 0x23,
 
     // ---- AMM (0x30 - 0x3F) ----
     CreatePool = 0x30,

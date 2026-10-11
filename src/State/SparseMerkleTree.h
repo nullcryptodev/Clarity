@@ -225,6 +225,17 @@ namespace State
     //  key (which encodes the sequence) without scanning the entire
     //  pair+side prefix.
     Crypto::Hash orderSequence(uint64_t order_id) noexcept;
+
+    //  Validator consensus-key history. Companion to
+    //  Keys::validator. Holds the list of (key, from, until)
+    //  entries describing which consensus key was authoritative
+    //  at each height in the validator's life.
+    //
+    //  Not part of the ValidatorInfo wire format. Written by
+    //  StateAccess::putValidatorKeyHistory, read by
+    //  StateAccess::validatorKeyAtHeight, removed by
+    //  StateAccess::deleteValidator.
+    Crypto::Hash validatorKeyHistory(uint64_t validator_id) noexcept;
   }
 
 } // namespace State

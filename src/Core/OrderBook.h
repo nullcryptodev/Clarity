@@ -52,9 +52,11 @@ namespace Core
     //  Maximum number of resting orders a single taker will cross
     //  in one transaction. Bounds block-apply time. When the cap is
     //  hit, the taker's remainder rests; the next block's orders
-    //  can continue crossing. Not a consensus parameter: it is
-    //  enforced identically on every node because it is part of the
-    //  state-transition function.
+    //  can continue crossing.
+    //
+    //  This is a consensus constant: it is part of the state-
+    //  transition function and every node must enforce the same
+    //  value. Changing it is a hard fork.
     inline constexpr size_t MAX_BOOK_LEVELS_PER_TAKER = 256;
 
     //  Pair key: Blake2b(min || max) over the two u32 token ids in

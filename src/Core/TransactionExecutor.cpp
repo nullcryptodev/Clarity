@@ -14,6 +14,7 @@
 #include "ValidatorTypes.h"
 #include "GlobalState.h"
 #include "RewardTypes.h"
+#include "KeyRotation.h"
 
 #include "State/StateAccess.h"
 #include "Crypto/Ed25519.h"
@@ -101,6 +102,10 @@ namespace Core
 
     case TxType::UpdateRewardAddress:
       receipt = executeUpdateRewardAddress(state, tx, ctx);
+      break;
+
+    case TxType::RotateConsensusKey:
+      receipt = executeRotateConsensusKey(state, tx, ctx);
       break;
 
     case TxType::CreateToken:
@@ -389,6 +394,20 @@ namespace Core
     state.putValidator(validator);
     state.putValidatorByAddress(validator.reward_address, validator.id);
 
+    //  Initialize the key history with a single entry covering
+    //  from registration onward. The initial signing key is
+    //  whatever the record carries, which for a fresh
+    //  registration is the payload key.
+    {
+      std::vector<Core::KeyRotation> history;
+      Core::KeyRotation entry;
+      entry.key = validator.effectiveConsensusKey();
+      entry.valid_from_height = ctx.current_height;
+      entry.valid_until_height = 0;
+      history.push_back(entry);
+      state.putValidatorKeyHistory(validator.id, history);
+    }
+
     uint64_t new_next = next_id + 1;
     std::vector<uint8_t> new_id_bytes(8);
     for (int i = 0; i < 8; ++i)
@@ -489,6 +508,85 @@ namespace Core
 
     validator.reward_address = new_address;
     validator.owner = new_address;
+    state.putValidator(validator);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  //  Rotate Consensus Key
+
+  Receipt TransactionExecutor::executeRotateConsensusKey(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    if (tx.payload.size() != 32)
+      return failure;
+
+    Crypto::PublicKey new_key;
+    std::memcpy(new_key.data.data(), tx.payload.data(), 32);
+
+    if (new_key.isNull())
+      return failure;
+
+    uint64_t validator_id = 0;
+    if (!state.getValidatorByAddress(tx.from, validator_id))
+      return failure;
+
+    ValidatorInfo validator;
+    if (!state.getValidator(validator_id, validator))
+      return failure;
+
+    //  Only the owner can rotate. In current deployments the owner
+    //  and reward_address are the same; the check is written
+    //  against owner so the invariant survives a future split.
+    if (validator.owner != tx.from)
+      return failure;
+
+    //  A no-op rotation is a user error. effectiveConsensusKey()
+    //  returns the current signing key whether it's the explicit
+    //  consensus_key or the reward_address fallback.
+    if (validator.effectiveConsensusKey() == new_key)
+      return failure;
+
+    //  A departing validator should not extend its signing window.
+    if (validator.pending_unbond_height != 0)
+      return failure;
+
+    //  Load the current history. If it doesn't exist (a validator
+    //  registered before the feature existed, or a record whose
+    //  history was never written), synthesize a single-entry
+    //  history covering from registration onward using the
+    //  record's current key. This migration path keeps every
+    //  pre-feature validator working through the first rotation.
+    std::vector<Core::KeyRotation> history;
+    if (!state.getValidatorKeyHistory(validator_id, history) ||
+        history.empty())
+    {
+      history.clear();
+      Core::KeyRotation initial;
+      initial.key = validator.effectiveConsensusKey();
+      initial.valid_from_height = validator.registered_at_height;
+      initial.valid_until_height = 0;
+      history.push_back(initial);
+    }
+
+    //  Seal the previous last entry at the rotation height.
+    history.back().valid_until_height = ctx.current_height;
+
+    //  Append the new entry.
+    Core::KeyRotation entry;
+    entry.key = new_key;
+    entry.valid_from_height = ctx.current_height;
+    entry.valid_until_height = 0;
+    history.push_back(entry);
+
+    state.putValidatorKeyHistory(validator_id, history);
+
+    //  Update the record's cached key.
+    validator.consensus_key = new_key;
     state.putValidator(validator);
 
     return {ReceiptStatus::Success, tx.fee};

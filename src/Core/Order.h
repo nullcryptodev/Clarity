@@ -108,6 +108,23 @@ namespace Core
     uint32_t buy_token{0};
 
     uint64_t sell_amount{0};
+
+    //  Minimum quote-token amount the order must receive for its
+    //  full sell_amount. The implied limit price is
+    //  min_buy_amount / sell_amount.
+    //
+    //  On a partial fill, the ratio is preserved but the absolute
+    //  minimum is NOT pro-rated. An order selling 5000 A for at
+    //  least 5000 B that partially fills 1000 A receives at least
+    //  1000 B for that tranche; the remaining 4000 A must still
+    //  receive 4000 B for the order to complete. The order record
+    //  tracks filled_amount on the sell side only, so the
+    //  effective limit is always the original
+    //  min_buy_amount / sell_amount ratio.
+    //
+    //  Rounding in the fill path is maker-favorable, so a partial
+    //  fill can deliver slightly more than the prorated minimum
+    //  (never less). The residual is absorbed by the maker.
     uint64_t min_buy_amount{0};
 
     uint64_t created_at_height{0};
