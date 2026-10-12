@@ -464,7 +464,7 @@ namespace
   int cmdNew(int argc, char **argv)
   {
     std::string out_path;
-    Network network = Network::Mainnet;
+    Network network = Network::Regtest;
     uint32_t strength = 256;
     bool show_secrets = false;
     bool network_was_set = false;
@@ -576,7 +576,7 @@ namespace
   int cmdImport(int argc, char **argv)
   {
     std::string out_path;
-    Network network = Network::Mainnet;
+    Network network = Network::Regtest;
     std::string passphrase;
     bool show_secrets = false;
     bool network_was_set = false;
@@ -857,7 +857,7 @@ namespace
     }
 
     std::string mnemonic = argv[0];
-    Network network = Network::Mainnet;
+    Network network = Network::Regtest;
     std::string passphrase;
     bool show_secrets = false;
     bool all_networks = false;

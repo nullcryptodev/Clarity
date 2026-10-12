@@ -156,6 +156,20 @@ namespace Common
     return v;
   }
 
+  inline void putU32BE(std::vector<uint8_t> &out, uint32_t v)
+  {
+    out.push_back(uint8_t(v >> 24));
+    out.push_back(uint8_t(v >> 16));
+    out.push_back(uint8_t(v >> 8));
+    out.push_back(uint8_t(v));
+  }
+
+  inline void putU64BE(std::vector<uint8_t> &out, uint64_t v)
+  {
+    for (int i = 0; i < 8; ++i)
+      out.push_back(uint8_t(v >> ((7 - i) * 8)));
+  }
+
   inline void putBytes(std::vector<uint8_t> &out, const uint8_t *p, size_t n)
   {
     out.insert(out.end(), p, p + n);

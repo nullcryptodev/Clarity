@@ -48,6 +48,14 @@ namespace Node
 
     // ---- Validator identity ----
     uint64_t validator_id{0};
+
+    // Path to a file containing the validator's consensus secret key,
+    // as 64 hex characters. Mutually exclusive with
+    // consensus_secret_key (the raw-hex form, which is dev-only and
+    // gated on network == regtest). Loaded by Daemon::loadSecrets()
+    // after config validation and before the node is constructed.
+    std::string consensus_key_file;
+
     Crypto::SecretKey consensus_secret_key{};
 
     // ---- Node identity (P2P auth) ----

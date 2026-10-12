@@ -30,10 +30,6 @@ namespace Rpc
     constexpr uint64_t DEFAULT_LIST_LIMIT = 50;
     constexpr uint64_t MAX_LIST_LIMIT = 500;
 
-    // =========================================================================
-    //  Existing helpers (unchanged)
-    // =========================================================================
-
     bool constantTimeEq(const std::string &a, const std::string &b) noexcept
     {
       if (a.size() != b.size())
@@ -44,24 +40,24 @@ namespace Rpc
       return diff == 0;
     }
 
-    void requireAdmin(const RpcConfig &config,
-                      const std::string &authorization_header)
+    void requireAdmin(const RpcConfig &config, const std::string &authorization_header)
     {
       if (config.admin_token.empty())
       {
         throw RpcMethodError(
             ErrorCode::MethodNotFound,
-            "admin methods are disabled (no admin token configured)");
+            "admin methods are disabled (no admin token configured)"
+        );
       }
 
       const std::string prefix = "Bearer ";
       if (authorization_header.size() < prefix.size() ||
-          strncasecmp(authorization_header.c_str(),
-                      prefix.c_str(), prefix.size()) != 0)
+          strncasecmp(authorization_header.c_str(), prefix.c_str(), prefix.size()) != 0)
       {
         throw RpcMethodError(
             ErrorCode::Unauthorized,
-            "missing or malformed Authorization header");
+            "missing or malformed Authorization header"
+        );
       }
 
       const std::string presented = authorization_header.substr(prefix.size());
@@ -69,21 +65,22 @@ namespace Rpc
       {
         throw RpcMethodError(
             ErrorCode::Unauthorized,
-            "invalid admin token");
+            "invalid admin token"
+        );
       }
     }
 
-    std::vector<Core::ValidatorInfo> loadAllValidators(
-        State::StateAccess &state)
+    std::vector<Core::ValidatorInfo> loadAllValidators(State::StateAccess &state)
     {
       std::vector<Core::ValidatorInfo> out;
       state.forEachValidator([&out](const Core::ValidatorInfo &v)
-                             { out.push_back(v); });
+      {
+        out.push_back(v);
+      });
       return out;
     }
 
-    std::vector<Core::ValidatorInfo> loadActiveValidators(
-        State::StateAccess &state)
+    std::vector<Core::ValidatorInfo> loadActiveValidators(State::StateAccess &state)
     {
       std::vector<uint8_t> set_bytes;
       if (!state.getGlobal("active_set", set_bytes))
@@ -124,14 +121,18 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'tx' must be 0x-prefixed even-length hex",
             makeErrorData(ErrorCode::InvalidParams,
-                          {{"field", "tx"}}));
+            {
+              {"field", "tx"}
+            })
+        );
       }
 
       if (bytes.empty())
       {
         throw RpcMethodError(
             ErrorCode::TxMalformed,
-            "transaction bytes are empty");
+            "transaction bytes are empty"
+        );
       }
 
       Core::Transaction tx;
@@ -139,14 +140,14 @@ namespace Rpc
       {
         throw RpcMethodError(
             ErrorCode::TxMalformed,
-            "transaction failed to deserialize");
+            "transaction failed to deserialize"
+        );
       }
 
       return tx;
     }
 
-    Common::Json rejectionData(const Core::Transaction &tx,
-                               const std::string &error)
+    Common::Json rejectionData(const Core::Transaction &tx, const std::string &error)
     {
       Common::Json d = Common::Json::object();
       d["tx_hash"] = encodeHash(tx.txid());
@@ -155,18 +156,13 @@ namespace Rpc
       return d;
     }
 
-    // =========================================================================
-    //  New helpers for the added methods
-    // =========================================================================
-
     struct PageParams
     {
       uint64_t limit{DEFAULT_LIST_LIMIT};
       uint64_t offset{0};
     };
 
-    PageParams parsePageParams(const Common::Json &params,
-                               uint64_t max_limit = MAX_LIST_LIMIT)
+    PageParams parsePageParams(const Common::Json &params, uint64_t max_limit = MAX_LIST_LIMIT)
     {
       PageParams p;
       if (auto v = optionalU64(params, "limit"); v.has_value())
@@ -180,8 +176,11 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'limit' must be 1.." + std::to_string(max_limit),
             makeErrorData(ErrorCode::InvalidParams,
-                          {{"field", "limit"},
-                           {"value", encodeU64Hex(p.limit)}}));
+            {
+              {"field", "limit"},
+              {"value", encodeU64Hex(p.limit)}
+            })
+        );
       }
       return p;
     }
@@ -212,9 +211,7 @@ namespace Rpc
                          b.address.data.data(), 32) < 0;
     }
 
-    uint64_t sumTxCountInWindow(Node::Node &node,
-                                uint64_t tip,
-                                uint64_t window)
+    uint64_t sumTxCountInWindow(Node::Node &node, uint64_t tip, uint64_t window)
     {
       uint64_t total = 0;
       uint64_t h = tip;
@@ -235,9 +232,7 @@ namespace Rpc
       return total;
     }
 
-    uint64_t sumFeesInWindow(Node::Node &node,
-                             uint64_t tip,
-                             uint64_t window)
+    uint64_t sumFeesInWindow(Node::Node &node, uint64_t tip, uint64_t window)
     {
       uint64_t total = 0;
       uint64_t h = tip;
@@ -258,13 +253,7 @@ namespace Rpc
       return total;
     }
 
-    // =========================================================================
-    //  Admin methods (unchanged)
-    // =========================================================================
-
-    Common::Json method_shutdown(Node::Node &node,
-                                 const RpcConfig &config,
-                                 const JsonRpcRequest &)
+    Common::Json method_shutdown(Node::Node &node, const RpcConfig &config, const JsonRpcRequest &)
     {
       requireAdmin(config, getCurrentAuthorization());
 
@@ -279,7 +268,8 @@ namespace Rpc
       return j;
     }
 
-    Common::Json method_setLogLevel(Node::Node &, const RpcConfig &config,
+    Common::Json method_setLogLevel(Node::Node &,
+                                    const RpcConfig &config,
                                     const JsonRpcRequest &req)
     {
       requireAdmin(config, getCurrentAuthorization());
@@ -292,19 +282,20 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "level must be one of: debug, info, warn, error",
             makeErrorData(ErrorCode::InvalidParams,
-                          {{"level", level}}));
+            {
+              {"level", level}
+            })
+        );
       }
 
       throw RpcMethodError(
           ErrorCode::InternalError,
-          "runtime log level changes are not yet supported");
+          "runtime log level changes are not yet supported"
+      );
     }
 
-    // =========================================================================
-    //  AMM methods (existing + new)
-    // =========================================================================
-
-    Common::Json method_getPool(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getPool(Node::Node &node,
+                                const RpcConfig & /*config*/,
                                 const JsonRpcRequest &req)
     {
       const Id pool_id = requireU64(req.params, "pool_id");
@@ -319,13 +310,17 @@ namespace Rpc
             ErrorCode::PoolNotFound,
             "no pool with id " + encodeU64Hex(pool_id),
             makeErrorData(ErrorCode::PoolNotFound,
-                          {{"pool_id", encodeU64Hex(pool_id)}}));
+            {
+              {"pool_id", encodeU64Hex(pool_id)}
+            })
+        );
       }
 
       return encodeAmmPool(pool, hrp);
     }
 
-    Common::Json method_getPosition(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getPosition(Node::Node &node,
+                                    const RpcConfig & /*config*/,
                                     const JsonRpcRequest &req)
     {
       const Id pos_id = requireU64(req.params, "position_id");
@@ -340,7 +335,10 @@ namespace Rpc
             ErrorCode::PoolNotFound,
             "no position with id " + encodeU64Hex(pos_id),
             makeErrorData(ErrorCode::PoolNotFound,
-                          {{"position_id", encodeU64Hex(pos_id)}}));
+            {
+              {"position_id", encodeU64Hex(pos_id)}
+            })
+        );
       }
 
       Core::AmmPool pool;
@@ -349,7 +347,8 @@ namespace Rpc
       return encodeAmmPosition(pos, have_pool ? &pool : nullptr, hrp);
     }
 
-    Common::Json method_getPositionByOwner(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getPositionByOwner(Node::Node &node,
+                                           const RpcConfig & /*config*/,
                                            const JsonRpcRequest &req)
     {
       const std::string hrp = hrpForNode(node);
@@ -366,8 +365,11 @@ namespace Rpc
             ErrorCode::PoolNotFound,
             "no position for this address in this pool",
             makeErrorData(ErrorCode::PoolNotFound,
-                          {{"address", encodeAddress(owner, hrp)},
-                           {"pool_id", encodeU64Hex(pool_id)}}));
+            {
+              {"address", encodeAddress(owner, hrp)},
+              {"pool_id", encodeU64Hex(pool_id)}
+            })
+        );
       }
 
       Core::AmmPosition pos;
@@ -377,7 +379,10 @@ namespace Rpc
             ErrorCode::StateReadInternal,
             "position index references a missing position",
             makeErrorData(ErrorCode::StateReadInternal,
-                          {{"position_id", encodeU64Hex(pos_id)}}));
+            {
+              {"position_id", encodeU64Hex(pos_id)}
+            })
+        );
       }
 
       Core::AmmPool pool;
@@ -386,9 +391,8 @@ namespace Rpc
       return encodeAmmPosition(pos, have_pool ? &pool : nullptr, hrp);
     }
 
-    // ---- clrty_getAllPools ----
-
-    Common::Json method_getAllPools(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getAllPools(Node::Node &node,
+                                    const RpcConfig & /*config*/,
                                     const JsonRpcRequest &req)
     {
       const PageParams page = parsePageParams(req.params);
@@ -402,7 +406,7 @@ namespace Rpc
       uint64_t emitted = 0;
 
       state.forEachAmmPool([&](const Core::AmmPool &pool)
-                           {
+      {
         if (seen < page.offset)
         {
           ++seen;
@@ -411,7 +415,8 @@ namespace Rpc
         if (emitted >= page.limit)
           return;
         arr.push_back(encodeAmmPool(pool, hrp));
-        ++emitted; });
+        ++emitted;
+      });
 
       Common::Json out = Common::Json::object();
       putU64(out, "count", emitted);
@@ -421,9 +426,8 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getPoolsForToken ----
-
-    Common::Json method_getPoolsForToken(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getPoolsForToken(Node::Node &node,
+                                         const RpcConfig & /*config*/,
                                          const JsonRpcRequest &req)
     {
       const Id token_id = requireU64(req.params, "token_id");
@@ -435,7 +439,9 @@ namespace Rpc
       Common::Json arr = Common::Json::array();
 
       state.forEachPoolForToken(token_id, [&](const Core::AmmPool &pool)
-                                { arr.push_back(encodeAmmPool(pool, hrp)); });
+      {
+        arr.push_back(encodeAmmPool(pool, hrp));
+      });
 
       Common::Json out = Common::Json::object();
       putU64(out, "count", static_cast<uint64_t>(arr.size()));
@@ -443,9 +449,8 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getPositionsForPool ----
-
-    Common::Json method_getPositionsForPool(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getPositionsForPool(Node::Node &node,
+                                            const RpcConfig & /*config*/,
                                             const JsonRpcRequest &req)
     {
       const Id pool_id = requireU64(req.params, "pool_id");
@@ -458,17 +463,17 @@ namespace Rpc
       std::vector<Core::AmmPosition> matches;
 
       state.forEachAmmPosition([&](const Core::AmmPosition &pos)
-                               {
+      {
         if (pos.pool_id == pool_id)
-          matches.push_back(pos); });
+          matches.push_back(pos);
+      });
 
-      std::sort(matches.begin(), matches.end(),
-                [](const Core::AmmPosition &a, const Core::AmmPosition &b)
-                {
-                  if (a.liquidity != b.liquidity)
-                    return a.liquidity > b.liquidity;
-                  return a.id < b.id;
-                });
+      std::sort(matches.begin(), matches.end(), [](const Core::AmmPosition &a, const Core::AmmPosition &b)
+      {
+        if (a.liquidity != b.liquidity)
+          return a.liquidity > b.liquidity;
+        return a.id < b.id;
+      });
 
       Common::Json arr = Common::Json::array();
       uint64_t emitted = 0;
@@ -481,8 +486,7 @@ namespace Rpc
         Core::AmmPool pool;
         const bool have_pool = state.getAmmPool(matches[i].pool_id, pool);
 
-        arr.push_back(encodeAmmPosition(
-            matches[i], have_pool ? &pool : nullptr, hrp));
+        arr.push_back(encodeAmmPosition(matches[i], have_pool ? &pool : nullptr, hrp));
         ++emitted;
       }
 
@@ -494,11 +498,8 @@ namespace Rpc
       return out;
     }
 
-    // =========================================================================
-    //  Chain methods (existing + new)
-    // =========================================================================
-
-    Common::Json method_chainId(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_chainId(Node::Node &node,
+                                const RpcConfig & /*config*/,
                                 const JsonRpcRequest &req)
     {
       Common::Json j = Common::Json::object();
@@ -506,7 +507,8 @@ namespace Rpc
       return j;
     }
 
-    Common::Json method_blockNumber(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_blockNumber(Node::Node &node,
+                                    const RpcConfig & /*config*/,
                                     const JsonRpcRequest &req)
     {
       Common::Json j = Common::Json::object();
@@ -514,7 +516,8 @@ namespace Rpc
       return j;
     }
 
-    Common::Json method_getBlockByNumber(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getBlockByNumber(Node::Node &node,
+                                         const RpcConfig & /*config*/,
                                          const JsonRpcRequest &req)
     {
       const uint64_t height = requireU64(req.params, "height");
@@ -527,13 +530,17 @@ namespace Rpc
             ErrorCode::BlockNotFound,
             "no block at height " + encodeU64Hex(height),
             makeErrorData(ErrorCode::BlockNotFound,
-                          {{"height", encodeU64Hex(height)}}));
+            {
+              {"height", encodeU64Hex(height)}
+            })
+        );
       }
 
       return encodeBlock(*block, full, hrpForNode(node));
     }
 
-    Common::Json method_getBlockByHash(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getBlockByHash(Node::Node &node,
+                                       const RpcConfig & /*config*/,
                                        const JsonRpcRequest &req)
     {
       const Crypto::Hash hash = requireHash(req.params, "hash");
@@ -546,13 +553,17 @@ namespace Rpc
             ErrorCode::BlockNotFound,
             "no block with hash " + encodeHash(hash),
             makeErrorData(ErrorCode::BlockNotFound,
-                          {{"hash", encodeHash(hash)}}));
+            {
+              {"hash", encodeHash(hash)}
+            })
+        );
       }
 
       return encodeBlock(*block, full, hrpForNode(node));
     }
 
-    Common::Json method_getBlockHeaderByNumber(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getBlockHeaderByNumber(Node::Node &node,
+                                               const RpcConfig & /*config*/,
                                                const JsonRpcRequest &req)
     {
       const uint64_t height = requireU64(req.params, "height");
@@ -564,13 +575,14 @@ namespace Rpc
             ErrorCode::BlockNotFound,
             "no header at height " + encodeU64Hex(height),
             makeErrorData(ErrorCode::BlockNotFound,
-                          {{"height", encodeU64Hex(height)}}));
+            {
+              {"height", encodeU64Hex(height)}
+            })
+        );
       }
 
       return encodeBlockHeader(*header, hrpForNode(node));
     }
-
-    // ---- clrty_getRecentBlocks ----
 
     Common::Json method_getRecentBlocks(Node::Node &node,
                                         const RpcConfig & /*config*/,
@@ -586,8 +598,11 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'limit' must be 1..100",
             makeErrorData(ErrorCode::InvalidParams,
-                          {{"field", "limit"},
-                           {"value", encodeU64Hex(limit)}}));
+            {
+              {"field", "limit"},
+              {"value", encodeU64Hex(limit)}
+            })
+        );
       }
 
       const uint64_t tip = node.chain().height();
@@ -619,7 +634,8 @@ namespace Rpc
       return out;
     }
 
-    Common::Json method_getStateRoot(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getStateRoot(Node::Node &node,
+                                     const RpcConfig & /*config*/,
                                      const JsonRpcRequest &req)
     {
       const uint64_t height = requireU64(req.params, "height");
@@ -636,14 +652,15 @@ namespace Rpc
             ErrorCode::BlockNotFound,
             "no committed state root at height " + encodeU64Hex(height),
             makeErrorData(ErrorCode::BlockNotFound,
-                          {{"height", encodeU64Hex(height)}}));
+            {
+              {"height", encodeU64Hex(height)}
+            })
+        );
       }
 
       putHash(j, "state_root", *root);
       return j;
     }
-
-    // ---- clrty_getBlocksRange ----
 
     Common::Json method_getBlocksRange(Node::Node &node,
                                        const RpcConfig & /*config*/,
@@ -661,8 +678,11 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'count' must be 1..100",
             makeErrorData(ErrorCode::InvalidParams,
-                          {{"field", "count"},
-                           {"value", encodeU64Hex(count)}}));
+            {
+              {"field", "count"},
+              {"value", encodeU64Hex(count)}
+            })
+        );
       }
 
       std::string order = "desc";
@@ -674,7 +694,11 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'order' must be 'asc' or 'desc'",
             makeErrorData(ErrorCode::InvalidParams,
-                          {{"field", "order"}, {"value", order}}));
+            {
+              {"field", "order"},
+              {"value", order}
+            })
+        );
       }
 
       const uint64_t tip = node.chain().height();
@@ -720,8 +744,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getBlocksByProducer ----
-
     Common::Json method_getBlocksByProducer(Node::Node &node,
                                             const RpcConfig & /*config*/,
                                             const JsonRpcRequest &req)
@@ -738,8 +760,11 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'limit' must be 1..100",
             makeErrorData(ErrorCode::InvalidParams,
-                          {{"field", "limit"},
-                           {"value", encodeU64Hex(limit)}}));
+            {
+              {"field", "limit"},
+              {"value", encodeU64Hex(limit)}
+            })
+        );
       }
 
       State::StateAccess state(node.stateDB(), node.chain().height());
@@ -765,8 +790,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getBlockStats ----
-
     Common::Json method_getBlockStats(Node::Node &node,
                                       const RpcConfig & /*config*/,
                                       const JsonRpcRequest &req)
@@ -789,7 +812,10 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "block range exceeds 10,000 blocks",
             makeErrorData(ErrorCode::InvalidParams,
-                          {{"range", encodeU64Hex(to - from + 1)}}));
+            {
+              {"range", encodeU64Hex(to - from + 1)}
+            })
+        );
       }
 
       uint64_t total_txs = 0;
@@ -815,8 +841,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getChainStats ----
-
     Common::Json method_getChainStats(Node::Node &node,
                                       const RpcConfig & /*config*/,
                                       const JsonRpcRequest & /*req*/)
@@ -833,14 +857,10 @@ namespace Rpc
       const uint64_t staker_count = readU64Global(state, "staker_count");
       const uint64_t pot = readU64Global(state, "pot");
 
-      const size_t unique_addresses =
-          state.tableEntryCount(State::StateDB::TBL_ACCOUNTS);
-      const size_t unique_tokens =
-          state.tableEntryCount(State::StateDB::TBL_TOKENS);
-      const size_t unique_validators =
-          state.tableEntryCount(State::StateDB::TBL_INDEX_VALIDATORS);
-      const size_t unique_pools =
-          state.tableEntryCount(State::StateDB::TBL_AMM_POOLS);
+      const size_t unique_addresses = state.tableEntryCount(State::StateDB::TBL_ACCOUNTS);
+      const size_t unique_tokens = state.tableEntryCount(State::StateDB::TBL_TOKENS);
+      const size_t unique_validators = state.tableEntryCount(State::StateDB::TBL_INDEX_VALIDATORS);
+      const size_t unique_pools = state.tableEntryCount(State::StateDB::TBL_AMM_POOLS);
 
       Common::Json out = Common::Json::object();
       putU64(out, "height", height);
@@ -859,12 +879,9 @@ namespace Rpc
       putU64(out, "unique_validators", unique_validators);
       putU64(out, "unique_pools", unique_pools);
 
-      putU64(out, "genesis_timestamp_ms",
-             GlobalConfig::GENESIS_TIMESTAMP_MS);
+      putU64(out, "genesis_timestamp_ms", GlobalConfig::GENESIS_TIMESTAMP_MS);
       return out;
     }
-
-    // ---- clrty_getEpochInfo ----
 
     Common::Json method_getEpochInfo(Node::Node &node,
                                      const RpcConfig & /*config*/,
@@ -880,13 +897,10 @@ namespace Rpc
       putU64(out, "epoch_start_height", epoch_start);
       putU64(out, "next_epoch_height", next_epoch_start);
       putU64(out, "current_height", height);
-      putU64(out, "blocks_until_next_epoch",
-             next_epoch_start > height ? next_epoch_start - height : 0);
+      putU64(out, "blocks_until_next_epoch", next_epoch_start > height ? next_epoch_start - height : 0);
       putU64(out, "rotation_interval", Core::ROTATION_INTERVAL);
       return out;
     }
-
-    // ---- clrty_getEpochSchedule ----
 
     Common::Json method_getEpochSchedule(Node::Node &node,
                                          const RpcConfig & /*config*/,
@@ -899,8 +913,7 @@ namespace Rpc
       Common::Json out = Common::Json::object();
       putU64(out, "rotation_interval", Core::ROTATION_INTERVAL);
       putU64(out, "unbonding_period", Core::UNBONDING_PERIOD);
-      putU64(out, "emergency_rotation_rounds",
-             Core::EMERGENCY_ROTATION_ROUNDS);
+      putU64(out, "emergency_rotation_rounds", Core::EMERGENCY_ROTATION_ROUNDS);
       putU64(out, "active_set_min", GlobalConfig::ACTIVE_SET_MIN);
       putU64(out, "active_set_max", GlobalConfig::ACTIVE_SET_MAX);
       putU64(out, "current_epoch", epoch);
@@ -908,15 +921,11 @@ namespace Rpc
       return out;
     }
 
-    // =========================================================================
-    //  Consensus methods (existing + new)
-    // =========================================================================
-
-    Common::Json method_getValidators(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getValidators(Node::Node &node,
+                                      const RpcConfig & /*config*/,
                                       const JsonRpcRequest &req)
     {
-      const bool active_only =
-          optionalBool(req.params, "active_only").value_or(false);
+      const bool active_only = optionalBool(req.params, "active_only").value_or(false);
       const std::string hrp = hrpForNode(node);
       const uint64_t height = node.chain().height();
 
@@ -938,15 +947,15 @@ namespace Rpc
         return out;
       }
 
-      const size_t end = std::min(
-          validators.size(), static_cast<size_t>(page.offset + page.limit));
+      const size_t end = std::min(validators.size(), static_cast<size_t>(page.offset + page.limit));
       std::vector<Core::ValidatorInfo> slice(
           validators.begin() + page.offset, validators.begin() + end);
 
       return encodeValidatorList(slice, height, hrp);
     }
 
-    Common::Json method_getValidator(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getValidator(Node::Node &node,
+                                     const RpcConfig & /*config*/,
                                      const JsonRpcRequest &req)
     {
       const Id id = requireU64(req.params, "id");
@@ -961,13 +970,17 @@ namespace Rpc
             ErrorCode::ValidatorNotFound,
             "no validator with id " + encodeU64Hex(id),
             makeErrorData(ErrorCode::ValidatorNotFound,
-                          {{"id", encodeU64Hex(id)}}));
+            {
+              {"id", encodeU64Hex(id)}
+            })
+        );
       }
 
       return encodeValidator(v, height, hrp);
     }
 
-    Common::Json method_getActiveSet(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getActiveSet(Node::Node &node,
+                                     const RpcConfig & /*config*/,
                                      const JsonRpcRequest & /*req*/)
     {
       const uint64_t height = node.chain().height();
@@ -1001,13 +1014,12 @@ namespace Rpc
       return out;
     }
 
-    Common::Json method_getValidatorByAddress(
-        Node::Node &node, const RpcConfig & /*config*/,
-        const JsonRpcRequest &req)
+    Common::Json method_getValidatorByAddress(Node::Node &node,
+                                              const RpcConfig & /*config*/,
+                                              const JsonRpcRequest &req)
     {
       const std::string hrp = hrpForNode(node);
-      const Crypto::Address address =
-          requireAddress(req.params, "address", hrp);
+      const Crypto::Address address = requireAddress(req.params, "address", hrp);
       const uint64_t height = node.chain().height();
 
       State::StateAccess state(node.stateDB(), height);
@@ -1019,7 +1031,10 @@ namespace Rpc
             ErrorCode::ValidatorNotFound,
             "no validator registered for this address",
             makeErrorData(ErrorCode::ValidatorNotFound,
-                          {{"address", encodeAddress(address, hrp)}}));
+            {
+              {"address", encodeAddress(address, hrp)}
+            })
+        );
       }
 
       Core::ValidatorInfo v;
@@ -1029,13 +1044,17 @@ namespace Rpc
             ErrorCode::ConsensusReadInternal,
             "validator index references a missing record",
             makeErrorData(ErrorCode::ConsensusReadInternal,
-                          {{"validator_id", encodeU64Hex(validator_id)}}));
+            {
+              {"validator_id", encodeU64Hex(validator_id)}
+            })
+        );
       }
 
       return encodeValidator(v, height, hrp);
     }
 
-    Common::Json method_getConsensusState(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getConsensusState(Node::Node &node,
+                                          const RpcConfig & /*config*/,
                                           const JsonRpcRequest & /*req*/)
     {
       Node::Node::Status s = node.status();
@@ -1050,8 +1069,6 @@ namespace Rpc
       putU64(out, "best_peer_height", s.best_peer_height);
       return out;
     }
-
-    // ---- clrty_getValidatorStats ----
 
     Common::Json method_getValidatorStats(Node::Node &node,
                                           const RpcConfig & /*config*/,
@@ -1069,7 +1086,10 @@ namespace Rpc
             ErrorCode::ValidatorNotFound,
             "no validator with id " + encodeU64Hex(id),
             makeErrorData(ErrorCode::ValidatorNotFound,
-                          {{"id", encodeU64Hex(id)}}));
+            {
+              {"id", encodeU64Hex(id)}
+            })
+        );
       }
 
       constexpr size_t RECENT_BLOCKS = 20;
@@ -1092,16 +1112,12 @@ namespace Rpc
       return out;
     }
 
-    // =========================================================================
-    //  State / address methods (existing + new)
-    // =========================================================================
-
-    Common::Json method_getBalance(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getBalance(Node::Node &node,
+                                   const RpcConfig & /*config*/,
                                    const JsonRpcRequest &req)
     {
       const std::string hrp = hrpForNode(node);
-      const Crypto::Address address =
-          requireAddress(req.params, "address", hrp);
+      const Crypto::Address address = requireAddress(req.params, "address", hrp);
       const Id token_id = optionalTokenId(req.params);
 
       State::StateAccess state(node.stateDB(), headHeight(node));
@@ -1123,12 +1139,12 @@ namespace Rpc
       return out;
     }
 
-    Common::Json method_getAccount(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getAccount(Node::Node &node,
+                                   const RpcConfig & /*config*/,
                                    const JsonRpcRequest &req)
     {
       const std::string hrp = hrpForNode(node);
-      const Crypto::Address address =
-          requireAddress(req.params, "address", hrp);
+      const Crypto::Address address = requireAddress(req.params, "address", hrp);
 
       State::StateAccess state(node.stateDB(), headHeight(node));
       Core::Account account = state.getAccount(address);
@@ -1138,12 +1154,12 @@ namespace Rpc
       return out;
     }
 
-    Common::Json method_getNonce(Node::Node &node, const RpcConfig & /*config*/,
+    Common::Json method_getNonce(Node::Node &node,
+                                 const RpcConfig & /*config*/,
                                  const JsonRpcRequest &req)
     {
       const std::string hrp = hrpForNode(node);
-      const Crypto::Address address =
-          requireAddress(req.params, "address", hrp);
+      const Crypto::Address address = requireAddress(req.params, "address", hrp);
 
       State::StateAccess state(node.stateDB(), headHeight(node));
       Core::Account account = state.getAccount(address);
@@ -1271,8 +1287,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getTokensForAddress ----
-
     Common::Json method_getTokensForAddress(Node::Node &node,
                                             const RpcConfig & /*config*/,
                                             const JsonRpcRequest &req)
@@ -1301,8 +1315,6 @@ namespace Rpc
       out["tokens"] = std::move(arr);
       return out;
     }
-
-    // ---- clrty_getPositionsForAddress ----
 
     Common::Json method_getPositionsForAddress(Node::Node &node,
                                                const RpcConfig & /*config*/,
@@ -1333,8 +1345,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getOrdersForAddress ----
-
     Common::Json method_getOrdersForAddress(Node::Node &node,
                                             const RpcConfig & /*config*/,
                                             const JsonRpcRequest &req)
@@ -1364,8 +1374,6 @@ namespace Rpc
       out["orders"] = std::move(arr);
       return out;
     }
-
-    // ---- clrty_getTransactionsForAddress ----
 
     Common::Json method_getTransactionsForAddress(Node::Node &node,
                                                   const RpcConfig & /*config*/,
@@ -1419,8 +1427,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getStakingInfo ----
-
     Common::Json method_getStakingInfo(Node::Node &node,
                                        const RpcConfig & /*config*/,
                                        const JsonRpcRequest & /*req*/)
@@ -1473,8 +1479,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getAddressStats ----
-
     Common::Json method_getAddressStats(Node::Node &node,
                                         const RpcConfig & /*config*/,
                                         const JsonRpcRequest &req)
@@ -1522,8 +1526,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getAddressList ----
-
     Common::Json method_getAddressList(Node::Node &node,
                                        const RpcConfig & /*config*/,
                                        const JsonRpcRequest &req)
@@ -1563,10 +1565,6 @@ namespace Rpc
       out["addresses"] = std::move(arr);
       return out;
     }
-
-    // =========================================================================
-    //  Token methods (existing + new)
-    // =========================================================================
 
     Common::Json method_getTokenInfo(Node::Node &node, const RpcConfig & /*config*/,
                                      const JsonRpcRequest &req)
@@ -1615,8 +1613,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getAllTokens ----
-
     Common::Json method_getAllTokens(Node::Node &node, const RpcConfig & /*config*/,
                                      const JsonRpcRequest &req)
     {
@@ -1648,8 +1644,6 @@ namespace Rpc
       out["tokens"] = std::move(arr);
       return out;
     }
-
-    // ---- clrty_getTokenHolders ----
 
     Common::Json method_getTokenHolders(Node::Node &node, const RpcConfig & /*config*/,
                                         const JsonRpcRequest &req)
@@ -1704,8 +1698,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getTokenTransfers ----
-
     Common::Json method_getTokenTransfers(Node::Node &node, const RpcConfig & /*config*/,
                                           const JsonRpcRequest &req)
     {
@@ -1757,8 +1749,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getTokensByCreator ----
-
     Common::Json method_getTokensByCreator(Node::Node &node,
                                            const RpcConfig & /*config*/,
                                            const JsonRpcRequest &req)
@@ -1798,10 +1788,6 @@ namespace Rpc
       out["tokens"] = std::move(arr);
       return out;
     }
-
-    // =========================================================================
-    //  NFT methods
-    // =========================================================================
 
     Common::Json method_getNft(Node::Node &node, const RpcConfig & /*config*/,
                                const JsonRpcRequest &req)
@@ -1970,10 +1956,6 @@ namespace Rpc
       return out;
     }
 
-    // =========================================================================
-    //  Order methods (existing + new)
-    // =========================================================================
-
     Common::Json method_getOrder(Node::Node &node, const RpcConfig & /*config*/,
                                  const JsonRpcRequest &req)
     {
@@ -2015,8 +1997,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getAllOrders ----
-
     Common::Json method_getAllOrders(Node::Node &node, const RpcConfig & /*config*/,
                                      const JsonRpcRequest &req)
     {
@@ -2052,8 +2032,6 @@ namespace Rpc
       out["orders"] = std::move(arr);
       return out;
     }
-
-    // ---- clrty_getOrdersByPair ----
 
     Common::Json method_getOrdersByPair(Node::Node &node, const RpcConfig & /*config*/,
                                         const JsonRpcRequest &req)
@@ -2094,10 +2072,6 @@ namespace Rpc
       out["orders"] = std::move(arr);
       return out;
     }
-
-    // =========================================================================
-    //  Transaction methods (existing + new)
-    // =========================================================================
 
     Common::Json method_sendRawTransaction(Node::Node &node, const RpcConfig & /*config*/,
                                            const JsonRpcRequest &req)
@@ -2367,8 +2341,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getAllTransactions ----
-
     Common::Json method_getAllTransactions(Node::Node &node,
                                            const RpcConfig & /*config*/,
                                            const JsonRpcRequest &req)
@@ -2381,8 +2353,6 @@ namespace Rpc
       sub.params = std::move(params);
       return method_getRecentTransactions(node, RpcConfig{}, sub);
     }
-
-    // ---- clrty_getTransactionsByType ----
 
     Common::Json method_getTransactionsByType(Node::Node &node,
                                               const RpcConfig & /*config*/,
@@ -2399,8 +2369,6 @@ namespace Rpc
       sub.params = std::move(params);
       return method_getRecentTransactions(node, RpcConfig{}, sub);
     }
-
-    // ---- clrty_getTxCount ----
 
     Common::Json method_getTxCount(Node::Node &node,
                                    const RpcConfig & /*config*/,
@@ -2422,10 +2390,6 @@ namespace Rpc
       putU64(out, "current_epoch", epoch);
       return out;
     }
-
-    // =========================================================================
-    //  Mempool methods (existing + updated)
-    // =========================================================================
 
     Common::Json method_getMempoolStats(Node::Node &node, const RpcConfig & /*config*/,
                                         const JsonRpcRequest & /*req*/)
@@ -2456,8 +2420,6 @@ namespace Rpc
 
       return encodeTransaction(*tx, hrpForNode(node));
     }
-
-    // ---- clrty_getMempoolList ----
 
     Common::Json method_getMempoolList(Node::Node &node,
                                        const RpcConfig & /*config*/,
@@ -2543,12 +2505,6 @@ namespace Rpc
       return out;
     }
 
-    // =========================================================================
-    //  Fee and pot metrics
-    // =========================================================================
-
-    // ---- clrty_getFeeStats ----
-
     Common::Json method_getFeeStats(Node::Node &node,
                                     const RpcConfig & /*config*/,
                                     const JsonRpcRequest & /*req*/)
@@ -2581,8 +2537,6 @@ namespace Rpc
       putU64(out, "total_transactions", tx_counter);
       return out;
     }
-
-    // ---- clrty_getPotInfo ----
 
     Common::Json method_getPotInfo(Node::Node &node,
                                    const RpcConfig & /*config*/,
@@ -2632,10 +2586,6 @@ namespace Rpc
              next_epoch > height ? next_epoch - height : 0);
       return out;
     }
-
-    // =========================================================================
-    //  Node / utility methods (existing + new)
-    // =========================================================================
 
     Common::Json method_ping(Node::Node &, const RpcConfig &,
                              const JsonRpcRequest &)
@@ -2726,8 +2676,6 @@ namespace Rpc
       j["verbose_errors"] = config.verbose_errors;
       return j;
     }
-
-    // ---- clrty_getMethods ----
 
     Common::Json method_getMethods(Node::Node & /*node*/, const RpcConfig & /*config*/,
                                    const JsonRpcRequest & /*req*/)
@@ -2882,8 +2830,6 @@ namespace Rpc
       return Common::Json(node.status().peer_count > 0);
     }
 
-    // ---- clrty_getOrderBook ----
-
     Common::Json method_getOrderBook(Node::Node &node,
                                      const RpcConfig & /*config*/,
                                      const JsonRpcRequest &req)
@@ -2950,8 +2896,6 @@ namespace Rpc
       return out;
     }
 
-    // ---- clrty_getOrderFills ----
-
     Common::Json method_getOrderFills(Node::Node &node,
                                       const RpcConfig & /*config*/,
                                       const JsonRpcRequest &req)
@@ -2991,8 +2935,6 @@ namespace Rpc
       out["fills"] = std::move(arr);
       return out;
     }
-
-    // ---- clrty_getPairTrades ----
 
     Common::Json method_getPairTrades(Node::Node &node,
                                       const RpcConfig & /*config*/,

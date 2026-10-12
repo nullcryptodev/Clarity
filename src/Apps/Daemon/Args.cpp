@@ -185,31 +185,46 @@ namespace Daemon
 
       // ---- Validator ----
       //
-      //  --validator-id    the validator's persistent ID in the
-      //                    registry. Non-zero means "this node is a
-      //                    validator" and enables the consensus
-      //                    subsystem.
+      //  --validator-id         the validator's persistent ID in the
+      //                         registry. Non-zero means "this node
+      //                         is a validator" and enables the
+      //                         consensus subsystem.
       //
-      //  --consensus-key   the Ed25519 secret key that signs this
-      //                    validator's consensus messages. Raw hex,
-      //                    64 characters. The public half is what
-      //                    goes into genesis (for seed validators)
-      //                    or a RegisterValidator transaction (for
-      //                    user registrations).
+      //  --consensus-key-file   path to a file containing the Ed25519
+      //                         secret key that signs this validator's
+      //                         consensus messages, as 64 hex
+      //                         characters. This is the production
+      //                         path: the secret never appears in
+      //                         argv, and the file's permissions are
+      //                         checked before it is read.
       //
-      //  This flag takes the secret on the command line, which is a
-      //  development convenience: the value appears in `ps`, shell
-      //  history, and any process listing. For a production
-      //  validator, prefer a future --consensus-key-file flag or an
-      //  environment variable. The flag exists today so the regtest
-      //  devnet can be started without a config file.
+      //  --consensus-key        the same secret as raw hex on the
+      //                         command line. This is a development
+      //                         convenience for the regtest devnet:
+      //                         the value is visible in `ps`, shell
+      //                         history, and any process listing.
+      //                         Gated on network == regtest; rejected
+      //                         on mainnet and testnet.
       if (arg == "--validator-id")
       {
         args.node.validator_id = parseU64(next());
         continue;
       }
+      if (arg == "--consensus-key-file")
+      {
+        args.node.consensus_key_file = next();
+        continue;
+      }
       if (arg == "--consensus-key")
       {
+        if (args.node.network != Node::Network::Regtest)
+        {
+          throw std::runtime_error(
+              "--consensus-key passes the secret on the command line, "
+              "where it is visible to every process on the host. It is "
+              "a regtest-only development convenience. Use "
+              "--consensus-key-file on mainnet and testnet.");
+        }
         args.node.consensus_secret_key = parseSecretKey(next());
         continue;
       }
@@ -363,6 +378,21 @@ namespace Daemon
       throw std::runtime_error("unknown argument: " + arg);
     }
 
+    // The two consensus key sources are alternatives, not a merge.
+    // This is an argv-level check: at this point both fields reflect
+    // what the operator typed, before loadSecrets() has run and
+    // populated consensus_secret_key from the file. Checking it here
+    // rather than in validateConfig() avoids the false positive that
+    // would otherwise fire on the second validation pass, after the
+    // loader has legitimately set both fields.
+    if (!args.node.consensus_key_file.empty() &&
+        !args.node.consensus_secret_key.isNull())
+    {
+      throw std::runtime_error(
+          "consensus_key_file and consensus_key are mutually exclusive; "
+          "set one or the other, not both");
+    }
+
     return args;
   }
 
@@ -387,10 +417,15 @@ namespace Daemon
         << "\n"
         << "Validator:\n"
         << "  --validator-id <N>         Validator ID (0 = not a validator)\n"
-        << "  --consensus-key <hex>      Ed25519 consensus secret key\n"
-        << "                             (64 hex chars). Signs votes and\n"
-        << "                             proposals. Use ValidatorKeyGen\n"
-        << "                             to produce one.\n"
+        << "  --consensus-key-file <path>\n"
+        << "                             File containing the Ed25519 consensus\n"
+        << "                             secret key, 64 hex chars. Must be a\n"
+        << "                             regular file, not a symlink, mode 0600\n"
+        << "                             or stricter. This is the production path.\n"
+        << "  --consensus-key <hex>      Ed25519 consensus secret key as raw hex.\n"
+        << "                             Development convenience for regtest only;\n"
+        << "                             rejected on mainnet and testnet.\n"
+        << "                             Produce one with `address --show-secret`.\n"
         << "\n"
         << "Consensus:\n"
         << "  --max-block-bytes <bytes>  Max block size (default: 262144)\n"
@@ -457,8 +492,20 @@ namespace Daemon
     }
     std::cout << "\n";
     std::cout << "  validator_id:         " << n.validator_id << "\n";
-    std::cout << "  consensus_key:        "
-              << (n.consensus_secret_key.isNull() ? "(none)" : "(set)") << "\n";
+    std::cout << "  consensus_key_source: ";
+    if (!n.consensus_key_file.empty())
+    {
+      std::cout << "file:" << n.consensus_key_file;
+    }
+    else if (!n.consensus_secret_key.isNull())
+    {
+      std::cout << "argv (regtest only)";
+    }
+    else
+    {
+      std::cout << "(none)";
+    }
+    std::cout << "\n";
     std::cout << "  max_block_bytes:      " << n.max_block_bytes << "\n";
     std::cout << "  max_block_txs:        " << n.max_block_txs << "\n";
     std::cout << "  consensus_poll_ms:    " << n.consensus_poll_ms << "\n";

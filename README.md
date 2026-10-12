@@ -6,9 +6,14 @@
 
 #### Documents
 
+- [Introduction](https://github.com/nullcryptodev/Clarity/blob/main/INTRO.md)
 - [Economics of Clarity](https://github.com/nullcryptodev/Clarity/blob/main/docs/ECONOMICS.md)
-- [Setup Clarity REGTEST](https://github.com/nullcryptodev/Clarity/blob/main/docs/SETUP-REGTEST.md)
+- [How to: Daemon](https://github.com/nullcryptodev/Clarity/blob/main/docs/DAEMON.md)
+- [How to: Client Wallet](https://github.com/nullcryptodev/Clarity/blob/main/docs/CLIENT-WALLET.md)
+- [How to: Setup REGTEST](https://github.com/nullcryptodev/Clarity/blob/main/docs/SETUP-REGTEST.md)
+- [Clarity NFTs](https://github.com/nullcryptodev/Clarity/blob/main/docs/NFT.md)
 - [Clarity Metrics Reference](https://github.com/nullcryptodev/Clarity/blob/main/docs/METRICS.md)
+
 
 #### Table of Contents
 

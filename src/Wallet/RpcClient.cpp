@@ -5,6 +5,8 @@
 
 #include "RpcClient.h"
 
+#include "RPC/JsonRpcError.h"
+
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/write.hpp>
@@ -495,6 +497,240 @@ namespace Wallet
     }
 
     return result.result;
+  }
+
+  std::optional<Common::Json> getNft(
+      RpcClient &rpc,
+      uint64_t nft_id,
+      bool *is_not_found,
+      std::string *error_out)
+  {
+    if (is_not_found)
+      *is_not_found = false;
+
+    Common::Json params = Common::Json::object();
+    params["nft_id"] = std::to_string(nft_id);
+
+    auto res = rpc.call("getNft", params);
+    if (!res.ok())
+    {
+      if (is_not_found && res.error.has_value() &&
+          res.error->code == static_cast<int>(Rpc::ErrorCode::NftNotFound))
+      {
+        *is_not_found = true;
+        return std::nullopt;
+      }
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<Common::Json> getNftsForOwner(
+      RpcClient &rpc,
+      const std::string &address_bech32m,
+      uint64_t limit,
+      uint64_t offset,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["address"] = address_bech32m;
+    params["limit"] = std::to_string(limit);
+    params["offset"] = std::to_string(offset);
+
+    auto res = rpc.call("getNftsForOwner", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<Common::Json> getNftsForCollection(
+      RpcClient &rpc,
+      uint64_t collection_id,
+      uint64_t limit,
+      uint64_t offset,
+      bool *is_not_found,
+      std::string *error_out)
+  {
+    if (is_not_found)
+      *is_not_found = false;
+
+    Common::Json params = Common::Json::object();
+    params["collection_id"] = std::to_string(collection_id);
+    params["limit"] = std::to_string(limit);
+    params["offset"] = std::to_string(offset);
+
+    auto res = rpc.call("getNftsForCollection", params);
+    if (!res.ok())
+    {
+      if (is_not_found && res.error.has_value() &&
+          res.error->code ==
+              static_cast<int>(Rpc::ErrorCode::NftCollectionNotFound))
+      {
+        *is_not_found = true;
+        return std::nullopt;
+      }
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<Common::Json> getCollection(
+      RpcClient &rpc,
+      uint64_t collection_id,
+      bool *is_not_found,
+      std::string *error_out)
+  {
+    if (is_not_found)
+      *is_not_found = false;
+
+    Common::Json params = Common::Json::object();
+    params["collection_id"] = std::to_string(collection_id);
+
+    auto res = rpc.call("getCollection", params);
+    if (!res.ok())
+    {
+      if (is_not_found && res.error.has_value() &&
+          res.error->code ==
+              static_cast<int>(Rpc::ErrorCode::NftCollectionNotFound))
+      {
+        *is_not_found = true;
+        return std::nullopt;
+      }
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<Common::Json> getAllCollections(
+      RpcClient &rpc,
+      uint64_t limit,
+      uint64_t offset,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["limit"] = std::to_string(limit);
+    params["offset"] = std::to_string(offset);
+
+    auto res = rpc.call("getAllCollections", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<Common::Json> getTokenInfo(
+      RpcClient &rpc,
+      uint64_t token_id,
+      bool *is_not_found,
+      std::string *error_out)
+  {
+    if (is_not_found)
+      *is_not_found = false;
+
+    Common::Json params = Common::Json::object();
+    params["token_id"] = std::to_string(token_id);
+
+    auto res = rpc.call("getTokenInfo", params);
+    if (!res.ok())
+    {
+      if (is_not_found && res.error.has_value() &&
+          res.error->code == static_cast<int>(Rpc::ErrorCode::TokenNotFound))
+      {
+        *is_not_found = true;
+        return std::nullopt;
+      }
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<Common::Json> getTokenSupply(
+      RpcClient &rpc,
+      uint64_t token_id,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["token_id"] = std::to_string(token_id);
+
+    auto res = rpc.call("getTokenSupply", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<Common::Json> getAllTokens(
+      RpcClient &rpc,
+      uint64_t limit,
+      uint64_t offset,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["limit"] = std::to_string(limit);
+    params["offset"] = std::to_string(offset);
+
+    auto res = rpc.call("getAllTokens", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<Common::Json> getTokensForAddress(
+      RpcClient &rpc,
+      const std::string &address_bech32m,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["address"] = address_bech32m;
+
+    auto res = rpc.call("getTokensForAddress", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
   }
 
   std::optional<HeaderInfo> getCurrentHeader(

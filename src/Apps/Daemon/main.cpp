@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "Args.h"
+#include "Secrets.h"
 
 #include "Logging/ConsoleLogger.h"
 #include "Logging/FileLogger.h"
@@ -71,6 +72,31 @@ int main(int argc, char **argv)
   {
     std::fprintf(stderr, "configuration error: %s\n", e.what());
     return 1;
+  }
+
+  // Load the validator consensus key from its file, if one was given.
+  // This happens after validateConfig (which already rejected the
+  // "both forms set" case) and before --print-config, so that
+  // printConfig can report whether a key was loaded. It also happens
+  // before the banner, so a permission or format error is visible
+  // before the daemon announces itself as starting.
+  //
+  // On regtest, an operator may have passed --consensus-key on the
+  // command line instead. In that case consensus_key_file is empty
+  // and consensus_secret_key is already populated; loadSecrets is a
+  // no-op.
+  if (!args.node.consensus_key_file.empty())
+  {
+    try
+    {
+      args.node.consensus_secret_key =
+          Daemon::loadConsensusKeyFile(args.node.consensus_key_file);
+    }
+    catch (const std::exception &e)
+    {
+      std::fprintf(stderr, "consensus key error: %s\n", e.what());
+      return 1;
+    }
   }
 
   if (args.print_config)

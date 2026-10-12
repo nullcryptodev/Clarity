@@ -5,6 +5,7 @@
 
 #include "Node.h"
 
+#include "Common/Wire.h"
 #include "Core/Genesis.h"
 #include "Core/TransactionExecutor.h"
 #include "Core/ValidatorRotation.h"
@@ -32,36 +33,6 @@ namespace Node
   {
     constexpr uint32_t WAL_KIND_VOTE = 0;
     constexpr uint32_t WAL_KIND_LOCK = 1;
-
-    void writeU32BE(std::vector<uint8_t> &out, uint32_t v)
-    {
-      out.push_back(uint8_t((v >> 24) & 0xFF));
-      out.push_back(uint8_t((v >> 16) & 0xFF));
-      out.push_back(uint8_t((v >> 8) & 0xFF));
-      out.push_back(uint8_t((v) & 0xFF));
-    }
-
-    void writeU64BE(std::vector<uint8_t> &out, uint64_t v)
-    {
-      for (int i = 7; i >= 0; --i)
-        out.push_back(uint8_t((v >> (i * 8)) & 0xFF));
-    }
-
-    uint32_t readU32BE(const uint8_t *p)
-    {
-      return (uint32_t(p[0]) << 24) |
-             (uint32_t(p[1]) << 16) |
-             (uint32_t(p[2]) << 8) |
-             (uint32_t(p[3]));
-    }
-
-    uint64_t readU64BE(const uint8_t *p)
-    {
-      uint64_t v = 0;
-      for (int i = 0; i < 8; ++i)
-        v = (v << 8) | uint64_t(p[i]);
-      return v;
-    }
   } // anonymous namespace
 
   //  Construction / Destruction
@@ -794,11 +765,11 @@ namespace Node
           {
             if (key.size() < 12)
               return true;
-            const uint64_t h = readU64BE(key.data());
+            const uint64_t h = Common::readU64BE(key.data());
             if (h != for_height)
               return true;
 
-            const uint32_t kind = readU32BE(key.data() + 8);
+            const uint32_t kind = Common::readU32BE(key.data() + 8);
 
             if (kind == WAL_KIND_VOTE)
             {
@@ -813,7 +784,7 @@ namespace Node
             {
               if (key.size() < 20 || value.size() != 32)
                 return true;
-              const Round r = readU64BE(key.data() + 12);
+              const Round r = Common::readU64BE(key.data() + 12);
               Crypto::Hash hash;
               std::memcpy(hash.data.data(), value.data(), 32);
               on_lock(h, r, hash);
@@ -835,7 +806,7 @@ namespace Node
           {
             if (key.size() < 8)
               return true;
-            const uint64_t h = readU64BE(key.data());
+            const uint64_t h = Common::readU64BE(key.data());
             if (h <= committed_height)
               to_delete.push_back(key);
             return true;
@@ -1908,10 +1879,10 @@ namespace Node
   {
     std::vector<uint8_t> key;
     key.reserve(8 + 4 + 8 + 8);
-    writeU64BE(key, height);
-    writeU32BE(key, WAL_KIND_VOTE);
-    writeU64BE(key, round);
-    writeU64BE(key, signer_id);
+    Common::putU64BE(key, height);
+    Common::putU32BE(key, WAL_KIND_VOTE);
+    Common::putU64BE(key, round);
+    Common::putU64BE(key, signer_id);
     return key;
   }
 
@@ -1919,9 +1890,9 @@ namespace Node
   {
     std::vector<uint8_t> key;
     key.reserve(8 + 4 + 8);
-    writeU64BE(key, height);
-    writeU32BE(key, WAL_KIND_LOCK);
-    writeU64BE(key, round);
+    Common::putU64BE(key, height);
+    Common::putU32BE(key, WAL_KIND_LOCK);
+    Common::putU64BE(key, round);
     return key;
   }
 

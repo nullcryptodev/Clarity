@@ -176,6 +176,111 @@ namespace Wallet
       bool *is_not_found,
       std::string *error_out = nullptr);
 
+  //  Fetch a single NFT by id.
+  //
+  //  Sends: { "nft_id": "0x..." }
+  //  Expects: an NftInfo JSON object, or NftNotFound.
+  //
+  //  On NftNotFound, `is_not_found` is set to true and the function
+  //  returns nullopt. On other errors, `is_not_found` is false and
+  //  error_out carries the message.
+  std::optional<Common::Json> getNft(
+      RpcClient &rpc,
+      uint64_t nft_id,
+      bool *is_not_found,
+      std::string *error_out = nullptr);
+
+  //  List NFTs owned by an address.
+  //
+  //  Sends: { "address": <bech32m>, "limit": "0x...", "offset": "0x..." }
+  //  Expects: { "nfts": [...], "count": ..., "offset": ..., "limit": ... }
+  std::optional<Common::Json> getNftsForOwner(
+      RpcClient &rpc,
+      const std::string &address_bech32m,
+      uint64_t limit,
+      uint64_t offset,
+      std::string *error_out = nullptr);
+
+  //  List NFTs in a collection.
+  //
+  //  Sends: { "collection_id": "0x...", "limit": "0x...", "offset": "0x..." }
+  //  Expects: { "nfts": [...], "count": ..., ... }, or NftCollectionNotFound.
+  std::optional<Common::Json> getNftsForCollection(
+      RpcClient &rpc,
+      uint64_t collection_id,
+      uint64_t limit,
+      uint64_t offset,
+      bool *is_not_found,
+      std::string *error_out = nullptr);
+
+  //  Fetch a single collection by id.
+  //
+  //  Sends: { "collection_id": "0x..." }
+  //  Expects: an NftCollection JSON object, or NftCollectionNotFound.
+  std::optional<Common::Json> getCollection(
+      RpcClient &rpc,
+      uint64_t collection_id,
+      bool *is_not_found,
+      std::string *error_out = nullptr);
+
+  //  List all collections.
+  //
+  //  Sends: { "limit": "0x...", "offset": "0x..." }
+  //  Expects: { "collections": [...], "count": ..., ... }
+  std::optional<Common::Json> getAllCollections(
+      RpcClient &rpc,
+      uint64_t limit,
+      uint64_t offset,
+      std::string *error_out = nullptr);
+
+  //  Fetch a single token's metadata.
+  //
+  //  Sends: { "token_id": "0x..." }
+  //  Expects: a TokenInfo JSON object, or TokenNotFound.
+  //
+  //  On TokenNotFound, `is_not_found` is set to true and the function
+  //  returns nullopt. On other errors, `is_not_found` is false and
+  //  error_out carries the message.
+  std::optional<Common::Json> getTokenInfo(
+      RpcClient &rpc,
+      uint64_t token_id,
+      bool *is_not_found,
+      std::string *error_out = nullptr);
+
+  //  Fetch a token's current supply.
+  //
+  //  Sends: { "token_id": "0x..." }
+  //  Expects: { "token_id": ..., "supply": "0x..." }
+  //
+  //  Works for the native token (id 0) and for user tokens.
+  std::optional<Common::Json> getTokenSupply(
+      RpcClient &rpc,
+      uint64_t token_id,
+      std::string *error_out = nullptr);
+
+  //  List all tokens known to the node.
+  //
+  //  Sends: { "limit": "0x...", "offset": "0x..." }
+  //  Expects: { "tokens": [...], "count": ..., ... }
+  std::optional<Common::Json> getAllTokens(
+      RpcClient &rpc,
+      uint64_t limit,
+      uint64_t offset,
+      std::string *error_out = nullptr);
+
+  //  List every token balance held by an address.
+  //
+  //  Sends: { "address": <bech32m> }
+  //  Expects: { "tokens": [ { "token_id": ..., "balance": ... }, ... ], ... }
+  //
+  //  This is the "what do I hold" call — the counterpart to
+  //  getBalance, which returns one balance. Useful for the wallet's
+  //  `tokens` command, which prints everything at once.
+  std::optional<Common::Json> getTokensForAddress(
+      RpcClient &rpc,
+      const std::string &address_bech32m,
+      std::string *error_out = nullptr);
+
   //  Fetch the node's current chain height and state root. Two
   //  RPC calls: `blockNumber` for the height, then
   //  `getBlockHeaderByNumber` for the header at that height.

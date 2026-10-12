@@ -1,3 +1,5 @@
+<img src='https://github.com/nullcryptodev/docs/blob/main/clarity/clarity-wide.png?raw=true'>
+
 # Clarity Metrics Reference
 
 > Prometheus-compatible metrics for a Clarity node
