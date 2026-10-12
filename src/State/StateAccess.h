@@ -699,6 +699,12 @@ namespace State
     std::optional<State::SmtProof> proveAtVersion(
         const Crypto::Hash &key, uint64_t version) const;
 
+    // Release the autocommit read txn if one is held. Called at the
+    // top of every write method. MDBX refuses to open a write txn on
+    // a thread that already has a read txn open; the next read after
+    // this method returns will transparently acquire a fresh one.
+    void releaseReadTxnIfHeld();
+
     // =================================================================
     //  Table stats (for RPC diagnostics and chain aggregates)
     // =================================================================
@@ -713,12 +719,6 @@ namespace State
                      const std::vector<uint8_t> &value);
     bool getMetaImpl(const std::string &key,
                      std::vector<uint8_t> &out) const;
-
-    // Release the autocommit read txn if one is held. Called at the
-    // top of every write method. MDBX refuses to open a write txn on
-    // a thread that already has a read txn open; the next read after
-    // this method returns will transparently acquire a fresh one.
-    void releaseReadTxnIfHeld();
 
     // =================================================================
     //  Index write helpers. Each is a small wrapper that picks the

@@ -342,6 +342,22 @@ namespace State
       //  Unbind from the SMT first, so the SMT doesn't hold a
       //  dangling pointer while we destroy the ReadTxn.
       smt_.setReadTxn(nullptr);
+
+      //  If our ReadTxn is the owner, its destructor will clear
+      //  tls_read_txn_. If it is a non-owning wrapper around some
+      //  outer read txn on this thread, the destructor is a no-op
+      //  and tls_read_txn_ would stay set — which would still trip
+      //  requireNoOpenReadTxn() on the next write.
+      //
+      //  In the RPC path, StateAccess is always the owner (the
+      //  worker thread starts with tls_read_txn_ == nullptr), so
+      //  the destructor clears it. The non-owner case only happens
+      //  if a StateAccess is constructed on a thread that already
+      //  has a read txn open, which the current code does not do.
+      //  We rely on that invariant rather than papering over it,
+      //  because clearing tls_read_txn_ when we are not the owner
+      //  would leave the true owner's ReadTxn destructor restoring
+      //  a stale prev_tls_ later.
       read_txn_.reset();
     }
   }

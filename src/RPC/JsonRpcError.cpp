@@ -55,6 +55,8 @@ namespace Rpc
       return "TxPoolFull";
     case ErrorCode::TxSubmitInternal:
       return "TxSubmitInternal";
+    case ErrorCode::TxPrecondition:
+      return "TxPrecondition";
 
     // ---- State ----
     case ErrorCode::AccountNotFound:
@@ -153,6 +155,8 @@ namespace Rpc
       return "Mempool is full and the transaction was not competitive";
     case ErrorCode::TxSubmitInternal:
       return "Transaction submission failed";
+    case ErrorCode::TxPrecondition:
+      return "Transaction cannot apply at the current chain tip";
 
     case ErrorCode::AccountNotFound:
       return "Account not found";
@@ -236,6 +240,20 @@ namespace Rpc
       return ErrorCode::TxInsufficientFunds;
     case Core::MempoolAddResult::Rejected_PoolFull:
       return ErrorCode::TxPoolFull;
+
+    //  The order-specific rejections already existed in the enum but
+    //  had no mapping here, so they fell through to InternalError and
+    //  the client saw "Internal error" for what was really a
+    //  well-formed but invalid order. Map them to TxMalformed: the
+    //  transaction's *payload* is the problem, and from the client's
+    //  perspective that is a malformed transaction.
+    case Core::MempoolAddResult::Rejected_OrderMalformed:
+      return ErrorCode::TxMalformed;
+    case Core::MempoolAddResult::Rejected_OrderPriceOverflow:
+      return ErrorCode::TxMalformed;
+
+    case Core::MempoolAddResult::Rejected_TokenPrecondition:
+      return ErrorCode::TxPrecondition;
     }
 
     return ErrorCode::InternalError;

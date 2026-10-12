@@ -30,9 +30,24 @@ namespace Core
     return access_->getTokenBalance(address, token_id);
   }
 
+  bool StateViewFromAccess::getToken(Id token_id, TokenInfo &out) const
+  {
+    return access_->getToken(token_id, out);
+  }
+
+  uint64_t StateViewFromAccess::getTokenSupply(Id token_id) const
+  {
+    return access_->getTokenSupply(token_id);
+  }
+
   bool Core::StateViewFromAccess::getValidator(Id validator_id,
                                                ValidatorInfo &out) const
   {
     return access_->getValidator(validator_id, out);
+  }
+
+  void StateViewFromAccess::releaseReadTxnIfHeld() const
+  {
+    access_->releaseReadTxnIfHeld();
   }
 } // namespace Core

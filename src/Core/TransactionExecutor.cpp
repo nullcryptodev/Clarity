@@ -112,21 +112,6 @@ namespace Core
         v |= uint64_t(p[off + i]) << (i * 8);
       return v;
     }
-
-    //  Write an id into a payload vector, LE.
-    void appendU32(std::vector<uint8_t> &out, uint32_t v)
-    {
-      out.push_back(uint8_t(v));
-      out.push_back(uint8_t(v >> 8));
-      out.push_back(uint8_t(v >> 16));
-      out.push_back(uint8_t(v >> 24));
-    }
-
-    void appendU64(std::vector<uint8_t> &out, uint64_t v)
-    {
-      for (int i = 0; i < 8; ++i)
-        out.push_back(uint8_t(v >> (i * 8)));
-    }
   }
 
   //  Dispatch

@@ -37,9 +37,13 @@ namespace Core
 
     Account getAccount(const Crypto::Address &address) const override;
     uint64_t getTokenBalance(const Crypto::Address &address, Id token_id) const override;
+    bool getToken(Id token_id, TokenInfo &out) const override;
+    uint64_t getTokenSupply(Id token_id) const override;
     uint64_t currentHeight() const override { return current_height_; }
     uint64_t chainId() const override { return chain_id_; }
     bool getValidator(Id validator_id, ValidatorInfo &out) const override;
+
+    void releaseReadTxnIfHeld() const override;
 
   private:
     std::unique_ptr<State::StateAccess> access_;

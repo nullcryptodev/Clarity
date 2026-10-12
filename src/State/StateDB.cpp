@@ -193,6 +193,27 @@ namespace State
     return tables_[tableId];
   }
 
+  //  Guard against writing with an open read txn on the current
+  //  thread. MDBX refuses to open a write txn in that state
+  //  (MDBX_TXN_OVERLAPPING), and the previous code worked around
+  //  that by aborting the read txn out from under its owning
+  //  ReadTxn object. When that object's destructor later ran, it
+  //  aborted the same freed handle, which glibc reported as a
+  //  "double free or corruption (out)" crash. Throwing here makes
+  //  the same mistake fail loudly and point at the write method
+  //  that needs its caller fixed.
+  void StateDB::requireNoOpenReadTxn(const char *where)
+  {
+    if (tls_read_txn_ != nullptr)
+    {
+      throw StateDBError(
+          std::string(where) +
+          ": write attempted while a read txn is open on this thread. "
+          "Destroy the ReadTxn (or the StateAccess that owns it) before "
+          "writing.");
+    }
+  }
+
   // =================================================================
   //  Txn (write)
   // =================================================================
@@ -859,10 +880,12 @@ namespace State
   StateDB::Txn StateDB::beginWrite()
   {
     //  MDBX refuses to open a write txn on a thread that already
-    //  has a read txn open. Release any read txn first — the caller
-    //  explicitly wants to write, and the next read will reopen a
-    //  read txn transparently.
-    releaseReadTxn();
+    //  has a read txn open (MDBX_TXN_OVERLAPPING). The previous
+    //  code worked around that by aborting the read txn out from
+    //  under its owning ReadTxn object, which caused a use-after-
+    //  free when that object was later destroyed. We now require
+    //  the caller to have destroyed the owning ReadTxn first.
+    requireNoOpenReadTxn("beginWrite");
 
     MDBX_txn *txn = nullptr;
     int rc = mdbx_txn_begin(env_, nullptr, MDBX_TXN_READWRITE, &txn);
@@ -899,15 +922,16 @@ namespace State
 
   // =============================================================
   //  Raw writes — these take write_mutex_ because MDBX permits
-  //  only one write txn at a time. They also release any read txn
-  //  on this thread first, because MDBX forbids overlapping.
+  //  only one write txn at a time. They also call
+  //  requireNoOpenReadTxn() first, because MDBX forbids opening a
+  //  write txn while a read txn is open on the same thread.
   // =============================================================
 
   void StateDB::rawPut(uint32_t tableId,
                        const void *key, size_t keyLen,
                        const void *value, size_t valueLen)
   {
-    releaseReadTxn();
+    requireNoOpenReadTxn("rawPut");
 
     std::lock_guard<std::mutex> lock(write_mutex_);
 
@@ -990,7 +1014,7 @@ namespace State
 
   void StateDB::rawDel(uint32_t tableId, const void *key, size_t keyLen)
   {
-    releaseReadTxn();
+    requireNoOpenReadTxn("rawDel");
 
     std::lock_guard<std::mutex> lock(write_mutex_);
 
@@ -1322,34 +1346,20 @@ namespace State
 
   void StateDB::releaseReadTxn() noexcept
   {
-    //  Close the outermost read txn on this thread, if any. Called
-    //  by every write path before opening a write txn, because MDBX
-    //  refuses to open a write txn while a read txn is open on the
-    //  same thread (MDBX_TXN_OVERLAPPING).
+    //  Historical no-op. This function used to abort the txn stored
+    //  in tls_read_txn_ directly, which left the owning ReadTxn    //  object thinking it still owned a live handle. When that
+    //  object's destructor later ran, it aborted the same freed
+    //  handle, which glibc reported as "double free or corruption
+    //  (out)" and which MDBX would have crashed on regardless.
     //
-    //  We do not know the previous tls_read_txn_ value here — the
-    //  ReadTxn that owns the txn holds it internally. But the
-    //  owning ReadTxn's destructor is what clears the thread-local,
-    //  so we just abort the txn and clear the thread-local
-    //  ourselves. The owning ReadTxn still thinks it has a valid
-    //  handle and its destructor will try to abort again; MDBX
-    //  tolerates abort on an already-aborted handle? No it does not
-    //  — so instead we rely on the caller having destroyed its
-    //  ReadTxn before calling us. In practice that's what happens:
-    //  rawPut and rawDel are only reached when the StateAccess has
-    //  already released its read_txn_ (see StateAccess.cpp's
-    //  releaseReadTxnIfHeld()).
+    //  The correct discipline is that the owning ReadTxn's
+    //  destructor is the only place the txn is aborted. Callers
+    //  that want to write must destroy their ReadTxn first;
+    //  StateAccess::releaseReadTxnIfHeld() does exactly that.
     //
-    //  For the legacy per-call path (rawGet, forEachEntry*), the
-    //  read txn is opened and aborted inside a single call, so it's
-    //  never visible to releaseReadTxn.
-    //
-    //  If anything is still open, abort it and clear the handle.
-    if (tls_read_txn_ != nullptr)
-    {
-      mdbx_txn_abort(tls_read_txn_);
-      tls_read_txn_ = nullptr;
-    }
+    //  Raw write methods now call requireNoOpenReadTxn() instead,
+    //  which throws if a read txn is still open. That turns a
+    //  silent use-after-free into a loud, addressable error.
   }
 
   // =============================================================
@@ -1440,7 +1450,7 @@ namespace State
     auto hist = histKey(hash, version);
     auto by_ver = byVersionKey(version, hash);
 
-    releaseReadTxn();
+    requireNoOpenReadTxn("putNodeAtVersion");
 
     std::lock_guard<std::mutex> lock(write_mutex_);
 
@@ -1490,7 +1500,7 @@ namespace State
     auto hist = histKey(leaf_hash, version);
     auto by_ver = byVersionKey(version, leaf_hash);
 
-    releaseReadTxn();
+    requireNoOpenReadTxn("putLeafDataAtVersion");
 
     std::lock_guard<std::mutex> lock(write_mutex_);
 
@@ -1577,7 +1587,7 @@ namespace State
 
   void StateDB::wipeConsensusWal()
   {
-    releaseReadTxn();
+    requireNoOpenReadTxn("wipeConsensusWal");
 
     std::lock_guard<std::mutex> lock(write_mutex_);
 

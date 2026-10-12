@@ -68,9 +68,7 @@
   - [Collections](#collections)
   - [Reward schedules](#reward-schedules)
   - [Transaction types](#transaction-types)
-  - [State layout](#state-layout)
   - [Ownership and transfers](#ownership-and-transfers)
-  - [Where NFTs fit in the codebase](#where-nfts-fit-in-the-codebase)
 - [**Validator identity**: two keys, two roles](#validator-identity-two-keys-two-roles)
   - [Consensus Key](#consensus-key)
   - [Reward Address](#reward-address)
@@ -594,44 +592,11 @@ Nine NFT transaction types:
 - **`ClaimNftReward`** — settles all of the caller's accrued NFT rewards into `pending_rewards`. Empty payload. The caller then claims normally.
 - **`RefillCollectionReward`** — creator-only. Adds to a collection's reward escrow and un-pauses it if it was drained.
 
-#### State layout
-
-Four new tables and four new SMT keys:
-
-- **`TBL_NFTS`** — mirror table of `NftInfo` records, keyed by `nft_id(8 LE)`. Written alongside the SMT leaf by `putNft`. Used by `forEachNft` for enumeration and by the indexes for reverse lookups.
-- **`TBL_NFT_COLLECTIONS`** — mirror table of `NftCollection` records, keyed by `collection_id(8 LE)`. Written by `putNftCollection`. Used by `forEachNftCollection` — notably, the epoch-boundary reward pass iterates over this table.
-- **`TBL_INDEX_NFTS_BY_OWNER`** — owner index, key = `owner(32) || nft_id(8 LE)`, sentinel value. Maintained by `putNft` and `unindexNft`. Used by `forEachNftForOwner`.
-- **`TBL_INDEX_NFTS_BY_COLLECTION`** — collection index, key = `collection_id(8 LE) || nft_id(8 LE)`, sentinel value. Maintained by `putNft` and `unindexNft`. Used by `forEachNftForCollection`.
-
-The SMT keys, defined in `State::Keys`:
-
-- **`Keys::nft(nft_id)`** = `hashDomain("nft ", LE(nft_id))` — the `NftInfo` leaf.
-- **`Keys::nftCollection(collection_id)`** = `hashDomain("ncol", LE(collection_id))` — the `NftCollection` leaf.
-- **`Keys::nftAddress(nft_id)`** = `Blake2b("nfa " || LE(nft_id))` — the virtual custody address.
-- **`Keys::nftCollectionAddress(collection_id)`** = `Blake2b("nca " || LE(collection_id))` — the escrow address.
-
-The custody and escrow addresses are deliberately in the same 32-byte space as real addresses, so the token balance table — which keys on address bytes — treats them as ordinary addresses with no special-casing.
-
-The mirror-table pattern matches the rest of the state layer: `putX` writes both the SMT leaf and a mirror row; `forEachX` walks the mirror; `deleteX` removes both. The chain's state root commits only to the SMT, so a node that skipped the mirror tables would still agree with every other node — the mirrors are a local index, not a consensus commitment.
-
 #### Ownership and transfers
 
 An NFT's owner is recorded in two places: the `NftInfo.owner` field and the shadow token balance table (the owner has a balance of 1). Both are updated by `TransferNft` in the same transaction. The shadow token balance is the more general source of truth — a client that watches token balances sees the ownership change without knowing about NFTs — but the `NftInfo.owner` field is what the executor checks for authorization.
 
 `TransferNft` uses `unindexNft` on the old record before `putNft` on the new record, so the previous owner's `forEachNftForOwner` no longer returns the NFT after the transfer. This is why `putNft` itself does not read the old record: a read inside a write path interleaves with the SMT's content-addressed node update buffer and can cause subsequent updates in the same transaction to be silently dropped. The cleanup is the caller's job, and the transfer executor does it explicitly.
-
-#### Where NFTs fit in the codebase
-
-- `Core/NftTypes.{h,cpp}` — the `NftInfo` and `NftCollection` record types and their state codecs.
-- `State/SparseMerkleTree.{h,cpp}` — the `Keys::nft*` and `Keys::nftCollection*` derivations.
-- `State/StateDB.h` — the four new table ids.
-- `State/StateAccess.{h,cpp}` — `getNft`/`putNft`/`deleteNft`/`unindexNft`, `getNftCollection`/`putNftCollection`/`deleteNftCollection`, and the four `forEach*` iterators.
-- `Core/TransactionTypes.h` — the nine new `TxType` values.
-- `Core/TransactionExecutor.{h,cpp}` — the nine handlers and the epoch reward settlement on transfer and burn.
-- `Core/BlockProcessor.cpp` — the epoch-boundary reward accrual in `processEpochBoundary`.
-- `Wallet/TransactionBuilder.{h,cpp}` — the nine builder functions.
-- `RPC/Methods.cpp`, `RPC/Encoders.{h,cpp}` — the six NFT read methods and the two JSON encoders.
-- `Tests/Core/Nft.cpp` — the codec tests, executor tests, state-layer tests, block-processor tests, and integration tests.
 
 ## Validator identity: two keys, two roles
 

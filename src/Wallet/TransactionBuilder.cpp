@@ -700,6 +700,279 @@ namespace Wallet
     return tx;
   }
 
+  //  ---- Create Token ----
+
+  std::optional<Core::Transaction> buildCreateToken(
+      const Crypto::Address &from,
+      const CreateTokenParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    //  Name and symbol are validated on-chain too, but a caller
+    //  that passes an empty name should see the error before the
+    //  fee is charged. The on-chain validation is authoritative.
+    if (params.name.empty())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "token name is empty");
+      return std::nullopt;
+    }
+
+    if (params.symbol.size() < Core::TOKEN_SYMBOL_MIN ||
+        params.symbol.size() > Core::TOKEN_SYMBOL_MAX)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "token symbol must be between TOKEN_SYMBOL_MIN and "
+            "TOKEN_SYMBOL_MAX characters");
+      return std::nullopt;
+    }
+
+    if (params.decimals > 18)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "decimals must be between 0 and 18");
+      return std::nullopt;
+    }
+
+    if (params.backing > 1)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "backing must be 0 (unbacked) or 1 (bridged)");
+      return std::nullopt;
+    }
+
+    if (params.royalty_bps > 10'000)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "royalty_bps must be between 0 and 10000");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::CreateToken, from, params.common);
+
+    std::vector<uint8_t> &p = tx.payload;
+
+    //  Payload layout, matching executeCreateToken:
+    //    [1]  decimals
+    //    [1]  backing
+    //    [1]  name_len
+    //    [N]  name
+    //    [1]  symbol_len
+    //    [M]  symbol
+    //    [8]  max_supply (LE)
+    //    [2]  royalty_bps (LE)
+    //    [1]  has_fingerprint
+    //    [32] fingerprint (only if has_fingerprint)
+
+    appendU8(p, params.decimals);
+    appendU8(p, params.backing);
+
+    if (!appendLenString(p, params.name, /*len_u16=*/false,
+                         Core::TOKEN_NAME_MAX, error_out, "name"))
+      return std::nullopt;
+    if (!appendLenString(p, params.symbol, /*len_u16=*/false,
+                         Core::TOKEN_SYMBOL_MAX, error_out, "symbol"))
+      return std::nullopt;
+
+    appendU64(p, params.max_supply);
+    appendU16(p, params.royalty_bps);
+
+    if (params.fingerprint.has_value())
+    {
+      appendU8(p, 1);
+      appendHash(p, *params.fingerprint);
+    }
+    else
+    {
+      appendU8(p, 0);
+    }
+
+    return tx;
+  }
+
+  //  ---- Mint Token ----
+
+  std::optional<Core::Transaction> buildMintToken(
+      const Crypto::Address &from,
+      const MintTokenParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.token_id == NATIVE_TOKEN_ID)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "cannot mint the native token");
+      return std::nullopt;
+    }
+
+    if (params.to.isNull())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "mint recipient is null");
+      return std::nullopt;
+    }
+
+    if (params.amount == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "mint amount is zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::MintToken, from, params.common);
+
+    //  The executor reads these from the fixed fields, not the
+    //  payload. The payload is empty.
+    tx.to = params.to;
+    tx.token_id = params.token_id;
+    tx.amount = params.amount;
+
+    return tx;
+  }
+
+  //  ---- Burn Token ----
+
+  std::optional<Core::Transaction> buildBurnToken(
+      const Crypto::Address &from,
+      const BurnTokenParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.token_id == NATIVE_TOKEN_ID)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "cannot burn the native token");
+      return std::nullopt;
+    }
+
+    if (params.amount == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "burn amount is zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::BurnToken, from, params.common);
+
+    //  Same as mint: the executor reads the fixed fields.
+    tx.token_id = params.token_id;
+    tx.amount = params.amount;
+
+    return tx;
+  }
+
+  //  ---- Update Token Meta ----
+
+  std::optional<Core::Transaction> buildUpdateTokenMeta(
+      const Crypto::Address &from,
+      const UpdateTokenMetaParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.token_id == NATIVE_TOKEN_ID)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "cannot update the native token's metadata");
+      return std::nullopt;
+    }
+
+    //  A no-op update burns a fee for nothing. Reject it here so
+    //  the caller sees the error before signing.
+    if (params.new_name.empty() &&
+        params.new_symbol.empty() &&
+        params.new_royalty_bps == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "no metadata change requested");
+      return std::nullopt;
+    }
+
+    if (!params.new_symbol.empty() &&
+        (params.new_symbol.size() < Core::TOKEN_SYMBOL_MIN ||
+         params.new_symbol.size() > Core::TOKEN_SYMBOL_MAX))
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "new symbol must be between TOKEN_SYMBOL_MIN and "
+            "TOKEN_SYMBOL_MAX characters");
+      return std::nullopt;
+    }
+
+    if (params.new_royalty_bps > 10'000)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "new_royalty_bps must be between 0 and 10000");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::UpdateTokenMeta, from, params.common);
+
+    //  The executor reads token_id from the fixed field.
+    tx.token_id = params.token_id;
+
+    //  Payload layout, matching executeUpdateTokenMeta:
+    //    [1]  name_len
+    //    [N]  name
+    //    [1]  symbol_len
+    //    [M]  symbol
+    //    [2]  royalty_bps (LE)
+    //
+    //  Empty name and empty symbol mean "no change" on the
+    //  respective field. The royalty is always written; the
+    //  executor treats 0 as "no change".
+
+    std::vector<uint8_t> &p = tx.payload;
+
+    if (!appendLenString(p, params.new_name, /*len_u16=*/false,
+                         Core::TOKEN_NAME_MAX, error_out, "new_name"))
+      return std::nullopt;
+    if (!appendLenString(p, params.new_symbol, /*len_u16=*/false,
+                         Core::TOKEN_SYMBOL_MAX, error_out, "new_symbol"))
+      return std::nullopt;
+
+    appendU16(p, params.new_royalty_bps);
+
+    return tx;
+  }
+
   //  ---- Sign ----
 
   std::optional<Crypto::Hash> signTransaction(

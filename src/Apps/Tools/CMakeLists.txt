@@ -17,3 +17,9 @@ add_executable(transaction_signer TransactionSigner.cpp)
 target_link_libraries(transaction_signer PRIVATE CoreLibs)
 target_include_directories(transaction_signer PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(transaction_signer PRIVATE cxx_std_17)
+
+# ./token
+add_executable(token Token.cpp)
+target_link_libraries(token PRIVATE CoreLibs)
+target_include_directories(token PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(token PRIVATE cxx_std_17)

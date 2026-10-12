@@ -201,10 +201,21 @@ namespace State
     //  than trying (and failing) to open a second overlapping one.
     //
     //  MDBX also refuses to open a write txn on a thread that
-    //  already has a read txn open. StateDB handles this by exposing
-    //  releaseReadTxn(): any write path calls it first, which
-    //  destroys the current ReadTxn on this thread and reopens it
-    //  lazily on the next read. See the comment on releaseReadTxn.
+    //  already has a read txn open. The write paths therefore
+    //  refuse to run while a read txn is open on the same thread:
+    //  they call requireNoOpenReadTxn(), which throws a StateDBError
+    //  naming the write method. Callers that want to write must
+    //  destroy the owning ReadTxn first — usually by destroying the
+    //  StateAccess that holds it, or by calling
+    //  StateAccess::releaseReadTxnIfHeld().
+    //
+    //  Before the guard was added, the write paths called
+    //  releaseReadTxn(), which aborted the txn out from under its
+    //  owning ReadTxn object. When that object's destructor later
+    //  ran, it aborted the same freed handle, which glibc reported
+    //  as "double free or corruption (out)" and which MDBX would
+    //  have crashed on regardless. The guard turns a silent
+    //  use-after-free into a loud, addressable error.
     // =================================================================
 
     class ReadTxn
@@ -288,17 +299,17 @@ namespace State
     //  concurrent-safe.
     //
     //  Reads reuse the per-thread read txn if one is open; see
-    //  beginRead / releaseReadTxn.
+    //  beginRead.
     //
     //  Writes DO take write_mutex_. MDBX allows only one write txn
     //  at a time; a second concurrent mdbx_txn_begin(READWRITE)
     //  returns MDBX_BUSY, which this code does not retry.
     //
-    //  Before opening a write txn, every write method calls
-    //  releaseReadTxn() to close any open read txn on this thread.
-    //  MDBX refuses to open a write txn while a read txn is open
-    //  on the same thread (MDBX_TXN_OVERLAPPING), so this release
-    //  step is mandatory.
+    //  Before opening a write txn, every raw write method calls
+    //  requireNoOpenReadTxn(), which throws if a read txn is open
+    //  on the current thread. MDBX refuses to open a write txn
+    //  while a read txn is open on the same thread
+    //  (MDBX_TXN_OVERLAPPING), so this check is mandatory.
     // =================================================================
 
     void rawPut(uint32_t tableId,
@@ -341,21 +352,23 @@ namespace State
     //  unique_ptr alongside the outer's owner without any
     //  coordination.
     //
-    //  releaseReadTxn closes the outermost read txn on this thread,
-    //  if any. Write paths call this before opening a write txn,
-    //  because MDBX refuses to overlap them. The next read (via
-    //  rawGet, rawHas, forEach*, or beginRead) will transparently
-    //  open a fresh read txn, so a caller that interleaves reads
-    //  and writes simply gets a new read txn after each write.
-    //
-    //  This is the mechanism that makes "hold a ReadTxn for the
-    //  lifetime of a StateAccess" compatible with "the same
-    //  StateAccess does a write halfway through": the write closes
-    //  the read txn, then the next read reopens it.
+    //  The owning ReadTxn's destructor is the only place the txn is
+    //  aborted. Callers that want to write must destroy the owning
+    //  ReadTxn first; the raw write paths enforce this with
+    //  requireNoOpenReadTxn().
     // =================================================================
 
     ReadTxn beginRead();
 
+    //  Historical no-op. Kept for source compatibility with call
+    //  sites written against the old behavior, where this method
+    //  aborted the thread-local read txn out from under its owning
+    //  ReadTxn object. That behavior caused a use-after-free when
+    //  the object was later destroyed.
+    //
+    //  Callers that previously called this method before a write
+    //  must now destroy their ReadTxn instead. StateAccess does
+    //  this correctly via releaseReadTxnIfHeld().
     void releaseReadTxn() noexcept;
 
     // =================================================================
@@ -439,10 +452,16 @@ namespace State
 
     static const char *tableName(uint32_t id) noexcept;
 
+    //  Throw if a read txn is open on the current thread. Called at
+    //  the top of every raw write path so that a write attempted
+    //  while a read txn is open fails loudly instead of aborting the
+    //  read txn out from under its owning ReadTxn object (which was
+    //  a use-after-free).
+    static void requireNoOpenReadTxn(const char *where);
+
     //  Per-thread handle to the outermost read txn on this thread,
     //  if one is open. Set by beginRead when it opens a fresh txn,
-    //  cleared by releaseReadTxn and by the owning ReadTxn's
-    //  destructor.
+    //  cleared by the owning ReadTxn's destructor.
     //
     //  MDBX requires this: a read txn already in progress on a given
     //  thread must be reused by any nested read, because

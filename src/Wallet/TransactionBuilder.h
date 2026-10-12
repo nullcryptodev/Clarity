@@ -183,6 +183,110 @@ namespace Wallet
       const RotateConsensusParams &params,
       WalletStatus *error_out = nullptr);
 
+  //  ---- Create Token ----
+  //
+  //  Creates a fungible token. The creator is the signer; only the
+  //  creator can later mint, burn, or update metadata on this token.
+  //
+  //  `backing` selects the token's backing model:
+  //    0 = unbacked (a free-standing token with no external claim)
+  //    1 = bridged  (a token that represents an external asset,
+  //                  identified by `fingerprint`)
+  //
+  //  `max_supply` is in atomic units and is a hard cap. Zero means
+  //  no cap: the creator can mint without limit. The executor
+  //  enforces the cap at mint time.
+  //
+  //  `royalty_bps` is a royalty hint in basis points (0-10000). The
+  //  chain stores it and the RPC returns it; it is not enforced at
+  //  the protocol level, the same as every other chain.
+  //
+  //  `fingerprint` is a 32-byte content hash, meaningful only for
+  //  bridged tokens. It is optional for all tokens.
+
+  struct CreateTokenParams
+  {
+    TxCommonParams common;
+    std::string name;
+    std::string symbol;
+    uint8_t decimals{8};
+    uint8_t backing{0};
+    uint64_t max_supply{0};
+    uint16_t royalty_bps{0};
+    std::optional<Crypto::Hash> fingerprint;
+  };
+
+  std::optional<Core::Transaction> buildCreateToken(
+      const Crypto::Address &from,
+      const CreateTokenParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- Mint Token ----
+  //
+  //  Mints units of an existing token. Only the token's creator can
+  //  mint. The executor enforces the max-supply cap; the builder
+  //  checks the parameters but not the supply (the builder has no
+  //  chain state).
+  //
+  //  The amount goes in the transaction's `amount` field; the token
+  //  id goes in `token_id`; the recipient goes in `to`.
+
+  struct MintTokenParams
+  {
+    TxCommonParams common;
+    Id token_id{0};
+    Crypto::Address to{};
+    uint64_t amount{0};
+  };
+
+  std::optional<Core::Transaction> buildMintToken(
+      const Crypto::Address &from,
+      const MintTokenParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- Burn Token ----
+  //
+  //  Burns units of a token the caller holds. The chain reduces the
+  //  tracked supply by the same amount. Anyone can burn any token
+  //  they hold; only tokens the caller holds can be burned, which
+  //  the executor checks.
+
+  struct BurnTokenParams
+  {
+    TxCommonParams common;
+    Id token_id{0};
+    uint64_t amount{0};
+  };
+
+  std::optional<Core::Transaction> buildBurnToken(
+      const Crypto::Address &from,
+      const BurnTokenParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- Update Token Meta ----
+  //
+  //  Changes a token's name, symbol, or royalty. Only the creator
+  //  can call this. An empty field means "leave unchanged". The
+  //  max-supply and decimals cannot be changed.
+  //
+  //  If all three fields are empty/default, the builder rejects the
+  //  transaction: a no-op update is a user error and would burn a
+  //  fee for nothing.
+
+  struct UpdateTokenMetaParams
+  {
+    TxCommonParams common;
+    Id token_id{0};
+    std::string new_name;        // empty = no change
+    std::string new_symbol;      // empty = no change
+    uint16_t new_royalty_bps{0}; // 0 = no change
+  };
+
+  std::optional<Core::Transaction> buildUpdateTokenMeta(
+      const Crypto::Address &from,
+      const UpdateTokenMetaParams &params,
+      WalletStatus *error_out = nullptr);
+
   //  ---- NFT: Create Collection ----
   //
   //  Creates a collection with an optional reward schedule. The

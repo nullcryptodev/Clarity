@@ -259,15 +259,57 @@ namespace Node
     if (!mempool_)
       return;
 
-    auto view = makeStateView();
-    if (!view)
+    //  Load the persisted mempool. The load path re-validates each
+    //  entry against current state and rebuilds the in-memory pool.
+    //  Entries that fail validation are dropped from memory and their
+    //  txids are collected by the mempool for the caller to prune
+    //  from disk.
+    //
+    //  The StateView is scoped so its ReadTxn is destroyed before the
+    //  pruning write below. MDBX refuses to open a write txn while a
+    //  read txn is open on the same thread, so the pruning has to
+    //  happen after this scope closes.
+    std::vector<Crypto::Hash> stale;
     {
-      (*log_)(Logging::WARNING)
-          << "initMempool: could not build state view, skipping load";
-      return;
-    }
+      auto view = makeStateView();
+      if (!view)
+      {
+        (*log_)(Logging::WARNING)
+            << "initMempool: could not build state view, skipping load";
+        return;
+      }
 
-    mempool_->load(*view);
+      mempool_->load(*view);
+      stale = mempool_->takeStaleAfterLoad();
+    } // view destroyed here; ReadTxn released
+
+    //  Prune the stale rows now that no read txn is open.
+    if (!stale.empty())
+    {
+      try
+      {
+        auto txn = state_db_->beginWrite();
+        for (const auto &txid : stale)
+        {
+          txn.del(State::StateDB::TBL_MEMPOOL,
+                  txid.data.data(), txid.data.size());
+        }
+        txn.commit();
+
+        (*log_)(Logging::DEBUGGING)
+            << "Mempool load pruned " << stale.size()
+            << " stale entries";
+      }
+      catch (const std::exception &e)
+      {
+        //  A prune failure is not fatal — the entries are already
+        //  gone from the in-memory pool, and the stale rows will be
+        //  overwritten or pruned on the next startup. Log and
+        //  continue so the daemon still starts.
+        (*log_)(Logging::WARNING)
+            << "Mempool load prune failed: " << e.what();
+      }
+    }
 
     (*log_)(Logging::INFO)
         << "Mempool loaded: " << Logging::BRIGHT_GREEN << mempool_->size() << " pending txs";

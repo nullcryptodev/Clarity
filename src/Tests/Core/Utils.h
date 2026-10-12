@@ -27,6 +27,15 @@ namespace Tests
     {
       return 0;
     }
+    bool getToken(Id /*token_id*/, Core::TokenInfo & /*out*/) const override
+    {
+      return false; // test snapshot has no token state
+    }
+
+    uint64_t getTokenSupply(Id /*token_id*/) const override
+    {
+      return 0;
+    }
 
     uint64_t currentHeight() const override { return height_; }
     uint64_t chainId() const override { return chain_id_; }

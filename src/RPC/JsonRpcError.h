@@ -72,6 +72,14 @@ namespace Rpc
     TxPoolFull = 1010,
     TxSubmitInternal = 1011, // Node::submitTransaction returned an
                              // unclassified failure
+    //  The transaction is well-formed and correctly signed, but its
+    //  type-specific preconditions cannot be satisfied at the current
+    //  chain tip: minting a token that does not exist, minting or
+    //  updating a token the sender did not create, exceeding the
+    //  supply cap, or burning a token that does not exist. Distinct
+    //  from TxMalformed (the bytes are fine) and from TxInsufficientFunds
+    //  (the fee and amount are covered).
+    TxPrecondition = 1012,
 
     // ---- Application: state lookup (1050..1099) ----
 

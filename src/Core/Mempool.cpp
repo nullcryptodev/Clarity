@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <utility>
 
 namespace Core
 {
@@ -53,6 +54,8 @@ namespace Core
       return "order-malformed";
     case MempoolAddResult::Rejected_OrderPriceOverflow:
       return "order-price-overflow";
+    case MempoolAddResult::Rejected_TokenPrecondition:
+      return "token-precondition";
     }
     return "unknown";
   }
@@ -357,6 +360,19 @@ namespace Core
   }
 
   //  Load
+  //
+  //  Reads persisted entries and re-adds them through the normal
+  //  validation path. Entries that fail validation are dropped from
+  //  memory and their txids are collected for the caller to prune
+  //  later.
+  //
+  //  Critically, `load` does NOT write during its run. The caller
+  //  passes a StateView whose reads are presumably backed by a read
+  //  txn held for the duration of load; MDBX refuses to open a write
+  //  txn while that read txn is open, so `add` sets a loading_ flag
+  //  that makes persistEntry a no-op. The stale rows are collected
+  //  and the caller drains them via takeStaleAfterLoad() from a
+  //  write-friendly context — after its read txn has been destroyed.
 
   void Mempool::load(const StateView &state)
   {
@@ -384,23 +400,43 @@ namespace Core
 
     // Re-add through the normal validation path. Entries that fail
     // (nonce too low, insufficient funds, expired, already on chain)
-    // are silently dropped and their persisted rows are deleted.
+    // are dropped from memory and their txids are stashed for the
+    // caller to prune from disk later.
     //
-    // `add` persists an accepted entry with a fresh sequence number,
-    // so a successful re-add leaves the persisted row overwritten with
-    // a current version. A failed re-add leaves the stale row, which
-    // we delete here.
-    std::vector<Crypto::Hash> stale;
+    // `loading_` is set for the duration of the re-add loop so that
+    // `add` does not persist. Persisting an entry that is already on
+    // disk is a no-op semantically, and attempting it would open a
+    // write txn while the caller's read txn is still open — which
+    // MDBX refuses.
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      loading_ = true;
+      stale_after_load_.clear();
+    }
+
     for (const auto &e : persisted)
     {
       auto result = add(e.tx, state, e.tier);
       if (result != MempoolAddResult::Accepted)
       {
-        stale.push_back(e.tx.txid());
+        std::lock_guard<std::mutex> lock(mutex_);
+        stale_after_load_.push_back(e.tx.txid());
       }
     }
-    unpersistBatch(stale);
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      loading_ = false;
+    }
   }
+
+  std::vector<Crypto::Hash> Mempool::takeStaleAfterLoad()
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::exchange(stale_after_load_, {});
+  }
+
+  //  Validation
 
   //  Validation
 
@@ -478,7 +514,21 @@ namespace Core
       return MempoolAddResult::Rejected_NonceTooLow;
     }
 
-    // ---- Balance (native CLRTY) ----
+    // ---- Balance ----
+    //
+    //  The fee is always paid in native CLRTY, so the sender must
+    //  always be able to cover it. The amount check depends on the
+    //  transaction type: only types that move value out of the
+    //  sender's balance need the sender to already hold that value.
+    //  Mint-family transactions create new supply and are exempt
+    //  from the amount check; the executor enforces their
+    //  type-specific preconditions (creator-only, supply cap, etc.)
+    //  when the transaction is applied.
+    //
+    //  See txMovesNativeFromSender() / txMovesTokenFromSender()
+    //  above for the per-type classification, and keep them in sync
+    //  with the executor if new tx types are added.
+
     if (tx.fee > 0 && acct.balance < tx.fee)
     {
       return MempoolAddResult::Rejected_InsufficientFunds;
@@ -486,17 +536,79 @@ namespace Core
 
     if (tx.token_id == NATIVE_TOKEN_ID)
     {
-      if (acct.balance < tx.amount + tx.fee)
+      if (txMovesNativeFromSender(tx.tx_type) &&
+          acct.balance < tx.amount + tx.fee)
       {
         return MempoolAddResult::Rejected_InsufficientFunds;
       }
     }
     else
     {
-      uint64_t token_balance = state.getTokenBalance(tx.from, tx.token_id);
-      if (token_balance < tx.amount)
+      if (txMovesTokenFromSender(tx.tx_type))
       {
-        return MempoolAddResult::Rejected_InsufficientFunds;
+        uint64_t token_balance = state.getTokenBalance(tx.from, tx.token_id);
+        if (token_balance < tx.amount)
+        {
+          return MempoolAddResult::Rejected_InsufficientFunds;
+        }
+      }
+    }
+
+    // ---- Token-type preconditions ----
+    //
+    //  These mirror the executor's checks in executeMintToken,
+    //  executeBurnToken, and executeUpdateTokenMeta. They live here
+    //  so a transaction the executor will reject never enters the
+    //  pool: a mint for a token that doesn't exist is not "some day
+    //  valid" — it is invalid forever — and admitting it wastes a
+    //  block slot on every proposal attempt and can stall the chain
+    //  on a single-validator network.
+    //
+    //  The check is deliberately narrow. It reads only the token
+    //  record and (for mints) the current supply, and it looks at
+    //  no other state. If the executor grows a new precondition for
+    //  one of these types, this function must be updated in the
+    //  same commit.
+    if (tx.tx_type == TxType::MintToken ||
+        tx.tx_type == TxType::BurnToken ||
+        tx.tx_type == TxType::UpdateTokenMeta)
+    {
+      //  The native token has id 0. None of these operations apply
+      //  to it, and the executor rejects them for it. Reject here
+      //  so the caller learns sooner.
+      if (tx.token_id == NATIVE_TOKEN_ID)
+      {
+        return MempoolAddResult::Rejected_TokenPrecondition;
+      }
+
+      Core::TokenInfo token;
+      if (!state.getToken(tx.token_id, token))
+      {
+        return MempoolAddResult::Rejected_TokenPrecondition;
+      }
+
+      //  Mint and update-meta are creator-only. Burn is not: any
+      //  holder may burn their own balance.
+      if ((tx.tx_type == TxType::MintToken ||
+           tx.tx_type == TxType::UpdateTokenMeta) &&
+          token.creator != tx.from)
+      {
+        return MempoolAddResult::Rejected_TokenPrecondition;
+      }
+
+      //  Supply cap. Only mints create supply; burns and updates
+      //  never touch it. A token with maxSupply == 0 is uncapped.
+      if (tx.tx_type == TxType::MintToken && token.maxSupply > 0)
+      {
+        const uint64_t current_supply = state.getTokenSupply(tx.token_id);
+        //  Overflow-safe: current_supply + tx.amount would wrap if
+        //  the sum exceeded UINT64_MAX. Do the comparison as a
+        //  subtraction instead.
+        if (tx.amount > token.maxSupply ||
+            current_supply > token.maxSupply - tx.amount)
+        {
+          return MempoolAddResult::Rejected_TokenPrecondition;
+        }
       }
     }
 
@@ -578,7 +690,15 @@ namespace Core
             total_bytes_ -= existing.tx_size;
             entries_.erase(existing_it);
             nonce_index_.erase(it);
-            unpersistEntry(existing_txid);
+            if (!loading_)
+            {
+              //  Release the caller's read txn before the write;
+              //  MDBX refuses to overlap a write txn with an open
+              //  read txn on the same thread. See the file-level
+              //  comment on persistence.
+              state.releaseReadTxnIfHeld();
+              unpersistEntry(existing_txid);
+            }
           }
           // Same tier, strictly higher fee rate: replace.
           else if (tier == existing.tier && fee_rate > existing.fee_rate)
@@ -586,7 +706,11 @@ namespace Core
             total_bytes_ -= existing.tx_size;
             entries_.erase(existing_it);
             nonce_index_.erase(it);
-            unpersistEntry(existing_txid);
+            if (!loading_)
+            {
+              state.releaseReadTxnIfHeld();
+              unpersistEntry(existing_txid);
+            }
           }
           // Otherwise: reject with conflict.
           else
@@ -610,7 +734,7 @@ namespace Core
     if (entries_.size() >= MAX_MEMPOOL_TXS ||
         total_bytes_ + tx_size > MAX_MEMPOOL_BYTES)
     {
-      if (!makeRoomFor(e))
+      if (!makeRoomFor(e, state))
       {
         return MempoolAddResult::Rejected_PoolFull;
       }
@@ -630,8 +754,20 @@ namespace Core
     item.txid = txid;
     heap_.push(item);
 
-    // Write through to persistence.
-    persistEntry(txid, entries_.at(txid));
+    // Write through to persistence — except during load, when the
+    // entries being re-added are already on disk and the caller's
+    // read txn is still open. See the file-level comment on load().
+    //
+    //  For the normal runtime path, we must release the read txn
+    //  the caller's StateView is holding before persisting: MDBX
+    //  refuses to open a write txn while a read txn is open on the
+    //  same thread. The view reopens a fresh read txn on the next
+    //  read, so releasing is safe.
+    if (!loading_)
+    {
+      state.releaseReadTxnIfHeld();
+      persistEntry(txid, entries_.at(txid));
+    }
 
     return MempoolAddResult::Accepted;
   }
@@ -802,10 +938,6 @@ namespace Core
     MaxHeap heap = heap_;
 
     // ---- Pass 1: priority txs, up to priority_cap bytes ----
-    //
-    // Within this pass, we retry skipped txs until no new progress is made.
-    // This handles the case where a nonce-2 tx is at the top of the heap
-    // but nonce 1 hasn't been processed yet.
     {
       uint64_t bytes_used = 0;
       bool progress = true;
@@ -869,8 +1001,6 @@ namespace Core
         }
 
         // Move deferred items back into the heap for the next pass.
-        // Any remaining priority items (below the break) also need to
-        // stay in the heap.
         while (!deferred.empty())
         {
           heap.push(deferred.top());
@@ -887,10 +1017,6 @@ namespace Core
     }
 
     // ---- Pass 2: standard txs, filling up to max_block_bytes ----
-    //
-    // Same retry-until-progress pattern. A tx may be deferred because its
-    // nonce isn't the next expected, but a later pass (after the expected
-    // tx is selected) will pick it up.
     {
       uint64_t bytes_used = 0;
       for (const auto &tx : result)
@@ -1001,7 +1127,7 @@ namespace Core
     return lowest;
   }
 
-  bool Mempool::makeRoomFor(const Entry &new_entry)
+  bool Mempool::makeRoomFor(const Entry &new_entry, const StateView &state)
   {
     if (total_bytes_ + new_entry.tx_size > MAX_MEMPOOL_BYTES * 2)
     {
@@ -1055,7 +1181,16 @@ namespace Core
                               entries_[victim_txid].tx.nonce);
     nonce_index_.erase(nk);
     entries_.erase(victim_txid);
-    unpersistEntry(victim_txid);
+    if (!loading_)
+    {
+      //  Release the caller's read txn before the write. The
+      //  caller (addImpl) is holding a StateView whose underlying
+      //  StateAccess still has an open read txn; MDBX refuses to
+      //  open a write txn while that is open. The view reopens a
+      //  fresh read txn on the next read.
+      state.releaseReadTxnIfHeld();
+      unpersistEntry(victim_txid);
+    }
 
     return true;
   }

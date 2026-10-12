@@ -54,9 +54,16 @@ namespace Core
   //    - On startup, `load(state)` rebuilds the pool from persisted
   //      rows by re-adding each through the normal validation path.
   //      Entries that fail validation (nonce too low, insufficient
-  //      funds, expired) are dropped and their rows deleted. This is
+  //      funds, expired) are dropped from memory and their txids are
+  //      collected for the caller to prune from disk later. This is
   //      what filters out transactions that were mined while the node
   //      was offline.
+  //    - During load, `add` does NOT persist. The entries being
+  //      re-added are already on disk; re-writing them would open a
+  //      write txn while the caller's read txn is still open, which
+  //      MDBX refuses. The load path collects the stale txids and the
+  //      caller drains them with takeStaleAfterLoad() from a
+  //      write-friendly context.
   //    - Persistence stores the full Entry (tx + tier + fee rate +
   //      sequence + add time), not just the tx, so eviction ordering
   //      and priority status survive a restart.
@@ -99,12 +106,27 @@ namespace Core
     //  wastes a block slot and a proposer's attempt.
     Rejected_OrderMalformed,
     Rejected_OrderPriceOverflow,
+    //  The transaction is well-formed, correctly signed, has a valid
+    //  nonce and enough balance for the fee, but its *type-specific*
+    //  preconditions cannot be satisfied at the current chain tip.
+    //  For MintToken: the token doesn't exist, the sender isn't the
+    //  creator, or the mint would exceed max_supply. For BurnToken:
+    //  the token doesn't exist. For UpdateTokenMeta: the token
+    //  doesn't exist or the sender isn't the creator.
+    //
+    //  These preconditions are also enforced by the executor when the
+    //  transaction is applied. The mempool checks them here so a
+    //  transaction the executor will reject never occupies a block
+    //  slot; without this check, a mint for a nonexistent token sits
+    //  in the pool forever and every block proposal that tries to
+    //  include it fails simulation.
+    Rejected_TokenPrecondition,
   };
 
   //  Pin the counter array size to the enum. Update both if a
   //  variant is added.
   static_assert(
-      static_cast<size_t>(MempoolAddResult::Rejected_OrderPriceOverflow) + 1 == 14,
+      static_cast<size_t>(MempoolAddResult::Rejected_TokenPrecondition) + 1 == 15,
       "MempoolAddResult grew; update Mempool::ADD_RESULT_COUNT");
 
   const char *mempoolAddResultName(MempoolAddResult r) noexcept;
@@ -116,6 +138,50 @@ namespace Core
     Standard = 0,
     Priority = 1,
   };
+
+  //  Which tx types move value out of the sender's balance?
+  //
+  //  The mempool's balance check applies only to transactions that
+  //  actually debit the sender. Mint-family transactions create new
+  //  supply and do not need the sender to already hold the token
+  //  they are minting; creation, metadata, staking, validator, and
+  //  reward transactions carry no amount at all. The executor has
+  //  the authoritative per-type rules; this predicate exists so the
+  //  mempool does not reject those types before the executor sees
+  //  them.
+  //
+  //  These two predicates must be kept in sync with the executor's
+  //  semantics. If a new tx type is added that debits the sender,
+  //  add it here.
+  inline bool txMovesNativeFromSender(TxType t) noexcept
+  {
+    switch (t)
+    {
+    case TxType::Transfer:
+    case TxType::TransferNft:
+    case TxType::BurnNft:
+    case TxType::MintNft:
+    case TxType::CreateNftCollection:
+    case TxType::TopUpNft:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  inline bool txMovesTokenFromSender(TxType t) noexcept
+  {
+    switch (t)
+    {
+    case TxType::Transfer:
+    case TxType::BurnToken:
+    case TxType::TransferNft:
+    case TxType::BurnNft:
+      return true;
+    default:
+      return false;
+    }
+  }
 
   //  Mempool
 
@@ -146,10 +212,26 @@ namespace Core
     // each stored Entry, re-adds it through the normal `add` path with
     // the supplied StateView. Entries that fail validation (nonce too
     // low, insufficient funds, expired, already on chain) are dropped
-    // and their rows deleted.
+    // from memory and their txids are collected for later pruning.
     //
     // No-op if no DB is attached. Typically called once at node startup.
+    //
+    // During load, `add` does NOT persist. The entries being re-added
+    // are already on disk. See takeStaleAfterLoad() for how the
+    // caller drains the collected stale txids.
     void load(const StateView &state);
+
+    // Return and clear the list of txids whose persisted rows should
+    // be pruned after the most recent load(). The caller is expected
+    // to delete those rows from TBL_MEMPOOL in a write-friendly
+    // context — after any read txn it held during load() has been
+    // destroyed — because MDBX refuses to open a write txn while a
+    // read txn is open on the same thread.
+    //
+    // Returns an empty vector if no load has been performed since the
+    // last call. Idempotent from the caller's perspective: the list
+    // is drained on every call.
+    std::vector<Crypto::Hash> takeStaleAfterLoad();
 
     // ---- Add / Remove ----
 
@@ -178,7 +260,7 @@ namespace Core
     //
     // The array has one slot per MempoolAddResult variant. The size
     // is pinned to the enum by a static_assert above.
-    static constexpr size_t ADD_RESULT_COUNT = 14;
+    static constexpr size_t ADD_RESULT_COUNT = 15;
     std::array<uint64_t, ADD_RESULT_COUNT> addResultCounts() const;
 
     // Remove a single transaction by txid. Returns true if it was present.
@@ -341,7 +423,13 @@ namespace Core
     // Eviction. Called when the pool is full and a new tx arrives.
     // Returns true if the new tx should be admitted (something was evicted
     // or there was room). Returns false if the new tx should be rejected.
-    bool makeRoomFor(const Entry &new_entry);
+    //
+    //  `state` is the caller's StateView. It is passed through so that
+    //  eviction can release the read txn the caller is holding before
+    //  calling unpersistEntry: MDBX refuses to open a write txn while
+    //  a read txn is open on the same thread. The view reopens a fresh
+    //  read txn on the next read, so releasing is safe.
+    bool makeRoomFor(const Entry &new_entry, const StateView &state);
 
     // Find the lowest-priority entry in the pool. O(n). Used for eviction.
     // Returns nullptr if the pool is empty.
@@ -356,6 +444,13 @@ namespace Core
     // hold mutex_. They take the StateDB's own lock internally; there
     // is no cross-lock dependency because the Mempool never calls into
     // a StateDB method that would call back into the Mempool.
+    //
+    // During load(), `persistEntry` is skipped entirely (see loading_
+    // below) so that load does not attempt a write while the caller's
+    // read txn is still open. `unpersistEntry` and `unpersistBatch`
+    // are still reachable during load only through the caller's
+    // explicit drain of the stale list (see takeStaleAfterLoad), which
+    // runs after the read txn is closed.
 
     void persistEntry(const Crypto::Hash &txid, const Entry &e);
     void unpersistEntry(const Crypto::Hash &txid);
@@ -397,6 +492,20 @@ namespace Core
     // The DB the pool persists to. Null when persistence is disabled.
     // Owned by the caller; must outlive the Mempool.
     State::StateDB *db_{nullptr};
+
+    //  Set while load() is running. addImpl checks this before
+    //  calling persistEntry, so that the load path does not attempt
+    //  a write while the caller's read txn is still open. Cleared
+    //  when load() returns.
+    bool loading_{false};
+
+    //  Txids collected by load() for entries that failed
+    //  re-validation. The caller drains this via
+    //  takeStaleAfterLoad() from a write-friendly context, after any
+    //  read txn it held during load() has been destroyed. Empty
+    //  outside of the window between a load() and the next
+    //  takeStaleAfterLoad().
+    std::vector<Crypto::Hash> stale_after_load_;
   };
 
 } // namespace Core
