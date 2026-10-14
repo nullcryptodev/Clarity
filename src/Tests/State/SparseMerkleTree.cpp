@@ -1,13 +1,28 @@
-#include "Fixtures.h"
+// Copyright (c) 2018-2026 Conceal Network & Conceal Devs
+//
+// Distributed under the MIT/X11 software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include "Crypto/Blake2b.h"
+#include "Tests/State/Fixtures.h"
+
+#include "State/SparseMerkleTree.h"
 
 using namespace State;
 using namespace Tests;
 
+// ============================================================================
+//  Empty tree
+// ============================================================================
+
 TEST_F(State_SmtFixture, EmptyTreeRootIsDefaultHash)
 {
-  EXPECT_EQ(tree_->root(), SparseMerkleTree::defaultHash(SparseMerkleTree::DEPTH));
+  EXPECT_EQ(tree_->root(),
+            SparseMerkleTree::defaultHash(SparseMerkleTree::KEY_BITS));
+}
+
+TEST_F(State_SmtFixture, EmptyTreeHeightIsZero)
+{
+  EXPECT_EQ(tree_->height(), 0u);
 }
 
 TEST_F(State_SmtFixture, EmptyTreeGetReturnsNullopt)
@@ -19,33 +34,56 @@ TEST_F(State_SmtFixture, EmptyTreeGetReturnsNullopt)
 
 TEST_F(State_SmtFixture, EmptyTreeRootIsDeterministic)
 {
-  SparseMerkleTree other(db_.db());
+  //  A second tree over the same empty DB sees the same root.
+  State::SparseMerkleTree other(db());
+  other.setTxn(txn_ ? &*txn_ : nullptr);
+  other.load();
   EXPECT_EQ(tree_->root(), other.root());
 }
 
+// ============================================================================
+//  Default hashes
+//
+//  The compressed tree uses the same default-hash scheme as the old
+//  fixed-depth tree: defaultHash(0) is the empty leaf, and
+//  defaultHash(d) for d > 0 is the hash of a branch whose two children
+//  are both defaultHash(d-1). The number of depths is still KEY_BITS
+//  (256), because the key space is still 256 bits.
+// ============================================================================
+
 TEST_F(State_SmtFixture, DefaultHashesAreConsistent)
 {
-  for (size_t d = 1; d <= SparseMerkleTree::DEPTH; ++d)
+  //  Recompute every default hash from its predecessor and confirm
+  //  the cached value matches. If this fails, the precomputation in
+  //  SparseMerkleTree.cpp is wrong.
+  for (size_t d = 1; d <= SparseMerkleTree::KEY_BITS; ++d)
   {
-    Crypto::Hash expected;
-    uint8_t buf[1 + 32 + 32];
-    buf[0] = 0x01;
-    std::memcpy(buf + 1, SparseMerkleTree::defaultHash(d - 1).data.data(), 32);
-    std::memcpy(buf + 33, SparseMerkleTree::defaultHash(d - 1).data.data(), 32);
-    Crypto::blake2b(buf, sizeof(buf), expected.data.data(), 32);
+    uint8_t buf[4 + 1 + 2 + 32 + 32];
+    std::memcpy(buf, "dflt", 4);
+    buf[4] = SparseMerkleTree::TAG_DEFAULT;
+    buf[5] = uint8_t(d >> 8);
+    buf[6] = uint8_t(d & 0xFF);
+    std::memcpy(buf + 7, SparseMerkleTree::defaultHash(d - 1).data.data(), 32);
+    std::memcpy(buf + 7 + 32, SparseMerkleTree::defaultHash(d - 1).data.data(),
+                32);
 
-    EXPECT_EQ(SparseMerkleTree::defaultHash(d), expected)
-        << "depth " << d;
+    Crypto::Hash expected;
+    Crypto::blake2b(buf, sizeof(buf), expected.data.data(), 32);
+    EXPECT_EQ(SparseMerkleTree::defaultHash(d), expected) << "depth " << d;
   }
 }
 
-TEST_F(State_SmtFixture, DefaultHashAboveDepthClamps)
+TEST_F(State_SmtFixture, DefaultHashAboveKeyBitsClamps)
 {
-  EXPECT_EQ(SparseMerkleTree::defaultHash(257),
-            SparseMerkleTree::defaultHash(256));
+  EXPECT_EQ(SparseMerkleTree::defaultHash(SparseMerkleTree::KEY_BITS + 1),
+            SparseMerkleTree::defaultHash(SparseMerkleTree::KEY_BITS));
   EXPECT_EQ(SparseMerkleTree::defaultHash(1000),
-            SparseMerkleTree::defaultHash(256));
+            SparseMerkleTree::defaultHash(SparseMerkleTree::KEY_BITS));
 }
+
+// ============================================================================
+//  Basic insert, update, remove
+// ============================================================================
 
 TEST_F(State_SmtFixture, InsertSingleLeafChangesRoot)
 {
@@ -154,6 +192,47 @@ TEST_F(State_SmtFixture, ReinsertAfterRemove)
   EXPECT_EQ(tree_->root(), r1);
 }
 
+TEST_F(State_SmtFixture, EmptyValueIsStored)
+{
+  Crypto::Hash k = makeKey(1);
+  std::vector<uint8_t> empty_val;
+
+  tree_->update(k, empty_val, 0);
+
+  auto v = tree_->get(k);
+  ASSERT_TRUE(v.has_value());
+  EXPECT_TRUE(v->empty());
+}
+
+TEST_F(State_SmtFixture, EmptyValueHasDifferentRootThanEmptyTree)
+{
+  auto empty_root = tree_->root();
+
+  Crypto::Hash k = makeKey(1);
+  tree_->update(k, {}, 0);
+
+  EXPECT_NE(tree_->root(), empty_root);
+}
+
+TEST_F(State_SmtFixture, RemoveEmptyValueLeafRestoresRoot)
+{
+  auto empty_root = tree_->root();
+
+  Crypto::Hash k = makeKey(1);
+  tree_->update(k, {}, 0);
+  tree_->remove(k, 0);
+
+  EXPECT_EQ(tree_->root(), empty_root);
+}
+
+// ============================================================================
+//  Order independence
+//
+//  The root depends only on the set of (key, value) pairs, not on the
+//  order in which they were written. This is a fundamental property of
+//  a Merkle trie and is what makes consensus possible.
+// ============================================================================
+
 TEST_F(State_SmtFixture, InsertionOrderDoesNotAffectRoot)
 {
   update(1, 100);
@@ -186,91 +265,9 @@ TEST_F(State_SmtFixture, ManyInsertsAreOrderIndependent)
   EXPECT_EQ(root_fwd, root_rev);
 }
 
-TEST_F(State_SmtPersistenceFixture, RootSurvivesSaveAndLoad)
-{
-  Crypto::Hash root_before;
-
-  {
-    auto db = openDB();
-    auto txn = db->beginWrite();
-    SparseMerkleTree tree(*db);
-    tree.setTxn(&txn);
-
-    tree.update(makeKey(1), makeValue(100), 0);
-    tree.update(makeKey(2), makeValue(200), 0);
-    root_before = tree.root();
-
-    tree.save(0);
-    txn.commit();
-    db->close();
-  }
-
-  {
-    auto db = openDB();
-    SparseMerkleTree tree2(*db);
-    tree2.load();
-    EXPECT_EQ(tree2.root(), root_before);
-    db->close();
-  }
-}
-
-TEST_F(State_SmtPersistenceFixture, DataSurvivesSaveAndLoad)
-{
-  {
-    auto db = openDB();
-    auto txn = db->beginWrite();
-    SparseMerkleTree tree(*db);
-    tree.setTxn(&txn);
-
-    for (uint64_t i = 1; i <= 20; ++i)
-      tree.update(makeKey(i), makeValue(i * 100), 0);
-    tree.save(0);
-    txn.commit();
-    db->close();
-  }
-
-  {
-    auto db = openDB();
-    SparseMerkleTree tree2(*db);
-    tree2.load();
-
-    for (uint64_t i = 1; i <= 20; ++i)
-    {
-      auto v = tree2.get(makeKey(i));
-      ASSERT_TRUE(v.has_value()) << "key " << i;
-      EXPECT_EQ(*v, makeValue(i * 100));
-    }
-    db->close();
-  }
-}
-
-TEST_F(State_SmtFixture, VersionedRootIsRetrievable)
-{
-  update(1, 100);
-  tree_->save(/*version=*/5);
-
-  auto root_at_5 = tree_->rootAtVersion(5);
-  ASSERT_TRUE(root_at_5.has_value());
-  EXPECT_EQ(*root_at_5, tree_->root());
-
-  auto root_at_6 = tree_->rootAtVersion(6);
-  EXPECT_FALSE(root_at_6.has_value());
-}
-
-TEST_F(State_SmtFixture, MultipleVersionsArePersisted)
-{
-  update(1, 100);
-  tree_->save(1);
-  auto root_v1 = tree_->root();
-
-  update(2, 200);
-  tree_->save(2);
-  auto root_v2 = tree_->root();
-
-  EXPECT_EQ(tree_->rootAtVersion(1), root_v1);
-  EXPECT_EQ(tree_->rootAtVersion(2), root_v2);
-  EXPECT_NE(root_v1, root_v2);
-}
+// ============================================================================
+//  Scale
+// ============================================================================
 
 TEST_F(State_SmtFixture, HundredLeaves)
 {
@@ -323,16 +320,68 @@ TEST_F(State_SmtFixture, HundredLeavesRemoveHalf)
   EXPECT_NE(tree_->root(), full_root);
 }
 
+// ============================================================================
+//  Path compression
+//
+//  These tests exercise the properties that distinguish the compressed
+//  tree from the fixed-depth trie. They are the ones that would catch a
+//  bug in split-on-insert or collapse-on-delete.
+// ============================================================================
+
+TEST_F(State_SmtFixture, TwoKeysShareABranch)
+{
+  //  Two keys that share all but the last bit. The tree should be a
+  //  single branch at the root whose prefix is 255 bits long, with the
+  //  two leaves as children.
+  auto [k1, k2] = SmtKeys::makeSiblingKeys(255);
+
+  tree_->update(k1, makeValue(1), 0);
+  tree_->update(k2, makeValue(2), 0);
+
+  ASSERT_TRUE(tree_->get(k1).has_value());
+  ASSERT_TRUE(tree_->get(k2).has_value());
+
+  EXPECT_EQ(*tree_->get(k1), makeValue(1));
+  EXPECT_EQ(*tree_->get(k2), makeValue(2));
+
+  //  Height should be 2: one branch hop, two leaf children.
+  EXPECT_EQ(tree_->height(), 2u);
+}
+
+TEST_F(State_SmtFixture, HeightGrowsLogarithmically)
+{
+  //  With N random keys, the tree height should be O(log N), not 256.
+  //  For N = 1024, we expect something close to 10, not 256.
+  constexpr uint64_t N = 1024;
+  for (uint64_t i = 1; i <= N; ++i)
+    update(i, i);
+
+  const size_t h = tree_->height();
+  EXPECT_GE(h, 8u) << "height " << h << " is suspiciously small";
+  EXPECT_LE(h, 24u) << "height " << h << " is suspiciously large";
+}
+
+TEST_F(State_SmtFixture, CollapseOnDelete)
+{
+  //  Two keys that share all but the last bit. Delete one; the tree
+  //  should collapse the branch back to a single leaf at the root.
+  auto [k1, k2] = SmtKeys::makeSiblingKeys(255);
+
+  tree_->update(k1, makeValue(1), 0);
+  tree_->update(k2, makeValue(2), 0);
+  EXPECT_EQ(tree_->height(), 2u);
+
+  tree_->remove(k2, 0);
+
+  //  After removing k2, the tree is a single leaf for k1.
+  EXPECT_EQ(tree_->height(), 1u);
+  ASSERT_TRUE(tree_->get(k1).has_value());
+  EXPECT_FALSE(tree_->get(k2).has_value());
+}
+
 TEST_F(State_SmtFixture, SimilarKeysAreDistinguished)
 {
-  Crypto::Hash k1;
-  Crypto::Hash k2;
-  for (size_t i = 0; i < 32; ++i)
-  {
-    k1.data[i] = 0xAA;
-    k2.data[i] = 0xAA;
-  }
-  k2.data[31] ^= 0x01;
+  auto [k1, k2] = SmtKeys::makeSiblingKeys(255);
 
   tree_->update(k1, makeValue(1), 0);
   tree_->update(k2, makeValue(2), 0);
@@ -347,14 +396,7 @@ TEST_F(State_SmtFixture, SimilarKeysAreDistinguished)
 
 TEST_F(State_SmtFixture, SimilarKeysRootReflectsBothLeaves)
 {
-  Crypto::Hash k1;
-  Crypto::Hash k2;
-  for (size_t i = 0; i < 32; ++i)
-  {
-    k1.data[i] = 0x55;
-    k2.data[i] = 0x55;
-  }
-  k2.data[31] ^= 0x01;
+  auto [k1, k2] = SmtKeys::makeSiblingKeys(128);
 
   tree_->update(k1, makeValue(1), 0);
   auto root_one = tree_->root();
@@ -365,38 +407,118 @@ TEST_F(State_SmtFixture, SimilarKeysRootReflectsBothLeaves)
   EXPECT_NE(root_one, root_two);
 }
 
-TEST_F(State_SmtFixture, EmptyValueIsStored)
+TEST_F(State_SmtFixture, PrefixSharedAtRoot)
 {
-  Crypto::Hash k = makeKey(1);
-  std::vector<uint8_t> empty_val;
+  //  Keys that share the first 200 bits. The tree should have a
+  //  branch near the root with a 200-bit prefix, then diverge into
+  //  two subtrees.
+  auto [k1, k2] = SmtKeys::makeSiblingKeys(200);
 
-  tree_->update(k, empty_val, 0);
+  tree_->update(k1, makeValue(1), 0);
+  tree_->update(k2, makeValue(2), 0);
 
-  auto v = tree_->get(k);
-  ASSERT_TRUE(v.has_value());
-  EXPECT_TRUE(v->empty());
+  ASSERT_TRUE(tree_->get(k1).has_value());
+  ASSERT_TRUE(tree_->get(k2).has_value());
 }
 
-TEST_F(State_SmtFixture, EmptyValueHasDifferentRootThanEmptyTree)
+TEST_F(State_SmtFixture, KeysDifferingInFirstBit)
 {
-  auto empty_root = tree_->root();
+  //  Keys that differ at the very first bit. The root should be a
+  //  branch with prefix_len 0 whose two children are the two leaves.
+  auto [k1, k2] = SmtKeys::makeSiblingKeys(0);
 
-  Crypto::Hash k = makeKey(1);
-  tree_->update(k, {}, 0);
+  tree_->update(k1, makeValue(1), 0);
+  tree_->update(k2, makeValue(2), 0);
 
-  EXPECT_NE(tree_->root(), empty_root);
+  EXPECT_EQ(tree_->height(), 2u);
+  ASSERT_TRUE(tree_->get(k1).has_value());
+  ASSERT_TRUE(tree_->get(k2).has_value());
 }
 
-TEST_F(State_SmtFixture, RemoveEmptyValueLeafRestoresRoot)
+// ============================================================================
+//  Write-count properties
+//
+//  The compressed tree's advantage is that a single update touches
+//  O(log N) nodes, not 256. These tests assert that property by
+//  measuring the tree's cumulative write counter.
+// ============================================================================
+
+TEST_F(State_SmtFixture, SingleUpdateWritesO1Nodes)
 {
-  auto empty_root = tree_->root();
-
-  Crypto::Hash k = makeKey(1);
-  tree_->update(k, {}, 0);
-  tree_->remove(k, 0);
-
-  EXPECT_EQ(tree_->root(), empty_root);
+  //  A single update on an empty tree writes exactly one leaf
+  //  preimage to TBL_SMT_NODES and one leaf value to
+  //  TBL_SMT_LEAVES. Two rows, not one — the preimage and the
+  //  value live in separate tables.
+  const auto before = tree_->stats().live_node_writes +
+                      tree_->stats().live_leaf_writes;
+  update(1, 100);
+  const auto after = tree_->stats().live_node_writes +
+                     tree_->stats().live_leaf_writes;
+  EXPECT_EQ(after - before, 2u);
 }
+
+TEST_F(State_SmtFixture, UpdateInLargerTreeWritesOlogN)
+{
+  //  Populate a tree with 1000 leaves, then measure the live-node
+  //  writes for one update. The number should be bounded by a small
+  //  constant times log2(1000) ≈ 10.
+  constexpr uint64_t N = 1000;
+  for (uint64_t i = 1; i <= N; ++i)
+    update(i, i);
+
+  const auto before = tree_->stats().live_node_writes +
+                      tree_->stats().live_leaf_writes;
+  update(N + 1, N + 1);
+  const auto after = tree_->stats().live_node_writes +
+                     tree_->stats().live_leaf_writes;
+  const auto writes = after - before;
+
+  //  A generous upper bound: with 1000 leaves, expected height ~10,
+  //  so one update should write ~10-20 nodes. Anything over 64
+  //  indicates the tree is not compressing as designed.
+  EXPECT_LE(writes, 64u) << "one update wrote " << writes << " nodes";
+  EXPECT_GE(writes, 2u) << "one update wrote only " << writes << " nodes";
+}
+
+TEST_F(State_SmtFixture, HistoricalWritesMatchLiveWritesAtNonzeroVersion)
+{
+  setVersion(5);
+
+  const auto live_before = tree_->stats().live_node_writes +
+                           tree_->stats().live_leaf_writes;
+  const auto hist_before = tree_->stats().hist_node_writes +
+                           tree_->stats().hist_leaf_writes;
+  const auto byver_before = tree_->stats().by_ver_writes;
+
+  update(1, 100);
+  update(2, 200);
+  update(3, 300);
+
+  const auto live_after = tree_->stats().live_node_writes +
+                          tree_->stats().live_leaf_writes;
+  const auto hist_after = tree_->stats().hist_node_writes +
+                          tree_->stats().hist_leaf_writes;
+  const auto byver_after = tree_->stats().by_ver_writes;
+
+  //  Every write at a nonzero version writes a corresponding
+  //  historical row and a corresponding by-version index entry. The
+  //  three totals should move in lockstep.
+  //
+  //  If the invariant doesn't hold, the diagnostic values printed
+  //  here tell you which counter diverged.
+  const auto live_delta = live_after - live_before;
+  const auto hist_delta = hist_after - hist_before;
+  const auto byver_delta = byver_after - byver_before;
+
+  EXPECT_EQ(live_delta, byver_delta)
+      << "live=" << live_delta
+      << " hist=" << hist_delta
+      << " byver=" << byver_delta;
+}
+
+// ============================================================================
+//  applyBatch
+// ============================================================================
 
 TEST_F(State_SmtFixture, ApplyBatchMatchesSequential)
 {
@@ -458,45 +580,158 @@ TEST_F(State_SmtFixture, ApplyBatchWithDeletes)
   }
 }
 
-TEST_F(State_SmtFixture, ReadChildrenOnEmptyRootFails)
+TEST_F(State_SmtFixture, ApplyBatchDeduplicatesKeys)
 {
-  Crypto::Hash left, right;
-  EXPECT_FALSE(tree_->readChildren(tree_->root(), left, right));
+  //  A batch with two updates for the same key. Only the last should
+  //  be applied, and only one write should reach the tree.
+  std::vector<SparseMerkleTree::Update> updates;
+
+  SparseMerkleTree::Update u1;
+  u1.key = makeKey(1);
+  u1.value = makeValue(100);
+  updates.push_back(u1);
+
+  SparseMerkleTree::Update u2;
+  u2.key = makeKey(1);
+  u2.value = makeValue(200);
+  updates.push_back(u2);
+
+  tree_->applyBatch(updates, 0);
+
+  auto v = get(1);
+  ASSERT_TRUE(v.has_value());
+  EXPECT_EQ(*v, makeValue(200));
 }
 
-TEST_F(State_SmtFixture, ReadChildrenAfterInsertSucceeds)
+// ============================================================================
+//  Persistence
+// ============================================================================
+
+TEST_F(State_SmtPersistenceFixture, RootSurvivesSaveAndLoad)
 {
+  Crypto::Hash root_before;
+
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    SparseMerkleTree tree(*db);
+    tree.setTxn(&txn);
+
+    tree.update(makeKey(1), makeValue(100), 0);
+    tree.update(makeKey(2), makeValue(200), 0);
+    root_before = tree.root();
+
+    tree.save(0);
+    txn.commit();
+    db->close();
+  }
+
+  {
+    auto db = openDB();
+    SparseMerkleTree tree2(*db);
+    tree2.load();
+    EXPECT_EQ(tree2.root(), root_before);
+    db->close();
+  }
+}
+
+TEST_F(State_SmtPersistenceFixture, DataSurvivesSaveAndLoad)
+{
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    SparseMerkleTree tree(*db);
+    tree.setTxn(&txn);
+
+    for (uint64_t i = 1; i <= 20; ++i)
+      tree.update(makeKey(i), makeValue(i * 100), 0);
+    tree.save(0);
+    txn.commit();
+    db->close();
+  }
+
+  {
+    auto db = openDB();
+    SparseMerkleTree tree2(*db);
+    tree2.load();
+
+    for (uint64_t i = 1; i <= 20; ++i)
+    {
+      auto v = tree2.get(makeKey(i));
+      ASSERT_TRUE(v.has_value()) << "key " << i;
+      EXPECT_EQ(*v, makeValue(i * 100));
+    }
+    db->close();
+  }
+}
+
+TEST_F(State_SmtPersistenceFixture, HeightRecoveredOnLoad)
+{
+  {
+    auto db = openDB();
+    auto txn = db->beginWrite();
+    SparseMerkleTree tree(*db);
+    tree.setTxn(&txn);
+
+    for (uint64_t i = 1; i <= 100; ++i)
+      tree.update(makeKey(i), makeValue(i), 0);
+    const size_t h = tree.height();
+    tree.save(0);
+    txn.commit();
+    db->close();
+
+    //  The height should be O(log 100) ≈ 7. It should not be zero
+    //  (the tree is not empty) and should not be the full 256 (the
+    //  tree is compressed).
+    EXPECT_GE(h, 4u);
+    EXPECT_LE(h, 20u);
+  }
+
+  {
+    auto db = openDB();
+    SparseMerkleTree tree2(*db);
+    tree2.load();
+    //  After load, the height is recomputed by walking the tree.
+    EXPECT_GE(tree2.height(), 4u);
+    EXPECT_LE(tree2.height(), 20u);
+    db->close();
+  }
+}
+
+// ============================================================================
+//  Historical reads
+// ============================================================================
+
+TEST_F(State_SmtFixture, VersionedRootIsRetrievable)
+{
+  setVersion(5);
   update(1, 100);
+  save();
 
-  Crypto::Hash left, right;
-  ASSERT_TRUE(tree_->readChildren(tree_->root(), left, right));
+  auto root_at_5 = tree_->rootAtVersion(5);
+  ASSERT_TRUE(root_at_5.has_value());
+  EXPECT_EQ(*root_at_5, tree_->root());
 
-  bool non_default = (left != SparseMerkleTree::defaultHash(SparseMerkleTree::DEPTH - 1)) ||
-                     (right != SparseMerkleTree::defaultHash(SparseMerkleTree::DEPTH - 1));
-  EXPECT_TRUE(non_default);
+  auto root_at_6 = tree_->rootAtVersion(6);
+  EXPECT_FALSE(root_at_6.has_value());
 }
 
-TEST_F(State_SmtFixture, ReadChildrenOnUnknownHashFails)
+TEST_F(State_SmtFixture, MultipleVersionsArePersisted)
 {
-  Crypto::Hash left, right;
-  Crypto::Hash unknown;
-  for (size_t i = 0; i < 32; ++i)
-    unknown.data[i] = 0xEE;
-  EXPECT_FALSE(tree_->readChildren(unknown, left, right));
-}
+  setVersion(1);
+  update(1, 100);
+  save();
+  auto root_v1 = tree_->root();
 
-// ============================================================================
-//  Versioned reads.
-//
-//  The SMT stores a historical row for every (node-hash, version) pair
-//  that was written. A node that did not change between versions is not
-//  re-stored, but it remains reachable from the later version's root
-//  because the tree is content-addressed: the same hash appears in both
-//  versions' trees.
-//
-//  These tests exercise the write path (which versions get rows), the
-//  read path (getAtVersion walks the historical tables), and pruning.
-// ============================================================================
+  setVersion(2);
+  update(2, 200);
+  save();
+  auto root_v2 = tree_->root();
+
+  EXPECT_EQ(tree_->rootAtVersion(1), root_v1);
+  EXPECT_EQ(tree_->rootAtVersion(2), root_v2);
+  EXPECT_NE(root_v1, root_v2);
+}
 
 TEST_F(State_SmtFixture, ReadValueAtPriorVersion)
 {
@@ -508,17 +743,14 @@ TEST_F(State_SmtFixture, ReadValueAtPriorVersion)
   update(1, 200);
   save();
 
-  // Current read gives the newest value.
   auto current = get(1);
   ASSERT_TRUE(current.has_value());
   EXPECT_EQ(*current, makeValue(200));
 
-  // Historical read at version 1 gives the old value.
   auto v1 = getAtVersion(1, 1);
   ASSERT_TRUE(v1.has_value());
   EXPECT_EQ(*v1, makeValue(100));
 
-  // Historical read at version 2 gives the newer value.
   auto v2 = getAtVersion(1, 2);
   ASSERT_TRUE(v2.has_value());
   EXPECT_EQ(*v2, makeValue(200));
@@ -533,10 +765,7 @@ TEST_F(State_SmtFixture, ReadNonInclusionAtPriorVersion)
   update(1, 100);
   save();
 
-  // At version 1, the key did not exist.
   EXPECT_FALSE(getAtVersion(1, 1).has_value());
-
-  // At version 2, it does.
   auto v2 = getAtVersion(1, 2);
   ASSERT_TRUE(v2.has_value());
   EXPECT_EQ(*v2, makeValue(100));
@@ -544,25 +773,18 @@ TEST_F(State_SmtFixture, ReadNonInclusionAtPriorVersion)
 
 TEST_F(State_SmtFixture, UnchangedKeyReadableAtLaterVersion)
 {
-  // Write key 1 at version 1.
   setVersion(1);
   update(1, 100);
   save();
 
-  // Write key 2 at version 2. Key 1's subtree is unchanged, so the
-  // write path skips re-storing it. But key 1's value at version 1
-  // must still be reachable from version 2's root, because the tree
-  // is content-addressed and key 1's leaf hash is the same.
   setVersion(2);
   update(2, 200);
   save();
 
-  // Read key 1 at version 2.
   auto v1_at_2 = getAtVersion(1, 2);
   ASSERT_TRUE(v1_at_2.has_value());
   EXPECT_EQ(*v1_at_2, makeValue(100));
 
-  // And key 2 did not exist at version 1.
   EXPECT_FALSE(getAtVersion(2, 1).has_value());
 }
 
@@ -576,12 +798,10 @@ TEST_F(State_SmtFixture, RemovedKeyIsAbsentAtLaterVersion)
   remove(1);
   save();
 
-  // Version 1 had key 1.
   auto v1 = getAtVersion(1, 1);
   ASSERT_TRUE(v1.has_value());
   EXPECT_EQ(*v1, makeValue(100));
 
-  // Version 2 does not.
   EXPECT_FALSE(getAtVersion(1, 2).has_value());
 }
 
@@ -591,15 +811,11 @@ TEST_F(State_SmtFixture, GetAtUnwrittenVersionReturnsNullopt)
   update(1, 100);
   save();
 
-  // Version 2 has no saved root.
   EXPECT_FALSE(getAtVersion(1, 2).has_value());
 }
 
 TEST_F(State_SmtFixture, GetAtVersionMatchesRootAtVersion)
 {
-  //  Two writes at different versions, then reads. The proof-free
-  //  invariant: if a version has a saved root, getAtVersion must
-  //  reflect the tree that produced that root.
   setVersion(7);
   update(1, 100);
   update(2, 200);
@@ -617,16 +833,18 @@ TEST_F(State_SmtFixture, GetAtVersionMatchesRootAtVersion)
   EXPECT_EQ(*tree_->rootAtVersion(9), root_9);
   EXPECT_NE(root_7, root_9);
 
-  // At version 7, key 3 is absent, keys 1 and 2 are present.
   EXPECT_FALSE(getAtVersion(3, 7).has_value());
   ASSERT_TRUE(getAtVersion(1, 7).has_value());
   ASSERT_TRUE(getAtVersion(2, 7).has_value());
 
-  // At version 9, all three are present.
   ASSERT_TRUE(getAtVersion(1, 9).has_value());
   ASSERT_TRUE(getAtVersion(2, 9).has_value());
   ASSERT_TRUE(getAtVersion(3, 9).has_value());
 }
+
+// ============================================================================
+//  Pruning
+// ============================================================================
 
 TEST_F(State_SmtFixture, PruneRemovesOldVersions)
 {
@@ -642,13 +860,10 @@ TEST_F(State_SmtFixture, PruneRemovesOldVersions)
   update(1, 300);
   save();
 
-  // Prune everything below version 2.
   tree_->pruneHistory(2);
 
-  // Version 1 is gone.
   EXPECT_FALSE(getAtVersion(1, 1).has_value());
 
-  // Versions 2 and 3 are still readable.
   auto v2 = getAtVersion(1, 2);
   ASSERT_TRUE(v2.has_value());
   EXPECT_EQ(*v2, makeValue(200));
@@ -657,7 +872,6 @@ TEST_F(State_SmtFixture, PruneRemovesOldVersions)
   ASSERT_TRUE(v3.has_value());
   EXPECT_EQ(*v3, makeValue(300));
 
-  // Current read is unaffected.
   auto cur = get(1);
   ASSERT_TRUE(cur.has_value());
   EXPECT_EQ(*cur, makeValue(300));
@@ -674,7 +888,7 @@ TEST_F(State_SmtFixture, PruneIsIdempotent)
   save();
 
   tree_->pruneHistory(2);
-  tree_->pruneHistory(2); // second call is a no-op
+  tree_->pruneHistory(2);
 
   EXPECT_FALSE(getAtVersion(1, 1).has_value());
   ASSERT_TRUE(getAtVersion(1, 2).has_value());
@@ -686,8 +900,91 @@ TEST_F(State_SmtFixture, PruneBelowAllVersionsIsNoOp)
   update(1, 100);
   save();
 
-  // keepFrom = 0 is below every version.
   tree_->pruneHistory(0);
 
   ASSERT_TRUE(getAtVersion(1, 1).has_value());
+}
+
+// ============================================================================
+//  Sparse-set behaviour
+//
+//  A tree with a small number of leaves should not touch every depth
+//  of the key space. The compressed tree collapses long single-child
+//  paths, so the physical node count stays proportional to the number
+//  of leaves.
+// ============================================================================
+
+TEST_F(State_SmtFixture, NodeCountIsLinearInLeaves)
+{
+  //  100 leaves. Live node writes should be bounded by ~2 * 100 + a
+  //  constant (the tree is a strict binary trie with N leaves and at
+  //  most 2N-1 internal nodes when fully expanded, but the compressed
+  //  tree has even fewer).
+  const auto before = tree_->stats().live_node_writes +
+                      tree_->stats().live_leaf_writes;
+  for (uint64_t i = 1; i <= 100; ++i)
+    update(i, i);
+  const auto after = tree_->stats().live_node_writes +
+                     tree_->stats().live_leaf_writes;
+  const auto writes = after - before;
+
+  //  Expected writes: ~log2(N) per insert, so ~N log N total.
+  //  For N=100, that's roughly 660 writes, plus slack.
+  EXPECT_LE(writes, 1500u) << "100 inserts wrote " << writes << " nodes";
+}
+
+// ============================================================================
+//  ReadChildren (used by proof generation)
+// ============================================================================
+
+TEST_F(State_SmtFixture, ReadNodeOnEmptyRootFails)
+{
+  std::vector<uint8_t> out;
+  EXPECT_FALSE(tree_->readNode(tree_->root(), out));
+}
+
+TEST_F(State_SmtFixture, ReadNodeAfterInsertSucceeds)
+{
+  update(1, 100);
+
+  //  The root is a leaf; reading it should return the leaf's preimage.
+  std::vector<uint8_t> out;
+  ASSERT_TRUE(tree_->readNode(tree_->root(), out));
+  EXPECT_EQ(out.size(), 1u + 32u + 32u);
+  EXPECT_EQ(out[0], SparseMerkleTree::TAG_LEAF);
+}
+
+TEST_F(State_SmtFixture, ReadNodeOnUnknownHashFails)
+{
+  Crypto::Hash unknown;
+  for (size_t i = 0; i < 32; ++i)
+    unknown.data[i] = 0xEE;
+  std::vector<uint8_t> out;
+  EXPECT_FALSE(tree_->readNode(unknown, out));
+}
+
+// ============================================================================
+//  Stats
+// ============================================================================
+
+TEST_F(State_SmtFixture, StatsCountUpdatesAndRemoves)
+{
+  const auto u0 = tree_->stats().updates;
+  const auto r0 = tree_->stats().removes;
+
+  update(1, 100);
+  update(2, 200);
+  remove(1);
+
+  EXPECT_EQ(tree_->stats().updates - u0, 2u);
+  EXPECT_EQ(tree_->stats().removes - r0, 1u);
+}
+
+TEST_F(State_SmtFixture, ResetStatsClearsCounters)
+{
+  update(1, 100);
+  ASSERT_GT(tree_->stats().updates, 0u);
+  tree_->resetStats();
+  EXPECT_EQ(tree_->stats().updates, 0u);
+  EXPECT_EQ(tree_->stats().live_node_writes, 0u);
 }

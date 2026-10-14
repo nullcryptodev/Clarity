@@ -26,6 +26,7 @@
 #include "P2P/P2PManager.h"
 #include "P2P/AuthMessage.h"
 #include "P2P/SyncManager.h"
+#include "State/SparseMerkleTree.h"
 #include "State/StateAccess.h"
 #include "State/StateDB.h"
 
@@ -112,6 +113,19 @@ namespace Node
 
     Crypto::Hash stateRoot() const;
 
+    //  Snapshot of the SMT's cumulative counters. Read by the metrics
+    //  handler. Returns a value copy, so the caller doesn't need to
+    //  hold any lock or worry about the tree mutating underneath.
+    //
+    //  The counters are for the tree attached to the most recent
+    //  StateAccess constructed by this node. Because the node opens a
+    //  fresh StateAccess for every block application and every RPC
+    //  call, the counters reflect the sum of writes since the DB was
+    //  opened, not since the tree object was constructed. Under the
+    //  compressed tree each block's writes are O(K log N) where K is
+    //  the number of state-changing transactions in the block.
+    State::SparseMerkleTree::Stats smtStats() const;
+
     // Test-only crash injection.
     enum class FailPoint
     {
@@ -127,20 +141,25 @@ namespace Node
     Core::ChainDB &chainDB() const { return *chain_db_; }
 
     // Data directory path. Read by the metrics handler to compute
-    // the on-disk size of the state and chain databases. Returns
-    // config_.data_dir verbatim — the caller appends "/state" or
-    // "/chain" as needed.
+    // the on-disk size of the state and chain databases.
     const std::string &dataDir() const noexcept { return config_.data_dir; }
 
     // Forwarding method for RPC. Returns an empty vector if P2P is
-    // disabled or not initialized. Thread-safe: P2PManager::peerList
-    // posts to the event loop and blocks.
+    // disabled or not initialized.
     std::vector<P2P::P2PManager::PeerInfo> p2pPeerList() const;
 
     // Given a peer's public key, return the validator ID whose reward
     // address matches it, or 0 if no active validator claims it.
-    // Called from the P2P auth path on the event loop thread.
     uint64_t validatorIdForAddress(const Crypto::PublicKey &pk) const;
+
+    //  The retention window the node is using, in blocks. Read by the
+    //  metrics handler and by the RPC getSmtHistoryWindow method.
+    //  Resolved at construction from NodeConfig (which validateConfig
+    //  has already filled from the network default).
+    uint64_t smtHistoryBlocks() const noexcept
+    {
+      return config_.smt_history_blocks;
+    }
 
   private:
     friend class Tests::NodeTestAccess;
@@ -167,15 +186,7 @@ namespace Node
     void handleIncomingHeaders(const P2P::Message &msg, P2P::PeerId from);
     void handleIncomingBlocks(const P2P::Message &msg, P2P::PeerId from);
 
-    // Broadcast a freshly committed block to every Established peer.
-    // Called from onBlockCommitted after applyCommittedBlock succeeds.
-    // No-op if P2P is disabled or there are no Established peers.
     void broadcastBlock(const Core::Block &block);
-
-    // Broadcast a transaction to every Established peer. Called after
-    // a successful mempool add, from both submitTransaction (local
-    // submission) and handleIncomingTx (relay). Symmetric with
-    // broadcastBlock.
     void broadcastTransaction(const Core::Transaction &tx);
 
     Consensus::Dependencies buildConsensusDeps();
@@ -196,15 +207,12 @@ namespace Node
 
     void onConsensusPoll();
 
-    // Start consensus if we have enough peers to form a quorum.
-    // Idempotent — safe to call multiple times. Called from run() and
-    // from onP2PPeerConnected(). Without this, the proposer broadcasts
-    // into an empty peer table and the first round fails on every node.
+    std::unique_ptr<State::StateAccess> makeStateAccess(uint64_t version) const;
+
     void maybeStartConsensus();
 
     bool applyCommittedBlock(const Core::Block &block, std::string &error);
 
-    // Auth callbacks for P2P. Wired in initP2P().
     P2P::AuthMessage buildAuthMessageForPeer(P2P::Peer &peer);
     bool verifyPeerAuth(P2P::Peer &peer,
                         const P2P::AuthMessage &msg,
@@ -217,22 +225,12 @@ namespace Node
 
     Core::GenesisConfig genesisConfig() const;
 
-    // Load <data_dir>/node_key, or generate and persist a fresh key
-    // on first run. Cached in node_key_ after the first call.
     void loadOrCreateNodeKey();
 
     void updateBestPeerHeight();
 
     void onSyncTick();
 
-    // Timer-driven poll loops. Each timer's handler does one tick of
-    // work, then re-arms the timer. Cancelled in stop().
-    //
-    // These replace an earlier post-and-sleep pattern that blocked
-    // the io_context thread for the sleep duration and made shutdown
-    // wait for up to one full interval. The timer approach leaves the
-    // io_context free to service I/O between ticks, and cancel() wakes
-    // the handler immediately on shutdown.
     void armConsensusPollTimer();
     void onConsensusPollTimer(const boost::system::error_code &ec);
 
@@ -240,14 +238,7 @@ namespace Node
     void onSyncTickTimer(const boost::system::error_code &ec);
 
     // ---- Write-ahead log helpers ----
-    //
-    //  Key layout (big-endian for prefix scans):
-    //
-    //    vote: [u64 height][u32 kind=0][u64 round][u64 signer_id]
-    //    lock: [u64 height][u32 kind=1][u64 round]
-    //
-    //  Height first, so wal_truncate can prefix-scan on
-    //  "height <= H".
+
     static std::vector<uint8_t> walVoteKey(Height height,
                                            Round round,
                                            Id signer_id);
@@ -279,51 +270,28 @@ namespace Node
     std::atomic<bool> consensus_started_{false};
     uint64_t active_set_height_{0};
 
+    //  The height at which the most recent history prune ran. The
+    //  prune itself is throttled: applyCommittedBlock() runs it only
+    //  when the block height has advanced since the last successful
+    //  prune, which prevents re-pruning on a re-applied block. On a
+    //  healthy chain the throttle never fires: heights are monotonic.
     uint64_t last_prune_height_{0};
 
     FailPoint fail_point_for_test_{FailPoint::None};
 
-    // The key used to sign P2P Auth messages. Either config_.node_secret_key
-    // (if set) or the key loaded/created by loadOrCreateNodeKey().
     Crypto::SecretKey node_key_{};
     bool node_key_loaded_{false};
 
-    // One sync manager per Established peer, keyed by PeerId. Created
-    // in onP2PPeerEstablished, destroyed in onP2PPeerDisconnected.
-    // All accesses happen on the P2P io_context thread, so no lock
-    // is needed.
     std::unordered_map<P2P::PeerId, std::unique_ptr<P2P::SyncManager>>
         sync_managers_;
 
     std::unordered_map<P2P::PeerId, uint64_t> peer_heights_;
 
-    // Timer-driven poll loops. Both use the P2P io_context's executor.
-    // Constructed lazily in run(), cancelled in stop(). The `armed_`
-    // flags guard against stop() racing with a handler that's mid-flight:
-    // the handler checks its flag before re-arming, so a cancel that
-    // happens between the work and the re-arm is honored.
     std::unique_ptr<boost::asio::steady_timer> consensus_timer_;
     std::unique_ptr<boost::asio::steady_timer> sync_timer_;
 
-    // Signal handling. Installed in run() on the P2P io_context's
-    // executor. asio's signal_set catches SIGINT and SIGTERM via a
-    // self-pipe and delivers the notification as an event on the
-    // io_context, so the callback runs on the event loop thread where
-    // it is safe to take locks and call stop().
-    //
-    // Previously this was handled by a std::signal handler in main.cpp
-    // that called node.stop() and rpc.stop() directly. That was
-    // undefined behavior: the signal could arrive while any thread
-    // held any of the daemon's mutexes, and the handler would try to
-    // acquire the same lock, deadlocking. The asio signal_set path
-    // avoids the problem entirely.
     std::unique_ptr<boost::asio::signal_set> signals_;
 
-    // Sync tick interval. Every tick, each peer's SyncManager::tick()
-    // is called, which drives both timeout detection and Idle refresh.
-    // 200ms is frequent enough for a 30s refresh interval and cheap
-    // when there's nothing to do (each tick is a timestamp comparison
-    // when Idle).
     static constexpr uint32_t SYNC_TICK_INTERVAL_MS = 200;
   };
 

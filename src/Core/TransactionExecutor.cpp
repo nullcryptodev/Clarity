@@ -16,6 +16,7 @@
 #include "RewardTypes.h"
 #include "KeyRotation.h"
 
+#include "State/Keys.h"
 #include "State/StateAccess.h"
 #include "Crypto/Ed25519.h"
 #include "Crypto/Types.h"
@@ -28,6 +29,35 @@ namespace Core
 
   namespace
   {
+    //  Integer square root. Returns floor(sqrt(n)).
+    //
+    //  Binary search over [0, 2^64). The result of sqrt(n) for
+    //  n < 2^128 always fits in 64 bits, so the search is bounded.
+    //
+    //  Used to compute a pool's initial LP supply from the initial
+    //  reserves: for a first deposit of amount_a and amount_b, the
+    //  minted liquidity is floor(sqrt(amount_a * amount_b)). This is
+    //  the Uniswap V2 convention and gives the first LP a share
+    //  proportional to the geometric mean of the two deposits.
+    uint64_t isqrt128(__uint128_t n)
+    {
+      if (n == 0)
+        return 0;
+
+      __uint128_t lo = 0;
+      __uint128_t hi = (__uint128_t(1) << 64); // exclusive upper bound
+
+      while (hi - lo > 1)
+      {
+        __uint128_t mid = lo + (hi - lo) / 2;
+        if (mid * mid <= n)
+          lo = mid;
+        else
+          hi = mid;
+      }
+
+      return static_cast<uint64_t>(lo);
+    }
 
     //  Read a uint64 from a global state entry via the SMT.
     //  Duplicated from BlockProcessor's anonymous namespace —
@@ -951,6 +981,25 @@ namespace Core
     if (fee_bps > AMM_MAX_FEE_BPS)
       return failure;
 
+    //  Enforce the pool-creation floor, but only on the CLRTY side.
+    //
+    //  MIN_POOL_LIQUIDITY is denominated in atomic units of the
+    //  native token. Applying it to a non-CLRTY side would mean a
+    //  token with low decimals — say, a token with decimals = 0
+    //  and max supply 100 — could never be pooled, because the
+    //  floor would exceed its entire supply.
+    //
+    //  A token/token pool has no CLRTY reference and therefore no
+    //  meaningful "1000 CLRTY equivalent" floor. Both reserves
+    //  must be positive; the exact amounts are the creator's
+    //  choice.
+    if (token_a == NATIVE_TOKEN_ID &&
+        amount_a < MIN_POOL_LIQUIDITY)
+      return failure;
+    if (token_b == NATIVE_TOKEN_ID &&
+        amount_b < MIN_POOL_LIQUIDITY)
+      return failure;
+
     if (token_a > token_b)
     {
       std::swap(token_a, token_b);
@@ -978,11 +1027,8 @@ namespace Core
     pool.created_at_height = ctx.current_height;
     pool.active = true;
 
-    __uint128_t prod = static_cast<__uint128_t>(amount_a) * amount_b;
-    uint64_t initial_liq = 1;
-    while (initial_liq <= prod / (initial_liq + 1))
-      ++initial_liq;
-    pool.total_liquidity = initial_liq;
+    const __uint128_t prod = static_cast<__uint128_t>(amount_a) * amount_b;
+    pool.total_liquidity = isqrt128(prod);
 
     if (!pool.isValid())
       return failure;
@@ -1059,7 +1105,7 @@ namespace Core
     pos.id = next_pos_id;
     pos.owner = tx.from;
     pos.pool_id = pool.id;
-    pos.liquidity = initial_liq;
+    pos.liquidity = isqrt128(prod);
     pos.created_at_height = ctx.current_height;
     state.putAmmPosition(pos);
 
@@ -1222,18 +1268,35 @@ namespace Core
 
   //  Remove Liquidity
 
+  //  Remove Liquidity
+  //
+  //  Removes a portion (or all) of an LP position. `amount` in the
+  //  payload is the number of LP tokens to remove; if it is 0, the
+  //  entire position is removed.
+  //
+  //  Partial removal: the position's liquidity is decremented by
+  //  `amount`, the reserves are decremented by the pro-rata share
+  //  of `amount`, and the position record is re-written with the
+  //  reduced liquidity. The position index entry is kept.
+  //
+  //  Full removal: the position's liquidity is zeroed, the position
+  //  index entry is deleted, and (if this drains the pool) the pool
+  //  record is deleted. The position record itself is left in place
+  //  with liquidity = 0; see the note in DEX.md.
   Receipt TransactionExecutor::executeRemoveLiquidity(State::StateAccess &state,
                                                       const Transaction &tx,
                                                       const TxExecutionContext & /*ctx*/)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    if (tx.payload.size() < 8)
+    //  Payload layout:
+    //    [8]  position_id (LE)
+    //    [8]  amount (LE)      — 0 = remove the whole position
+    if (tx.payload.size() != 16)
       return failure;
 
-    uint64_t position_id = 0;
-    for (int i = 0; i < 8; ++i)
-      position_id |= uint64_t(tx.payload[i]) << (i * 8);
+    const uint64_t position_id = readU64At(tx.payload, 0);
+    const uint64_t requested_amount = readU64At(tx.payload, 8);
 
     AmmPosition pos;
     if (!state.getAmmPosition(position_id, pos))
@@ -1243,18 +1306,61 @@ namespace Core
     if (pos.liquidity == 0)
       return failure;
 
+    //  amount == 0 means "remove everything". amount > 0 must not
+    //  exceed the position's liquidity. Any value in between is a
+    //  partial removal.
+    const uint64_t amount =
+        (requested_amount == 0) ? pos.liquidity : requested_amount;
+
+    if (amount > pos.liquidity)
+      return failure;
+
     AmmPool pool;
     if (!state.getAmmPool(pos.pool_id, pool))
       return failure;
 
-    uint64_t share_a = (pos.liquidity * pool.reserve_a) / pool.total_liquidity;
-    uint64_t share_b = (pos.liquidity * pool.reserve_b) / pool.total_liquidity;
+    //  Compute the LP's pro-rata share of both reserves.
+    //
+    //  Two issues with the naive form:
+    //
+    //    1. amount * pool.reserve_a overflows uint64_t for
+    //       realistic pool sizes. The products must be promoted
+    //       to unsigned __int128.
+    //
+    //    2. When the removal is the last of the pool's liquidity
+    //       (amount == pool.total_liquidity), rounding in the
+    //       pro-rata computation can leave dust in the reserves.
+    //       A pool with `1` unit on each side is not `isClosed()`
+    //       (which requires both reserves to be exactly zero) and
+    //       cannot be drained further. Special-case the last
+    //       removal: the LP gets everything, regardless of
+    //       rounding.
+    const bool is_last_removal = (amount == pool.total_liquidity);
+
+    uint64_t share_a = 0;
+    uint64_t share_b = 0;
+
+    if (is_last_removal)
+    {
+      share_a = pool.reserve_a;
+      share_b = pool.reserve_b;
+    }
+    else
+    {
+      share_a = static_cast<uint64_t>(
+          static_cast<unsigned __int128>(amount) * pool.reserve_a /
+          pool.total_liquidity);
+      share_b = static_cast<uint64_t>(
+          static_cast<unsigned __int128>(amount) * pool.reserve_b /
+          pool.total_liquidity);
+    }
 
     pool.reserve_a -= share_a;
     pool.reserve_b -= share_b;
-    pool.total_liquidity -= pos.liquidity;
+    pool.total_liquidity -= amount;
     state.putAmmPool(pool);
 
+    //  Credit the LP with both shares.
     if (pool.token_a == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1279,11 +1385,24 @@ namespace Core
       state.putTokenBalance(tx.from, pool.token_b, bal + share_b);
     }
 
-    pos.liquidity = 0;
-    state.putAmmPosition(pos);
+    //  Update the position. Partial removal decrements liquidity
+    //  and keeps the position record and index. Full removal
+    //  zeroes liquidity and drops the index entry.
+    if (is_last_removal)
+    {
+      pos.liquidity = 0;
+      state.putAmmPosition(pos);
+      state.deletePositionIndex(pos.owner, pos.pool_id);
+    }
+    else
+    {
+      pos.liquidity -= amount;
+      state.putAmmPosition(pos);
+      //  Position index unchanged.
+    }
 
-    state.deletePositionIndex(pos.owner, pos.pool_id);
-
+    //  If the pool is now drained (last LP removed all their
+    //  liquidity), delete the pool record.
     if (pool.isClosed())
     {
       state.deleteAmmPool(pool.id);
@@ -1355,7 +1474,8 @@ namespace Core
         return failure;
     }
 
-    uint64_t amount_in_with_fee = amount_in * (10'000 - pool.fee_bps) / 10'000;
+    const uint64_t amount_in_with_fee = static_cast<uint64_t>(
+        static_cast<__uint128_t>(amount_in) * (10'000 - pool.fee_bps) / 10'000);
 
     __uint128_t numerator = static_cast<__uint128_t>(reserve_out) * amount_in_with_fee;
     uint64_t denominator = reserve_in + amount_in_with_fee;

@@ -11,6 +11,8 @@
 #include <vector>
 
 #include "Core/Transaction.h"
+#include "Core/AmmPool.h"
+#include "Core/Order.h"
 #include "Crypto/Types.h"
 #include "GlobalConfig.h"
 #include "HdPath.h"
@@ -459,6 +461,169 @@ namespace Wallet
       const Crypto::Address &from,
       const RefillCollectionRewardParams &params,
       WalletStatus *error_out = nullptr);
+
+  //  ---- AMM: Create Pool ----
+  //
+  //  Creates a new constant-product pool. The transaction's
+  //  `token_id` and `amount` carry one side of the initial
+  //  deposit; the payload carries the other.
+  //
+  //  The pair is canonicalized by the executor: whichever of the
+  //  two token ids is smaller becomes `token_a`, and the
+  //  corresponding amount becomes `amount_a`. The user's debit is
+  //  always the sum of the two amounts they specified, regardless
+  //  of which side ends up as A.
+  //
+  //  `fee_bps` is per-pool and immutable after creation. It must be
+  //  at most `AMM_MAX_FEE_BPS` (1000 = 10%). The default, if the
+  //  caller leaves it at 0, is `AMM_DEFAULT_FEE_BPS` (30 = 0.3%).
+
+  struct CreatePoolParams
+  {
+    TxCommonParams common;
+
+    //  One side of the pair, in the transaction's fixed fields.
+    Id token_a{0};
+    uint64_t amount_a{0};
+
+    //  The other side, written to the payload.
+    Id token_b{0};
+    uint64_t amount_b{0};
+
+    uint16_t fee_bps{Core::AMM_DEFAULT_FEE_BPS};
+  };
+
+  std::optional<Core::Transaction> buildCreatePool(
+      const Crypto::Address &from,
+      const CreatePoolParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- AMM: Add Liquidity ----
+  //
+  //  Adds liquidity to an existing pool. The transaction's
+  //  `token_id` and `amount` carry one side; the payload carries
+  //  the pool id and the other side's amount.
+  //
+  //  Which side goes in the fixed fields and which goes in the
+  //  payload is a client choice: the executor checks both balances
+  //  and computes the LP tokens minted from the pair, without
+  //  caring which is "A" or "B".
+
+  struct AddLiquidityParams
+  {
+    TxCommonParams common;
+
+    uint64_t pool_id{0};
+
+    Id token_in{0};
+    uint64_t amount_in{0};
+
+    uint64_t amount_other{0};
+  };
+
+  std::optional<Core::Transaction> buildAddLiquidity(
+      const Crypto::Address &from,
+      const AddLiquidityParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- AMM: Remove Liquidity ----
+  //
+  //  Removes LP tokens from a position. `amount` is the number of
+  //  LP tokens to remove; 0 means "remove the whole position". The
+  //  executor enforces that `amount <= position.liquidity`.
+
+  struct RemoveLiquidityParams
+  {
+    TxCommonParams common;
+    uint64_t position_id{0};
+    uint64_t amount{0}; // 0 = remove everything
+  };
+
+  std::optional<Core::Transaction> buildRemoveLiquidity(
+      const Crypto::Address &from,
+      const RemoveLiquidityParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- AMM: Swap ----
+  //
+  //  Swaps `amount_in` of `token_in` for the other side of the
+  //  pool, sending the output to `to`.
+  //
+  //  `min_amount_out` is slippage protection: if the computed
+  //  output at execution time is less than this, the swap fails.
+  //  A caller that wants no protection can pass 1 (or 0, but 1 is
+  //  safer — the executor treats 0 as "no minimum" but a positive
+  //  minimum is a stronger guarantee).
+
+  struct SwapParams
+  {
+    TxCommonParams common;
+
+    uint64_t pool_id{0};
+    Id token_in{0};
+    uint64_t amount_in{0};
+    uint64_t min_amount_out{1};
+
+    Crypto::Address to{};
+  };
+
+  std::optional<Core::Transaction> buildSwap(
+      const Crypto::Address &from,
+      const SwapParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- Order Book: Create Order ----
+  //
+  //  Places a limit order. `mode` selects Passive (rest in the
+  //  book) or Active (route against a pool). The `pool_id` is
+  //  meaningful only for Active orders; the executor rejects a
+  //  Passive order with a non-zero pool_id and an Active order with
+  //  a zero pool_id.
+  //
+  //  `conditions` is optional. A Passive order with conditions is
+  //  evaluated at the epoch boundary; an Active order with
+  //  conditions is routed at the epoch boundary if the conditions
+  //  hold, or cancelled if they don't. An Active order with no
+  //  conditions routes immediately on creation.
+
+  struct CreateOrderParams
+  {
+    TxCommonParams common;
+
+    Id sell_token{0};
+    Id buy_token{0};
+    uint64_t sell_amount{0};
+    uint64_t min_buy_amount{0};
+
+    Core::OrderExecutionMode mode{Core::OrderExecutionMode::Passive};
+    uint64_t pool_id{0}; // meaningful only for Active
+
+    uint64_t expires_at_height{0};
+
+    std::vector<Core::OrderCondition> conditions;
+  };
+
+  std::optional<Core::Transaction> buildCreateOrder(
+      const Crypto::Address &from,
+      const CreateOrderParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- Order Book: Cancel Order ----
+  //
+  //  Cancels a resting or unfulfilled order. The remaining sell-
+  //  token lock is refunded to the owner, minus the cancel fee.
+
+  struct CancelOrderParams
+  {
+    TxCommonParams common;
+    uint64_t order_id{0};
+  };
+
+  std::optional<Core::Transaction> buildCancelOrder(
+      const Crypto::Address &from,
+      const CancelOrderParams &params,
+      WalletStatus *error_out = nullptr);
+
   //  ---- Sign ----
 
   //  Compute the transaction's signing hash, ask the signer to sign

@@ -75,9 +75,9 @@ namespace GlobalConfig
   // error, instead of silently diverging from other nodes on the same
   // network.
   // When creating new hashes, rotate the addresses too.
-  inline constexpr const char *MAINNET_GENESIS_HASH = "a6217a322ac4218f28c857c805995c8257ae5c33e7421bc7849ccc345c4a32e3";
-  inline constexpr const char *TESTNET_GENESIS_HASH = "cd9ce50f10f5910be0d7407e7081d1adfeda995194bdb13713d78039f185974f";
-  inline constexpr const char *REGTEST_GENESIS_HASH = "45702c87ead128a609d4d4f8e6fb58db1ec9cd5655e515a46cdc633ddde6853a";
+  inline constexpr const char *MAINNET_GENESIS_HASH = "9def9871496416713c277544592e6409e372cc4577593062910604143ad1f2b0";
+  inline constexpr const char *TESTNET_GENESIS_HASH = "b735c17969ea1c76d8823ab6132f8396ba26a1913f7465269aea77a1c805e75a";
+  inline constexpr const char *REGTEST_GENESIS_HASH = "39225b762030873e38dfda67bfd811e2e208ecc78f3b9770e94d684ec947662e";
 
   // Seed validators.
   //
@@ -97,20 +97,20 @@ namespace GlobalConfig
   //   ./address --show <keystore> --show-secret
 
   // Seed validator 1
-  inline constexpr const char *SEED_ADDRESS_MAINNET = "clrty1qrcxv3x7yl40qawdur49auruy6ngkakmqkeq6kcg0hp74ltk63zzw96srqq";  // address as bech32m
-  inline constexpr const char *SEED_ADDRESS_TESTNET = "tclrty1qrcxv3x7yl40qawdur49auruy6ngkakmqkeq6kcg0hp74ltk63zzwxpt2jx"; // address as bech32m
-  inline constexpr const char *SEED_ADDRESS_REGTEST = "rclrty1qrcxv3x7yl40qawdur49auruy6ngkakmqkeq6kcg0hp74ltk63zzwhzd0v5"; // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_MAINNET = "clrty1qpt8lfr2rds5q2dxt2ng56y6mu9a6x7x3lh0napgekukp8a9ce3t2szumup";  // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_TESTNET = "tclrty1qpt8lfr2rds5q2dxt2ng56y6mu9a6x7x3lh0napgekukp8a9ce3t2ne8jw8"; // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_REGTEST = "rclrty1qpt8lfr2rds5q2dxt2ng56y6mu9a6x7x3lh0napgekukp8a9ce3t2z6phs4"; // address as bech32m
   inline constexpr Amount SEED_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 1'000;                                                 // just fund the seed as to be a validator
 
   // Seed validator 2
-  inline constexpr const char *SEED_ADDRESS_TWO_MAINNET = "clrty1qqm2lnc8x020l0wkzsnv3vyjtvtnvxm05a27yz6tuenxunq3x5v9cgzp6rq";  // address as bech32m
-  inline constexpr const char *SEED_ADDRESS_TWO_TESTNET = "tclrty1qqm2lnc8x020l0wkzsnv3vyjtvtnvxm05a27yz6tuenxunq3x5v9cte6n3x"; // address as bech32m
-  inline constexpr const char *SEED_ADDRESS_TWO_REGTEST = "rclrty1qqm2lnc8x020l0wkzsnv3vyjtvtnvxm05a27yz6tuenxunq3x5v9c66uk05"; // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_TWO_MAINNET = "clrty1qqwpcjfxlvnhwk4j907rdtnka00ywc03tw0drzt6f8c68h5dyrw56j50g7d";  // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_TWO_TESTNET = "tclrty1qqwpcjfxlvnhwk4j907rdtnka00ywc03tw0drzt6f8c68h5dyrw56305pvt"; // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_TWO_REGTEST = "rclrty1qqwpcjfxlvnhwk4j907rdtnka00ywc03tw0drzt6f8c68h5dyrw56qvjyje"; // address as bech32m
   inline constexpr Amount SEED_FUND_AMOUNT_TWO = ATOMIC_UNITS_PER_COIN * 1'000;                                                 // just fund the seed as to be a validator
 
   // Consensus keys are identical across all three networks
-  inline constexpr const char *SEED_NODE = "819e73fb3824110623a96473c734150777c9c7ed54f236bc593aba46064d0ef6";     // consensus pubkey
-  inline constexpr const char *SEED_NODE_TWO = "ead6df6eecfa78ddd00645ebaea5238e86666e32207b3002718d02fb53b43a89"; // consensus pubkey
+  inline constexpr const char *SEED_NODE = "84efa7717ca8286de2331fb0cff419f02f830486501f1d3748d387067b610ff1";     // consensus pubkey
+  inline constexpr const char *SEED_NODE_TWO = "1051bde916098cb2a55d806ace794d384de0dd78f5bbad3ef6cf8304da5183e6"; // consensus pubkey
 
   inline constexpr uint32_t INITIAL_SET_SIZE = 2; // should match seed node count
   inline constexpr uint64_t SEED_NODES_COUNT = 2; // active seeds amount
@@ -138,4 +138,26 @@ namespace GlobalConfig
   // Balance bonus: stakers holding >= threshold get +3% weight
   inline constexpr Bps BALANCE_BONUS_BPS = 300;                                      // 3.00%
   inline constexpr Amount BALANCE_BONUS_THRESHOLD = 1000ULL * ATOMIC_UNITS_PER_COIN; // 1000 CLRTY
+
+  //  SMT history retention
+  //  The number of historical versions the node retains in the SMT
+  //  historical tables. Rows for versions older than
+  //  (current_height - smt_history_blocks) are pruned on every block
+  //  commit inside the same transaction.
+  //  Since consensus is BFT with immediate finality, there are no
+  //  reorgs: historical state queries are a block-explorer convenience
+  //  and a light-client-proof feature, not a consensus requirement.
+  //  The default is deliberately small. Operators who want deeper
+  //  history run an indexer, which scrapes blocks and maintains its
+  //  own state.
+  //  These values are the defaults a fresh node uses when opening an
+  //  existing DB. Changing them on an existing DB takes effect at the
+  //  next prune. Set to 0 to disable pruning entirely (the historical
+  //  tables grow without bound).
+  //  Values are per-network because a regtest that runs thousands of
+  //  blocks per hour should not retain the same window as a mainnet.
+
+  inline constexpr uint64_t MAINNET_SMT_HISTORY_BLOCKS = 2048;
+  inline constexpr uint64_t TESTNET_SMT_HISTORY_BLOCKS = 512;
+  inline constexpr uint64_t REGTEST_SMT_HISTORY_BLOCKS = 64;
 }

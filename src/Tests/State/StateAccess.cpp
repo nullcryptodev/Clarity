@@ -19,6 +19,18 @@
 using namespace State;
 using namespace Tests;
 
+namespace
+{
+  //  Build a StateAccess at a specific version with the retention
+  //  window effectively disabled. Used by historical-read tests that
+  //  write at multiple versions and then read all of them; the
+  //  production default window is smaller than these tests span.
+  void configureOpenWindow(StateAccess &s)
+  {
+    s.setHistoryWindow(UINT64_MAX);
+  }
+} // anonymous namespace
+
 // ============================================================================
 //  A. Accounts
 // ============================================================================

@@ -46,7 +46,8 @@ namespace Node
         << "Node constructing: network=" << networkName(config_.network)
         << " chain_id=0x" << std::hex << config_.chain_id << std::dec
         << " data_dir=" << config_.data_dir
-        << " validator_id=" << config_.validator_id;
+        << " validator_id=" << config_.validator_id
+        << " smt_history_blocks=" << config_.smt_history_blocks;
   }
 
   Node::~Node()
@@ -95,16 +96,8 @@ namespace Node
 
     (*log_)(Logging::INFO) << "Node entering event loop";
 
-    // Kick off P2P listening and connection attempts.
     p2p_->start(config_.seeds);
 
-    //  Install signal handling on the P2P io_context.
-    //
-    //  asio's signal_set catches SIGINT and SIGTERM via a self-pipe
-    //  and delivers the notification as an event on the io_context.
-    //  The callback below runs on the event loop thread — the same
-    //  thread that services P2P I/O and consensus ticks — so it is
-    //  safe to take locks, join threads, and call node methods.
     signals_ = std::make_unique<boost::asio::signal_set>(
         p2p_->executor(), SIGINT, SIGTERM);
     signals_->async_wait(
@@ -120,7 +113,6 @@ namespace Node
     armConsensusPollTimer();
     armSyncTickTimer();
 
-    // Run the event loop. Blocks until stop() is called.
     p2p_->run();
 
     (*log_)(Logging::INFO) << "Node event loop exited";
@@ -155,6 +147,16 @@ namespace Node
 
     running_ = false;
     (*log_)(Logging::INFO) << "Node stopped";
+  }
+
+  // This helper makes "every StateAccess in Node has the
+  // configured window" a structural property rather than a discipline.
+  std::unique_ptr<State::StateAccess>
+  Node::makeStateAccess(uint64_t version) const
+  {
+    auto s = std::make_unique<State::StateAccess>(*state_db_, version);
+    s->setHistoryWindow(config_.smt_history_blocks);
+    return s;
   }
 
   void Node::maybeStartConsensus()
@@ -222,7 +224,8 @@ namespace Node
 
     (*log_)(Logging::DEBUGGING)
         << "Storage opened: state at " << state_path
-        << " top height=" << chain_->height();
+        << " top height=" << chain_->height()
+        << " smt_history_blocks=" << config_.smt_history_blocks;
   }
 
   void Node::initMempool()
@@ -230,16 +233,6 @@ namespace Node
     if (!mempool_)
       return;
 
-    //  Load the persisted mempool. The load path re-validates each
-    //  entry against current state and rebuilds the in-memory pool.
-    //  Entries that fail validation are dropped from memory and their
-    //  txids are collected by the mempool for the caller to prune
-    //  from disk.
-    //
-    //  The StateView is scoped so its ReadTxn is destroyed before the
-    //  pruning write below. MDBX refuses to open a write txn while a
-    //  read txn is open on the same thread, so the pruning has to
-    //  happen after this scope closes.
     std::vector<Crypto::Hash> stale;
     {
       auto view = makeStateView();
@@ -252,9 +245,8 @@ namespace Node
 
       mempool_->load(*view);
       stale = mempool_->takeStaleAfterLoad();
-    } // view destroyed here; ReadTxn released
+    }
 
-    //  Prune the stale rows now that no read txn is open.
     if (!stale.empty())
     {
       try
@@ -273,10 +265,6 @@ namespace Node
       }
       catch (const std::exception &e)
       {
-        //  A prune failure is not fatal — the entries are already
-        //  gone from the in-memory pool, and the stale rows will be
-        //  overwritten or pruned on the next startup. Log and
-        //  continue so the daemon still starts.
         (*log_)(Logging::WARNING)
             << "Mempool load prune failed: " << e.what();
       }
@@ -293,10 +281,6 @@ namespace Node
 
     Core::GenesisConfig cfg = genesisConfig();
 
-    //  Inspect the existing DB state first. This is a read-only
-    //  check; use a short-lived autocommit StateAccess for it. The
-    //  ReadTxn it holds is released when the StateAccess goes out
-    //  of scope.
     bool db_initialized = false;
     {
       auto head = chain_db_->getHead();
@@ -319,20 +303,19 @@ namespace Node
         << "Empty state detected, applying genesis for "
         << networkName(config_.network);
 
-    //  Genesis is one atomic write: the entire genesis state, the
-    //  genesis block, and the chain head all live in a single MDBX
-    //  write txn. Either all of it commits, or none of it does.
-    //
-    //  This also sidesteps the MDBX_TXN_OVERLAPPING problem that
-    //  arises when an autocommit StateAccess holds a read txn and
-    //  then tries to write through db_.rawPut(). Under a bound
-    //  write txn, every read and write goes through the write txn
-    //  and no read txn is ever opened.
     Crypto::Hash genesis_hash;
 
     {
       auto txn = state_db_->beginWrite();
+
+      //  CHANGED: construct the StateAccess with the retention
+      //  window set. The window is irrelevant here (genesis writes
+      //  at version 0, which the tree never writes to the historical
+      //  tables), but using the same helper everywhere keeps the
+      //  invariant "every StateAccess has the configured window"
+      //  structurally true.
       State::StateAccess state(*state_db_, txn, /*version=*/0);
+      state.setHistoryWindow(config_.smt_history_blocks);
 
       Core::applyGenesis(state, cfg);
       state.commit(0);
@@ -340,11 +323,6 @@ namespace Node
       Core::Block genesis = Core::makeGenesisBlock(state, cfg);
       genesis_hash = genesis.hash();
 
-      // Pinned-hash check: refuse to start if genesis construction
-      // has drifted from the canonical value. Skipped when the
-      // caller supplied a genesis override — that's a test or a
-      // private chain, and the override is explicitly saying "use
-      // this genesis, not the network's."
       if (!config_.test_genesis_override.has_value())
       {
         Crypto::Hash expected = Core::expectedGenesisHash(cfg);
@@ -380,13 +358,6 @@ namespace Node
       txn.commit();
     }
 
-    //  Wipe any stale consensus WAL. A fresh DB is a fresh chain;
-    //  any WAL rows from a previous life reference blocks whose
-    //  height and hash no longer correspond to anything on the
-    //  current chain. If they survived, the consensus engine would
-    //  replay them at start() and force this validator to vote for
-    //  a block that no other node recognises, deadlocking the
-    //  round.
     state_db_->wipeConsensusWal();
 
     chain_db_->setChainId(config_.chain_id);
@@ -526,13 +497,13 @@ namespace Node
     if (pk.isNull())
       return 0;
 
-    State::StateAccess state(*state_db_, /*version=*/0);
-    auto active = loadActiveSetFromState(state);
+    auto state = makeStateAccess(/*version=*/0);
+    auto active = loadActiveSetFromState(*state);
 
     for (Id vid : active)
     {
       Core::ValidatorInfo v;
-      if (!state.getValidator(vid, v))
+      if (!state->getValidator(vid, v))
         continue;
       if (v.effectiveConsensusKey() == pk)
         return vid;
@@ -637,6 +608,24 @@ namespace Node
     return s;
   }
 
+  // CHANGED: new method. Returns a snapshot of the tree's cumulative
+  // counters. Constructs a short-lived autocommit StateAccess, reads
+  // its stats, and destroys it. The stats struct is a value copy, so
+  // there's no lifetime concern.
+  //
+  // The counters reflect writes since the DB was opened, aggregated
+  // across every StateAccess the node has constructed. Under the
+  // compressed tree, each block's writes are O(K log N) for K
+  // state-changing transactions and N live keys; the historical
+  // counters in the struct show the retention-window cost directly.
+  State::SparseMerkleTree::Stats Node::smtStats() const
+  {
+    if (!state_db_)
+      return State::SparseMerkleTree::Stats{};
+    auto s = makeStateAccess(chain_ ? chain_->height() : 0);
+    return s->smtStats();
+  }
+
   Consensus::Dependencies Node::buildConsensusDeps()
   {
     Consensus::Dependencies deps;
@@ -649,10 +638,10 @@ namespace Node
 
     deps.active_set = [this](bool force_rotation) -> std::vector<Id>
     {
-      State::StateAccess state(*state_db_, /*version=*/0);
+      auto state = makeStateAccess(/*version=*/0);
       std::vector<Id> committed = getActiveSet();
       return Core::resolveActiveSet(
-          state, committed, chain_->height(), force_rotation);
+          *state, committed, chain_->height(), force_rotation);
     };
 
     deps.state_lookup_validator =
@@ -680,9 +669,9 @@ namespace Node
 
     deps.my_address = [this]() -> Crypto::Address
     {
-      State::StateAccess state(*state_db_, /*version=*/0);
+      auto state = makeStateAccess(/*version=*/0);
       Core::ValidatorInfo v;
-      if (!state.getValidator(config_.validator_id, v))
+      if (!state->getValidator(config_.validator_id, v))
         return Crypto::Address{};
       return v.reward_address;
     };
@@ -694,6 +683,8 @@ namespace Node
       try
       {
         State::StateAccess state(*state_db_, txn, b.header.height);
+        state.setHistoryWindow(config_.smt_history_blocks);
+
         Core::BlockContext ctx;
         ctx.chain_id = config_.chain_id;
         ctx.current_height = b.header.height;
@@ -715,9 +706,9 @@ namespace Node
     deps.verify_slash_proof =
         [this](const std::vector<uint8_t> &payload) -> bool
     {
-      State::StateAccess state(*state_db_, /*version=*/0);
+      auto state = makeStateAccess(/*version=*/0);
       std::vector<Id> empty;
-      auto result = Core::verifyEquivocationProof(payload, empty, state);
+      auto result = Core::verifyEquivocationProof(payload, empty, *state);
       return result.has_value();
     };
 
@@ -881,8 +872,8 @@ namespace Node
 
   std::vector<Id> Node::getActiveSet() const
   {
-    State::StateAccess state(*state_db_, /*version=*/0);
-    return loadActiveSetFromState(state);
+    auto state = makeStateAccess(/*version=*/0);
+    return loadActiveSetFromState(*state);
   }
 
   std::vector<Id> Node::loadActiveSetFromState(
@@ -919,9 +910,9 @@ namespace Node
 
     Id vid = active[idx];
 
-    State::StateAccess state(*state_db_, /*version=*/0);
+    auto state = makeStateAccess(/*version=*/0);
     Core::ValidatorInfo v;
-    if (!state.getValidator(vid, v))
+    if (!state->getValidator(vid, v))
       return std::nullopt;
 
     return v.effectiveConsensusKey();
@@ -974,7 +965,7 @@ namespace Node
     uint64_t version = chain_->height();
     uint64_t chain_id = config_.chain_id;
 
-    auto state = std::make_unique<State::StateAccess>(*state_db_, version);
+    auto state = makeStateAccess(version);
     return std::make_unique<Core::StateViewFromAccess>(
         std::move(state), version, chain_id);
   }
@@ -1339,6 +1330,7 @@ namespace Node
       }
 
       State::StateAccess state(*state_db_, txn, block.header.height);
+      state.setHistoryWindow(config_.smt_history_blocks);
 
       Core::BlockContext ctx;
       ctx.chain_id = config_.chain_id;
@@ -1363,14 +1355,6 @@ namespace Node
       head.height = block.header.height;
       chain_db_->setHeadTxn(txn, head);
 
-      //  Persist the receipts. Written inside the same MDBX txn as
-      //  the block and head, so a crash cannot leave a committed
-      //  block whose receipts are missing. This is the write side
-      //  of ChainDB::getReceipt, which the RPC reads.
-      //
-      //  result.receipts is populated by BlockProcessor::applyBlock
-      //  in the same order as block.transactions, so the index i
-      //  here matches the tx_index we write into the receipt row.
       for (size_t i = 0; i < result.receipts.size(); ++i)
       {
         const Core::Transaction &tx = block.transactions[i];
@@ -1381,6 +1365,46 @@ namespace Node
                                    block.header.height,
                                    static_cast<uint32_t>(i),
                                    r.serializeState());
+      }
+
+      //  CHANGED: prune runs inside the commit transaction, every
+      //  block. Previously it ran outside the transaction and was
+      //  throttled to once every 100 blocks. The old design had
+      //  two problems:
+      //
+      //    1. A crash between block commit and prune would leave
+      //       the retention window larger than configured, which
+      //       made the storage bound loose rather than tight.
+      //    2. With the small windows we now use (64/512/2048), a
+      //       once-per-100-blocks throttle means a regtest can run
+      //       its whole window between prunes, which is the bug
+      //       that produced the 800 MB DBs.
+      //
+      //  The prune is now atomic with the block commit: either the
+      //  block and its prune both land, or neither does. On failure
+      //  the whole commit is aborted, which surfaces a storage
+      //  problem loudly rather than letting the historical tables
+      //  grow unbounded behind a silent warning.
+      //
+      //  The keepFrom is computed so that after this block commits,
+      //  the oldest version in the historical tables is exactly
+      //  (block.header.height - config_.smt_history_blocks). The
+      //  version just committed (block.header.height) is retained
+      //  because it is at the top of the window.
+      if (config_.smt_history_blocks > 0 &&
+          block.header.height > config_.smt_history_blocks)
+      {
+        const uint64_t keep_from =
+            block.header.height - config_.smt_history_blocks;
+
+        //  last_prune_height_ guards against re-pruning when the
+        //  same height is applied twice (which shouldn't happen on
+        //  a healthy chain, but a defensive check costs nothing).
+        if (block.header.height != last_prune_height_)
+        {
+          state_db_->pruneHistoryBeforeTxn(txn, keep_from);
+          last_prune_height_ = block.header.height;
+        }
       }
 
       txn.commit();
@@ -1403,12 +1427,12 @@ namespace Node
     }
 
     {
-      State::StateAccess state(*state_db_, block.header.height);
+      auto state = makeStateAccess(block.header.height);
 
       const uint64_t window = config_.fee_window_blocks;
       const uint64_t tip = block.header.height;
 
-      uint64_t sum = state.getMetaU64("fees_in_window");
+      uint64_t sum = state->getMetaU64("fees_in_window");
 
       if (tip >= window)
       {
@@ -1423,26 +1447,13 @@ namespace Node
 
       sum += block.header.total_fees;
 
-      state.putMetaU64("fees_in_window", sum);
+      state->putMetaU64("fees_in_window", sum);
     }
 
-    if (config_.smt_history_blocks > 0 &&
-        block.header.height >= config_.smt_history_blocks &&
-        block.header.height - last_prune_height_ >= 100)
-    {
-      const uint64_t keep_from =
-          block.header.height - config_.smt_history_blocks;
-      try
-      {
-        state_db_->pruneHistoryBefore(keep_from);
-        last_prune_height_ = block.header.height;
-      }
-      catch (const std::exception &e)
-      {
-        (*log_)(Logging::WARNING)
-            << "SMT history prune failed: " << e.what();
-      }
-    }
+    //  CHANGED: removed the old prune-outside-txn block. It lived
+    //  here, before the flush, and ran at most once per 100 blocks.
+    //  The prune now happens inside applyCommittedBlock's commit
+    //  transaction above.
 
     state_db_->flush();
     return true;
@@ -1477,8 +1488,8 @@ namespace Node
   {
     if (!state_db_)
       return Crypto::Hash{};
-    State::StateAccess state(*state_db_, /*version=*/0);
-    return state.stateRoot();
+    auto state = makeStateAccess(/*version=*/0);
+    return state->stateRoot();
   }
 
   std::vector<P2P::P2PManager::PeerInfo> Node::p2pPeerList() const
@@ -1712,8 +1723,7 @@ namespace Node
 
     resp.version = resolved_version;
 
-    auto state = std::make_unique<State::StateAccess>(
-        *state_db_, resolved_version);
+    auto state = makeStateAccess(resolved_version);
 
     auto root = state->smtRootAtVersion(resolved_version);
     if (!root.has_value())
@@ -1728,19 +1738,29 @@ namespace Node
 
     resp.state_root = *root;
 
-    auto proof = state->proveAtVersion(*key, resolved_version);
-    if (!proof.has_value())
-    {
-      resp.status = P2P::ProofMessage::Status::KeyNotFound;
-      P2P::Message reply;
-      reply.type = P2P::MessageType::Proof;
-      reply.payload = P2P::serializeProof(resp);
-      p2p_->sendTo(from, reply);
-      return;
-    }
+    //  CHANGED: StateAccess::proveAtVersion now returns a typed
+    //  ProofResult instead of an optional<SmtProof>. The status
+    //  distinguishes Ok from VersionUnavailable (window miss) and
+    //  KeyNotFound (the version has a root, but the walk could not
+    //  produce a proof for the key — pruned or inconsistent DB).
+    auto result = state->proveAtVersion(*key, resolved_version);
 
-    resp.status = P2P::ProofMessage::Status::Ok;
-    resp.proof = std::move(*proof);
+    switch (result.status)
+    {
+    case State::ProofResultStatus::Ok:
+      resp.status = P2P::ProofMessage::Status::Ok;
+      resp.proof = std::move(*result.proof);
+      break;
+    case State::ProofResultStatus::VersionUnavailable:
+      resp.status = P2P::ProofMessage::Status::VersionUnavailable;
+      break;
+    case State::ProofResultStatus::KeyNotFound:
+      resp.status = P2P::ProofMessage::Status::KeyNotFound;
+      break;
+    case State::ProofResultStatus::InternalError:
+      resp.status = P2P::ProofMessage::Status::Malformed;
+      break;
+    }
 
     P2P::Message reply;
     reply.type = P2P::MessageType::Proof;
@@ -1751,6 +1771,7 @@ namespace Node
         << "Served proof for peer " << from
         << " key_type=" << static_cast<int>(req.key_type)
         << " version=" << resolved_version
+        << " status=" << static_cast<int>(resp.status)
         << " proof_bytes=" << reply.payload.size();
   }
 

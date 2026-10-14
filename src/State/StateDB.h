@@ -28,6 +28,51 @@ namespace State
         : std::runtime_error("StateDB: " + what) {}
   };
 
+  //  =========================================================================
+  //  StateDB
+  //
+  //  An MDBX-backed key-value store with 39 tables. The tables fall into
+  //  four groups:
+  //
+  //    - Live SMT: TBL_SMT_NODES, TBL_SMT_LEAVES. Written by every tree
+  //      update. Content-addressed, so a re-write of the same node
+  //      upserts the same row.
+  //
+  //    - Historical SMT: TBL_SMT_NODES_HIST, TBL_SMT_LEAVES_HIST, and
+  //      the two by-version prune indexes. Written by every tree update
+  //      at version != 0. Pruned by StateAccess on block commit.
+  //
+  //    - Entity tables: accounts, tokens, balances, validators, orders,
+  //      pools, positions, NFTs, receipts, blocks, transactions,
+  //      mempool, consensus WAL, meta. Some are mirrors of state
+  //      that also lives in the SMT (accounts, orders, etc.); others
+  //      are the only copy (blocks, tx index, mempool, meta).
+  //
+  //    - Index tables: the "by owner", "by token", "by pair", "by
+  //      producer", "by type" indexes that the RPC and metrics
+  //      layers read. None of these participate in the state root;
+  //      they are node-local and can be rebuilt from the entity
+  //      tables.
+  //
+  //  Transactions
+  //  ------------
+  //
+  //  MDBX permits one write txn at a time and at most one read txn per
+  //  thread. StateDB exposes:
+  //
+  //    - Txn: an owning write-txn wrapper. Move-only.
+  //    - ReadTxn: an owning-or-non-owning read-txn wrapper.
+  //
+  //  beginWrite() returns an owning Txn. beginRead() returns a ReadTxn
+  //  that owns its txn if none was open on the current thread, or
+  //  wraps the existing per-thread txn if one was. The wrapper tracks
+  //  which case it is in and does the right thing in its destructor.
+  //
+  //  A write attempted while a read txn is open on the same thread
+  //  throws. The discipline is: destroy the ReadTxn (or the
+  //  StateAccess that owns it) before writing.
+  //  =========================================================================
+
   class StateDB
   {
   public:
@@ -71,58 +116,22 @@ namespace State
       //  Orders indexed by the AMM pool their conditions reference.
       //  Key = pool_id (4 LE) || order_id (8 LE). Value = sentinel.
       //  Written when an order is created, removed on cancel or
-      //  condition-triggered cancellation. Used by the condition
-      //  evaluator to enumerate orders per pool without scanning the
-      //  full order table.
+      //  condition-triggered cancellation.
       TBL_INDEX_ORDERS_BY_POOL = 32,
 
-      //  Order book: resting orders keyed by
-      //    pair_key(32) || side(1) || ~price(8 BE) || sequence(8 BE)
-      //  and valued with a sentinel byte. The pair_key is
-      //  Blake2b(min(sell,buy)(4 LE) || max(sell,buy)(4 LE)) so a
-      //  buy-A-for-B order and a sell-B-for-A order share a book.
-      //  The side byte is 0 if the order sells the pair's min
-      //  token, 1 otherwise. The ~price byte order makes ascending
-      //  MDBX iteration yield best-price-first on both sides; the
-      //  sequence byte is the price-time tiebreaker. See
-      //  Core/OrderBook.h for the full key derivation.
+      //  Order book placement index. Key shape:
       //
-      //  This table is a *placement* index, not a state mirror.
-      //  It is written by MatchingEngine when an order first rests
-      //  and deleted when the order leaves the book. It is NOT
-      //  rewritten on every partial fill: a fill changes the
-      //  order's filled_amount, not its price or its sequence, so
-      //  the book row is stable across the order's resting life.
-      //  See StateAccess::addToOrderBook / removeFromOrderBook.
+      //    pair_key(32) || side(1) || ~canonical_price(8 BE)
+      //                 || sequence(8 BE)
+      //
+      //  Value = order_id (8 LE). Written by StateAccess::addToOrderBook
+      //  and removed by removeFromOrderBook. A partial fill does not
+      //  move the row: the price and sequence are unchanged.
       TBL_INDEX_ORDER_BOOK = 33,
 
-      //  Fill history. One row per fill produced by a taker
-      //  crossing a resting maker. Written by the matching engine
-      //  at fill time. Two key shapes share the table, distinguished
-      //  by a leading tag byte:
-      //
-      //    tag 0x01  pair view
-      //      key = 0x01 || pair_key(32) || height(8 BE) ||
-      //            tx_index(4 BE) || fill_index(2 BE)
-      //      value = Fill::serializeState() (55 bytes)
-      //
-      //    tag 0x02  order view
-      //      key = 0x02 || order_id(8 BE) || height(8 BE) ||
-      //            tx_index(4 BE) || fill_index(2 BE)
-      //      value = Fill::serializeState() (55 bytes)
-      //
-      //  The order-view rows are written twice per fill: once with
-      //  the maker's id and once with the taker's. That is what
-      //  makes getOrderFills(order_id) a single prefix scan.
-      //
-      //  The pair view is ordered by height ascending, so a
-      //  reverse-prefix scan yields the newest trades first. The
-      //  order view is the same shape with a different prefix.
-      //
-      //  Nothing removes rows from this table today. History is
-      //  cheap (55 bytes + a 47/23-byte key per fill) and the table
-      //  grows with fills, not with block count. A retention policy
-      //  can be added later without a schema change.
+      //  Fill history. One row per fill, three rows per matched fill
+      //  (pair view, maker order view, taker order view). See
+      //  StateAccess::indexFill.
       TBL_FILL_HISTORY = 34,
 
       TBL_NFTS = 35,
@@ -133,12 +142,27 @@ namespace State
       TBL_COUNT = 39,
     };
 
+    //  Per-table diagnostic information. Reported by the metrics
+    //  endpoint and by the clrty_getChainStats RPC method.
+    //
+    //  bytes_estimate is derived from MDBX's page counts, not from a
+    //  scan of the values. It is an upper bound on the live data
+    //  (MDBX allocates pages in fixed-size chunks and keeps a
+    //  freelist, so an over-estimate is expected and normal). It is
+    //  accurate enough for capacity planning and for detecting a
+    //  runaway table.
+    struct TableStats
+    {
+      uint64_t entries = 0;
+      uint64_t bytes_estimate = 0;
+    };
+
     using EntryVisitor = std::function<bool(const std::vector<uint8_t> &key,
                                             const std::vector<uint8_t> &value)>;
 
-    // =================================================================
+    //  =====================================================================
     //  Write transaction
-    // =================================================================
+    //  =====================================================================
 
     class Txn
     {
@@ -189,7 +213,7 @@ namespace State
       bool open_{false};
     };
 
-    // =================================================================
+    //  =====================================================================
     //  Read transaction
     //
     //  A holder of an MDBX read txn. Any number of read txns can be
@@ -200,23 +224,12 @@ namespace State
     //  legacy rawGet / forEach* call reuses the outer txn rather
     //  than trying (and failing) to open a second overlapping one.
     //
-    //  MDBX also refuses to open a write txn on a thread that
-    //  already has a read txn open. The write paths therefore
-    //  refuse to run while a read txn is open on the same thread:
-    //  they call requireNoOpenReadTxn(), which throws a StateDBError
-    //  naming the write method. Callers that want to write must
-    //  destroy the owning ReadTxn first — usually by destroying the
-    //  StateAccess that holds it, or by calling
-    //  StateAccess::releaseReadTxnIfHeld().
-    //
-    //  Before the guard was added, the write paths called
-    //  releaseReadTxn(), which aborted the txn out from under its
-    //  owning ReadTxn object. When that object's destructor later
-    //  ran, it aborted the same freed handle, which glibc reported
-    //  as "double free or corruption (out)" and which MDBX would
-    //  have crashed on regardless. The guard turns a silent
-    //  use-after-free into a loud, addressable error.
-    // =================================================================
+    //  MDBX also refuses to open a write txn on a thread that already
+    //  has a read txn open. The write paths therefore refuse to run
+    //  while a read txn is open on the same thread: they call
+    //  requireNoOpenReadTxn(), which throws a StateDBError naming
+    //  the write method.
+    //  =====================================================================
 
     class ReadTxn
     {
@@ -262,9 +275,9 @@ namespace State
       MDBX_txn *prev_tls_{nullptr};
     };
 
-    // =================================================================
+    //  =====================================================================
     //  Lifecycle
-    // =================================================================
+    //  =====================================================================
 
     StateDB(const std::string &path, size_t mapSizeBytes);
     ~StateDB();
@@ -275,9 +288,9 @@ namespace State
     void flush();
     void close();
 
-    // =================================================================
+    //  =====================================================================
     //  Transactions
-    // =================================================================
+    //  =====================================================================
 
     Txn beginWrite();
 
@@ -292,25 +305,17 @@ namespace State
     void txnDel(Txn &txn, uint32_t tableId,
                 const void *key, size_t keyLen);
 
-    // =================================================================
+    //  =====================================================================
     //  Raw access (autocommit)
     //
-    //  Reads do NOT take write_mutex_. MDBX readers are MVCC and
-    //  concurrent-safe.
+    //  Reads do NOT take write_mutex_; MDBX readers are MVCC.
+    //  Writes take write_mutex_ and refuse to run while a read txn
+    //  is open on the current thread.
     //
-    //  Reads reuse the per-thread read txn if one is open; see
-    //  beginRead.
-    //
-    //  Writes DO take write_mutex_. MDBX allows only one write txn
-    //  at a time; a second concurrent mdbx_txn_begin(READWRITE)
-    //  returns MDBX_BUSY, which this code does not retry.
-    //
-    //  Before opening a write txn, every raw write method calls
-    //  requireNoOpenReadTxn(), which throws if a read txn is open
-    //  on the current thread. MDBX refuses to open a write txn
-    //  while a read txn is open on the same thread
-    //  (MDBX_TXN_OVERLAPPING), so this check is mandatory.
-    // =================================================================
+    //  Raw reads reuse the per-thread read txn if one is open; see
+    //  beginRead. This is what makes a nested read from inside a
+    //  forEach visitor safe.
+    //  =====================================================================
 
     void rawPut(uint32_t tableId,
                 const void *key, size_t keyLen,
@@ -325,10 +330,10 @@ namespace State
     bool rawHas(uint32_t tableId,
                 const void *key, size_t keyLen) const;
 
-    // =================================================================
+    //  =====================================================================
     //  Iteration (autocommit — opens its own read-only txn if none
     //  is open on this thread)
-    // =================================================================
+    //  =====================================================================
 
     void forEachEntry(uint32_t tableId, const EntryVisitor &visitor) const;
 
@@ -343,20 +348,19 @@ namespace State
                                        const std::vector<uint8_t> &prefix,
                                        const EntryVisitor &visitor) const;
 
-    // =================================================================
+    //  =====================================================================
     //  Read txn lifecycle
     //
-    //  beginRead returns a ReadTxn for the current thread. If a
-    //  read txn is already open, it returns a non-owning ReadTxn
-    //  wrapping the outer one, so the caller can hold it in a
-    //  unique_ptr alongside the outer's owner without any
-    //  coordination.
+    //  beginRead returns a ReadTxn for the current thread. If a read
+    //  txn is already open, it returns a non-owning ReadTxn wrapping
+    //  the outer one, so the caller can hold it in a unique_ptr
+    //  alongside the outer's owner without any coordination.
     //
     //  The owning ReadTxn's destructor is the only place the txn is
     //  aborted. Callers that want to write must destroy the owning
     //  ReadTxn first; the raw write paths enforce this with
     //  requireNoOpenReadTxn().
-    // =================================================================
+    //  =====================================================================
 
     ReadTxn beginRead();
 
@@ -365,24 +369,29 @@ namespace State
     //  aborted the thread-local read txn out from under its owning
     //  ReadTxn object. That behavior caused a use-after-free when
     //  the object was later destroyed.
-    //
-    //  Callers that previously called this method before a write
-    //  must now destroy their ReadTxn instead. StateAccess does
-    //  this correctly via releaseReadTxnIfHeld().
     void releaseReadTxn() noexcept;
 
-    // =================================================================
+    //  =====================================================================
     //  Meta helpers
-    // =================================================================
+    //  =====================================================================
 
     bool getMeta(const std::string &key, std::vector<uint8_t> &out) const;
     std::optional<std::vector<uint8_t>> getMeta(const std::string &key) const;
     void putMeta(const std::string &key, const std::vector<uint8_t> &value);
     void removeMeta(const std::string &key);
 
-    // =================================================================
+    //  =====================================================================
     //  SMT convenience API
-    // =================================================================
+    //
+    //  These methods are used by callers that write SMT rows outside
+    //  of a SparseMerkleTree instance (genesis, test fixtures, and
+    //  migration code). The tree itself writes through its own
+    //  txn-aware helpers in SparseMerkleTree.cpp, which build the
+    //  same key layouts directly against the bound txn.
+    //
+    //  The version argument on the "live" methods is ignored: live
+    //  rows are content-addressed and versionless.
+    //  =====================================================================
 
     void putNode(const Crypto::Hash &hash,
                  const std::vector<uint8_t> &children,
@@ -418,21 +427,35 @@ namespace State
                               uint64_t version,
                               std::vector<uint8_t> &out) const;
 
-    void pruneHistoryBefore(uint64_t keepFrom);
+    //  =====================================================================
+    //  Historical pruning
+    //
+    //  Both variants delete every historical row whose version is
+    //  strictly less than keepFrom, from all four historical tables.
+    //  The live tables and the current root are untouched.
+    //
+    //  pruneHistoryBefore opens its own write txn. Used by callers
+    //  that want to prune outside a block-commit context (e.g. at
+    //  startup with --prune-on-startup).
+    //
+    //  pruneHistoryBeforeTxn runs inside the caller's txn. Used by
+    //  the block processor to make pruning atomic with the commit.
+    //  =====================================================================
 
+    void pruneHistoryBefore(uint64_t keepFrom);
     void pruneHistoryBeforeTxn(Txn &txn, uint64_t keepFrom);
 
     //  Delete every row in TBL_CONSENSUS_WAL. Called from
     //  Node::initGenesis on a fresh DB, so that stale WAL entries
-    //  from a previous chain (whose votes reference blocks that no
-    //  longer exist) don't get replayed by the consensus engine.
+    //  from a previous chain don't get replayed.
     void wipeConsensusWal();
 
-    // =================================================================
+    //  =====================================================================
     //  Diagnostics
-    // =================================================================
+    //  =====================================================================
 
     size_t entryCount(uint32_t tableId) const;
+    TableStats tableStats(uint32_t tableId) const;
     size_t mapSize() const noexcept;
     MDBX_env *env() const noexcept;
 
@@ -440,6 +463,46 @@ namespace State
     {
       return tableHandle(tableId);
     }
+
+    //  =====================================================================
+    //  Historical key helpers
+    //
+    //  The historical SMT tables use a two-field key encoding:
+    //
+    //    TBL_SMT_*_HIST:     hash(32) || version_be64
+    //    TBL_SMT_*_BY_VER:   version_be64 || hash(32)
+    //
+    //  The same encoding is used by:
+    //
+    //    - SparseMerkleTree::putNodeImpl and putLeafDataImpl when
+    //      writing historical rows.
+    //    - SparseMerkleTree::getNodeAtVersionImpl and
+    //      getLeafDataAtVersionImpl when reading them.
+    //    - pruneHistoryBefore and pruneHistoryBeforeTxn when
+    //      deleting them.
+    //
+    //  Consolidating the encoding here means a future change to the
+    //  layout only needs to touch this header and the two callers
+    //  in SparseMerkleTree.cpp, not the prune path in this file.
+    //  =====================================================================
+
+    struct HistKey
+    {
+      uint8_t bytes[40];
+    };
+
+    static HistKey makeHistKey(const Crypto::Hash &hash,
+                               uint64_t version) noexcept;
+
+    static HistKey makeByVersionKey(uint64_t version,
+                                    const Crypto::Hash &hash) noexcept;
+
+    static uint64_t readVersionFromByVersionKey(const uint8_t *key) noexcept;
+
+    //  Per-thread handle to the outermost read txn on this thread,
+    //  if one is open. Set by beginRead when it opens a fresh txn,
+    //  cleared by the owning ReadTxn's destructor.
+    static thread_local MDBX_txn *tls_read_txn_;
 
   private:
     void openEnv(const std::string &path, size_t mapSizeBytes);
@@ -455,26 +518,14 @@ namespace State
     //  Throw if a read txn is open on the current thread. Called at
     //  the top of every raw write path so that a write attempted
     //  while a read txn is open fails loudly instead of aborting the
-    //  read txn out from under its owning ReadTxn object (which was
-    //  a use-after-free).
+    //  read txn out from under its owning ReadTxn object.
     static void requireNoOpenReadTxn(const char *where);
-
-    //  Per-thread handle to the outermost read txn on this thread,
-    //  if one is open. Set by beginRead when it opens a fresh txn,
-    //  cleared by the owning ReadTxn's destructor.
-    //
-    //  MDBX requires this: a read txn already in progress on a given
-    //  thread must be reused by any nested read, because
-    //  mdbx_txn_begin returns MDBX_BUSY for a second overlapping
-    //  read txn on the same thread, and MDBX_TXN_OVERLAPPING for a
-    //  write txn that would overlap an existing read txn.
-    static thread_local MDBX_txn *tls_read_txn_;
 
     MDBX_env *env_{nullptr};
     MDBX_dbi tables_[TBL_COUNT]{};
     size_t mapSizeBytes_{0};
 
-    // Guards writes only. Reads are lock-free (MVCC).
+    //  Guards writes only. Reads are lock-free (MVCC).
     mutable std::mutex write_mutex_;
     std::string path_;
   };

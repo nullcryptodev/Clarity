@@ -64,13 +64,21 @@ namespace Core
         return sell_amount;
       if (price == 0)
         return 0;
-      //  sell_amount * SCALE can overflow u64 only if sell_amount is
-      //  near u64::MAX / 10^10, which the order codec's bounds
-      //  exclude. Compute in u128 anyway for safety.
+
       const unsigned __int128 prod =
           static_cast<unsigned __int128>(sell_amount) *
           static_cast<unsigned __int128>(OrderBook::BOOK_PRICE_SCALE);
-      return static_cast<uint64_t>(prod / price);
+
+      const unsigned __int128 q = prod / price;
+
+      //  A quotient that does not fit in uint64_t means the order's
+      //  sell amount is unrepresentable in base units at this price.
+      //  Return 0 so the caller skips the maker rather than filling
+      //  against a truncated quantity.
+      if (q > static_cast<unsigned __int128>(UINT64_MAX))
+        return 0;
+
+      return static_cast<uint64_t>(q);
     }
 
     //  Convert a base-token amount into an order's sell-token units
@@ -87,10 +95,17 @@ namespace Core
     {
       if (order_sells_base)
         return base_amount;
+
       const unsigned __int128 prod =
           static_cast<unsigned __int128>(base_amount) *
           static_cast<unsigned __int128>(price);
-      return static_cast<uint64_t>(prod / OrderBook::BOOK_PRICE_SCALE);
+
+      const unsigned __int128 q = prod / OrderBook::BOOK_PRICE_SCALE;
+
+      if (q > static_cast<unsigned __int128>(UINT64_MAX))
+        return 0;
+
+      return static_cast<uint64_t>(q);
     }
 
     //  Credit `amount` of `token_id` to `owner`. Routes through

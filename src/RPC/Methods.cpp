@@ -1253,8 +1253,22 @@ namespace Rpc
               ? node.chain().height()
               : version;
 
+      //  CHANGED: set the retention window from the node's config.
+      //  Without this, the StateAccess's default window is
+      //  UINT64_MAX and a version outside the node's actual
+      //  retention would be attempted rather than rejected early.
+      //  The window check inside proveAtVersion is what distinguishes
+      //  "version is older than what we retain" from "the walk
+      //  failed for some other reason."
       State::StateAccess state(node.stateDB(), resolved_version);
+      state.setHistoryWindow(node.smtHistoryBlocks());
 
+      //  Fetch the root first. If the version is outside the window
+      //  or has no saved root, this is where we report it. The
+      //  distinction matters: VersionUnavailable should be a 4xx
+      //  error (the client asked for something the node can't
+      //  provide), while a walk failure below is a 5xx (the node
+      //  is supposed to be able to produce this proof).
       auto root = state.smtRootAtVersion(resolved_version);
       if (!root.has_value())
       {
@@ -1266,18 +1280,64 @@ namespace Rpc
                           {{"version", encodeU64Hex(resolved_version)}}));
       }
 
-      auto proof = state.proveAtVersion(*key, resolved_version);
-      if (!proof.has_value())
+      //  CHANGED: proveAtVersion now returns a typed ProofResult.
+      //  Switch on the status to distinguish a key-not-in-tree
+      //  result (Expected -- the client asked about a key that
+      //  doesn't exist at that version) from a version-unavailable
+      //  result (which shouldn't happen here since we just checked
+      //  the root above, but defend against a race) from an
+      //  internal error (a malformed node encountered on the walk,
+      //  which is a corruption indication).
+      State::ProofResult result =
+          state.proveAtVersion(*key, resolved_version);
+
+      switch (result.status)
       {
+      case State::ProofResultStatus::Ok:
+        //  Fall through to the response construction below.
+        break;
+
+      case State::ProofResultStatus::VersionUnavailable:
+        //  The root check above should have caught this, but a
+        //  concurrent prune between the two calls could in principle
+        //  have removed the version. Report the same error as the
+        //  root check.
+        throw RpcMethodError(
+            ErrorCode::ProofVersionUnavailable,
+            "no committed state root at version " +
+                encodeU64Hex(resolved_version),
+            makeErrorData(ErrorCode::ProofVersionUnavailable,
+                          {{"version", encodeU64Hex(resolved_version)}}));
+
+      case State::ProofResultStatus::KeyNotFound:
+        //  The version exists, but the key is not represented in
+        //  the tree at that version. This is not an error: it is
+        //  the correct answer for "prove that this key doesn't
+        //  exist at version N."
         throw RpcMethodError(
             ErrorCode::ProofNotAvailable,
-            "could not produce a proof for this key at this version",
+            "key is not present in the state at this version",
             makeErrorData(ErrorCode::ProofNotAvailable,
                           {{"version", encodeU64Hex(resolved_version)},
                            {"key_type", encodeU64Hex(*key_type_u64)}}));
+
+      case State::ProofResultStatus::InternalError:
+        //  A malformed node was encountered on the walk. This
+        //  should not happen on a healthy node; it indicates either
+        //  a DB bug or storage corruption. Report it as an internal
+        //  error rather than a client error, and make the message
+        //  distinct so an operator can tell the two apart in logs.
+        throw RpcMethodError(
+            ErrorCode::InternalError,
+            "internal error while generating proof: the state tree "
+            "encountered an unreadable node at this version",
+            makeErrorData(ErrorCode::InternalError,
+                          {{"version", encodeU64Hex(resolved_version)}}));
       }
 
-      const auto proof_bytes = proof->serialize();
+      //  At this point result.status is Ok and result.proof has a
+      //  value. Serialize and return.
+      const auto proof_bytes = result.proof->serialize();
 
       Common::Json out = Common::Json::object();
       out["status"] = "ok";

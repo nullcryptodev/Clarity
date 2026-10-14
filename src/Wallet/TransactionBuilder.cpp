@@ -9,6 +9,7 @@
 
 #include "Core/TransactionTypes.h"
 #include "Core/NftTypes.h"
+#include "Core/OrderBook.h"
 
 #include <cstring>
 
@@ -671,6 +672,336 @@ namespace Wallet
     return tx;
   }
 
+  //  ---- AMM: Create Pool ----
+
+  std::optional<Core::Transaction> buildCreatePool(
+      const Crypto::Address &from,
+      const CreatePoolParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.token_a == params.token_b)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "token_a and token_b must differ");
+      return std::nullopt;
+    }
+
+    if (params.amount_a == 0 || params.amount_b == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "both amounts must be non-zero");
+      return std::nullopt;
+    }
+
+    if (params.fee_bps > Core::AMM_MAX_FEE_BPS)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "fee_bps exceeds AMM_MAX_FEE_BPS");
+      return std::nullopt;
+    }
+
+    //  Enforce the pool-creation floor as a client-side check. The
+    //  executor enforces it too; this just gives the caller the
+    //  error before signing.
+    //
+    //  MIN_POOL_LIQUIDITY is denominated in atomic units of the
+    //  native CLRTY token. Applying it to a non-CLRTY side would
+    //  mean a token with low decimals — e.g. decimals = 0 with a
+    //  small max supply — could never be pooled, because the floor
+    //  would exceed its entire supply.
+    //
+    //  A token/token pool has no CLRTY reference and therefore no
+    //  meaningful "1000 CLRTY equivalent" floor. For those pools,
+    //  the only requirement is that both amounts are non-zero,
+    //  which is already checked above.
+    if (params.token_a == NATIVE_TOKEN_ID &&
+        params.amount_a < Core::MIN_POOL_LIQUIDITY)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "CLRTY side is below MIN_POOL_LIQUIDITY");
+      return std::nullopt;
+    }
+
+    if (params.token_b == NATIVE_TOKEN_ID &&
+        params.amount_b < Core::MIN_POOL_LIQUIDITY)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "CLRTY side is below MIN_POOL_LIQUIDITY");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::CreatePool, from, params.common);
+
+    //  One side in the fixed fields, the other in the payload.
+    tx.token_id = params.token_a;
+    tx.amount = params.amount_a;
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU32(p, params.token_b);
+    appendU64(p, params.amount_b);
+    appendU16(p, params.fee_bps);
+
+    return tx;
+  }
+
+  //  ---- AMM: Add Liquidity ----
+
+  std::optional<Core::Transaction> buildAddLiquidity(
+      const Crypto::Address &from,
+      const AddLiquidityParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.pool_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "pool_id is zero");
+      return std::nullopt;
+    }
+
+    if (params.amount_in == 0 || params.amount_other == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "both amounts must be non-zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::AddLiquidity, from, params.common);
+
+    tx.token_id = params.token_in;
+    tx.amount = params.amount_in;
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.pool_id);
+    appendU64(p, params.amount_other);
+
+    return tx;
+  }
+
+  //  ---- AMM: Swap ----
+
+  std::optional<Core::Transaction> buildSwap(
+      const Crypto::Address &from,
+      const SwapParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.pool_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "pool_id is zero");
+      return std::nullopt;
+    }
+
+    if (params.amount_in == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "amount_in is zero");
+      return std::nullopt;
+    }
+
+    if (params.to.isNull())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "swap recipient is null");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::Swap, from, params.common);
+
+    tx.token_id = params.token_in;
+    tx.amount = params.amount_in;
+    tx.to = params.to;
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.pool_id);
+    appendU64(p, params.min_amount_out);
+
+    return tx;
+  }
+
+  //  ---- Order Book: Create Order ----
+
+  std::optional<Core::Transaction> buildCreateOrder(
+      const Crypto::Address &from,
+      const CreateOrderParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.sell_token == params.buy_token)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "sell_token and buy_token must differ");
+      return std::nullopt;
+    }
+
+    if (params.sell_amount == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "sell_amount is zero");
+      return std::nullopt;
+    }
+
+    if (params.min_buy_amount == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "min_buy_amount is zero");
+      return std::nullopt;
+    }
+
+    if (params.mode != Core::OrderExecutionMode::Passive &&
+        params.mode != Core::OrderExecutionMode::Active)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "unknown order mode");
+      return std::nullopt;
+    }
+
+    if (params.mode == Core::OrderExecutionMode::Active)
+    {
+      if (params.pool_id == 0)
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::InvalidParameter,
+              "Active order requires a non-zero pool_id");
+        return std::nullopt;
+      }
+    }
+    else
+    {
+      if (params.pool_id != 0)
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::InvalidParameter,
+              "Passive order must have pool_id == 0");
+        return std::nullopt;
+      }
+    }
+
+    if (params.conditions.size() > Core::ORDER_MAX_CONDITIONS)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "too many conditions");
+      return std::nullopt;
+    }
+
+    for (const auto &c : params.conditions)
+    {
+      if (!c.isValid())
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::InvalidParameter,
+              "one or more conditions are invalid");
+        return std::nullopt;
+      }
+    }
+
+    //  Canonical-price sanity check for Passive orders. The
+    //  executor checks this too; a Passive order whose canonical
+    //  price would overflow cannot enter the book and would be a
+    //  lock with no exit.
+    if (params.mode == Core::OrderExecutionMode::Passive)
+    {
+      Core::Order probe;
+      probe.sell_token = params.sell_token;
+      probe.buy_token = params.buy_token;
+      probe.sell_amount = params.sell_amount;
+      probe.min_buy_amount = params.min_buy_amount;
+      uint64_t canonical_price = 0;
+      if (!Core::OrderBook::canonicalPrice(probe, canonical_price))
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::InvalidParameter,
+              "canonical price overflows; order cannot enter the book");
+        return std::nullopt;
+      }
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::CreateOrder, from, params.common);
+
+    tx.token_id = params.sell_token;
+    tx.amount = params.sell_amount;
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU32(p, params.buy_token);
+    appendU64(p, params.min_buy_amount);
+    appendU8(p, static_cast<uint8_t>(params.mode));
+    appendU32(p, static_cast<uint32_t>(params.pool_id));
+    appendU64(p, params.expires_at_height);
+    appendU8(p, static_cast<uint8_t>(params.conditions.size()));
+
+    for (const auto &c : params.conditions)
+      c.serializeState(p);
+
+    return tx;
+  }
+
+  //  ---- Order Book: Cancel Order ----
+
+  std::optional<Core::Transaction> buildCancelOrder(
+      const Crypto::Address &from,
+      const CancelOrderParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.order_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "order_id is zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::CancelOrder, from, params.common);
+
+    appendU64(tx.payload, params.order_id);
+
+    return tx;
+  }
+
   //  ---- Rotate Consensus Key ----
 
   std::optional<Core::Transaction> buildRotateConsensusKey(
@@ -969,6 +1300,37 @@ namespace Wallet
       return std::nullopt;
 
     appendU16(p, params.new_royalty_bps);
+
+    return tx;
+  }
+
+  //  ---- Remove Liquidity ----
+
+  std::optional<Core::Transaction> buildRemoveLiquidity(
+      const Crypto::Address &from,
+      const RemoveLiquidityParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.position_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "position_id is zero");
+      return std::nullopt;
+    }
+
+    //  amount may be zero (meaning "all"), so no positive check
+    //  here. The executor resolves zero to the full position.
+
+    Core::Transaction tx = makeBase(Core::TxType::RemoveLiquidity,
+                                    from, params.common);
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.position_id);
+    appendU64(p, params.amount);
 
     return tx;
   }

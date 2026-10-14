@@ -9,6 +9,7 @@
 #include "Tests/Utils.h"
 
 #include "State/ProofKeys.h"
+#include "State/Keys.h"
 #include "State/SmtProof.h"
 #include "State/SparseMerkleTree.h"
 

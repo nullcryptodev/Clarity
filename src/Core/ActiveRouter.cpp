@@ -118,12 +118,14 @@ namespace Core::ActiveRouter
     if (reserve_in == 0 || reserve_out == 0 || amount_in == 0)
       return 0;
 
-    const uint64_t amount_in_with_fee =
-        amount_in * (10'000 - fee_bps) / 10'000;
+    const unsigned __int128 amount_in_with_fee =
+        static_cast<unsigned __int128>(amount_in) *
+        (10'000 - fee_bps) / 10'000;
 
     const unsigned __int128 numerator =
         static_cast<unsigned __int128>(reserve_out) * amount_in_with_fee;
-    const uint64_t denominator = reserve_in + amount_in_with_fee;
+    const unsigned __int128 denominator =
+        static_cast<unsigned __int128>(reserve_in) + amount_in_with_fee;
 
     if (denominator == 0)
       return 0;
@@ -148,6 +150,11 @@ namespace Core::ActiveRouter
         static_cast<unsigned __int128>(out) *
         static_cast<unsigned __int128>(OrderBook::BOOK_PRICE_SCALE);
 
-    return static_cast<uint64_t>(price / amount_in);
+    const unsigned __int128 q = price / amount_in;
+
+    if (q > static_cast<unsigned __int128>(UINT64_MAX))
+      return 0;
+
+    return static_cast<uint64_t>(q);
   }
 } // namespace Core::ActiveRouter

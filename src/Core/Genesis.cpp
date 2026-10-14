@@ -28,11 +28,11 @@
 
 namespace
 {
-  // Parse a 64-character hex string into a Crypto::Hash. Throws if
-  // the input is malformed (wrong length, non-hex characters). The
-  // pinned genesis hash constants are compile-time-defined 64-char
-  // hex strings, so a throw here means the constants themselves are
-  // wrong, not that runtime data is bad.
+  //  Parse a 64-character hex string into a Crypto::Hash. Throws if
+  //  the input is malformed (wrong length, non-hex characters). The
+  //  pinned genesis hash constants are compile-time-defined 64-char
+  //  hex strings, so a throw here means the constants themselves are
+  //  wrong, not that runtime data is bad.
   Crypto::Hash hashFromHex(const char *hex)
   {
     Crypto::Hash h;
@@ -107,6 +107,15 @@ namespace
 
 namespace Core
 {
+  //  =========================================================================
+  //  Network configurations
+  //
+  //  Each returns a GenesisConfig describing the initial accounts,
+  //  validators, and globals for one network. The three are
+  //  structurally identical; only the chain id, the addresses, and
+  //  the fund amounts differ.
+  //  =========================================================================
+
   GenesisConfig mainnetGenesis()
   {
     GenesisConfig cfg;
@@ -159,7 +168,7 @@ namespace Core
   GenesisConfig testnetGenesis()
   {
     GenesisConfig cfg;
-    cfg.chain_id = GlobalConfig::TESTNET_CHAIN_ID; // 'CLTT'
+    cfg.chain_id = GlobalConfig::TESTNET_CHAIN_ID;
     cfg.timestamp_ms = GlobalConfig::GENESIS_TIMESTAMP_MS;
 
     constexpr Wallet::Network net = Wallet::Network::Testnet;
@@ -268,6 +277,13 @@ namespace Core
     //  global writes reset the accumulators before the accounts loop
     //  re-adds them. Without this ordering, a second run would double
     //  the accumulated values.
+    //
+    //  Every write below goes through the SMT. Under the compressed
+    //  radix tree, the root produced by applyGenesis is the genesis
+    //  state root that every node must agree on. The tree's shape
+    //  changed in the compressed-tree rewrite; the *set* of writes
+    //  did not. A node that runs applyGenesis under the same tree
+    //  implementation produces the same root.
 
     // ---- Global state ----
 
@@ -494,8 +510,16 @@ namespace Core
 
     try
     {
+      //  Use the regtest history window for the genesis computation,
+      //  regardless of the config's chain id. Genesis is written at
+      //  version 0, which the tree never writes to the historical
+      //  tables anyway, and the window only matters for reads at
+      //  versions >= 1. Setting it explicitly here makes the
+      //  computation independent of whatever default the calling
+      //  network would otherwise pick.
       State::StateDB db(temp_dir.string(), 64ULL * 1024 * 1024);
       State::StateAccess state(db, /*version=*/0);
+      state.setHistoryWindow(GlobalConfig::REGTEST_SMT_HISTORY_BLOCKS);
       applyGenesis(state, config);
       Crypto::Hash root = state.stateRoot();
       db.close();

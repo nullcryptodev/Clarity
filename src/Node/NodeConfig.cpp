@@ -32,13 +32,30 @@ namespace Node
     switch (n)
     {
     case Network::Mainnet:
-      return GlobalConfig::CHAIN_ID; // 'CLRT'
+      return GlobalConfig::CHAIN_ID;
     case Network::Testnet:
-      return GlobalConfig::TESTNET_CHAIN_ID; // 'CLTT'
+      return GlobalConfig::TESTNET_CHAIN_ID;
     case Network::Regtest:
-      return GlobalConfig::REGNET_CHAIN_ID; // 'CLRG'
+      return GlobalConfig::REGNET_CHAIN_ID;
     }
     return 0;
+  }
+
+  //  Resolve the SMT history window default from GlobalConfig, chosen
+  //  by network. See the comment on NodeConfig::smt_history_blocks for
+  //  the rationale on the specific values.
+  static uint64_t smtHistoryDefaultForNetwork(Network n) noexcept
+  {
+    switch (n)
+    {
+    case Network::Mainnet:
+      return GlobalConfig::MAINNET_SMT_HISTORY_BLOCKS;
+    case Network::Testnet:
+      return GlobalConfig::TESTNET_SMT_HISTORY_BLOCKS;
+    case Network::Regtest:
+      return GlobalConfig::REGTEST_SMT_HISTORY_BLOCKS;
+    }
+    return GlobalConfig::REGTEST_SMT_HISTORY_BLOCKS;
   }
 
   void validateConfig(NodeConfig &config)
@@ -52,6 +69,14 @@ namespace Node
     if (config.chain_id == 0)
     {
       config.chain_id = chainIdForNetwork(config.network);
+    }
+
+    // Resolve smt_history_blocks from the network default if the
+    // caller left it at 0. An explicit non-zero value is honored
+    // verbatim: it is how a node operator opts into a different window.
+    if (config.smt_history_blocks == 0)
+    {
+      config.smt_history_blocks = smtHistoryDefaultForNetwork(config.network);
     }
 
     // Sanity bounds.
@@ -82,10 +107,7 @@ namespace Node
             "consensus key is only meaningful on a validator");
       }
 
-      // Raw-hex key on the command line is a regtest-only convenience:
-      // the secret is visible in `ps`, shell history, and any process
-      // listing. Enforced here rather than in the arg parser so it is
-      // independent of flag ordering (see Args.cpp).
+      // Raw-hex key on the command line is a regtest-only convenience.
       if (!config.consensus_secret_key.isNull() &&
           config.network != Network::Regtest)
       {
@@ -95,11 +117,10 @@ namespace Node
             "testnet");
       }
 
-      // A validator must have a key, but "a key source was specified" is
-      // enough at this stage — loadSecrets() runs after validateConfig()
-      // and is what turns a path into a loaded key. Requiring the key to
-      // be non-null here would reject every file-based config, because
-      // the file hasn't been read yet.
+      // A validator must have a key, either inline or via file. The
+      // file hasn't been read yet at this stage — loadSecrets() does
+      // that after validateConfig — so "a source was specified" is
+      // the correct check.
       if (config.validator_id != 0 &&
           config.consensus_secret_key.isNull() &&
           config.consensus_key_file.empty())

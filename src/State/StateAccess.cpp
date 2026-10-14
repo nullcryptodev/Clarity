@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "StateAccess.h"
+#include "Keys.h"
 
 #include "Common/Wire.h"
 #include "Core/GlobalState.h"
@@ -17,16 +18,16 @@
 namespace State
 {
 
-  //  Little-endian list encoding helpers.
+  //  =========================================================================
+  //  Little-endian list encoding helpers
   //
   //  Order-expiry lists are stored as a 4-byte count followed by N
   //  8-byte LE IDs. This is specific to the order-expiry index and
-  //  isn't a general-purpose format, so it stays here rather than in
-  //  Common/Wire.h.
+  //  isn't a general-purpose format.
+  //  =========================================================================
 
   namespace
   {
-
     //  Compose the 49-byte book key.
     //
     //    [0..32)  pair_key
@@ -36,10 +37,7 @@ namespace State
     //
     //  The ~price byte order makes ascending MDBX iteration yield
     //  best-price-first. The sequence byte is big-endian so
-    //  lexicographic order equals numeric order, which makes the
-    //  tiebreaker deterministic and gives later orders higher keys
-    //  (they lose to earlier orders at the same price, which is the
-    //  FIFO behavior a price-time book is supposed to have).
+    //  lexicographic order equals numeric order.
     void encodeBookKey(const Crypto::Hash &pair_key,
                        uint8_t side,
                        uint64_t canonical_price,
@@ -49,10 +47,6 @@ namespace State
       std::memcpy(out, pair_key.data.data(), 32);
       out[32] = side;
 
-      //  Sellers (side 0) want the lowest price first: store price
-      //  directly so ascending key order puts the best ask first.
-      //  Buyers (side 1) want the highest price first: store ~price
-      //  so ascending key order puts the best bid first.
       const uint64_t key_price = (side == 0) ? canonical_price
                                              : ~canonical_price;
       for (int i = 0; i < 8; ++i)
@@ -62,9 +56,6 @@ namespace State
         out[41 + i] = uint8_t(sequence >> ((7 - i) * 8));
     }
 
-    //  Decode the ~price and sequence back out of a book key.
-    //  Used by forEachBookLevel to hand the caller the un-inverted
-    //  price and the numeric sequence.
     void decodeBookKey(const uint8_t *key,
                        uint64_t &canonical_price_out,
                        uint64_t &sequence_out)
@@ -146,10 +137,6 @@ namespace State
     //      [4]  tx_index BE
     //      [2]  fill_index BE
     //      total 23 bytes
-    //
-    //  All multi-byte fields are big-endian so lexicographic order
-    //  equals numeric order, which is what makes reverse-prefix
-    //  scans yield newest-first without a comparator.
 
     void encodePairFillKey(const Crypto::Hash &pair_key,
                            uint64_t height,
@@ -183,10 +170,11 @@ namespace State
       out[21] = uint8_t(fill_index >> 8);
       out[22] = uint8_t(fill_index);
     }
-
   } // anonymous namespace
 
+  //  =========================================================================
   //  Construction
+  //  =========================================================================
 
   StateAccess::StateAccess(StateDB &db, uint64_t version)
       : db_(db), txn_(nullptr), version_(version), smt_(db)
@@ -194,12 +182,10 @@ namespace State
     //  Autocommit mode. Hold one read txn for the lifetime of this
     //  StateAccess and bind it into the SMT. Reads below route
     //  through it, so a 256-level SMT walk is one reader slot, not
-    //  256. This is what keeps maxreaders=126 from being exhausted
-    //  under load.
+    //  256.
     //
     //  Writes below must release this read txn before opening their
-    //  own write txn, because MDBX refuses to overlap them on the
-    //  same thread. See the releaseReadTxnIfHeld() helper.
+    //  own write txn. See releaseReadTxnIfHeld().
     read_txn_ = std::make_unique<StateDB::ReadTxn>(db.beginRead());
     smt_.setReadTxn(read_txn_.get());
     smt_.load();
@@ -216,7 +202,7 @@ namespace State
     smt_.load();
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Read dispatch helpers
   //
   //  Three-layer fallback for reads:
@@ -228,9 +214,8 @@ namespace State
   //                                        this thread
   //
   //  Layer 1 wins when present, because a write txn that has just
-  //  written a value must see that value on the next read, and a
-  //  fresh read txn would not.
-  // ===========================================================================
+  //  written a value must see that value on the next read.
+  //  =========================================================================
 
   bool StateAccess::readRow(uint32_t table_id,
                             const void *key, size_t key_len,
@@ -321,50 +306,22 @@ namespace State
     return db_.entryCount(table_id);
   }
 
-  // ===========================================================================
-  //  Write-side read txn release
-  //
-  //  MDBX refuses to open a write txn on a thread that already has
-  //  a read txn open (MDBX_TXN_OVERLAPPING). Before any write, we
-  //  must release the read txn we're holding. After the write
-  //  finishes, the next read will transparently open a fresh one.
-  //
-  //  This helper is called at the top of every write method. It's a
-  //  no-op when the StateAccess is bound to a write txn (txn_ !=
-  //  nullptr), because in that case we never opened a read txn in
-  //  the first place.
-  // ===========================================================================
+  //  =========================================================================
+  //  Read txn release
+  //  =========================================================================
 
   void StateAccess::releaseReadTxnIfHeld()
   {
     if (read_txn_)
     {
-      //  Unbind from the SMT first, so the SMT doesn't hold a
-      //  dangling pointer while we destroy the ReadTxn.
       smt_.setReadTxn(nullptr);
-
-      //  If our ReadTxn is the owner, its destructor will clear
-      //  tls_read_txn_. If it is a non-owning wrapper around some
-      //  outer read txn on this thread, the destructor is a no-op
-      //  and tls_read_txn_ would stay set — which would still trip
-      //  requireNoOpenReadTxn() on the next write.
-      //
-      //  In the RPC path, StateAccess is always the owner (the
-      //  worker thread starts with tls_read_txn_ == nullptr), so
-      //  the destructor clears it. The non-owner case only happens
-      //  if a StateAccess is constructed on a thread that already
-      //  has a read txn open, which the current code does not do.
-      //  We rely on that invariant rather than papering over it,
-      //  because clearing tls_read_txn_ when we are not the owner
-      //  would leave the true owner's ReadTxn destructor restoring
-      //  a stale prev_tls_ later.
       read_txn_.reset();
     }
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Low-level index primitives
-  // ===========================================================================
+  //  =========================================================================
 
   void StateAccess::putSentinel(uint32_t table_id,
                                 const void *key, size_t key_len)
@@ -425,9 +382,9 @@ namespace State
     db_.rawDel(table_id, key, key_len);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Index writers — one per entity type
-  // ===========================================================================
+  //  =========================================================================
 
   void StateAccess::indexAccountRow(const Crypto::Address &address)
   {
@@ -467,12 +424,6 @@ namespace State
                                          Id token_id,
                                          uint64_t balance)
   {
-    // Two directions:
-    //   TBL_TOKEN_BALANCES          key = address(32) || token_id(4 LE)
-    //   TBL_INDEX_BALANCES_BY_TOKEN key = token_id(4 LE) || address(32)
-    //
-    // Both hold the balance as an 8-byte LE value.
-
     uint8_t key_by_owner[36];
     std::memcpy(key_by_owner, address.data.data(), 32);
     Common::writeU32(key_by_owner + 32, static_cast<uint32_t>(token_id));
@@ -514,8 +465,6 @@ namespace State
     putBlobRow(StateDB::TBL_AMM_POOLS, key, sizeof(key),
                bytes.data(), bytes.size());
 
-    // Two index rows, one per token, so forEachPoolForToken works
-    // regardless of which side of the pair a token is on.
     uint8_t key_a[12];
     Common::writeU32(key_a, static_cast<uint32_t>(token_a));
     Common::writeU64(key_a + 4, pool_id);
@@ -557,9 +506,6 @@ namespace State
     putBlobRow(StateDB::TBL_AMM_POSITIONS, key, sizeof(key),
                bytes.data(), bytes.size());
 
-    // Owner index. Key = owner(32) || position_id(8 LE).
-    // Value = pool_id(8 LE), so callers can resolve the pool without
-    // a second lookup.
     uint8_t owner_key[40];
     std::memcpy(owner_key, owner.data.data(), 32);
     Common::writeU64(owner_key + 32, position_id);
@@ -595,14 +541,12 @@ namespace State
     putBlobRow(StateDB::TBL_ORDERS, key, sizeof(key),
                bytes.data(), bytes.size());
 
-    // Owner index.
     uint8_t owner_key[40];
     std::memcpy(owner_key, owner.data.data(), 32);
     Common::writeU64(owner_key + 32, order_id);
     putSentinel(StateDB::TBL_INDEX_ORDERS_BY_OWNER,
                 owner_key, sizeof(owner_key));
 
-    // Pair index. Key = sell(4 LE) || buy(4 LE) || order_id(8 LE).
     uint8_t pair_key[16];
     Common::writeU32(pair_key, static_cast<uint32_t>(sell_token));
     Common::writeU32(pair_key + 4, static_cast<uint32_t>(buy_token));
@@ -635,12 +579,6 @@ namespace State
 
   void StateAccess::indexOrderPoolRows(const Core::Order &order)
   {
-    //  Collect the distinct pool IDs referenced by the order's
-    //  conditions, then write one index row per pool.
-    //
-    //  An order can reference the same pool in multiple conditions
-    //  (e.g. PriceAbove + VolumeBelow on the same pool). The
-    //  `unordered_set` deduplicates so we write the row once.
     std::unordered_set<uint32_t> pools;
     for (uint8_t i = 0; i < order.condition_count; ++i)
     {
@@ -685,9 +623,9 @@ namespace State
     }
   }
 
-  // ===========================================================================
-  //  Transaction and block indexes (called by BlockProcessor)
-  // ===========================================================================
+  //  =========================================================================
+  //  Transaction and block indexes
+  //  =========================================================================
 
   void StateAccess::indexTransaction(
       const Crypto::Hash &txid,
@@ -697,7 +635,6 @@ namespace State
       const std::vector<Id> &token_ids,
       uint8_t tx_type)
   {
-    // By-address. One row per unique address.
     for (const auto &addr : addresses)
     {
       if (addr.isNull())
@@ -712,7 +649,6 @@ namespace State
                  txid.data.data(), txid.data.size());
     }
 
-    // By-token. One row per unique token.
     for (Id token_id : token_ids)
     {
       uint8_t key[16];
@@ -724,7 +660,6 @@ namespace State
                  txid.data.data(), txid.data.size());
     }
 
-    // By-type.
     uint8_t type_key[13];
     type_key[0] = tx_type;
     Common::writeU64BE(type_key + 1, block_height);
@@ -749,9 +684,9 @@ namespace State
                block_hash.data.data(), block_hash.data.size());
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Accounts
-  // ===========================================================================
+  //  =========================================================================
 
   Core::Account StateAccess::getAccount(const Crypto::Address &address) const
   {
@@ -792,8 +727,7 @@ namespace State
     const bool was_staker = (old.staked > 0);
     const bool is_staker = (copy.staked > 0);
 
-    // ---- Update staker_since_height based on the transition ----
-
+    //  ---- Update staker_since_height based on the transition ----
     if (is_staker && !was_staker)
     {
       copy.staker_since_height = version_;
@@ -811,23 +745,15 @@ namespace State
       copy.staker_since_height = 0;
     }
 
-    // ---- Release read txn before any writes ----
-    //
-    //  The SMT update below and the index writes further down both
-    //  need to open their own write txns. Releasing the read txn
-    //  here, once, means each of them can proceed without hitting
-    //  MDBX_TXN_OVERLAPPING. The next read call after this method
-    //  returns will transparently reacquire a fresh read txn.
+    //  ---- Release read txn before any writes ----
     releaseReadTxnIfHeld();
 
-    // ---- Write the account record ----
-
+    //  ---- Write the account record ----
     Crypto::Hash key = Keys::account(address);
     auto value = copy.serializeState();
     smt_.update(key, value, version_);
 
-    // ---- Write the index row ----
-
+    //  ---- Write the index row ----
     {
       auto bytes = copy.serializeState();
       putBlobRow(StateDB::TBL_ACCOUNTS,
@@ -835,18 +761,13 @@ namespace State
                  bytes.data(), bytes.size());
     }
 
-    // ---- Native balance by-token index ----
+    //  ---- Native balance by-token index ----
     //
     //  The native token (id 0) lives in Account.balance, not in the
     //  SMT as a tokenBalance entry. But getTokenHolders(0) and
     //  getTokensForAddress(0) both route through
-    //  TBL_INDEX_BALANCES_BY_TOKEN, so without this block the native
-    //  token has no holders in the by-token index even though every
-    //  account carries a CLRTY balance.
-    //
-    //  Only write when the balance actually changed. When the
-    //  balance reaches zero, delete the row so the index stays
-    //  sparse.
+    //  TBL_INDEX_BALANCES_BY_TOKEN, so without this block the
+    //  native token has no holders in the by-token index.
     if (copy.balance != old.balance)
     {
       if (copy.balance == 0)
@@ -855,7 +776,7 @@ namespace State
         indexTokenBalanceRow(address, NATIVE_TOKEN_ID, copy.balance);
     }
 
-    // Helper: read a uint64 from a global state entry via the SMT.
+    //  Helper lambdas for globals.
     auto readGlobalU64 = [this](const char *name) -> uint64_t
     {
       std::vector<uint8_t> bytes;
@@ -871,8 +792,7 @@ namespace State
       putGlobal(name, bytes);
     };
 
-    // ---- Maintain total_staked ----
-
+    //  ---- Maintain total_staked ----
     if (copy.staked != old.staked)
     {
       uint64_t total = readGlobalU64("total_staked");
@@ -885,8 +805,7 @@ namespace State
       writeGlobalU64("total_staked", total);
     }
 
-    // ---- Maintain the staker index and staker_count ----
-
+    //  ---- Maintain the staker index and staker_count ----
     if (is_staker && !was_staker)
     {
       indexStaker(address);
@@ -913,8 +832,6 @@ namespace State
     smt_.remove(key, version_);
 
     unindexAccountRow(address);
-
-    //  Drop the native-balance by-token row if one was written.
     unindexTokenBalanceRow(address, NATIVE_TOKEN_ID);
 
     if (!was_staker)
@@ -953,9 +870,6 @@ namespace State
   void StateAccess::forEachAccount(
       const std::function<void(const Crypto::Address &, const Core::Account &)> &fn) const
   {
-    //  Exhaustive walk: the visitor returns true unconditionally and
-    //  fn's return value (void) carries no signal. See the callback
-    //  convention comment in StateAccess.h.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -975,9 +889,9 @@ namespace State
     readForEach(StateDB::TBL_ACCOUNTS, visitor);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Token balances
-  // ===========================================================================
+  //  =========================================================================
 
   uint64_t StateAccess::getTokenBalance(const Crypto::Address &address, Id token_id) const
   {
@@ -1022,7 +936,6 @@ namespace State
       const Crypto::Address &owner,
       const std::function<void(Id token_id, uint64_t balance)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     std::vector<uint8_t> prefix(owner.data.begin(), owner.data.end());
 
     auto visitor = [&fn](const std::vector<uint8_t> &key,
@@ -1043,9 +956,6 @@ namespace State
       Id token_id,
       const std::function<bool(const Crypto::Address &, uint64_t balance)> &fn) const
   {
-    //  Early-exit walk: propagate the callback's return value so a
-    //  caller with its own bound (e.g. "stop once I have K holders")
-    //  can stop before the full set is materialized.
     uint8_t prefix_bytes[4];
     Common::writeU32(prefix_bytes, static_cast<uint32_t>(token_id));
     std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 4);
@@ -1064,9 +974,9 @@ namespace State
     readForEachWithPrefix(StateDB::TBL_INDEX_BALANCES_BY_TOKEN, prefix, visitor);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Token metadata
-  // ===========================================================================
+  //  =========================================================================
 
   bool StateAccess::getToken(Id token_id, Core::TokenInfo &out) const
   {
@@ -1091,7 +1001,6 @@ namespace State
   void StateAccess::forEachToken(
       const std::function<void(const Core::TokenInfo &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -1109,9 +1018,9 @@ namespace State
     readForEach(StateDB::TBL_TOKENS, visitor);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Token supply
-  // ===========================================================================
+  //  =========================================================================
 
   uint64_t StateAccess::getTokenSupply(Id token_id) const
   {
@@ -1140,9 +1049,9 @@ namespace State
     smt_.update(key, value, version_);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Validators
-  // ===========================================================================
+  //  =========================================================================
 
   bool StateAccess::getValidator(uint64_t validator_id, Core::ValidatorInfo &out) const
   {
@@ -1186,7 +1095,6 @@ namespace State
   void StateAccess::forEachValidator(
       const std::function<void(const Core::ValidatorInfo &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -1204,9 +1112,9 @@ namespace State
     readForEach(StateDB::TBL_VALIDATORS, visitor);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Validator by address
-  // ===========================================================================
+  //  =========================================================================
 
   bool StateAccess::getValidatorByAddress(const Crypto::Address &address,
                                           uint64_t &validator_id_out) const
@@ -1239,9 +1147,9 @@ namespace State
     smt_.remove(key, version_);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Validator consensus-key history
-  // ===========================================================================
+  //  =========================================================================
 
   bool StateAccess::getValidatorKeyHistory(
       uint64_t validator_id,
@@ -1281,16 +1189,12 @@ namespace State
     std::vector<Core::KeyRotation> history;
     if (!getValidatorKeyHistory(validator_id, history))
     {
-      //  No history. Fall back to the validator record's
-      //  effectiveConsensusKey — the same answer the pre-feature
-      //  code gave for a validator without a recorded history.
       Core::ValidatorInfo v;
       if (!getValidator(validator_id, v))
         return std::nullopt;
       return v.effectiveConsensusKey();
     }
 
-    //  Fast path: single entry covering the requested height.
     if (history.size() == 1 &&
         history[0].valid_until_height == 0 &&
         height >= history[0].valid_from_height)
@@ -1298,8 +1202,6 @@ namespace State
       return history[0].key;
     }
 
-    //  General case: find the entry whose half-open interval
-    //  contains the height. Linear scan; the history is small.
     for (const auto &entry : history)
     {
       if (height < entry.valid_from_height)
@@ -1313,9 +1215,9 @@ namespace State
     return std::nullopt;
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  NFTs
-  // ===========================================================================
+  //  =========================================================================
 
   bool StateAccess::getNft(uint64_t nft_id, Core::NftInfo &out) const
   {
@@ -1357,16 +1259,6 @@ namespace State
 
   void StateAccess::unindexNft(const Core::NftInfo &old)
   {
-    //  Remove the index rows that correspond to a specific *old*
-    //  state of an NFT record. Called by the transfer and burn
-    //  paths before they write a new version of the record, so the
-    //  previous owner's forEachNftForOwner and the previous
-    //  collection's forEachNftForCollection do not return a stale
-    //  entry.
-    //
-    //  Safe to call with a record that was never indexed (e.g. a
-    //  fresh mint whose index rows were just written): MDBX's
-    //  mdbx_del returns MDBX_NOTFOUND, which deleteRow ignores.
     releaseReadTxnIfHeld();
 
     if (!old.owner.isNull())
@@ -1405,7 +1297,7 @@ namespace State
     if (!have_nft)
       return;
 
-    //  Owner index.
+    if (!nft.owner.isNull())
     {
       uint8_t owner_key[40];
       std::memcpy(owner_key, nft.owner.data.data(), 32);
@@ -1414,7 +1306,6 @@ namespace State
                 owner_key, sizeof(owner_key));
     }
 
-    //  Collection index.
     if (nft.collection_id != 0)
     {
       uint8_t coll_key[16];
@@ -1465,7 +1356,6 @@ namespace State
   void StateAccess::forEachNft(
       const std::function<void(const Core::NftInfo &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -1487,7 +1377,6 @@ namespace State
       const Crypto::Address &owner,
       const std::function<void(const Core::NftInfo &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     std::vector<uint8_t> prefix(owner.data.begin(), owner.data.end());
 
     auto visitor = [this, &fn](const std::vector<uint8_t> &key,
@@ -1510,7 +1399,6 @@ namespace State
       uint64_t collection_id,
       const std::function<void(const Core::NftInfo &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     uint8_t prefix_bytes[8];
     Common::writeU64(prefix_bytes, collection_id);
     std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 8);
@@ -1534,7 +1422,6 @@ namespace State
   void StateAccess::forEachNftCollection(
       const std::function<void(const Core::NftCollection &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -1553,9 +1440,9 @@ namespace State
     readForEach(StateDB::TBL_NFT_COLLECTIONS, visitor);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Orders
-  // ===========================================================================
+  //  =========================================================================
 
   bool StateAccess::getOrder(Id order_id, Core::Order &out) const
   {
@@ -1600,7 +1487,6 @@ namespace State
   void StateAccess::forEachOrder(
       const std::function<void(const Core::Order &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -1622,7 +1508,6 @@ namespace State
       const Crypto::Address &owner,
       const std::function<void(const Core::Order &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     std::vector<uint8_t> prefix(owner.data.begin(), owner.data.end());
 
     auto visitor = [this, &fn](const std::vector<uint8_t> &key,
@@ -1644,7 +1529,6 @@ namespace State
       Id sell_token, Id buy_token,
       const std::function<void(const Core::Order &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     uint8_t prefix_bytes[8];
     Common::writeU32(prefix_bytes, static_cast<uint32_t>(sell_token));
     Common::writeU32(prefix_bytes + 4, static_cast<uint32_t>(buy_token));
@@ -1669,7 +1553,6 @@ namespace State
       Id pool_id,
       const std::function<void(const Core::Order &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     uint8_t prefix_bytes[4];
     Common::writeU32(prefix_bytes, static_cast<uint32_t>(pool_id));
     std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 4);
@@ -1690,9 +1573,9 @@ namespace State
                           prefix, visitor);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Order book
-  // ===========================================================================
+  //  =========================================================================
 
   void StateAccess::addToOrderBook(const Core::Order &order, uint64_t sequence)
   {
@@ -1712,14 +1595,9 @@ namespace State
     uint8_t key[49];
     encodeBookKey(pair_key, side, canonical_price, sequence, key);
 
-    //  Book row: order_id in the value.
     putU64Row(StateDB::TBL_INDEX_ORDER_BOOK,
               key, sizeof(key), static_cast<uint64_t>(order.id));
 
-    //  Companion sequence key in the SMT, so removeFromOrderBook can
-    //  recover the sequence without scanning. This is an SMT write,
-    //  not a table write, so it participates in the dry-run/apply
-    //  invariant.
     releaseReadTxnIfHeld();
 
     Crypto::Hash seq_key = Keys::orderSequence(order.id);
@@ -1733,43 +1611,10 @@ namespace State
     if (order.id == INVALID_ID)
       return;
 
-    //  We do not know the sequence that was used when the order
-    //  entered the book — sequence is not part of the Order record
-    //  (it is derivable from the book key, but not from the record).
-    //  To remove the row we must find it. The only stable prefix is
-    //  (pair_key || side); the price and sequence are unknown.
-    //
-    //  Two options:
-    //    (a) store the sequence on the Order record (adds 8 bytes to
-    //        the wire format and to every historical read)
-    //    (b) scan the (pair_key || side) prefix and match on price
-    //        and order_id — but the book row's value is a sentinel,
-    //        not the order_id, so we cannot match on order_id from
-    //        the row alone. We would have to read every candidate
-    //        order and compare ids. Expensive.
-    //
-    //  We take option (a) but keep it out of the wire format: the
-    //  sequence is derivable from the order's price, and a separate
-    //  in-memory map is not durable. The clean solution is to store
-    //  the sequence in the SMT alongside the order, in a companion
-    //  key. That companion key is written and removed together with
-    //  the order itself, and the matcher never has to scan.
-    //
-    //  Key:   Keys::orderSequence(order.id)
-    //  Value: 8-byte LE sequence
-    //
-    //  This is strictly a book concern; it is written by
-    //  addToOrderBook and removed by removeFromOrderBook. It is not
-    //  visible to RPC or to the state codec.
-    //
-    //  Implementation lives below; this method reads the companion
-    //  key to recover the sequence, then deletes both the book row
-    //  and the companion key.
-
     Crypto::Hash seq_key = Keys::orderSequence(order.id);
     auto seq_bytes = smt_.get(seq_key);
     if (!seq_bytes.has_value() || seq_bytes->size() != 8)
-      return; // no book row was ever written, or it was already removed
+      return;
 
     const uint64_t sequence = Common::readU64(seq_bytes->data());
 
@@ -1786,9 +1631,6 @@ namespace State
 
     deleteRow(StateDB::TBL_INDEX_ORDER_BOOK, key, sizeof(key));
 
-    //  Remove the companion key in the same call. releaseReadTxnIfHeld
-    //  is called by deleteRow; the subsequent SMT remove re-acquires
-    //  a read txn transparently if needed.
     releaseReadTxnIfHeld();
     smt_.remove(seq_key, version_);
   }
@@ -1799,8 +1641,6 @@ namespace State
                                uint64_t canonical_price,
                                uint64_t sequence)> &fn) const
   {
-    //  Early-exit walk: propagate the caller's return value so the
-    //  matcher can stop iteration at MAX_BOOK_LEVELS_PER_TAKER.
     const Crypto::Hash pair_key =
         Core::OrderBook::pairKey(sell_token, buy_token);
 
@@ -1857,8 +1697,6 @@ namespace State
         refund = 0;
     }
 
-    //  Credit the sell token back to the owner. The sell token is
-    //  the asset the order locked at creation.
     if (order.sell_token == NATIVE_TOKEN_ID)
     {
       Core::Account acct = getAccount(order.owner);
@@ -1871,26 +1709,17 @@ namespace State
       putTokenBalance(order.owner, order.sell_token, cur + refund);
     }
 
-    //  Remove from the expiry index. removeOrderExpiry is idempotent.
     if (order.order_expires_at_height != 0)
       removeOrderExpiry(order.order_expires_at_height, order.id);
 
-    //  Remove from the book. Only the matcher's self-trade path
-    //  calls refundOrder on a currently-resting order; the condition
-    //  evaluator's cancellations go through deleteOrder, which does
-    //  not touch the book because the evaluator's orders may or may
-    //  not be resting. To keep this helper safe from both callers,
-    //  we remove the book row unconditionally — removeFromOrderBook
-    //  is a no-op when no companion sequence key is present.
     removeFromOrderBook(order);
 
-    //  Finally, drop the order record and its state mirror indexes.
     deleteOrder(order.id);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Order expiry index
-  // ===========================================================================
+  //  =========================================================================
 
   std::vector<uint64_t> StateAccess::getOrdersExpiringAt(uint64_t height) const
   {
@@ -1958,16 +1787,11 @@ namespace State
     if (order.id == INVALID_ID)
       return;
 
-    //  Book row and companion sequence key. No-op if the order
-    //  never rested (no companion key present).
     removeFromOrderBook(order);
 
-    //  Expiry index. Zero means the order was created with
-    //  "never expires" and was never indexed; skip.
     if (order.order_expires_at_height != 0)
       removeOrderExpiry(order.order_expires_at_height, order.id);
 
-    //  SMT record + owner index + pair index + pool index.
     deleteOrder(order.id);
   }
 
@@ -1978,7 +1802,6 @@ namespace State
   {
     const auto bytes = fill.serializeState();
 
-    //  Pair view.
     const Crypto::Hash pair_key =
         Core::OrderBook::pairKey(fill.base_token, fill.quote_token);
 
@@ -1990,7 +1813,6 @@ namespace State
                pair_key_bytes, sizeof(pair_key_bytes),
                bytes.data(), bytes.size());
 
-    //  Order view — one row per side.
     uint8_t maker_key[23];
     encodeOrderFillKey(fill.maker_order_id, height, tx_index_in_block,
                        fill_index, maker_key);
@@ -2014,9 +1836,6 @@ namespace State
                                uint64_t,
                                uint32_t)> &fn) const
   {
-    //  Early-exit walk: propagate the callback's return value. The
-    //  max_results bound is a separate ceiling the iterator enforces
-    //  regardless of what the callback does.
     const Crypto::Hash pair_key = Core::OrderBook::pairKey(base_token, quote_token);
 
     uint8_t prefix_bytes[33];
@@ -2034,7 +1853,6 @@ namespace State
       if (emitted >= max_results)
         return false;
 
-      //  key[33..41) is height BE, key[41..45) is tx_index BE.
       const uint64_t height = Common::readU64BE(key.data() + 33);
       const uint32_t tx_index = Common::readU32BE(key.data() + 41);
 
@@ -2057,7 +1875,6 @@ namespace State
                                uint64_t,
                                uint32_t)> &fn) const
   {
-    //  Early-exit walk: propagate the callback's return value.
     uint8_t prefix_bytes[9];
     prefix_bytes[0] = 0x02;
     for (int i = 0; i < 8; ++i)
@@ -2096,21 +1913,6 @@ namespace State
       size_t depth,
       const std::function<void(uint64_t, uint64_t, size_t)> &fn) const
   {
-    //  forEachBookLevel hands us (order_id, price, sequence) one
-    //  order at a time, best-first. We aggregate consecutive
-    //  orders at the same price and invoke the callback once per
-    //  level. Depth 0 means "all"; a nonzero depth stops after
-    //  that many levels have been emitted.
-    //
-    //  We need each order's remaining base quantity, which means
-    //  a getOrder per row. This method is for RPC read paths,
-    //  not for the matcher's hot loop.
-    //
-    //  The caller's callback is void; this is a presentation helper
-    //  and the depth bound terminates the iteration. A caller that
-    //  wants to stop before depth is exhausted should use
-    //  forEachBookLevel directly.
-
     uint64_t current_price = 0;
     uint64_t current_total_base = 0;
     size_t current_count = 0;
@@ -2147,17 +1949,12 @@ namespace State
 
           Core::Order o;
           if (!getOrder(order_id, o))
-            return true; // stale index row; skip
+            return true;
 
-          //  Convert the order's remaining amount into base units.
-          //  If the order sells base, its remaining is already in
-          //  base. If it sells quote, convert at the execution
-          //  price (the order's canonical price).
           const bool sells_base = (o.sell_token < o.buy_token);
           uint64_t rem = o.remainingAmount();
           if (!sells_base)
           {
-            //  rem is quote. base = rem * SCALE / price.
             const unsigned __int128 prod =
                 static_cast<unsigned __int128>(rem) *
                 static_cast<unsigned __int128>(Core::OrderBook::BOOK_PRICE_SCALE);
@@ -2176,9 +1973,9 @@ namespace State
       flush();
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  AMM Pools
-  // ===========================================================================
+  //  =========================================================================
 
   bool StateAccess::getAmmPool(Id pool_id, Core::AmmPool &out) const
   {
@@ -2217,7 +2014,6 @@ namespace State
   void StateAccess::forEachAmmPool(
       const std::function<void(const Core::AmmPool &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -2239,7 +2035,6 @@ namespace State
       Id token_id,
       const std::function<void(const Core::AmmPool &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     uint8_t prefix_bytes[4];
     Common::writeU32(prefix_bytes, static_cast<uint32_t>(token_id));
     std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 4);
@@ -2259,9 +2054,9 @@ namespace State
     readForEachWithPrefix(StateDB::TBL_INDEX_POOLS_BY_TOKEN, prefix, visitor);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  AMM Positions
-  // ===========================================================================
+  //  =========================================================================
 
   bool StateAccess::getAmmPosition(Id pos_id, Core::AmmPosition &out) const
   {
@@ -2300,7 +2095,6 @@ namespace State
   void StateAccess::forEachAmmPosition(
       const std::function<void(const Core::AmmPosition &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &value) -> bool
     {
@@ -2322,7 +2116,6 @@ namespace State
       const Crypto::Address &owner,
       const std::function<void(const Core::AmmPosition &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     std::vector<uint8_t> prefix(owner.data.begin(), owner.data.end());
 
     auto visitor = [this, &fn](const std::vector<uint8_t> &key,
@@ -2340,9 +2133,9 @@ namespace State
     readForEachWithPrefix(StateDB::TBL_INDEX_POSITIONS_BY_OWNER, prefix, visitor);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  LP position index
-  // ===========================================================================
+  //  =========================================================================
 
   bool StateAccess::getPositionIndex(const Crypto::Address &owner,
                                      uint64_t pool_id,
@@ -2378,9 +2171,9 @@ namespace State
     smt_.remove(key, version_);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Receipts
-  // ===========================================================================
+  //  =========================================================================
 
   bool StateAccess::getReceipt(const Crypto::Hash &tx_hash, Core::Receipt &out) const
   {
@@ -2400,9 +2193,9 @@ namespace State
     smt_.update(key, value, version_);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Global state
-  // ===========================================================================
+  //  =========================================================================
 
   bool StateAccess::getGlobal(const std::string &name, std::vector<uint8_t> &out) const
   {
@@ -2453,9 +2246,9 @@ namespace State
     putMetaImpl(key, bytes);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Raw SMT access
-  // ===========================================================================
+  //  =========================================================================
 
   std::optional<std::vector<uint8_t>> StateAccess::getRaw(const Crypto::Hash &smt_key) const
   {
@@ -2477,16 +2270,14 @@ namespace State
     smt_.remove(smt_key, version_);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Commit
-  // ===========================================================================
+  //  =========================================================================
 
   void StateAccess::commit(uint64_t version)
   {
     version_ = version;
 
-    //  smt_.save writes to meta, which is a write. Release the read
-    //  txn so it can open its own write txn.
     releaseReadTxnIfHeld();
 
     smt_.save(version);
@@ -2495,9 +2286,9 @@ namespace State
       db_.flush();
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Indexes
-  // ===========================================================================
+  //  =========================================================================
 
   void StateAccess::indexStaker(const Crypto::Address &address)
   {
@@ -2514,7 +2305,6 @@ namespace State
   void StateAccess::forEachStaker(
       const std::function<void(const Crypto::Address &)> &fn) const
   {
-    //  Exhaustive walk; the callback's return value is ignored.
     auto visitor = [&fn](const std::vector<uint8_t> &key,
                          const std::vector<uint8_t> &) -> bool
     {
@@ -2529,9 +2319,9 @@ namespace State
     readForEach(StateDB::TBL_INDEX_STAKERS, visitor);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Transaction history queries
-  // ===========================================================================
+  //  =========================================================================
 
   void StateAccess::forEachRecentTxForAddress(
       const Crypto::Address &address,
@@ -2540,7 +2330,6 @@ namespace State
                                uint64_t block_height,
                                uint32_t tx_index)> &fn) const
   {
-    //  Early-exit walk: propagate the callback's return value.
     std::vector<uint8_t> prefix(address.data.begin(), address.data.end());
 
     size_t emitted = 0;
@@ -2574,7 +2363,6 @@ namespace State
                                uint64_t block_height,
                                uint32_t tx_index)> &fn) const
   {
-    //  Early-exit walk: propagate the callback's return value.
     uint8_t prefix_bytes[4];
     Common::writeU32(prefix_bytes, static_cast<uint32_t>(token_id));
     std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 4);
@@ -2610,7 +2398,6 @@ namespace State
                                uint64_t block_height,
                                uint32_t tx_index)> &fn) const
   {
-    //  Early-exit walk: propagate the callback's return value.
     std::vector<uint8_t> prefix{tx_type};
 
     size_t emitted = 0;
@@ -2643,7 +2430,6 @@ namespace State
       const std::function<bool(uint64_t block_height,
                                const Crypto::Hash &block_hash)> &fn) const
   {
-    //  Early-exit walk: propagate the callback's return value.
     std::vector<uint8_t> prefix(proposer.data.begin(), proposer.data.end());
 
     size_t emitted = 0;
@@ -2669,9 +2455,9 @@ namespace State
         StateDB::TBL_INDEX_BLOCKS_BY_PRODUCER, prefix, visitor);
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Txn-aware helpers
-  // ===========================================================================
+  //  =========================================================================
 
   void StateAccess::putMetaImpl(const std::string &key,
                                 const std::vector<uint8_t> &value)
@@ -2695,18 +2481,55 @@ namespace State
                    key.data(), key.size(), out);
   }
 
-  std::optional<Crypto::Hash> StateAccess::smtRootAtVersion(uint64_t version) const
+  //  =========================================================================
+  //  Versioned reads
+  //  =========================================================================
+
+  bool StateAccess::versionIsAvailable(uint64_t version) const noexcept
   {
-    return smt_.rootAtVersion(version);
+    //  The window is unbounded by default (UINT64_MAX), which makes
+    //  every version "available" — the correct behavior before
+    //  setHistoryWindow is called, and for tests.
+    if (history_window_ == UINT64_MAX)
+      return true;
+
+    //  The current version is always available.
+    if (version >= version_)
+      return true;
+
+    //  Versions older than (current - window) have been pruned.
+    if (version_ > history_window_)
+    {
+      const uint64_t oldest = version_ - history_window_;
+      return version >= oldest;
+    }
+
+    //  The window extends back past genesis, so every version is
+    //  available.
+    return true;
   }
 
-  // ===========================================================================
-  //  Versioned reads
-  // ===========================================================================
+  uint64_t StateAccess::oldestAvailableVersion() const noexcept
+  {
+    if (history_window_ == UINT64_MAX)
+      return 0;
+    if (version_ <= history_window_)
+      return 0;
+    return version_ - history_window_;
+  }
+
+  std::optional<Crypto::Hash> StateAccess::smtRootAtVersion(uint64_t version) const
+  {
+    if (!versionIsAvailable(version))
+      return std::nullopt;
+    return smt_.rootAtVersion(version);
+  }
 
   std::optional<std::vector<uint8_t>> StateAccess::getRawAtVersion(
       const Crypto::Hash &smt_key, uint64_t version) const
   {
+    if (!versionIsAvailable(version))
+      return std::nullopt;
     return smt_.getAtVersion(smt_key, version);
   }
 
@@ -2714,6 +2537,9 @@ namespace State
       const Crypto::Address &address, uint64_t version) const
   {
     Core::Account result;
+
+    if (!versionIsAvailable(version))
+      return result;
 
     Crypto::Hash key = Keys::account(address);
     auto value = smt_.getAtVersion(key, version);
@@ -2728,6 +2554,9 @@ namespace State
                                           uint64_t version,
                                           Core::ValidatorInfo &out) const
   {
+    if (!versionIsAvailable(version))
+      return false;
+
     Crypto::Hash key = Keys::validator(validator_id);
     auto value = smt_.getAtVersion(key, version);
     if (!value.has_value())
@@ -2739,6 +2568,9 @@ namespace State
                                        uint64_t version,
                                        std::vector<uint8_t> &out) const
   {
+    if (!versionIsAvailable(version))
+      return false;
+
     Crypto::Hash key = Keys::global(name);
     auto value = smt_.getAtVersion(key, version);
     if (!value.has_value())
@@ -2747,23 +2579,48 @@ namespace State
     return true;
   }
 
-  std::optional<State::SmtProof> StateAccess::proveAtVersion(
-      const Crypto::Hash &key, uint64_t version) const
+  ProofResult StateAccess::proveAtVersion(const Crypto::Hash &key,
+                                          uint64_t version) const
   {
+    ProofResult result;
+
+    if (!versionIsAvailable(version))
+    {
+      result.status = ProofResultStatus::VersionUnavailable;
+      return result;
+    }
+
     auto root = smt_.rootAtVersion(version);
     if (!root.has_value())
-      return std::nullopt;
+    {
+      result.status = ProofResultStatus::VersionUnavailable;
+      return result;
+    }
 
-    return State::proveAtRoot(smt_, *root, key);
+    auto proof = State::proveAtRoot(smt_, *root, key);
+    if (!proof.has_value())
+    {
+      result.status = ProofResultStatus::KeyNotFound;
+      return result;
+    }
+
+    result.status = ProofResultStatus::Ok;
+    result.proof = std::move(proof);
+    return result;
   }
 
-  // ===========================================================================
+  //  =========================================================================
   //  Table stats
-  // ===========================================================================
+  //  =========================================================================
 
   size_t StateAccess::tableEntryCount(uint32_t table_id) const
   {
     return readTableCount(table_id);
+  }
+
+  StateDB::TableStats StateAccess::tableStats(uint32_t table_id) const
+  {
+    return db_.tableStats(table_id);
   }
 
   bool StateAccess::getMeta(const std::string &key,

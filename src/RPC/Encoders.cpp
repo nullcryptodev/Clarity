@@ -7,6 +7,7 @@
 #include "Encoding.h"
 
 #include "Wallet/AddressCodec.h"
+#include "State/Keys.h"
 #include "State/SparseMerkleTree.h"
 
 #include <algorithm>

@@ -10,6 +10,7 @@
 #include "Crypto/Types.h"
 #include "P2P/ProofMessages.h"
 #include "P2P/MessageTypes.h"
+#include "State/Keys.h"
 #include "State/SmtProof.h"
 #include "State/SparseMerkleTree.h"
 
@@ -24,6 +25,44 @@ namespace
     for (size_t i = 0; i < 32; ++i)
       b[i] = uint8_t(seed + i);
     return b;
+  }
+
+  //  Build a ProofSibling whose fields are internally consistent. Used
+  //  by the round-trip tests to construct proofs they can serialize
+  //  and decode. The prefix_bits length must equal
+  //  ceil(prefix_len / 8), which is what ProofSibling::isValid()
+  //  enforces and what the wire codec expects.
+  State::ProofSibling makeSibling(uint16_t prefix_len, uint8_t hash_seed)
+  {
+    State::ProofSibling s;
+    s.prefix_len = prefix_len;
+
+    const size_t prefix_bytes = (prefix_len + 7) / 8;
+    s.prefix_bits.assign(prefix_bytes, 0);
+    for (size_t i = 0; i < prefix_bytes; ++i)
+      s.prefix_bits[i] = uint8_t(hash_seed + i);
+
+    for (size_t i = 0; i < 32; ++i)
+      s.hash.data[i] = uint8_t(hash_seed + i);
+
+    return s;
+  }
+
+  //  Compare two ProofSiblings field by field. vector<ProofSibling> has
+  //  no operator==, so the tests use this. The alternative — adding
+  //  operator== to ProofSibling — would be a production change for a
+  //  test-only need, and future changes to the struct would silently
+  //  affect equality semantics across the codebase.
+  void expectSiblingsEqual(const std::vector<State::ProofSibling> &a,
+                           const std::vector<State::ProofSibling> &b)
+  {
+    ASSERT_EQ(a.size(), b.size());
+    for (size_t i = 0; i < a.size(); ++i)
+    {
+      EXPECT_EQ(a[i].prefix_len, b[i].prefix_len) << "sibling " << i;
+      EXPECT_EQ(a[i].prefix_bits, b[i].prefix_bits) << "sibling " << i;
+      EXPECT_EQ(a[i].hash, b[i].hash) << "sibling " << i;
+    }
   }
 } // anonymous namespace
 
@@ -93,7 +132,7 @@ TEST(P2P_ProofMessages, GetProofRejectsTruncatedHeader)
 
   auto encoded = serializeGetProof(m);
 
-  // Truncate to fewer than the minimum header (17 bytes).
+  // Truncate to fewer than the minimum header.
   encoded.resize(10);
 
   GetProofMessage decoded;
@@ -120,7 +159,7 @@ TEST(P2P_ProofMessages, GetProofRejectsOversizeKey)
 {
   GetProofMessage m;
   m.key_type = ProofKeyType::Global;
-  m.key_bytes = std::vector<uint8_t>(100, 0x41); // 100 > MAX_KEY_BYTES (64)
+  m.key_bytes = std::vector<uint8_t>(100, 0x41); // > MAX_KEY_BYTES
   m.version = 1;
 
   auto encoded = serializeGetProof(m);
@@ -154,10 +193,16 @@ TEST(P2P_ProofMessages, ProofOkRoundTrip)
   original.state_root.data[0] = 0x42;
   original.version = 100;
   original.proof.key.data[0] = 0x99;
+  original.proof.terminal_kind = State::ProofTerminalKind::Inclusion;
   original.proof.value = std::vector<uint8_t>{1, 2, 3, 4};
-  original.proof.siblings.resize(State::SparseMerkleTree::DEPTH);
-  for (size_t i = 0; i < original.proof.siblings.size(); ++i)
-    original.proof.siblings[i].data[0] = uint8_t(i);
+
+  //  Build a small, valid sibling list. The compressed tree's proofs
+  //  are variable-length; the wire codec doesn't care about the
+  //  content, only that each sibling's prefix_len and prefix_bits are
+  //  consistent.
+  original.proof.siblings.push_back(makeSibling(0, 0x10));
+  original.proof.siblings.push_back(makeSibling(5, 0x20));
+  original.proof.siblings.push_back(makeSibling(16, 0x30));
 
   auto encoded = serializeProof(original);
 
@@ -168,25 +213,85 @@ TEST(P2P_ProofMessages, ProofOkRoundTrip)
   EXPECT_EQ(decoded.state_root, original.state_root);
   EXPECT_EQ(decoded.version, original.version);
   EXPECT_EQ(decoded.proof.key, original.proof.key);
+  EXPECT_EQ(decoded.proof.terminal_kind, original.proof.terminal_kind);
   ASSERT_TRUE(decoded.proof.value.has_value());
   EXPECT_EQ(*decoded.proof.value, *original.proof.value);
-  EXPECT_EQ(decoded.proof.siblings, original.proof.siblings);
+  expectSiblingsEqual(decoded.proof.siblings, original.proof.siblings);
 }
 
-TEST(P2P_ProofMessages, ProofNonInclusionRoundTrip)
+TEST(P2P_ProofMessages, ProofNonInclusionDefaultRoundTrip)
 {
   ProofMessage original;
   original.status = ProofMessage::Status::Ok;
   original.proof.key.data[0] = 0xAA;
-  original.proof.value.reset(); // non-inclusion
-  original.proof.siblings.resize(State::SparseMerkleTree::DEPTH);
+  original.proof.terminal_kind = State::ProofTerminalKind::Default;
+  original.proof.value.reset();
+  original.proof.siblings.push_back(makeSibling(0, 0x10));
+  original.proof.siblings.push_back(makeSibling(3, 0x20));
 
   auto encoded = serializeProof(original);
 
   ProofMessage decoded;
   ASSERT_TRUE(deserializeProof(encoded.data(), encoded.size(), decoded));
   EXPECT_EQ(decoded.status, ProofMessage::Status::Ok);
+  EXPECT_EQ(decoded.proof.terminal_kind,
+            State::ProofTerminalKind::Default);
   EXPECT_FALSE(decoded.proof.value.has_value());
+  expectSiblingsEqual(decoded.proof.siblings, original.proof.siblings);
+}
+
+TEST(P2P_ProofMessages, ProofNonInclusionDifferentLeafRoundTrip)
+{
+  ProofMessage original;
+  original.status = ProofMessage::Status::Ok;
+  original.proof.key.data[0] = 0xAA;
+  original.proof.terminal_kind = State::ProofTerminalKind::DifferentLeaf;
+  original.proof.value.reset();
+  original.proof.divergent_leaf_key.data[0] = 0xBB;
+  original.proof.divergent_leaf_value_hash.data[0] = 0xCC;
+  original.proof.siblings.push_back(makeSibling(0, 0x10));
+
+  auto encoded = serializeProof(original);
+
+  ProofMessage decoded;
+  ASSERT_TRUE(deserializeProof(encoded.data(), encoded.size(), decoded));
+  EXPECT_EQ(decoded.proof.terminal_kind,
+            State::ProofTerminalKind::DifferentLeaf);
+  EXPECT_EQ(decoded.proof.divergent_leaf_key,
+            original.proof.divergent_leaf_key);
+  EXPECT_EQ(decoded.proof.divergent_leaf_value_hash,
+            original.proof.divergent_leaf_value_hash);
+  expectSiblingsEqual(decoded.proof.siblings, original.proof.siblings);
+}
+
+TEST(P2P_ProofMessages, ProofNonInclusionDivergentBranchRoundTrip)
+{
+  ProofMessage original;
+  original.status = ProofMessage::Status::Ok;
+  original.proof.key.data[0] = 0xAA;
+  original.proof.terminal_kind = State::ProofTerminalKind::DivergentBranch;
+  original.proof.value.reset();
+  original.proof.divergent_branch_prefix_len = 12;
+  original.proof.divergent_branch_prefix_bits = {0xAB, 0xC0};
+  original.proof.divergent_branch_left.data[0] = 0x11;
+  original.proof.divergent_branch_right.data[0] = 0x22;
+  original.proof.siblings.push_back(makeSibling(0, 0x10));
+
+  auto encoded = serializeProof(original);
+
+  ProofMessage decoded;
+  ASSERT_TRUE(deserializeProof(encoded.data(), encoded.size(), decoded));
+  EXPECT_EQ(decoded.proof.terminal_kind,
+            State::ProofTerminalKind::DivergentBranch);
+  EXPECT_EQ(decoded.proof.divergent_branch_prefix_len,
+            original.proof.divergent_branch_prefix_len);
+  EXPECT_EQ(decoded.proof.divergent_branch_prefix_bits,
+            original.proof.divergent_branch_prefix_bits);
+  EXPECT_EQ(decoded.proof.divergent_branch_left,
+            original.proof.divergent_branch_left);
+  EXPECT_EQ(decoded.proof.divergent_branch_right,
+            original.proof.divergent_branch_right);
+  expectSiblingsEqual(decoded.proof.siblings, original.proof.siblings);
 }
 
 TEST(P2P_ProofMessages, ProofVersionUnavailableHasNoProof)
@@ -194,7 +299,6 @@ TEST(P2P_ProofMessages, ProofVersionUnavailableHasNoProof)
   ProofMessage original;
   original.status = ProofMessage::Status::VersionUnavailable;
   original.version = 999;
-  // No proof set.
 
   auto encoded = serializeProof(original);
 
@@ -202,6 +306,20 @@ TEST(P2P_ProofMessages, ProofVersionUnavailableHasNoProof)
   ASSERT_TRUE(deserializeProof(encoded.data(), encoded.size(), decoded));
   EXPECT_EQ(decoded.status, ProofMessage::Status::VersionUnavailable);
   EXPECT_EQ(decoded.version, 999u);
+}
+
+TEST(P2P_ProofMessages, ProofKeyNotFoundHasNoProof)
+{
+  ProofMessage original;
+  original.status = ProofMessage::Status::KeyNotFound;
+  original.version = 42;
+
+  auto encoded = serializeProof(original);
+
+  ProofMessage decoded;
+  ASSERT_TRUE(deserializeProof(encoded.data(), encoded.size(), decoded));
+  EXPECT_EQ(decoded.status, ProofMessage::Status::KeyNotFound);
+  EXPECT_EQ(decoded.version, 42u);
 }
 
 TEST(P2P_ProofMessages, ProofMalformedHasNoProof)
@@ -289,15 +407,12 @@ TEST(P2P_ProofMessages, ResolveAmmPoolKey)
 
 TEST(P2P_ProofMessages, ResolveRejectsWrongLength)
 {
-  // Account needs 32 bytes; give it 31.
   std::vector<uint8_t> short_bytes(31, 0);
   EXPECT_FALSE(resolveProofKey(ProofKeyType::Account, short_bytes).has_value());
 
-  // Validator needs 8; give it 9.
   std::vector<uint8_t> long_bytes(9, 0);
   EXPECT_FALSE(resolveProofKey(ProofKeyType::Validator, long_bytes).has_value());
 
-  // Global rejects empty.
   std::vector<uint8_t> empty;
   EXPECT_FALSE(resolveProofKey(ProofKeyType::Global, empty).has_value());
 }

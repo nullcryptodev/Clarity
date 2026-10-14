@@ -29,6 +29,25 @@ namespace Core
   inline constexpr uint16_t AMM_DEFAULT_FEE_BPS = 30;
   inline constexpr uint16_t AMM_MAX_FEE_BPS = 1000; // 10% max
 
+  //  Minimum initial reserve on each side of a new pool.
+  //
+  //  A pool with reserves below this floor is a griefing surface:
+  //  the price is trivially manipulable for a few atomic units, and
+  //  the pool has no economic function. Enforced at pool creation
+  //  only; a pool that later drains below the floor through
+  //  withdrawals is handled by the last-LP drain path, not by this
+  //  check.
+  //
+  //  Denominated in atomic units of the native token. The check
+  //  applies to both sides of the pool regardless of the tokens'
+  //  own decimals, so a token with decimals=0 needs this many whole
+  //  tokens on each side to be poolable. That's a deliberate
+  //  "you must be serious about this" floor for a chain where the
+  //  native unit is the reference.
+  //
+  //  Consensus constant: changing it is a hard fork.
+  inline constexpr Amount MIN_POOL_LIQUIDITY = 100 * GlobalConfig::ATOMIC_UNITS_PER_COIN;
+
   struct AmmPool
   {
     Id id{INVALID_ID};

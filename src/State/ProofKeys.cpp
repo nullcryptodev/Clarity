@@ -5,6 +5,7 @@
 
 #include "ProofKeys.h"
 
+#include "Keys.h"
 #include "SparseMerkleTree.h"
 
 #include <cstring>

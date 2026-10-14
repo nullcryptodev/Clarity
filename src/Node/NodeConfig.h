@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -70,11 +71,6 @@ namespace Node
     // <data_dir>/node_key, generating and persisting a fresh key on
     // first run. Set it explicitly only for tests that need a fixed
     // identity.
-    //
-    // On a validator, this may be the same key as consensus_secret_key
-    // or different — either works. The auth protocol doesn't require
-    // the node key to match the validator key; the validator binding
-    // is a separate lookup by reward address in verifyPeerAuth().
     Crypto::SecretKey node_secret_key{};
 
     // ---- Consensus ----
@@ -85,24 +81,30 @@ namespace Node
     //  Number of blocks in the rolling fee window. Used by
     //  getFeeStats to answer "fees in the last 24 hours" without
     //  walking the whole window on every call.
-    //
-    //  Default: 86,400 blocks (24 hours at NOMINAL_BLOCK_SECONDS = 1).
-    //  On a test chain with a smaller window, set this lower so the
-    //  value is populated quickly.
     uint64_t fee_window_blocks{86'400};
 
     //  Number of recent versions of the SMT to retain. Older
     //  versions are pruned after each block commit. Zero disables
     //  pruning entirely (unbounded growth).
     //
-    //  Default: 10,000 blocks. On a chain with meaningful state
-    //  traffic, the historical SMT is the dominant storage consumer;
-    //  keeping this bounded is what keeps disk usage predictable.
+    //  A value of 0 here means "use the network default", which
+    //  validateConfig() resolves from GlobalConfig:
     //
-    //  Pruning happens in a background pass after block commit, at
-    //  most once every HISTORY_PRUNE_INTERVAL_BLOCKS blocks, so the
-    //  cost is amortized.
-    uint64_t smt_history_blocks{10'000};
+    //    mainnet:  2048  (~68 minutes at 1s blocks)
+    //    testnet:   512  (~8 minutes)
+    //    regtest:    64  (~1 minute)
+    //
+    //  Set an explicit non-zero value to override the network default.
+    //  The override is what an operator uses when running a dedicated
+    //  indexer node that wants deep history.
+    //
+    //  Rationale for the small defaults: since the consensus layer is
+    //  BFT with immediate finality, there are no reorgs and no
+    //  fork-choice that needs historical state. Historical queries are
+    //  a block-explorer convenience; a node that wants more history
+    //  than the default window should run an indexer that scrapes
+    //  blocks and maintains its own state.
+    uint64_t smt_history_blocks{0};
 
     // ---- Genesis ----
     bool apply_genesis_on_start{true};
