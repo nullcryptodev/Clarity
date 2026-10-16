@@ -444,7 +444,10 @@ namespace Tests
       };
 
       backend.simulate_block =
-          [n](const Core::Block &b) -> std::optional<Crypto::Hash>
+          [n](const Core::Block &b,
+              Crypto::Hash &out_state_root,
+              std::vector<Core::Fill> &out_epoch_fills,
+              Crypto::Hash *out_failed_txid) -> bool
       {
         auto &db = NodeTestAccess::stateDb(*n);
         auto txn = db.beginWrite();
@@ -459,8 +462,24 @@ namespace Tests
         txn.abort();
 
         if (!r.valid)
-          return std::nullopt;
-        return r.new_state_root;
+        {
+          //  Surface the failing txid the same way the node's real
+          //  callback does, so the proposer's drop-and-retry loop
+          //  and validateProposal can act on it.
+          if (out_failed_txid)
+            *out_failed_txid = r.failed_txid;
+          return false;
+        }
+
+        //  Hand back both outputs. On an epoch boundary this is where
+        //  the fixture's consensus nodes get their fills — the same
+        //  fills that a real node would produce via its own
+        //  simulate_block callback in Node::buildConsensusDeps().
+        out_state_root = r.new_state_root;
+        out_epoch_fills = std::move(r.epoch_fills);
+        if (out_failed_txid)
+          *out_failed_txid = Crypto::Hash{};
+        return true;
       };
 
       backend.parent_hash = [n]() -> Crypto::Hash

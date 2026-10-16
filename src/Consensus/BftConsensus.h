@@ -24,6 +24,7 @@
 #include "Common/RoundTimer.h"
 
 #include "Core/Block.h"
+#include "Core/Fill.h"
 #include "Core/ValidatorTypes.h"
 #include "Crypto/Types.h"
 
@@ -110,7 +111,29 @@ namespace Consensus
 
     std::function<uint64_t()> chain_id;
     std::function<Crypto::Hash()> parent_hash;
-    std::function<std::optional<Crypto::Hash>(const Core::Block &)> simulate_block;
+
+    //  Apply a candidate block against a copy of state and return
+    //  the resulting state root. Used by the proposer to build a
+    //  header and by every validator to verify a peer's proposal.
+    //
+    //  On success, `out_state_root` receives the post-state root and
+    //  `out_epoch_fills` receives the fills produced by the epoch
+    //  boundary (empty if this height was not a boundary, or if the
+    //  boundary produced no routable fills). The proposer needs the
+    //  fills to compute epoch_fills_root before sealing the header.
+    //
+    //  On failure the callback returns false and, if
+    //  `out_failed_txid` is non-null, sets it to the txid of the
+    //  first transaction whose execution threw. A block-level
+    //  failure (bad header, bad tx_root, etc.) reports a null hash
+    //  in `out_failed_txid`.
+    std::function<bool(
+        const Core::Block &,
+        Crypto::Hash &out_state_root,
+        std::vector<Core::Fill> &out_epoch_fills,
+        Crypto::Hash *out_failed_txid)>
+        simulate_block;
+
     std::function<Crypto::Address()> my_address;
     std::function<uint64_t()> now_ms;
 
@@ -241,6 +264,15 @@ namespace Consensus
     // commit. Note this only covers quorums THIS node has seen.
     std::optional<Core::Block> heldQuorumBlock(Height height) const;
 
+    // Forward to deps_.simulate_block. The out-parameter is
+    // optional: pass nullptr when the caller only needs to know
+    // whether the block simulates (validateProposal), or a valid
+    // pointer when the caller needs the failing txid (propose).
+    bool simulateBlock(const Core::Block &block,
+                       Crypto::Hash &out_state_root,
+                       std::vector<Core::Fill> &out_epoch_fills,
+                       Crypto::Hash *out_failed_txid = nullptr);
+
   private:
     using VoteMap = std::unordered_map<Id, Vote>;
     using SignedKey = std::tuple<Height, Round, bool>; // (height, round, is_precommit)
@@ -277,7 +309,6 @@ namespace Consensus
     Core::Block buildFreshBlock() const;
     // Signature is checked by the caller (handleProposal).
     bool validateProposal(const Proposal &p, const Core::Block &block);
-    std::optional<Crypto::Hash> simulateBlock(const Core::Block &block);
 
     // Signature + "is this the expected proposer" check against one set.
     bool verifyProposalSignatureIn(const Proposal &p, bool emergency) const;
@@ -449,6 +480,8 @@ namespace Consensus
     std::unordered_map<Id, Round> round_hints_;
 
     Round consecutive_timeouts_{0};
+
+    static constexpr uint32_t MAX_SIMULATION_RETRIES = 15;
   };
 
 } // namespace Consensus

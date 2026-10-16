@@ -103,8 +103,18 @@ namespace Tests
       //  simulation will reject the block.
       std::function<std::vector<Id>(bool force_rotation)> active_set;
 
-      std::function<std::optional<Crypto::Hash>(const Core::Block &)>
+      //  Mirrors Consensus::Dependencies::simulate_block. On success
+      //  returns true and fills out_state_root / out_epoch_fills; on
+      //  failure returns false and (optionally) sets out_failed_txid.
+      //  Node-backed tests wire this to a real dry-run applyBlock, so
+      //  the fills are whatever execution actually produced.
+      std::function<bool(
+          const Core::Block &,
+          Crypto::Hash &out_state_root,
+          std::vector<Core::Fill> &out_epoch_fills,
+          Crypto::Hash *out_failed_txid)>
           simulate_block;
+
       std::function<Crypto::Hash()> parent_hash;
       std::function<bool(Id, Core::ValidatorInfo &)> lookup_validator;
     };
@@ -280,20 +290,28 @@ namespace Tests
       };
 
       deps.simulate_block =
-          [this, local_index](const Core::Block &b)
-          -> std::optional<Crypto::Hash>
+          [this, local_index](const Core::Block &b,
+                              Crypto::Hash &out_state_root,
+                              std::vector<Core::Fill> &out_epoch_fills,
+                              Crypto::Hash *out_failed_txid) -> bool
       {
         auto it = backends_.find(local_index);
         if (it != backends_.end() && it->second.simulate_block)
-          return it->second.simulate_block(b);
-        return b.header.state_root;
-      };
+        {
+          return it->second.simulate_block(
+              b, out_state_root, out_epoch_fills, out_failed_txid);
+        }
 
-      deps.my_address = [this, local_index]() -> Crypto::Address
-      {
-        if (local_index == SIZE_MAX || local_index >= validators_.size())
-          return Crypto::Address{};
-        return validators_[local_index].address;
+        //  Stub path: no execution environment. Echo the header's
+        //  declared state root and report no epoch fills. This keeps
+        //  the existing consensus state-machine tests working
+        //  unchanged — they build blocks with null epoch_fills_root
+        //  and no fills, so the fills/root invariant holds trivially.
+        out_state_root = b.header.state_root;
+        out_epoch_fills.clear();
+        if (out_failed_txid)
+          *out_failed_txid = Crypto::Hash{};
+        return true;
       };
 
       deps.now_ms = [this]() -> uint64_t

@@ -250,6 +250,21 @@ namespace Core
                          const StateView &state,
                          FeeTier tier);
 
+    //  Called by the block builder when a transaction was rejected
+    //  during block simulation. The tx is removed from the pool and
+    //  its persisted row is deleted, so the next proposal does not
+    //  pick it up again.
+    //
+    //  Returns true if the tx was in the pool and has been removed.
+    //
+    //  A tx that fails simulation is one the executor rejected. The
+    //  mempool's validate() is supposed to catch those, but the
+    //  executor's preconditions are the authoritative set and the
+    //  mempool's are a mirror; when they diverge, this method is
+    //  the safety net that keeps a bad tx from being re-proposed
+    //  indefinitely.
+    bool reject(const Crypto::Hash &txid, const StateView &state);
+
     // Counters for add() results, indexed by MempoolAddResult. The
     // i-th element is the count of add() calls that returned result i
     // since process start.
@@ -419,6 +434,8 @@ namespace Core
     //  the payload's shape and the order-specific invariants that
     //  do not depend on state.
     static MempoolAddResult validateOrderPayload(const Transaction &tx);
+
+    static MempoolAddResult validateCreatePoolPayload(const Transaction &tx);
 
     // Eviction. Called when the pool is full and a new tx arrives.
     // Returns true if the new tx should be admitted (something was evicted

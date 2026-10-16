@@ -85,9 +85,23 @@ namespace Tests
       deps.parent_hash = []() -> Crypto::Hash
       { return Crypto::Hash{}; };
       deps.simulate_block =
-          [](const Core::Block &b) -> std::optional<Crypto::Hash>
+          [](const Core::Block &b,
+             Crypto::Hash &out_state_root,
+             std::vector<Core::Fill> &out_epoch_fills,
+             Crypto::Hash *out_failed_txid) -> bool
       {
-        return b.header.state_root;
+        //  The test harness has no real state to execute against, so
+        //  it treats the header's declared state_root as the
+        //  simulated result and reports no epoch fills. Real fills
+        //  at epoch boundaries are exercised by the node-level and
+        //  BlockProcessor-level tests, not by the consensus state
+        //  machine tests, which are only concerned with vote/quorum
+        //  plumbing.
+        out_state_root = b.header.state_root;
+        out_epoch_fills.clear();
+        if (out_failed_txid)
+          *out_failed_txid = Crypto::Hash{};
+        return true;
       };
       deps.my_address = [this, local_index]() -> Crypto::Address
       {

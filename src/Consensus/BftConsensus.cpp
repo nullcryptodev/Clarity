@@ -985,27 +985,68 @@ namespace Consensus
       }
     }
 
-    auto computed_root = simulateBlock(block);
-    if (!computed_root.has_value())
+    Crypto::Hash computed_root{};
+    std::vector<Core::Fill> computed_fills;
+    if (!simulateBlock(block, computed_root, computed_fills))
     {
-      log_(Logging::WARNING) << "validateProposal: simulateBlock returned nullopt";
+      log_(Logging::WARNING) << "validateProposal: simulateBlock failed";
       return false;
     }
 
-    if (*computed_root != block.header.state_root)
+    if (computed_root != block.header.state_root)
     {
       log_(Logging::WARNING) << "validateProposal: state root mismatch";
       return false;
     }
 
+    //  Epoch-fills commitment.
+    //
+    //  The same invariant the commit path enforces, checked here at
+    //  proposal time so we never prevote a block we would later
+    //  refuse to commit. The commit-path check in
+    //  BlockProcessor::applyBlock is unchanged; this is an earlier,
+    //  cheaper gate on the same condition.
+    //
+    //  Reject when the dry-run produced fills but the proposer
+    //  committed to nothing. Also reject when the proposer's
+    //  commitment does not match what execution actually produced.
+    //  A null root with no fills is legal (the common case: not an
+    //  epoch boundary, or a boundary with no routable orders).
+    if (!computed_fills.empty() &&
+        block.header.epoch_fills_root.isNull())
+    {
+      log_(Logging::WARNING)
+          << "validateProposal: block produced " << computed_fills.size()
+          << " epoch fills but header epoch_fills_root is null";
+      return false;
+    }
+
+    if (!block.header.epoch_fills_root.isNull())
+    {
+      const Crypto::Hash expected =
+          Core::BlockProcessor::computeEpochFillsRoot(computed_fills);
+      if (expected != block.header.epoch_fills_root)
+      {
+        log_(Logging::WARNING)
+            << "validateProposal: epoch_fills_root mismatch (expected "
+            << expected.toString().substr(0, 16) << ", got "
+            << block.header.epoch_fills_root.toString().substr(0, 16) << ")";
+        return false;
+      }
+    }
+
     return true;
   }
 
-  std::optional<Crypto::Hash> BftConsensus::simulateBlock(const Core::Block &block)
+  bool BftConsensus::simulateBlock(const Core::Block &block,
+                                   Crypto::Hash &out_state_root,
+                                   std::vector<Core::Fill> &out_epoch_fills,
+                                   Crypto::Hash *out_failed_txid)
   {
     if (!deps_.simulate_block)
-      return std::nullopt;
-    return deps_.simulate_block(block);
+      return false;
+    return deps_.simulate_block(block, out_state_root,
+                                out_epoch_fills, out_failed_txid);
   }
 
   //  Vote routing
@@ -1734,7 +1775,6 @@ namespace Consensus
 
     return block;
   }
-
   bool BftConsensus::propose()
   {
     const Height propose_height = height_;
@@ -1776,6 +1816,9 @@ namespace Consensus
     {
       block = buildFreshBlock();
 
+      //  Attach any equivocation evidence we hold, as Slash
+      //  transactions. These are dropped below if the block
+      //  fails simulation for them.
       if (!equivocations_.empty())
       {
         std::set<Id> already_slashed;
@@ -1795,9 +1838,9 @@ namespace Consensus
           auto payload = Core::encodeSlashPayload(
               encodeVote(ev.vote_a), encodeVote(ev.vote_b));
 
-          //  Not "target is in the active set": a validator inside its
-          //  unbonding window has left the active set but must stay
-          //  slashable.
+          //  Not "target is in the active set": a validator inside
+          //  its unbonding window has left the active set but must
+          //  stay slashable.
           if (deps_.verify_slash_proof)
           {
             if (!deps_.verify_slash_proof(payload))
@@ -1866,38 +1909,102 @@ namespace Consensus
       return false;
     }
 
-    auto sim_root = simulateBlock(block);
-    if (!sim_root.has_value() && !re_proposing && !block.transactions.empty())
-    {
-      //  Never strip a re-proposal: that would change its hash.
-      const size_t txs_before = block.transactions.size();
-      block.transactions.erase(
-          std::remove_if(block.transactions.begin(),
-                         block.transactions.end(),
-                         [](const Core::Transaction &tx)
-                         {
-                           return tx.tx_type == Core::TxType::Slash;
-                         }),
-          block.transactions.end());
+    //  Simulate the block. On a fresh proposal, drop the failing
+    //  transaction and retry, up to MAX_SIMULATION_RETRIES. On a
+    //  re-proposal, simulate once: the block hash is already
+    //  committed to by the lock, and changing the transaction set
+    //  would change the hash, which would make the re-proposal
+    //  unrecognisable to validators who voted on the original.
+    //
+    //  The mempool is supposed to keep unappliable transactions out
+    //  of the pool. Its `validate` is a mirror of the executor's
+    //  preconditions, and the mirror can drift. This loop is the
+    //  safety net: a transaction that slips past the mempool and
+    //  fails execution is dropped here and the block is proposed
+    //  without it. The node's simulate_block callback removes the
+    //  dropped transaction from the mempool so it is not selected
+    //  again next round.
+    Crypto::Hash sim_state_root{};
+    std::vector<Core::Fill> sim_fills;
+    bool sim_ok = false;
 
-      if (block.transactions.size() != txs_before)
+    if (re_proposing)
+    {
+      sim_ok = simulateBlock(block, sim_state_root, sim_fills);
+    }
+    else
+    {
+      for (uint32_t attempt = 0; attempt < MAX_SIMULATION_RETRIES; ++attempt)
       {
-        log_(Logging::WARNING)
-            << "Proposal simulation failed with Slash txs; retrying without";
+        Crypto::Hash failed_txid{};
+        sim_ok = simulateBlock(block, sim_state_root, sim_fills, &failed_txid);
+
+        if (sim_ok)
+          break;
+
+        if (failed_txid.isNull())
+          break;
+
+        if (block.transactions.empty())
+          break;
+
+        const size_t before = block.transactions.size();
+
+        block.transactions.erase(
+            std::remove_if(block.transactions.begin(),
+                           block.transactions.end(),
+                           [&](const Core::Transaction &tx)
+                           { return tx.txid() == failed_txid; }),
+            block.transactions.end());
+
+        if (block.transactions.size() == before)
+        {
+          log_(Logging::WARNING)
+              << "simulateBlock reported txid "
+              << failed_txid.toString().substr(0, 16)
+              << " not present in the proposed block";
+          break;
+        }
+
         block.header.tx_count =
             static_cast<uint32_t>(block.transactions.size());
         block.header.tx_root = Core::computeTxRoot(block.transactions);
-        sim_root = simulateBlock(block);
+
+        uint64_t total_fees = 0;
+        for (const auto &tx : block.transactions)
+          total_fees += tx.fee;
+        block.header.total_fees = total_fees;
+
+        log_(Logging::WARNING)
+            << "Dropped failing transaction "
+            << failed_txid.toString().substr(0, 16)
+            << " from proposed block at h=" << propose_height
+            << " r=" << propose_round
+            << " (attempt " << (attempt + 1) << "/"
+            << MAX_SIMULATION_RETRIES << ")";
       }
     }
 
-    if (!sim_root.has_value())
+    if (!sim_ok)
     {
       log_(Logging::WARNING) << "Proposed block failed simulation"
                              << (re_proposing ? " (re-proposal)" : "");
       return false;
     }
-    block.header.state_root = *sim_root;
+
+    block.header.state_root = sim_state_root;
+
+    //  Commit the epoch fills to the header. On a re-proposal the
+    //  header already carries the original proposer's root — and
+    //  any change would change the block hash, invalidating the
+    //  lock. On a fresh proposal the dry-run just told us exactly
+    //  which fills execution will produce; commit their root now,
+    //  before the proposal hash is computed.
+    if (!re_proposing)
+    {
+      block.header.epoch_fills_root =
+          Core::BlockProcessor::computeEpochFillsRoot(sim_fills);
+    }
 
     const Crypto::Hash block_hash = block.hash();
     Proposal p;

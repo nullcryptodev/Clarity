@@ -60,6 +60,19 @@ namespace Core
     std::vector<Crypto::Hash> tx_hashes;
     Crypto::Hash block_hash;
 
+    //  On failure, the txid of the transaction whose execution
+    //  threw or was refused, if the failure was
+    //  transaction-level. Null if the failure was a block-level
+    //  check (header, tx_root, quorum, state_root mismatch,
+    //  etc.) or if the block was valid.
+    //
+    //  Populated on both the dry-run and apply paths. A
+    //  production apply does not act on it — the whole block is
+    //  rejected either way — but it is useful for logging, and
+    //  the proposer's drop-and-retry loop reads it to identify
+    //  the transaction it should remove from a candidate block.
+    Crypto::Hash failed_txid;
+
     //  Fills produced at the epoch boundary by the Active-order
     //  router. These are not attached to any transaction — there
     //  is no transaction at the epoch boundary — so they cannot
@@ -214,7 +227,8 @@ namespace Core
                                   const std::vector<Id> &active_set,
                                   std::vector<Receipt> &receipts,
                                   std::vector<Crypto::Hash> &tx_hashes,
-                                  std::string &error);
+                                  std::string &error,
+                                  Crypto::Hash &out_failed_txid);
 
     static void processOrderExpiries(State::StateAccess &state,
                                      uint64_t current_height);

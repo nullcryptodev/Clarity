@@ -340,10 +340,11 @@ namespace Tests
     return p;
   }
 
-  std::vector<uint8_t> makeRemoveLiquidityPayload(uint64_t position_id)
+  std::vector<uint8_t> makeRemoveLiquidityPayload(uint64_t position_id, uint64_t amount)
   {
     std::vector<uint8_t> p;
     Common::putU64(p, position_id);
+    Common::putU64(p, amount);
     return p;
   }
 

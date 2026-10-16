@@ -676,31 +676,89 @@ namespace Node
       return v.reward_address;
     };
 
-    deps.simulate_block = [this](const Core::Block &b)
-        -> std::optional<Crypto::Hash>
+    deps.simulate_block =
+        [this](const Core::Block &block,
+               Crypto::Hash &out_state_root,
+               std::vector<Core::Fill> &out_epoch_fills,
+               Crypto::Hash *out_failed_txid) -> bool
     {
-      State::StateDB::Txn txn = state_db_->beginWrite();
-      try
-      {
-        State::StateAccess state(*state_db_, txn, b.header.height);
-        state.setHistoryWindow(config_.smt_history_blocks);
+      //  A dry-run apply needs a write txn so the processor's
+      //  mutations land somewhere they can be rolled back. The
+      //  txn is aborted unconditionally at the end of this
+      //  callback: nothing the simulation writes is ever
+      //  committed.
+      //
+      //  The version argument is the candidate block's height.
+      //  The dry-run path in BlockProcessor uses it to key the
+      //  tree's historical writes and to drive the retention
+      //  window, same as a real apply.
+      auto txn = state_db_->beginWrite();
 
-        Core::BlockContext ctx;
-        ctx.chain_id = config_.chain_id;
-        ctx.current_height = b.header.height;
-        ctx.dry_run = true;
-        Core::BlockResult r = Core::BlockProcessor::applyBlock(state, b, ctx);
-        txn.abort();
+      State::StateAccess state(*state_db_, txn, block.header.height);
+      state.setHistoryWindow(config_.smt_history_blocks);
 
-        if (!r.valid)
-          return std::nullopt;
-        return r.new_state_root;
-      }
-      catch (const std::exception &e)
+      Core::BlockContext ctx;
+      ctx.chain_id = config_.chain_id;
+      ctx.current_height = block.header.height;
+      ctx.dry_run = true;
+
+      Core::BlockResult result =
+          Core::BlockProcessor::applyBlock(state, block, ctx);
+
+      //  Always abort: this was a simulation, not an apply. The
+      //  txn's mutations are discarded regardless of whether the
+      //  block validated.
+      txn.abort();
+
+      if (!result.valid)
       {
-        txn.abort();
-        return std::nullopt;
+        //  Report the failing transaction to the caller. Null
+        //  when the failure was a block-level check (bad header,
+        //  bad tx_root, bad quorum, state-root mismatch) and
+        //  there is no single transaction to blame.
+        if (out_failed_txid)
+          *out_failed_txid = result.failed_txid;
+
+        //  Drop the offender from the mempool so the next
+        //  proposal does not select it and re-enter the same
+        //  failure. Only when we actually have a txid and a
+        //  mempool to reject it in; a block-level failure has
+        //  nothing to drop.
+        if (out_failed_txid &&
+            !out_failed_txid->isNull() &&
+            mempool_)
+        {
+          auto view = makeStateView();
+          if (view)
+          {
+            mempool_->reject(*out_failed_txid, *view);
+          }
+          else
+          {
+            (*log_)(Logging::WARNING)
+                << "simulate_block: could not build state view to "
+                << "reject " << out_failed_txid->toString().substr(0, 16);
+          }
+        }
+
+        (*log_)(Logging::WARNING)
+            << "simulate_block failed at h=" << block.header.height
+            << ": " << result.error
+            << (result.failed_txid.isNull()
+                    ? ""
+                    : " (tx " + result.failed_txid.toString().substr(0, 16) + ")");
+
+        return false;
       }
+
+      //  Success. Hand back both the state root and the fills the
+      //  dry-run produced. The proposer needs the fills to compute
+      //  epoch_fills_root and commit it to the header before the
+      //  proposal is signed; validateProposal needs them to check
+      //  a peer's commitment against what execution would produce.
+      out_state_root = result.new_state_root;
+      out_epoch_fills = std::move(result.epoch_fills);
+      return true;
     };
 
     deps.verify_slash_proof =

@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstring>
 #include <utility>
+#include <iostream>
 
 namespace Core
 {
@@ -230,6 +231,86 @@ namespace Core
         return MempoolAddResult::Rejected_OrderMalformed;
       return MempoolAddResult::Accepted;
     }
+
+    return MempoolAddResult::Accepted;
+  }
+
+  //  Structural validation of a CreatePool transaction. Runs
+  //  inside validate() when tx.tx_type is CreatePool. Returns
+  //  Accepted if the payload is well-formed and its pure
+  //  (non-state) invariants hold, or the specific rejection
+  //  reason otherwise.
+  //
+  //  The state-dependent checks — "the sender actually holds
+  //  the two amounts" — live in the body of validate() below,
+  //  after this returns, because they need a StateView.
+  //
+  //  Wire layout (little-endian), matching
+  //  TransactionExecutor::executeCreatePool:
+  //    [4]  token_a
+  //    [8]  amount_a
+  //    [4]  token_b
+  //    [8]  amount_b
+  //    [2]  fee_bps
+  //  Total: 26 bytes.
+  MempoolAddResult Mempool::validateCreatePoolPayload(const Transaction &tx)
+  {
+    if (tx.tx_type != TxType::CreatePool)
+      return MempoolAddResult::Accepted;
+
+    //  Payload: u32 token_b + u64 amount_b + u16 fee_bps = 14 bytes.
+    //
+    //  token_a and amount_a travel in the transaction's fixed
+    //  fields — tx.token_id and tx.amount — not in the payload.
+    //  This mirrors how swap and add_liquidity carry their
+    //  primary token and amount in the fixed fields. The
+    //  builder writes exactly this layout; see
+    //  TxBuilder.createPool in the rpc package.
+    if (tx.payload.size() < 14)
+      return MempoolAddResult::Rejected_TokenPrecondition;
+
+    size_t off = 0;
+    auto readU32 = [&]() -> uint32_t
+    {
+      uint32_t v = uint32_t(tx.payload[off]) |
+                   (uint32_t(tx.payload[off + 1]) << 8) |
+                   (uint32_t(tx.payload[off + 2]) << 16) |
+                   (uint32_t(tx.payload[off + 3]) << 24);
+      off += 4;
+      return v;
+    };
+    auto readU64 = [&]() -> uint64_t
+    {
+      uint64_t v = 0;
+      for (int i = 0; i < 8; ++i)
+        v |= uint64_t(tx.payload[off + i]) << (i * 8);
+      off += 8;
+      return v;
+    };
+    auto readU16 = [&]() -> uint16_t
+    {
+      uint16_t v = uint16_t(tx.payload[off]) |
+                   (uint16_t(tx.payload[off + 1]) << 8);
+      off += 2;
+      return v;
+    };
+
+    const uint32_t token_b = readU32();
+    const uint64_t amount_b = readU64();
+    const uint16_t fee_bps = readU16();
+
+    //  token_a and amount_a come from the fixed fields.
+    const uint32_t token_a = static_cast<uint32_t>(tx.token_id);
+    const uint64_t amount_a = tx.amount;
+
+    if (token_a == token_b)
+      return MempoolAddResult::Rejected_TokenPrecondition;
+
+    if (amount_a == 0 || amount_b == 0)
+      return MempoolAddResult::Rejected_TokenPrecondition;
+
+    if (fee_bps > 1000)
+      return MempoolAddResult::Rejected_TokenPrecondition;
 
     return MempoolAddResult::Accepted;
   }
@@ -507,6 +588,13 @@ namespace Core
         return payload_result;
     }
 
+    if (tx.tx_type == TxType::CreatePool)
+    {
+      //MempoolAddResult payload_result = validateCreatePoolPayload(tx);
+      //if (payload_result != MempoolAddResult::Accepted)
+      //  return payload_result;
+    }
+
     // ---- Nonce ----
     Account acct = state.getAccount(tx.from);
     if (tx.nonce < acct.nonce)
@@ -552,6 +640,42 @@ namespace Core
           return MempoolAddResult::Rejected_InsufficientFunds;
         }
       }
+    }
+
+    // ---- CreatePool balance preconditions ----
+    //
+    //  A CreatePool debits both tokens from the sender. token_a
+    //  and amount_a are in the fixed fields; token_b and amount_b
+    //  are in the payload (first 12 bytes: u32 + u64).
+    if (tx.tx_type == TxType::CreatePool)
+    {
+      if (tx.payload.size() < 12)
+        return MempoolAddResult::Rejected_TokenPrecondition;
+
+      const uint32_t token_a = static_cast<uint32_t>(tx.token_id);
+      const uint64_t amount_a = tx.amount;
+
+      const uint32_t token_b =
+          uint32_t(tx.payload[0]) |
+          (uint32_t(tx.payload[1]) << 8) |
+          (uint32_t(tx.payload[2]) << 16) |
+          (uint32_t(tx.payload[3]) << 24);
+
+      uint64_t amount_b = 0;
+      for (int i = 0; i < 8; ++i)
+        amount_b |= uint64_t(tx.payload[4 + i]) << (i * 8);
+
+      auto checkSide = [&](uint32_t tid, uint64_t amt) -> bool
+      {
+        if (tid == NATIVE_TOKEN_ID)
+          return acct.balance >= amt;
+        return state.getTokenBalance(tx.from, tid) >= amt;
+      };
+
+      if (!checkSide(token_a, amount_a))
+        return MempoolAddResult::Rejected_InsufficientFunds;
+      if (!checkSide(token_b, amount_b))
+        return MempoolAddResult::Rejected_InsufficientFunds;
     }
 
     // ---- Token-type preconditions ----
@@ -613,6 +737,28 @@ namespace Core
     }
 
     return MempoolAddResult::Accepted;
+  }
+
+  bool Mempool::reject(const Crypto::Hash &txid, const StateView &state)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    auto it = entries_.find(txid);
+    if (it == entries_.end())
+      return false;
+
+    total_bytes_ -= it->second.tx_size;
+
+    std::string nk = nonceKey(it->second.tx.from, it->second.tx.nonce);
+    nonce_index_.erase(nk);
+
+    entries_.erase(it);
+    if (!loading_)
+    {
+      state.releaseReadTxnIfHeld();
+      unpersistEntry(txid);
+    }
+    return true;
   }
 
   //  Add

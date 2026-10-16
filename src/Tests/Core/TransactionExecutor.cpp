@@ -2614,3 +2614,118 @@ TEST_F(Core_ExecutorFixture, PartialRemovalDoesNotClosePool)
 
   EXPECT_EQ(run(swap).status, ReceiptStatus::Success);
 }
+
+TEST_F(Core_ExecutorFixture, PartialRemovalWithReservesThatOverflowU64)
+{
+  //  The naive pro-rata computation is:
+  //
+  //    share_a = amount * pool.reserve_a / pool.total_liquidity
+  //
+  //  evaluated left-to-right in uint64_t. When amount * reserve_a
+  //  exceeds 2^64 - 1 the product wraps and the LP receives a
+  //  silently wrong (usually tiny) share. The executor promotes the
+  //  product to unsigned __int128 to avoid this.
+  //
+  //  This test pins the promotion. It sets up a pool whose
+  //  (amount * reserve) product is larger than 2^64 and asserts the
+  //  LP receives the correct pro-rata share, then verifies the pool
+  //  still holds the remainder.
+  //
+  //  Numbers:
+  //    total_liquidity = 2^40
+  //    reserve_a       = 2^40
+  //    reserve_b       = 2^40
+  //    amount          = 2^39   (a partial removal, half the pool)
+  //
+  //  Naive product: 2^39 * 2^40 = 2^79, which wraps to
+  //  (2^79 mod 2^64) = 0. With the wrap, share_a and share_b would
+  //  both be 0 and the LP would receive nothing for their half.
+  //
+  //  Correct product: 2^79 / 2^40 = 2^39. The LP should get 2^39
+  //  of each reserve, and the pool should retain 2^39 of each.
+  //
+  //  Setup note: we cannot reach these reserves through the normal
+  //  pool-creation path (MIN_POOL_LIQUIDITY and the balance caps
+  //  make it impractical), so the pool and position are written
+  //  directly. That is fine: the test is about the arithmetic in
+  //  the removal path, not about how the pool got there.
+
+  const Id token_b = 100;
+  const uint64_t total_liquidity = uint64_t(1) << 40;
+  const uint64_t reserve = uint64_t(1) << 40;
+  const uint64_t remove_amount = uint64_t(1) << 39;
+
+  //  Create a pool record with the large reserves.
+  AmmPool pool;
+  pool.id = 77;
+  pool.token_a = NATIVE_TOKEN_ID;
+  pool.token_b = token_b;
+  pool.reserve_a = reserve;
+  pool.reserve_b = reserve;
+  pool.total_liquidity = total_liquidity;
+  pool.fee_bps = AMM_DEFAULT_FEE_BPS;
+  pool.creator = alice_.publicKey;
+  pool.created_at_height = 1;
+  pool.active = true;
+  state_->putAmmPool(pool);
+
+  //  Create Alice's position holding half the pool's liquidity.
+  AmmPosition pos;
+  pos.id = 88;
+  pos.owner = alice_.publicKey;
+  pos.pool_id = pool.id;
+  pos.liquidity = remove_amount;
+  pos.created_at_height = 1;
+  state_->putAmmPosition(pos);
+  state_->putPositionIndex(alice_.publicKey, pool.id, pos.id);
+
+  //  Give Alice a balance for the token_b side so the credit
+  //  accounting is observable. The native side is Account.balance.
+  state_->putTokenBalance(alice_.publicKey, token_b, 0);
+
+  const uint64_t alice_native_before = balanceOf(alice_.publicKey);
+
+  //  Partial removal of `remove_amount` LP tokens. The payload
+  //  carries (position_id, amount); amount != 0 means partial.
+  Transaction tx = TransactionBuilder()
+                       .type(TxType::RemoveLiquidity)
+                       .from(alice_)
+                       .to(Crypto::Address{})
+                       .amount(1)
+                       .fee(1)
+                       .nonce(0)
+                       .chainId(EXEC_CHAIN_ID)
+                       .payload(makeRemoveLiquidityPayload(pos.id, remove_amount))
+                       .build();
+
+  ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
+
+  //  Correct shares: remove_amount / total_liquidity = 1/2, so the
+  //  LP receives 1/2 of each reserve = 2^39. Under the naive u64
+  //  product the shares would be 0 (the product wrapped to 0) and
+  //  the assertions below would fail.
+  const uint64_t expected_share = remove_amount; // == reserve / 2
+
+  EXPECT_EQ(balanceOf(alice_.publicKey),
+            alice_native_before + expected_share - 1); // -1 for the fee
+  EXPECT_EQ(state_->getTokenBalance(alice_.publicKey, token_b),
+            expected_share);
+
+  //  The pool retains the other half. The pool is not closed
+  //  because only half the liquidity was removed.
+  AmmPool pool_after;
+  ASSERT_TRUE(state_->getAmmPool(pool.id, pool_after));
+  EXPECT_EQ(pool_after.reserve_a, reserve - expected_share);
+  EXPECT_EQ(pool_after.reserve_b, reserve - expected_share);
+  EXPECT_EQ(pool_after.total_liquidity, total_liquidity - remove_amount);
+
+  //  Alice's position is decremented, not deleted, and the index
+  //  is still present.
+  AmmPosition pos_after;
+  ASSERT_TRUE(state_->getAmmPosition(pos.id, pos_after));
+  EXPECT_EQ(pos_after.liquidity, 0u); // she removed her whole position
+
+  uint64_t idx = 0;
+  EXPECT_TRUE(state_->getPositionIndex(alice_.publicKey, pool.id, idx));
+  EXPECT_EQ(idx, pos.id);
+}

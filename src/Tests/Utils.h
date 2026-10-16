@@ -188,7 +188,7 @@ namespace Tests
       std::optional<Crypto::Hash> fingerprint = std::nullopt);
   std::vector<uint8_t> makeAddLiquidityPayload(uint64_t pool_id, uint64_t amount_b);
   std::vector<uint8_t> makeSwapPayload(uint64_t pool_id, uint64_t amount_min_out);
-  std::vector<uint8_t> makeRemoveLiquidityPayload(uint64_t position_id);
+  std::vector<uint8_t> makeRemoveLiquidityPayload(uint64_t position_id, uint64_t amount = 0);
   std::vector<uint8_t> makeCancelOrderPayload(uint64_t order_id);
   std::vector<uint8_t> makeRegisterValidatorPayload();
   std::vector<uint8_t> makeCreateOrderPayload(

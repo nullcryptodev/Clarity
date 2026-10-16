@@ -294,9 +294,10 @@ namespace Core
 
     std::vector<Receipt> receipts;
     std::vector<Crypto::Hash> tx_hashes;
+    Crypto::Hash out_failed_txid;
 
     if (!applyTransactions(state, block, ctx, active_set,
-                           receipts, tx_hashes, error))
+                           receipts, tx_hashes, error, out_failed_txid))
     {
       result.error = error;
       return result;
@@ -729,14 +730,24 @@ namespace Core
                                          const std::vector<Id> &active_set,
                                          std::vector<Receipt> &receipts,
                                          std::vector<Crypto::Hash> &tx_hashes,
-                                         std::string &error)
+                                         std::string &error,
+                                         Crypto::Hash &out_failed_txid)
   {
+    //  Default to "no specific transaction to blame". Any failure
+    //  that isn't caused by one tx leaves this at the null hash;
+    //  the caller uses the null hash to distinguish a block-level
+    //  failure (bad header, bad tx_root, etc.) from a
+    //  transaction-level one.
+    out_failed_txid = Crypto::Hash{};
+
     receipts.reserve(block.transactions.size());
     tx_hashes.reserve(block.transactions.size());
 
     for (size_t i = 0; i < block.transactions.size(); ++i)
     {
       const Transaction &tx = block.transactions[i];
+
+      //  ---- System transactions ----
 
       if (isSystemTx(tx.tx_type))
       {
@@ -745,6 +756,10 @@ namespace Core
           std::string slash_err;
           if (!applySlash(state, tx, active_set, ctx, slash_err))
           {
+            //  The Slash transaction is what failed. Report it
+            //  so a caller that wants to drop the offender from
+            //  a candidate block can.
+            out_failed_txid = tx.txid();
             error = "slash failed at index " + std::to_string(i) +
                     ": " + slash_err;
             return false;
@@ -757,8 +772,13 @@ namespace Core
         continue;
       }
 
+      //  ---- User transactions ----
+
       if (!tx.isWellFormed())
       {
+        //  A malformed user transaction is a transaction-level
+        //  failure. The offender is this tx.
+        out_failed_txid = tx.txid();
         error = "malformed transaction at index " + std::to_string(i);
         return false;
       }
@@ -772,6 +792,11 @@ namespace Core
 
       if (r.status != ReceiptStatus::Success)
       {
+        //  The executor refused the transaction. Report it so
+        //  the proposer can drop it and retry; a transaction
+        //  the executor rejects is the single most common case
+        //  the drop-and-retry loop exists to handle.
+        out_failed_txid = tx.txid();
         error = "transaction failed at index " + std::to_string(i) +
                 " (type=" + std::string(txTypeName(tx.tx_type)) + ")";
         return false;
@@ -1648,11 +1673,6 @@ namespace Core
     state.forEachNftCollection(
         [&](const Core::NftCollection &collection)
         {
-          std::cerr << "[NFT] forEachNftCollection: id=" << collection.id
-                    << " minted=" << collection.minted_count
-                    << " rate=" << collection.reward_rate_per_epoch
-                    << " escrow=" << collection.reward_escrow_remaining
-                    << " paused=" << collection.reward_paused << "\n";
           if (!collection.hasReward())
             return;
           if (collection.reward_paused)
