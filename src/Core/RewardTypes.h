@@ -50,13 +50,10 @@ namespace Core
 
   // ---- Timing ----
 
-  // Assumed wall-clock duration of one block, in seconds. Used only by
-  // the reward formula to convert "blocks per epoch" into "seconds per
-  // epoch" for the APY target calculation. It is a *modelling* parameter,
-  // not a consensus rule: the actual block interval may drift and the
-  // pot absorbs the difference. The value is chosen to match the design
-  // discussion's 1-second-block assumption.
-  inline constexpr uint64_t NOMINAL_BLOCK_SECONDS = 1;
+  // It is a *modelling* parameter, not a consensus rule: the actual block
+  // interval may drift and the pot absorbs the difference. The value is
+  // chosen to match the design discussion's 10-second-block hearbeat.
+  inline constexpr uint64_t NOMINAL_BLOCK_SECONDS = 10;
 
   inline constexpr uint64_t SECONDS_PER_EPOCH =
       ROTATION_INTERVAL * NOMINAL_BLOCK_SECONDS;

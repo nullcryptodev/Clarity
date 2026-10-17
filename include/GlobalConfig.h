@@ -46,7 +46,7 @@ namespace GlobalConfig
 
   inline constexpr uint8_t DECIMALS = 5;
   inline constexpr Amount ATOMIC_UNITS_PER_COIN = 100'000;           // 1 full coin
-  inline constexpr Amount BLOCK_REWARD = ATOMIC_UNITS_PER_COIN * 10; // 10 $CLRTY
+  inline constexpr Amount BLOCK_REWARD = ATOMIC_UNITS_PER_COIN * 1;  // 1 $CLRTY
 
   // Split percentages in basis points
   inline constexpr Bps STAKER_SHARE_BPS = 4000;    // 40%
@@ -57,17 +57,32 @@ namespace GlobalConfig
   static_assert(STAKER_SHARE_BPS + VALIDATOR_SHARE_BPS == MAX_BPS, "Block reward share percentages must sum to 100%");
   static_assert(PRODUCER_BONUS_BPS + SET_SHARE_BPS == MAX_BPS, "Validator distribution must sum to 100%");
 
+  // Validator set
+
+  inline constexpr uint32_t INITIAL_SET_SIZE = 2; // should match seed node count
+
+  inline constexpr Amount VALIDATOR_MIN_STAKE = 10ULL * ATOMIC_UNITS_PER_COIN; // 10 CLRTY
+
+  inline constexpr uint64_t ACTIVE_SET_MIN = 2;   // BFT minimum (2 of 2)
+  inline constexpr uint64_t ACTIVE_SET_MAX = 100; // BFT ceiling
+  inline constexpr uint64_t ACTIVE_SET_DEFAULT = 11;
+
+  static_assert(ACTIVE_SET_MIN >= 2, "BFT needs at least 2 validators");
+  static_assert(ACTIVE_SET_MIN <= ACTIVE_SET_DEFAULT, "Default must be >= minimum");
+  static_assert(ACTIVE_SET_DEFAULT <= ACTIVE_SET_MAX, "Default must be <= maximum");
+  static_assert(INITIAL_SET_SIZE <= ACTIVE_SET_MIN, "Seeds must fit within the minimum active set");
+
   // Genesis
 
   inline constexpr uint64_t GENESIS_TIMESTAMP_MS = 1767225600000ULL;
 
   // The genesis supply gets split multiple addresses
-  // Current config splits 100k into 3 addresses.
+  // Current config splits 250k into 3 addresses.
   // 98k to "treasury", 1k to each each seed to pay VALIDATOR_MIN_STAKE.
-  inline constexpr Amount GENESIS_SUPPLY = ATOMIC_UNITS_PER_COIN * 100'000; // 100k
+  inline constexpr Amount GENESIS_SUPPLY = ATOMIC_UNITS_PER_COIN * 250'000; // 250k
 
   inline constexpr const char *TREASURY_FUND_ADDRESS = "0000000000000000000000000000000000000000000000000000000000000001";  // address
-  inline constexpr Amount TREASURY_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 98'000; // pay seed validators
+  inline constexpr Amount TREASURY_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 249'980; // pay seed validators
 
   // Genesis block hashes, one per network. Computed once and pinned.
   // If a change to genesis construction produces a different hash,
@@ -100,39 +115,25 @@ namespace GlobalConfig
   inline constexpr const char *SEED_ADDRESS_MAINNET = "clrty1qpt8lfr2rds5q2dxt2ng56y6mu9a6x7x3lh0napgekukp8a9ce3t2szumup";  // address as bech32m
   inline constexpr const char *SEED_ADDRESS_TESTNET = "tclrty1qpt8lfr2rds5q2dxt2ng56y6mu9a6x7x3lh0napgekukp8a9ce3t2ne8jw8"; // address as bech32m
   inline constexpr const char *SEED_ADDRESS_REGTEST = "rclrty1qpt8lfr2rds5q2dxt2ng56y6mu9a6x7x3lh0napgekukp8a9ce3t2z6phs4"; // address as bech32m
-  inline constexpr Amount SEED_FUND_AMOUNT = ATOMIC_UNITS_PER_COIN * 1'000;                                                 // just fund the seed as to be a validator
+  inline constexpr Amount SEED_FUND_AMOUNT = VALIDATOR_MIN_STAKE;                                                           // just fund the seed as to be a validator
 
   // Seed validator 2
   inline constexpr const char *SEED_ADDRESS_TWO_MAINNET = "clrty1qqwpcjfxlvnhwk4j907rdtnka00ywc03tw0drzt6f8c68h5dyrw56j50g7d";  // address as bech32m
   inline constexpr const char *SEED_ADDRESS_TWO_TESTNET = "tclrty1qqwpcjfxlvnhwk4j907rdtnka00ywc03tw0drzt6f8c68h5dyrw56305pvt"; // address as bech32m
   inline constexpr const char *SEED_ADDRESS_TWO_REGTEST = "rclrty1qqwpcjfxlvnhwk4j907rdtnka00ywc03tw0drzt6f8c68h5dyrw56qvjyje"; // address as bech32m
-  inline constexpr Amount SEED_FUND_AMOUNT_TWO = ATOMIC_UNITS_PER_COIN * 1'000;                                                 // just fund the seed as to be a validator
+  inline constexpr Amount SEED_FUND_AMOUNT_TWO = VALIDATOR_MIN_STAKE;                                                           // just fund the seed as to be a validator
 
   // Consensus keys are identical across all three networks
   inline constexpr const char *SEED_NODE = "84efa7717ca8286de2331fb0cff419f02f830486501f1d3748d387067b610ff1";     // consensus pubkey
   inline constexpr const char *SEED_NODE_TWO = "1051bde916098cb2a55d806ace794d384de0dd78f5bbad3ef6cf8304da5183e6"; // consensus pubkey
 
-  inline constexpr uint32_t INITIAL_SET_SIZE = 2; // should match seed node count
-  inline constexpr uint64_t SEED_NODES_COUNT = 2; // active seeds amount
-
-  // Validator set
-
-  inline constexpr Amount VALIDATOR_MIN_STAKE = 1000ULL * ATOMIC_UNITS_PER_COIN; // 1000 CLRTY
-
-  inline constexpr uint64_t ACTIVE_SET_MIN = SEED_NODES_COUNT; // BFT minimum (2 of 2)
-  inline constexpr uint64_t ACTIVE_SET_MAX = 100;              // BFT ceiling
-  inline constexpr uint64_t ACTIVE_SET_DEFAULT = 11;
-
-  static_assert(ACTIVE_SET_MIN >= 2, "BFT needs at least 2 validators");
-  static_assert(ACTIVE_SET_MIN <= ACTIVE_SET_DEFAULT, "Default must be >= minimum");
-  static_assert(ACTIVE_SET_DEFAULT <= ACTIVE_SET_MAX, "Default must be <= maximum");
-  static_assert(SEED_NODES_COUNT <= ACTIVE_SET_MIN, "Seeds must fit within the minimum active set");
+  inline constexpr uint64_t SEED_NODES_COUNT = INITIAL_SET_SIZE; // active seeds amount
 
   // Staking
 
-  inline constexpr Amount AUTO_STAKE_THRESHOLD = 100ULL * ATOMIC_UNITS_PER_COIN;  // 100 CLRTY
-  inline constexpr Bps APY_BASE_BPS = 500;                                        // 5.00% (gov)
-  inline constexpr Bps APY_ACTIVITY_MAX_BPS = 500;                                // +5.00% max
+  inline constexpr Amount AUTO_STAKE_THRESHOLD = 1ULL * ATOMIC_UNITS_PER_COIN;    // 1 CLRTY
+  inline constexpr Bps APY_BASE_BPS = 300;                                        // 3.00% (gov)
+  inline constexpr Bps APY_ACTIVITY_MAX_BPS = 300;                                // +3.00% max
   inline constexpr Bps APY_POT_BONUS_MAX_BPS = 300;                               // +3.00% max
 
   // Balance bonus: stakers holding >= threshold get +3% weight
@@ -154,8 +155,6 @@ namespace GlobalConfig
   //  existing DB. Changing them on an existing DB takes effect at the
   //  next prune. Set to 0 to disable pruning entirely (the historical
   //  tables grow without bound).
-  //  Values are per-network because a regtest that runs thousands of
-  //  blocks per hour should not retain the same window as a mainnet.
 
   inline constexpr uint64_t MAINNET_SMT_HISTORY_BLOCKS = 2048;
   inline constexpr uint64_t TESTNET_SMT_HISTORY_BLOCKS = 512;

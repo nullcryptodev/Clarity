@@ -24,21 +24,21 @@ The reward splits immediately into two pools:
 | Validator pool | 60% | Compensates the active set for producing blocks |
 | Staker pool | 40% | Compensates stakers for locking value |
 
-At the current block reward of 10 CLRTY:
+At the current block reward of 1 CLRTY:
 
 | Pool | Amount |
 |---|---|
-| Validator pool | 6 CLRTY |
-| Staker pool | 4 CLRTY |
+| Validator pool | 0.60000 CLRTY |
+| Staker pool | 0.40000 CLRTY |
 
 ## Validator pool
 
 The validator pool splits into two further components:
 
-| Component | Share of validator pool | Amount at 10 CLRTY block reward | Recipient |
+| Component | Share of validator pool | Amount at 1 CLRTY block reward | Recipient |
 |---|---|---|---|
-| Producer bonus | 20% | 1.2 CLRTY | The block's proposer |
-| Set share | 80% | 4.8 CLRTY | Split across the active set |
+| Producer bonus | 20% | 0.12000 CLRTY | The block's proposer |
+| Set share | 80% | 0.48000 CLRTY | Split across the active set |
 
 The producer bonus rewards the validator whose turn it was to propose. The set share rewards everyone who was in the active set for that block, whether or not they were the proposer.
 
@@ -128,18 +128,18 @@ effective_apy = min(
 
 | Component | Constant | Maximum |
 |---|---|---|
-| Base | `APY_BASE_BPS` | 5.00% |
-| Activity | `APY_ACTIVITY_MAX_BPS` | +5.00% |
+| Base | `APY_BASE_BPS` | 3.00% |
+| Activity | `APY_ACTIVITY_MAX_BPS` | +3.00% |
 | Pot bonus | `APY_POT_BONUS_MAX_BPS` | +3.00% |
-| **Cap** | `APY_MAX_BPS` | **13.00%** |
+| **Cap** | `APY_MAX_BPS` | **9.00%** |
 
 ### Base rate
 
-5% flat, applied regardless of chain activity. This is the "baseline return for staking" — it's what a staker earns just for participating in the staking pool, without any additional incentive.
+3% flat, applied regardless of chain activity. This is the "baseline return for staking" — it's what a staker earns just for participating in the staking pool, without any additional incentive.
 
 ### Activity bonus
 
-Scales with recent transaction throughput, up to +5%. The metric is the epoch's transaction count divided by the number of blocks in the epoch. Higher throughput means a higher bonus, which pulls more stake into the pool during busy periods.
+Scales with recent transaction throughput, up to +3%. The metric is the epoch's transaction count divided by the number of blocks in the epoch. Higher throughput means a higher bonus, which pulls more stake into the pool during busy periods.
 
 The activity metric uses two counters stored in the node's meta table:
 
@@ -156,7 +156,7 @@ The pot bonus is a release valve: when the pot grows past its high threshold, th
 
 ### Cap
 
-The effective APY is capped at 13%. This is a policy limit, not a promise — the target is what the protocol *tries* to pay, and the actual distribution may be lower if the pot is empty.
+The effective APY is capped at 9%. This is a policy limit, not a promise — the target is what the protocol *tries* to pay, and the actual distribution may be lower if the pot is empty.
 
 The payout is computed deterministically from the state at the epoch boundary, so the exact number a staker receives is knowable in advance of the boundary being processed.
 
@@ -191,16 +191,15 @@ The `POT_MAX` value is intentionally large. On a chain with low staked value, th
 
 ## Total supply
 
-Genesis has an initial supply of **100,000 CLRTY** on mainnet, allocated as follows:
+Genesis has an initial supply of **250,000 CLRTY** on mainnet, allocated as follows:
 
 | Allocation | Amount | Purpose |
 |---|---|---|
-| Treasury | 58,000 CLRTY | Project operations, seed validator funding |
-| Community | 40,000 CLRTY | Community distribution, ecosystem grants |
-| Seed validator 1 | 1,000 CLRTY | Bootstrap the first seed validator |
-| Seed validator 2 | 1,000 CLRTY | Bootstrap the second seed validator |
+| Treasury | 249,980 CLRTY | Project operations, seed validator funding |
+| Seed validator 1 | 10 CLRTY | Bootstrap the first seed validator |
+| Seed validator 2 | 10 CLRTY | Bootstrap the second seed validator |
 
-Total supply **increases by the block reward each block**. There is no hard cap. The growth rate is bounded by the block reward, which is a fixed constant. At one block per minute and a 10 CLRTY reward, the annualized issuance rate is roughly 5.256 million CLRTY per year, which is large relative to the genesis supply.
+Total supply **increases by the block reward each block**. There is no hard cap. The growth rate is bounded by the block reward, which is a fixed constant. At one block per minute and a 1 CLRTY reward, the daily issuance rate is roughly ~86k CLRTY per day.
 
 The issuance rate is a policy parameter. If the emission needs to slow, the lever is the block reward amount, not the block interval. Halving `BLOCK_REWARD` halves the emission without changing the reward split, the validator economics, or the staking APY formula.
 
