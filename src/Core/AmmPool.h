@@ -46,7 +46,7 @@ namespace Core
   //  native unit is the reference.
   //
   //  Consensus constant: changing it is a hard fork.
-  inline constexpr Amount MIN_POOL_LIQUIDITY = 100 * GlobalConfig::ATOMIC_UNITS_PER_COIN;
+  inline constexpr Amount MIN_POOL_LIQUIDITY = 1 * GlobalConfig::ATOMIC_UNITS_PER_COIN;
 
   struct AmmPool
   {

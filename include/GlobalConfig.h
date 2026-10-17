@@ -90,9 +90,9 @@ namespace GlobalConfig
   // error, instead of silently diverging from other nodes on the same
   // network.
   // When creating new hashes, rotate the addresses too.
-  inline constexpr const char *MAINNET_GENESIS_HASH = "9def9871496416713c277544592e6409e372cc4577593062910604143ad1f2b0";
-  inline constexpr const char *TESTNET_GENESIS_HASH = "b735c17969ea1c76d8823ab6132f8396ba26a1913f7465269aea77a1c805e75a";
-  inline constexpr const char *REGTEST_GENESIS_HASH = "39225b762030873e38dfda67bfd811e2e208ecc78f3b9770e94d684ec947662e";
+  inline constexpr const char *MAINNET_GENESIS_HASH = "eb03ccc1fd7ee6fc85f141183c19d4eabe4876afbc09b8faedb5b8b86264b683";
+  inline constexpr const char *TESTNET_GENESIS_HASH = "2c6f71f6440e64bd1e80514d2239f88ed62b6a2af6f3e0988dd6afd132438692";
+  inline constexpr const char *REGTEST_GENESIS_HASH = "571dd8db044a01b6e6c0634f468c50693586cb4f58e956f7f05cf118c0a5a01e";
 
   // Seed validators.
   //
@@ -112,20 +112,20 @@ namespace GlobalConfig
   //   ./address --show <keystore> --show-secret
 
   // Seed validator 1
-  inline constexpr const char *SEED_ADDRESS_MAINNET = "clrty1qpt8lfr2rds5q2dxt2ng56y6mu9a6x7x3lh0napgekukp8a9ce3t2szumup";  // address as bech32m
-  inline constexpr const char *SEED_ADDRESS_TESTNET = "tclrty1qpt8lfr2rds5q2dxt2ng56y6mu9a6x7x3lh0napgekukp8a9ce3t2ne8jw8"; // address as bech32m
-  inline constexpr const char *SEED_ADDRESS_REGTEST = "rclrty1qpt8lfr2rds5q2dxt2ng56y6mu9a6x7x3lh0napgekukp8a9ce3t2z6phs4"; // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_MAINNET = "clrty1qrtzfefxvh8s22gxuyap5aju6zza09rktgea8vrqvstnde7e8x7lv0887e7";  // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_TESTNET = "tclrty1qrtzfefxvh8s22gxuyap5aju6zza09rktgea8vrqvstnde7e8x7lvvuuhtc"; // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_REGTEST = "rclrty1qrtzfefxvh8s22gxuyap5aju6zza09rktgea8vrqvstnde7e8x7lval6j42"; // address as bech32m
   inline constexpr Amount SEED_FUND_AMOUNT = VALIDATOR_MIN_STAKE;                                                           // just fund the seed as to be a validator
 
   // Seed validator 2
-  inline constexpr const char *SEED_ADDRESS_TWO_MAINNET = "clrty1qqwpcjfxlvnhwk4j907rdtnka00ywc03tw0drzt6f8c68h5dyrw56j50g7d";  // address as bech32m
-  inline constexpr const char *SEED_ADDRESS_TWO_TESTNET = "tclrty1qqwpcjfxlvnhwk4j907rdtnka00ywc03tw0drzt6f8c68h5dyrw56305pvt"; // address as bech32m
-  inline constexpr const char *SEED_ADDRESS_TWO_REGTEST = "rclrty1qqwpcjfxlvnhwk4j907rdtnka00ywc03tw0drzt6f8c68h5dyrw56qvjyje"; // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_TWO_MAINNET = "clrty1qp8ngvgn8p6snhq3tsvxurtn3vxadrclh3rcrc9atwmpqnus6nm5up7h6d0";  // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_TWO_TESTNET = "tclrty1qp8ngvgn8p6snhq3tsvxurtn3vxadrclh3rcrc9atwmpqnus6nm5uz9vnlf"; // address as bech32m
+  inline constexpr const char *SEED_ADDRESS_TWO_REGTEST = "rclrty1qp8ngvgn8p6snhq3tsvxurtn3vxadrclh3rcrc9atwmpqnus6nm5unx2kpm"; // address as bech32m
   inline constexpr Amount SEED_FUND_AMOUNT_TWO = VALIDATOR_MIN_STAKE;                                                           // just fund the seed as to be a validator
 
   // Consensus keys are identical across all three networks
-  inline constexpr const char *SEED_NODE = "84efa7717ca8286de2331fb0cff419f02f830486501f1d3748d387067b610ff1";     // consensus pubkey
-  inline constexpr const char *SEED_NODE_TWO = "1051bde916098cb2a55d806ace794d384de0dd78f5bbad3ef6cf8304da5183e6"; // consensus pubkey
+  inline constexpr const char *SEED_NODE = "5a46e6c209758cc54cc1d77f316ae2caa3458d50a2edb1319c4cdf5b958e4f63";     // consensus pubkey
+  inline constexpr const char *SEED_NODE_TWO = "d0c96f3a5b8511a100ea7bc1a0521e09c6258f717d36b1a5e5b4322e32704c15"; // consensus pubkey
 
   inline constexpr uint64_t SEED_NODES_COUNT = INITIAL_SET_SIZE; // active seeds amount
 

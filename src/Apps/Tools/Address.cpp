@@ -80,7 +80,7 @@ namespace
   {
     std::filesystem::path p(path);
     if (p.extension().empty())
-      p += ".ks";
+      p += ".keystone.json";
     return p.string();
   }
 
@@ -214,7 +214,7 @@ namespace
         << "\n"
         << "Options:\n"
         << "  -o <path>            output path (required for --new and --import).\n"
-        << "                       A \".ks\" extension is added if none is present.\n"
+        << "                       A \".keystone.json\" extension is added if none is present.\n"
         << "  --network <name>     mainnet | testnet | regtest (default: mainnet)\n"
         << "  --strength <bits>    for --new: 128 | 160 | 192 | 224 | 256\n"
         << "                       (default: 256)\n"
@@ -907,7 +907,7 @@ namespace
     namespace fs = std::filesystem;
     const auto tmp_dir = fs::temp_directory_path();
     const auto tmp_path = tmp_dir / ("clrty_mnemonic_" +
-                                     std::to_string(::getpid()) + ".ks");
+                                     std::to_string(::getpid()) + ".keystone.json");
 
     std::error_code ec;
     fs::remove(tmp_path, ec);
