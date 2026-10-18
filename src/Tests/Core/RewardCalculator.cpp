@@ -50,16 +50,6 @@ TEST(Core_ApplyBpsRound, RoundsToNearest)
   // 1001 * 250 / 10000 = 25.025 → rounds to 25.
   EXPECT_EQ(applyBpsRound(1001, 250), 25u);
 
-  // 1002 * 250 / 10000 = 25.05 → rounds to 25.
-  // 1003 * 250 / 10000 = 25.075 → rounds to 25.
-  // 1004 * 250 / 10000 = 25.1 → rounds to 25.
-  // 1005 * 250 / 10000 = 25.125 → rounds to 25.
-  // 1006 * 250 / 10000 = 25.15 → rounds to 25.
-  // 1007 * 250 / 10000 = 25.175 → rounds to 25.
-  // 1008 * 250 / 10000 = 25.2 → rounds to 25.
-  // 1009 * 250 / 10000 = 25.225 → rounds to 25.
-  // 1010 * 250 / 10000 = 25.25 → rounds to 25.
-
   // 2000 * 250 / 10000 = 50.0 exactly.
   EXPECT_EQ(applyBpsRound(2000, 250), 50u);
 
@@ -92,8 +82,9 @@ TEST(Core_ComputeBlockReward, ValidatorPoolShare)
 
   auto result = computeBlockReward(ctx, registry);
 
-  // Validator pool = 60% of 1000 = 600.
-  EXPECT_EQ(result.total_issued, 600u);
+  // Validator pool = VALIDATOR_SHARE_BPS (60%) of 1000.
+  EXPECT_EQ(result.total_issued,
+            applyBps(1000, GlobalConfig::VALIDATOR_SHARE_BPS));
 }
 
 TEST(Core_ComputeBlockReward, ProducerBonusShare)
@@ -104,12 +95,14 @@ TEST(Core_ComputeBlockReward, ProducerBonusShare)
 
   auto result = computeBlockReward(ctx, registry);
 
-  // Validator pool = 60% of 10000 = 6000.
-  // Producer bonus = 20% of 6000 = 1200.
-  // Set amount = 80% of 6000 = 4800.
-  EXPECT_EQ(result.total_issued, 6000u);
-  EXPECT_EQ(result.producer_amount, 1200u);
-  EXPECT_EQ(result.set_amount, 4800u);
+  const uint64_t validator_pool =
+      applyBps(10'000, GlobalConfig::VALIDATOR_SHARE_BPS);
+
+  EXPECT_EQ(result.total_issued, validator_pool);
+  EXPECT_EQ(result.producer_amount,
+            applyBps(validator_pool, GlobalConfig::PRODUCER_BONUS_BPS));
+  EXPECT_EQ(result.set_amount,
+            applyBps(validator_pool, GlobalConfig::SET_SHARE_BPS));
 }
 
 TEST(Core_ComputeBlockReward, SetDistributionSingleValidator)
@@ -120,9 +113,13 @@ TEST(Core_ComputeBlockReward, SetDistributionSingleValidator)
 
   auto result = computeBlockReward(ctx, registry);
 
+  const uint64_t validator_pool =
+      applyBps(10'000, GlobalConfig::VALIDATOR_SHARE_BPS);
+
   ASSERT_EQ(result.validator_rewards.size(), 1u);
   EXPECT_EQ(result.validator_rewards[0].validator_id, 1u);
-  EXPECT_EQ(result.validator_rewards[0].amount, 4800u);
+  EXPECT_EQ(result.validator_rewards[0].amount,
+            applyBps(validator_pool, GlobalConfig::SET_SHARE_BPS));
 }
 
 TEST(Core_ComputeBlockReward, SetDistributionMultipleValidators)
@@ -133,16 +130,19 @@ TEST(Core_ComputeBlockReward, SetDistributionMultipleValidators)
 
   auto result = computeBlockReward(ctx, registry);
 
-  // Set amount = 4800. Split across 10 → 480 each.
+  const uint64_t set_amount =
+      applyBps(applyBps(10'000, GlobalConfig::VALIDATOR_SHARE_BPS),
+               GlobalConfig::SET_SHARE_BPS);
+
   ASSERT_EQ(result.validator_rewards.size(), 10u);
 
   uint64_t total = 0;
   for (const auto &r : result.validator_rewards)
   {
-    EXPECT_EQ(r.amount, 480u);
+    EXPECT_EQ(r.amount, set_amount / 10);
     total += r.amount;
   }
-  EXPECT_EQ(total, 4800u);
+  EXPECT_EQ(total, set_amount);
 }
 
 TEST(Core_ComputeBlockReward, RemainderDistributedDeterministically)
@@ -154,24 +154,30 @@ TEST(Core_ComputeBlockReward, RemainderDistributedDeterministically)
 
   auto result = computeBlockReward(ctx, registry);
 
+  const uint64_t set_amount =
+      applyBps(applyBps(10'000, GlobalConfig::VALIDATOR_SHARE_BPS),
+               GlobalConfig::SET_SHARE_BPS);
+  const uint64_t base = set_amount / 7;
+  const uint64_t rem = set_amount % 7;
+
   ASSERT_EQ(result.validator_rewards.size(), 7u);
 
-  // First 5 validators get +1 remainder.
-  for (size_t i = 0; i < 5; ++i)
+  // First `rem` validators get +1 remainder.
+  for (size_t i = 0; i < rem; ++i)
   {
-    EXPECT_EQ(result.validator_rewards[i].amount, 686u)
+    EXPECT_EQ(result.validator_rewards[i].amount, base + 1)
         << "index " << i;
   }
-  for (size_t i = 5; i < 7; ++i)
+  for (size_t i = rem; i < 7; ++i)
   {
-    EXPECT_EQ(result.validator_rewards[i].amount, 685u)
+    EXPECT_EQ(result.validator_rewards[i].amount, base)
         << "index " << i;
   }
 
   uint64_t total = 0;
   for (const auto &r : result.validator_rewards)
     total += r.amount;
-  EXPECT_EQ(total, 4800u);
+  EXPECT_EQ(total, set_amount);
 }
 
 TEST(Core_ComputeBlockReward, TotalDistributionEqualsPool)
@@ -209,72 +215,78 @@ TEST(Core_ComputeBlockReward, ActiveSetIdsMatchOrder)
 TEST(Core_ComputeEffectiveApy, BaseOnly)
 {
   RewardContext ctx = makeContext();
-  ctx.apy_base_bps = 500;
+  ctx.apy_base_bps = GlobalConfig::APY_BASE_BPS;
   ctx.apy_activity_bps = 0;
   ctx.apy_pot_bonus_bps = 0;
 
-  EXPECT_EQ(computeEffectiveApy(ctx, 60), 500u);
+  EXPECT_EQ(computeEffectiveApy(ctx, 60), GlobalConfig::APY_BASE_BPS);
 }
 
 TEST(Core_ComputeEffectiveApy, ActivityAdded)
 {
   RewardContext ctx = makeContext();
-  ctx.apy_base_bps = 500;
-  ctx.apy_activity_bps = 300;
+  ctx.apy_base_bps = GlobalConfig::APY_BASE_BPS;
+  ctx.apy_activity_bps = 100; // below cap
 
-  EXPECT_EQ(computeEffectiveApy(ctx, 60), 800u);
+  EXPECT_EQ(computeEffectiveApy(ctx, 60),
+            GlobalConfig::APY_BASE_BPS + 100);
 }
 
 TEST(Core_ComputeEffectiveApy, ActivityCapped)
 {
   RewardContext ctx = makeContext();
-  ctx.apy_base_bps = 500;
+  ctx.apy_base_bps = GlobalConfig::APY_BASE_BPS;
   ctx.apy_activity_bps = 9999; // exceeds max
 
-  // Base 500 + cap of 500 (APY_ACTIVITY_MAX_BPS) = 1000.
-  EXPECT_EQ(computeEffectiveApy(ctx, 60), 1000u);
+  EXPECT_EQ(computeEffectiveApy(ctx, 60),
+            GlobalConfig::APY_BASE_BPS + GlobalConfig::APY_ACTIVITY_MAX_BPS);
 }
 
 TEST(Core_ComputeEffectiveApy, PotBonusAdded)
 {
   RewardContext ctx = makeContext();
-  ctx.apy_base_bps = 500;
-  ctx.apy_pot_bonus_bps = 200;
+  ctx.apy_base_bps = GlobalConfig::APY_BASE_BPS;
+  ctx.apy_pot_bonus_bps = 100;
 
-  EXPECT_EQ(computeEffectiveApy(ctx, 60), 700u);
+  EXPECT_EQ(computeEffectiveApy(ctx, 60),
+            GlobalConfig::APY_BASE_BPS + 100);
 }
 
 TEST(Core_ComputeEffectiveApy, PotBonusCapped)
 {
   RewardContext ctx = makeContext();
-  ctx.apy_base_bps = 500;
+  ctx.apy_base_bps = GlobalConfig::APY_BASE_BPS;
   ctx.apy_pot_bonus_bps = 9999; // exceeds max
 
-  // Base 500 + cap of 300 (APY_POT_BONUS_MAX_BPS) = 800.
-  EXPECT_EQ(computeEffectiveApy(ctx, 60), 800u);
+  EXPECT_EQ(computeEffectiveApy(ctx, 60),
+            GlobalConfig::APY_BASE_BPS + GlobalConfig::APY_POT_BONUS_MAX_BPS);
 }
 
 TEST(Core_ComputeEffectiveApy, AllComponentsMax)
 {
   RewardContext ctx = makeContext();
-  ctx.apy_base_bps = 500;
-  ctx.apy_activity_bps = 500;  // at cap
-  ctx.apy_pot_bonus_bps = 300; // at cap
+  ctx.apy_base_bps = GlobalConfig::APY_BASE_BPS;
+  ctx.apy_activity_bps = GlobalConfig::APY_ACTIVITY_MAX_BPS;
+  ctx.apy_pot_bonus_bps = GlobalConfig::APY_POT_BONUS_MAX_BPS;
 
-  // 500 + 500 + 300 = 1300.
-  EXPECT_EQ(computeEffectiveApy(ctx, 60), 1300u);
+  EXPECT_EQ(computeEffectiveApy(ctx, 60),
+            GlobalConfig::APY_BASE_BPS +
+                GlobalConfig::APY_ACTIVITY_MAX_BPS +
+                GlobalConfig::APY_POT_BONUS_MAX_BPS);
 }
 
 TEST(Core_ComputeEffectiveApy, Uint16Cap)
 {
   RewardContext ctx = makeContext();
   ctx.apy_base_bps = 60'000;
-  ctx.apy_activity_bps = 500;
-  ctx.apy_pot_bonus_bps = 300;
+  ctx.apy_activity_bps = GlobalConfig::APY_ACTIVITY_MAX_BPS;
+  ctx.apy_pot_bonus_bps = GlobalConfig::APY_POT_BONUS_MAX_BPS;
 
-  // Should cap at 65535, but also won't exceed because inputs are small.
-  // Actually 60000 + 500 + 300 = 60800, fits in uint16.
-  EXPECT_EQ(computeEffectiveApy(ctx, 60), 60'800u);
+  // 60000 + APY_ACTIVITY_MAX_BPS + APY_POT_BONUS_MAX_BPS.
+  EXPECT_EQ(computeEffectiveApy(ctx, 60),
+            60'000u +
+                GlobalConfig::APY_ACTIVITY_MAX_BPS +
+                GlobalConfig::APY_POT_BONUS_MAX_BPS);
 }
 
 TEST(Core_ComputeTargetStakerPayout, ZeroStake)
@@ -300,9 +312,7 @@ TEST(Core_ComputeTargetStakerPayout, BasicCase)
 
   // APY = 500 bps = 5%. Epoch = 60 seconds.
   // Target = 1e9 * 500 / 10000 * 60 / 31556952
-  //        = 5e7 * 60 / 31556952
   //        = 3e9 / 31556952
-  //        = 95.06...
   //        = 95 (integer division)
   uint64_t payout = computeTargetStakerPayout(ctx, 500, 60);
   EXPECT_EQ(payout, 95u);
@@ -318,7 +328,6 @@ TEST(Core_ComputeTargetStakerPayout, ScalesWithStake)
   ctx.total_staked = 2'000'000'000ULL;
   uint64_t p2 = computeTargetStakerPayout(ctx, 500, 60);
 
-  // Should approximately double.
   EXPECT_GE(p2, p1 * 2 - 1);
   EXPECT_LE(p2, p1 * 2 + 1);
 }
@@ -331,7 +340,6 @@ TEST(Core_ComputeTargetStakerPayout, ScalesWithTime)
   uint64_t p1 = computeTargetStakerPayout(ctx, 500, 60);
   uint64_t p2 = computeTargetStakerPayout(ctx, 500, 120);
 
-  // Should approximately double.
   EXPECT_GE(p2, p1 * 2 - 1);
   EXPECT_LE(p2, p1 * 2 + 1);
 }
@@ -339,11 +347,10 @@ TEST(Core_ComputeTargetStakerPayout, ScalesWithTime)
 TEST(Core_ComputeTargetStakerPayout, ScalesWithApy)
 {
   RewardContext ctx = makeContext();
-  ctx.total_staked = 100'000'000'000ULL; // 100B
+  ctx.total_staked = 100'000'000'000ULL;
 
-  // Longer epoch to reduce rounding error.
-  uint64_t p1 = computeTargetStakerPayout(ctx, 500, 3600);  // 5%
-  uint64_t p2 = computeTargetStakerPayout(ctx, 1000, 3600); // 10%
+  uint64_t p1 = computeTargetStakerPayout(ctx, 500, 3600);
+  uint64_t p2 = computeTargetStakerPayout(ctx, 1000, 3600);
 
   EXPECT_GE(p2, p1 * 2 - 1);
   EXPECT_LE(p2, p1 * 2 + 1);
@@ -354,20 +361,14 @@ TEST(Core_ComputeTargetStakerPayout, NoOverflowAtMax)
   RewardContext ctx = makeContext();
   ctx.total_staked = std::numeric_limits<uint64_t>::max();
 
-  // Shouldn't overflow due to __uint128_t usage.
   uint64_t payout = computeTargetStakerPayout(ctx, 10'000, SECONDS_PER_YEAR);
   EXPECT_GT(payout, 0u);
 
-  // Sanity: should approximately equal total_staked (100% APY, 1 year).
-  // uint128 math: max * 10000 * 31556952 / 10000 / 31556952 = max.
-  // But intermediate steps might truncate. Expect within a factor of 2.
   EXPECT_GE(payout, ctx.total_staked / 2);
 }
 
 TEST(Core_ApplyPotMechanics, PoolCoversTarget)
 {
-  // Pool = 1000, target = 600, pot = 0, baseline = 100.
-  // Result: distribute 600, add 400 to pot, no drain, no burn.
   auto adj = applyPotMechanics(
       /*staker_pool=*/1000,
       /*target_payout=*/600,
@@ -382,7 +383,6 @@ TEST(Core_ApplyPotMechanics, PoolCoversTarget)
 
 TEST(Core_ApplyPotMechanics, PoolEqualsTarget)
 {
-  // Pool == target, pot unchanged.
   auto adj = applyPotMechanics(1000, 1000, 0, 100);
 
   EXPECT_EQ(adj.distributed, 1000u);
@@ -393,8 +393,6 @@ TEST(Core_ApplyPotMechanics, PoolEqualsTarget)
 
 TEST(Core_ApplyPotMechanics, PoolShortPotCovers)
 {
-  // Pool = 500, target = 1000, pot = 700.
-  // Result: distribute 1000, drain 500 from pot, no add.
   auto adj = applyPotMechanics(500, 1000, 700, 100);
 
   EXPECT_EQ(adj.distributed, 1000u);
@@ -405,8 +403,6 @@ TEST(Core_ApplyPotMechanics, PoolShortPotCovers)
 
 TEST(Core_ApplyPotMechanics, PoolShortPotInsufficient)
 {
-  // Pool = 500, target = 1000, pot = 300.
-  // Result: distribute 800 (all available), drain 300, no add.
   auto adj = applyPotMechanics(500, 1000, 300, 100);
 
   EXPECT_EQ(adj.distributed, 800u);
@@ -417,15 +413,9 @@ TEST(Core_ApplyPotMechanics, PoolShortPotInsufficient)
 
 TEST(Core_ApplyPotMechanics, PotBurnedAtMax)
 {
-  // pot_max = baseline * POT_MAX_EPOCHS. Compute it rather than
-  // hardcoding so this test stays correct if the constant changes.
   const uint64_t baseline = 100;
   const uint64_t pot_max = baseline * POT_MAX_EPOCHS;
 
-  // Case 1: pot + added stays at or below pot_max — no burn.
-  //
-  // Pool = 1000, target = 100, so added = 900.
-  // Current pot chosen so new_pot = pot + 900 = pot_max exactly.
   {
     const uint64_t pot_before = pot_max - 900;
     auto adj = applyPotMechanics(1000, 100, pot_before, baseline);
@@ -433,10 +423,6 @@ TEST(Core_ApplyPotMechanics, PotBurnedAtMax)
     EXPECT_EQ(adj.burned, 0u);
   }
 
-  // Case 2: pot + added exceeds pot_max — burn the excess.
-  //
-  // Start at pot_max. Add 900. New pot = pot_max + 900.
-  // Burn = 900.
   {
     auto adj = applyPotMechanics(1000, 100, pot_max, baseline);
     EXPECT_EQ(adj.added_to_pot, 900u);
@@ -456,8 +442,6 @@ TEST(Core_ApplyPotMechanics, PoolZeroTargetZero)
 
 TEST(Core_ApplyPotMechanics, ZeroBaselineUsesPool)
 {
-  // If baseline is 0, use staker_pool.
-  // Shouldn't crash, should still compute reasonably.
   auto adj = applyPotMechanics(1000, 500, 0, 0);
   EXPECT_EQ(adj.distributed, 500u);
   EXPECT_EQ(adj.added_to_pot, 500u);
@@ -471,8 +455,8 @@ TEST(Core_ApyToPerSecondScaled, Zero)
 TEST(Core_ApyToPerSecondScaled, NonZero)
 {
   // 500 * 10^12 / 31,556,952 = 15,844,369 (integer division).
-  // Pinning the exact value makes this test fail loudly if SCALE or
-  // SECONDS_PER_YEAR changes.
+  // This pins the exact value; if SCALE or SECONDS_PER_YEAR changes
+  // this test will fail and must be recomputed.
   EXPECT_EQ(apyToPerSecondScaled(500), 15'844'369u);
 }
 
@@ -481,7 +465,6 @@ TEST(Core_ApyToPerSecondScaled, ScalesLinearly)
   uint64_t r1 = apyToPerSecondScaled(500);
   uint64_t r2 = apyToPerSecondScaled(1000);
 
-  // Should double.
   EXPECT_GE(r2, r1 * 2 - 1);
   EXPECT_LE(r2, r1 * 2 + 1);
 }
@@ -499,51 +482,54 @@ TEST(Core_RewardIntegration, TypicalBlock)
 
   auto result = computeBlockReward(ctx, reg);
 
-  // Validator pool = 60% of 1,000,000 = 600,000.
-  EXPECT_EQ(result.total_issued, 600'000u);
+  // Every expectation is derived from GlobalConfig::BLOCK_REWARD so
+  // this test does not go stale if DECIMALS or the block-reward
+  // constant changes again.
+  const uint64_t validator_pool =
+      applyBps(GlobalConfig::BLOCK_REWARD, GlobalConfig::VALIDATOR_SHARE_BPS);
+  const uint64_t producer = applyBps(validator_pool,
+                                     GlobalConfig::PRODUCER_BONUS_BPS);
+  const uint64_t set_amount = applyBps(validator_pool,
+                                       GlobalConfig::SET_SHARE_BPS);
 
-  // Producer bonus = 20% of 600,000 = 120,000.
-  EXPECT_EQ(result.producer_amount, 120'000u);
+  EXPECT_EQ(result.total_issued, validator_pool);
+  EXPECT_EQ(result.producer_amount, producer);
+  EXPECT_EQ(result.set_amount, set_amount);
 
-  // Set share = 480,000.
-  EXPECT_EQ(result.set_amount, 480'000u);
-
-  // Per validator: 480,000 / 21 = 22,857 remainder 3.
-  // First 3 validators get 22,858, rest get 22,857.
   uint64_t total = 0;
   for (const auto &r : result.validator_rewards)
     total += r.amount;
-  EXPECT_EQ(total, 480'000u);
+  EXPECT_EQ(total, set_amount);
   EXPECT_EQ(result.validator_rewards.size(), 21u);
 }
 
 TEST(Core_RewardIntegration, TypicalEpoch)
 {
   RewardContext ctx = makeContext();
-  ctx.total_staked = 50'000'000 * 100'000ULL; // 50M CLRTY staked
-  ctx.apy_base_bps = GlobalConfig::APY_BASE_BPS; // 5%
-  ctx.apy_activity_bps = 300;                 // medium activity
+  ctx.total_staked = 50'000'000 * GlobalConfig::ATOMIC_UNITS_PER_COIN;
+  ctx.apy_base_bps = GlobalConfig::APY_BASE_BPS;
+  ctx.apy_activity_bps = 100;
   ctx.apy_pot_bonus_bps = 0;
 
-  // Effective APY = 500 + 300 + 0 = 800 bps = 8%.
+  // Effective APY = APY_BASE_BPS + 100.
+  const uint16_t expected_apy =
+      GlobalConfig::APY_BASE_BPS + 100;
   uint16_t apy = computeEffectiveApy(ctx, 60);
-  EXPECT_EQ(apy, 800u);
+  EXPECT_EQ(apy, expected_apy);
 
-  // Target for one epoch (60 seconds).
   uint64_t target = computeTargetStakerPayout(ctx, apy, 60);
   EXPECT_GT(target, 0u);
 
-  // Expected: 50M * 100,000 * 800 / 10,000 * 60 / 31,556,952
-  //         = 5e12 * 800 / 10,000 * 60 / 31,556,952
-  //         = 5e12 * 0.08 * 60 / 31,556,952
-  //         = 4e11 * 60 / 31,556,952
-  //         = 2.4e13 / 31,556,952
-  //         ≈ 760,498 atomic units
-  EXPECT_NEAR(target, 760'000u, 10'000u);
-}
+  // Recompute the expected target in the same integer arithmetic the
+  // calculator uses, so the test tracks the constants.
+  const __uint128_t numerator =
+      static_cast<__uint128_t>(ctx.total_staked) * apy * 60;
+  const __uint128_t denominator =
+      static_cast<__uint128_t>(10'000) * SECONDS_PER_YEAR;
+  const uint64_t expected = static_cast<uint64_t>(numerator / denominator);
 
-// Returns 0 at zero activity, APY_ACTIVITY_MAX_BPS at TRAFFIC_SATURATION_TX,
-// linearly interpolated between. Clamps above saturation.
+  EXPECT_EQ(target, expected);
+}
 
 TEST(Core_ComputeActivityBps, ZeroTxReturnsZero)
 {
@@ -552,57 +538,69 @@ TEST(Core_ComputeActivityBps, ZeroTxReturnsZero)
 
 TEST(Core_ComputeActivityBps, AtSaturationReturnsMax)
 {
-  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX), GlobalConfig::APY_ACTIVITY_MAX_BPS);
+  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX),
+            GlobalConfig::APY_ACTIVITY_MAX_BPS);
 }
 
 TEST(Core_ComputeActivityBps, AboveSaturationClampsToMax)
 {
-  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX + 1), GlobalConfig::APY_ACTIVITY_MAX_BPS);
-  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX * 100), GlobalConfig::APY_ACTIVITY_MAX_BPS);
-  EXPECT_EQ(computeActivityBps(std::numeric_limits<uint64_t>::max()), GlobalConfig::APY_ACTIVITY_MAX_BPS);
+  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX + 1),
+            GlobalConfig::APY_ACTIVITY_MAX_BPS);
+  EXPECT_EQ(computeActivityBps(TRAFFIC_SATURATION_TX * 100),
+            GlobalConfig::APY_ACTIVITY_MAX_BPS);
+  EXPECT_EQ(computeActivityBps(std::numeric_limits<uint64_t>::max()),
+            GlobalConfig::APY_ACTIVITY_MAX_BPS);
 }
 
 TEST(Core_ComputeActivityBps, LinearInterpolation)
 {
-  // TRAFFIC_SATURATION_TX = 1000, APY_ACTIVITY_MAX_BPS = 500.
-  // Halfway: 500 tx → 250 bps.
-  EXPECT_EQ(computeActivityBps(500), 250u);
+  // Halfway through the saturation window the bonus is half the max.
+  // Expressed against the constants so a future change to
+  // APY_ACTIVITY_MAX_BPS doesn't break the test.
+  const uint64_t half = TRAFFIC_SATURATION_TX / 2;
+  const uint64_t quarter = TRAFFIC_SATURATION_TX / 4;
+  const uint64_t tenth = TRAFFIC_SATURATION_TX / 10;
 
-  // Quarter: 250 tx → 125 bps.
-  EXPECT_EQ(computeActivityBps(250), 125u);
+  EXPECT_EQ(computeActivityBps(half),
+            applyBps(GlobalConfig::APY_ACTIVITY_MAX_BPS, half * 10'000 / TRAFFIC_SATURATION_TX));
+  EXPECT_EQ(computeActivityBps(quarter),
+            applyBps(GlobalConfig::APY_ACTIVITY_MAX_BPS, quarter * 10'000 / TRAFFIC_SATURATION_TX));
+  EXPECT_EQ(computeActivityBps(tenth),
+            applyBps(GlobalConfig::APY_ACTIVITY_MAX_BPS, tenth * 10'000 / TRAFFIC_SATURATION_TX));
 
-  // Tenth: 100 tx → 50 bps.
-  EXPECT_EQ(computeActivityBps(100), 50u);
+  // Anchor the exact expected values under the current config.
+  EXPECT_EQ(computeActivityBps(half),
+            GlobalConfig::APY_ACTIVITY_MAX_BPS / 2);
+  EXPECT_EQ(computeActivityBps(quarter),
+            GlobalConfig::APY_ACTIVITY_MAX_BPS / 4);
+  EXPECT_EQ(computeActivityBps(tenth),
+            GlobalConfig::APY_ACTIVITY_MAX_BPS / 10);
 }
 
 TEST(Core_ComputeActivityBps, SmallValuesRoundDown)
 {
-  // 1 tx out of 1000 → 500 * 1 / 1000 = 0 (integer division).
+  // 1 tx out of TRAFFIC_SATURATION_TX → APY_ACTIVITY_MAX_BPS / TRAFFIC_SATURATION_TX,
+  // which rounds down to 0 for the small inputs.
   EXPECT_EQ(computeActivityBps(1), 0u);
 
-  // 2 tx → 1.
-  EXPECT_EQ(computeActivityBps(2), 1u);
+  // 2 tx → 300 * 2 / 1000 = 0.
+  EXPECT_EQ(computeActivityBps(2), 0u);
 
-  // 3 tx → 1.
-  EXPECT_EQ(computeActivityBps(3), 1u);
+  // 3 tx → 300 * 3 / 1000 = 0.
+  EXPECT_EQ(computeActivityBps(3), 0u);
 
-  // 4 tx → 2.
-  EXPECT_EQ(computeActivityBps(4), 2u);
+  // 4 tx → 300 * 4 / 1000 = 1.
+  EXPECT_EQ(computeActivityBps(4), 1u);
 }
 
 TEST(Core_ComputeActivityBps, NeverExceedsMax)
 {
-  // Sweep a range and confirm the cap holds.
   for (uint64_t tx = 0; tx <= TRAFFIC_SATURATION_TX * 2; tx += 50)
   {
     EXPECT_LE(computeActivityBps(tx), GlobalConfig::APY_ACTIVITY_MAX_BPS)
         << "tx=" << tx;
   }
 }
-
-// Returns 0 below POT_HIGH, ramps linearly from 0 to APY_POT_BONUS_MAX_BPS
-// between POT_HIGH and POT_MAX, clamps at the max above POT_MAX. Returns
-// 0 when baseline is 0.
 
 TEST(Core_ComputePotBonusBps, ZeroBaselineReturnsZero)
 {
@@ -625,9 +623,6 @@ TEST(Core_ComputePotBonusBps, AtPotHighReturnsZero)
   const uint64_t baseline = 100;
   const uint64_t pot_high = baseline * POT_HIGH_EPOCHS;
 
-  // The bonus zone starts just above POT_HIGH. At exactly POT_HIGH,
-  // the bonus is still 0 (the boundary is inclusive on the "below"
-  // side).
   EXPECT_EQ(computePotBonusBps(pot_high, baseline), 0u);
 }
 
@@ -637,11 +632,9 @@ TEST(Core_ComputePotBonusBps, MidpointInterpolates)
   const uint64_t pot_high = baseline * POT_HIGH_EPOCHS;
   const uint64_t pot_max = baseline * POT_MAX_EPOCHS;
 
-  // Halfway between POT_HIGH and POT_MAX → half the max bonus.
   const uint64_t midpoint = pot_high + (pot_max - pot_high) / 2;
   const uint16_t expected = GlobalConfig::APY_POT_BONUS_MAX_BPS / 2;
 
-  // Allow ±1 for integer rounding.
   uint16_t actual = computePotBonusBps(midpoint, baseline);
   EXPECT_GE(actual, expected - 1);
   EXPECT_LE(actual, expected + 1);
@@ -652,7 +645,8 @@ TEST(Core_ComputePotBonusBps, AtPotMaxReturnsMax)
   const uint64_t baseline = 100;
   const uint64_t pot_max = baseline * POT_MAX_EPOCHS;
 
-  EXPECT_EQ(computePotBonusBps(pot_max, baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS);
+  EXPECT_EQ(computePotBonusBps(pot_max, baseline),
+            GlobalConfig::APY_POT_BONUS_MAX_BPS);
 }
 
 TEST(Core_ComputePotBonusBps, AbovePotMaxClampsToMax)
@@ -660,9 +654,12 @@ TEST(Core_ComputePotBonusBps, AbovePotMaxClampsToMax)
   const uint64_t baseline = 100;
   const uint64_t pot_max = baseline * POT_MAX_EPOCHS;
 
-  EXPECT_EQ(computePotBonusBps(pot_max + 1, baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS);
-  EXPECT_EQ(computePotBonusBps(pot_max * 10, baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS);
-  EXPECT_EQ(computePotBonusBps(std::numeric_limits<uint64_t>::max(), baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS);
+  EXPECT_EQ(computePotBonusBps(pot_max + 1, baseline),
+            GlobalConfig::APY_POT_BONUS_MAX_BPS);
+  EXPECT_EQ(computePotBonusBps(pot_max * 10, baseline),
+            GlobalConfig::APY_POT_BONUS_MAX_BPS);
+  EXPECT_EQ(computePotBonusBps(std::numeric_limits<uint64_t>::max(), baseline),
+            GlobalConfig::APY_POT_BONUS_MAX_BPS);
 }
 
 TEST(Core_ComputePotBonusBps, MonotonicallyNonDecreasing)
@@ -671,30 +668,27 @@ TEST(Core_ComputePotBonusBps, MonotonicallyNonDecreasing)
   const uint64_t pot_high = baseline * POT_HIGH_EPOCHS;
   const uint64_t pot_max = baseline * POT_MAX_EPOCHS;
 
-  // Sweep across the ramp and confirm the value never decreases.
-  // The step is span/20, which doesn't necessarily land exactly on
-  // pot_max from pot_high - 1, so we stop just before it and check
-  // the endpoint separately below.
   uint16_t prev = 0;
-  for (uint64_t pot = pot_high - 1; pot < pot_max; pot += (pot_max - pot_high) / 20)
+  for (uint64_t pot = pot_high - 1; pot < pot_max;
+       pot += (pot_max - pot_high) / 20)
   {
     uint16_t cur = computePotBonusBps(pot, baseline);
     EXPECT_GE(cur, prev) << "pot=" << pot;
     prev = cur;
   }
 
-  // The top of the ramp is exactly APY_POT_BONUS_MAX_BPS.
-  EXPECT_EQ(computePotBonusBps(pot_max, baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS);
+  EXPECT_EQ(computePotBonusBps(pot_max, baseline),
+            GlobalConfig::APY_POT_BONUS_MAX_BPS);
 }
 
 TEST(Core_ComputePotBonusBps, NeverExceedsMax)
 {
   const uint64_t baseline = 100;
 
-  // Sweep a huge range and confirm the cap holds.
   for (uint64_t pot = 0; pot < 1'000'000'000ULL; pot += 50'000'000ULL)
   {
-    EXPECT_LE(computePotBonusBps(pot, baseline), GlobalConfig::APY_POT_BONUS_MAX_BPS)
+    EXPECT_LE(computePotBonusBps(pot, baseline),
+              GlobalConfig::APY_POT_BONUS_MAX_BPS)
         << "pot=" << pot;
   }
 }

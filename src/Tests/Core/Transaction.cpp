@@ -262,7 +262,7 @@ TEST(Core_TxTypes, NameLookup)
 {
   EXPECT_EQ(txTypeName(TxType::Transfer), "transfer");
   EXPECT_EQ(txTypeName(TxType::Swap), "swap");
-  EXPECT_EQ(txTypeName(TxType::CreateToken), "create-token");
+  EXPECT_EQ(txTypeName(TxType::CreateToken), "create_token");
   EXPECT_EQ(txTypeName(TxType::Invalid), "invalid");
 }
 

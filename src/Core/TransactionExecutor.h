@@ -7,8 +7,10 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "Account.h"
+#include "BridgeTypes.h"
 #include "Receipt.h"
 #include "Transaction.h"
 #include "TransactionTypes.h"
@@ -184,6 +186,70 @@ namespace Core
     static Receipt executeRefillCollectionReward(State::StateAccess &state,
                                                  const Transaction &tx,
                                                  const TxExecutionContext &ctx);
+    //  ---- Bridge ----
+
+    static Receipt executeBridgeMint(State::StateAccess &state,
+                                     const Transaction &tx,
+                                     const TxExecutionContext &ctx);
+    static Receipt executeBridgeBurn(State::StateAccess &state,
+                                     const Transaction &tx,
+                                     const TxExecutionContext &ctx);
+    static Receipt executeBridgePause(State::StateAccess &state,
+                                      const Transaction &tx,
+                                      const TxExecutionContext &ctx);
+    static Receipt executeBridgeUnpause(State::StateAccess &state,
+                                        const Transaction &tx,
+                                        const TxExecutionContext &ctx);
+    static Receipt executeBridgeAckWithdrawal(State::StateAccess &state,
+                                              const Transaction &tx,
+                                              const TxExecutionContext &ctx);
+    static Receipt executeBridgeRegisterChain(State::StateAccess &state,
+                                              const Transaction &tx,
+                                              const TxExecutionContext &ctx);
+    static Receipt executeRegisterBridgeWatcher(State::StateAccess &state,
+                                                const Transaction &tx,
+                                                const TxExecutionContext &ctx);
+    static Receipt executeUnregisterBridgeWatcher(State::StateAccess &state,
+                                                  const Transaction &tx,
+                                                  const TxExecutionContext &ctx);
+
+    //  Verify M-of-N watcher attestations for a source chain.
+    //
+    //  The signer set is the active watcher set for `source_chain_id`
+    //  at `ctx.current_height`, resolved from state. The threshold is
+    //  bftQuorum(active_count), same as consensus.
+    //
+    //  `signatures` is the same `[2] count || N*66` block used before;
+    //  the `signer_index` in each entry is a position in the sorted
+    //  active watcher id list, not a position in a config-declared
+    //  set.
+    //
+    //  The signature is verified against the validator's consensus
+    //  key at `ctx.current_height` (the height-scoped key, not the
+    //  current key — a validator that rotated its consensus key
+    //  after signing must still verify).
+    static bool verifyBridgeSignatures(
+        State::StateAccess &state,
+        uint64_t source_chain_id,
+        std::string_view domain,
+        const uint8_t *message, size_t message_len,
+        const uint8_t *signatures, size_t signatures_len,
+        const TxExecutionContext &ctx);
+
+    //  Verify M-of-N validator-set attestations for a governance
+    //  operation (pause, unpause, register-chain). The signer set
+    //  is the active validator set at `ctx.current_height`; the
+    //  threshold is bftQuorum(active_count).
+    //
+    //  Reuses the same `[2] count || N*66` signature block; the
+    //  `signer_index` is a position in the active validator set.
+    static bool verifyGovernanceSignatures(
+        State::StateAccess &state,
+        std::string_view domain,
+        const uint8_t *message, size_t message_len,
+        const uint8_t *signatures, size_t signatures_len,
+        const TxExecutionContext &ctx);
+
     // ---- Common helpers ----
 
     // Charge the fee from `tx.from`. Returns true if the fee was charged.

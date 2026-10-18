@@ -67,6 +67,27 @@ namespace Core
     Crypto::PublicKey consensus_key{};
   };
 
+  //  Bridge genesis configuration.
+  //
+  //  The bridge is a registered role: watchers are validators who
+  //  have registered to witness deposits and withdrawals on a source
+  //  chain, and the operational signer set is the active watcher set
+  //  resolved from state at each verification. Genesis only needs to
+  //  know whether the bridge is on and which chain it's for; the
+  //  watcher records, the wrapped-CCX token, and the chain
+  //  registration are written by applyGenesis from the validator
+  //  list (each seed validator is registered as an initial watcher).
+  //
+  //  There are no operational/governance key bundles in this
+  //  struct. Those concepts don't exist under the watcher design:
+  //  the operational set is derived from watcher records, and the
+  //  governance set is the validator set.
+  struct GenesisBridgeConfig
+  {
+    bool enabled{false};
+    uint64_t ccx_chain_id{0};
+  };
+
   struct GenesisConfig
   {
     uint64_t chain_id{0};
@@ -77,6 +98,8 @@ namespace Core
     // Initial values for global state.
     uint64_t initial_total_supply{0};
     uint32_t initial_active_set_size{0};
+
+    GenesisBridgeConfig bridge;
   };
 
   //  Network configurations
@@ -91,11 +114,15 @@ namespace Core
   //
   // Overwrite-safe, not check-safe. The function unconditionally writes
   // every account, validator, and global entry — it does not first check
-  // whether the state already contains genesis. Calling it twice on the
-  // same state produces the same result as calling it once, because every
-  // write is an assignment (`balance = X`, `stake = Y`) rather than an
-  // increment (`balance += X`). This is idempotency by construction, not
-  // by a guard.
+  // whether the state already contains genesis.
+  // Idempotent on the same state: calling it twice produces the same
+  // resulting root. This is not simply "every write is an assignment" —
+  // putAccount() maintains `total_staked` and `staker_count` by an
+  // incremental update, so applyGenesis recomputes those two globals
+  // from `config.accounts` and overwrites them once the accounts loop
+  // has finished. The wrapped-CCX token id is likewise written as a
+  // fixed constant (1) rather than derived from `next_token_id`, so a
+  // re-run cannot shift it.
   //
   // If you change any write in this function from `=` to `+=`, calling it
   // twice stops being safe. Callers should still only call this on an

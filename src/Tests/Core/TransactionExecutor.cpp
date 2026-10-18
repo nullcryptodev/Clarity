@@ -671,16 +671,23 @@ TEST_F(Core_ExecutorFixture, BurnInsufficientBalance)
 }
 
 // AMM
+//
+// Every AMM amount below is in atomic units under the current
+// `GlobalConfig::DECIMALS`. The original tests used 1000/1000 pools
+// sized for `DECIMALS = 8`; under `DECIMALS = 5` that is 0.01 CLRTY
+// per side, well below `MIN_POOL_LIQUIDITY`. Every amount has been
+// scaled by 1000× so the tests keep exercising the same economic
+// magnitudes, at a reserve large enough to satisfy the floor.
 
 TEST_F(Core_ExecutorFixture, CreatePool)
 {
   const Id token_a = NATIVE_TOKEN_ID;
   const Id token_b = 100;
 
-  state_->putTokenBalance(alice_.publicKey, token_b, 10'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 10'000'000);
 
-  const uint64_t amount_a = 1000;
-  const uint64_t amount_b = 1000;
+  const uint64_t amount_a = 1'000'000;
+  const uint64_t amount_b = 1'000'000;
 
   uint64_t pool_id = createPool(alice_, token_a, amount_a, token_b, amount_b);
   ASSERT_NE(pool_id, 0u);
@@ -695,21 +702,21 @@ TEST_F(Core_ExecutorFixture, CreatePool)
   EXPECT_EQ(pool.creator, alice_.publicKey);
   EXPECT_TRUE(pool.active);
 
-  EXPECT_EQ(state_->getTokenBalance(alice_.publicKey, token_b), 9'000u);
+  EXPECT_EQ(state_->getTokenBalance(alice_.publicKey, token_b), 9'000'000u);
 }
 
 TEST_F(Core_ExecutorFixture, CreatePoolLiquidityIsSqrt)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 1000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 1'000'000);
 
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 100,
-                                token_b, 100);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 100'000,
+                                token_b, 100'000);
   ASSERT_NE(pool_id, 0u);
 
   AmmPool pool;
   ASSERT_TRUE(state_->getAmmPool(pool_id, pool));
-  EXPECT_EQ(pool.total_liquidity, 100u);
+  EXPECT_EQ(pool.total_liquidity, 100'000u);
 }
 
 TEST_F(Core_ExecutorFixture, CreatePoolRejectsSameTokens)
@@ -718,14 +725,14 @@ TEST_F(Core_ExecutorFixture, CreatePoolRejectsSameTokens)
                        .type(TxType::CreatePool)
                        .from(alice_)
                        .to(Crypto::Address{})
-                       .amount(1000)
+                       .amount(1'000'000)
                        .fee(1)
                        .nonce(0)
                        .tokenId(NATIVE_TOKEN_ID)
                        .chainId(EXEC_CHAIN_ID)
                        .payload(makeCreatePoolPayload(
                            static_cast<uint32_t>(NATIVE_TOKEN_ID),
-                           1000, AMM_DEFAULT_FEE_BPS))
+                           1'000'000, AMM_DEFAULT_FEE_BPS))
                        .build();
 
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
@@ -734,10 +741,10 @@ TEST_F(Core_ExecutorFixture, CreatePoolRejectsSameTokens)
 TEST_F(Core_ExecutorFixture, AddLiquidity)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000'000);
 
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
-                                token_b, 1000);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1'000'000,
+                                token_b, 1'000'000);
   ASSERT_NE(pool_id, 0u);
 
   AmmPool before;
@@ -747,30 +754,30 @@ TEST_F(Core_ExecutorFixture, AddLiquidity)
                        .type(TxType::AddLiquidity)
                        .from(alice_)
                        .to(Crypto::Address{})
-                       .amount(500)
+                       .amount(500'000)
                        .fee(1)
                        .nonce(1)
                        .tokenId(NATIVE_TOKEN_ID)
                        .chainId(EXEC_CHAIN_ID)
-                       .payload(makeAddLiquidityPayload(pool_id, 500))
+                       .payload(makeAddLiquidityPayload(pool_id, 500'000))
                        .build();
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
   AmmPool after;
   ASSERT_TRUE(state_->getAmmPool(pool_id, after));
-  EXPECT_EQ(after.reserve_a, before.reserve_a + 500);
-  EXPECT_EQ(after.reserve_b, before.reserve_b + 500);
+  EXPECT_EQ(after.reserve_a, before.reserve_a + 500'000);
+  EXPECT_EQ(after.reserve_b, before.reserve_b + 500'000);
   EXPECT_GT(after.total_liquidity, before.total_liquidity);
 }
 
 TEST_F(Core_ExecutorFixture, RemoveLiquidity)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000'000);
 
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
-                                token_b, 1000);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1'000'000,
+                                token_b, 1'000'000);
   ASSERT_NE(pool_id, 0u);
 
   uint64_t position_id = 0;
@@ -811,10 +818,7 @@ TEST_F(Core_ExecutorFixture, RemoveLiquidity)
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
   //  The pool record is gone. Alice was the only LP, so her full
-  //  removal drained the pool and triggered the auto-close. Under
-  //  the old behavior the record survived with zero reserves; that
-  //  assertion was removed along with the old behavior — the close
-  //  is now the observable post-condition.
+  //  removal drained the pool and triggered the auto-close.
   AmmPool pool_after;
   EXPECT_FALSE(state_->getAmmPool(pool_id, pool_after));
 
@@ -824,17 +828,12 @@ TEST_F(Core_ExecutorFixture, RemoveLiquidity)
   EXPECT_EQ(state_->getTokenBalance(alice_.publicKey, token_b),
             alice_token_before + pool_before.reserve_b);
 
-  //  The position is zeroed. The record itself is retained (it's
-  //  unreachable from the position index, which was removed, so it's
-  //  inert), but its liquidity is zero.
+  //  The position is zeroed. The record itself is retained.
   AmmPosition pos_after;
   ASSERT_TRUE(state_->getAmmPosition(position_id, pos_after));
   EXPECT_EQ(pos_after.liquidity, 0u);
 
-  //  The position index entry is gone, so a future AddLiquidity would
-  //  create a fresh position rather than merge into the zeroed one.
-  //  (In practice there's no pool to add to — see the closed-pool
-  //  test — but the index cleanup is worth asserting separately.)
+  //  The position index entry is gone.
   uint64_t idx = 0;
   EXPECT_FALSE(state_->getPositionIndex(alice_.publicKey, pool_id, idx));
 }
@@ -842,20 +841,26 @@ TEST_F(Core_ExecutorFixture, RemoveLiquidity)
 TEST_F(Core_ExecutorFixture, SwapXForY)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000'000);
 
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
-                                token_b, 1000);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1'000'000,
+                                token_b, 1'000'000);
   ASSERT_NE(pool_id, 0u);
 
-  const uint64_t amount_in = 10;
+  const uint64_t amount_in = 10'000;
   const uint64_t expected_out =
-      expectedSwapOutput(1000, 1000, amount_in, AMM_DEFAULT_FEE_BPS);
+      expectedSwapOutput(1'000'000, 1'000'000, amount_in, AMM_DEFAULT_FEE_BPS);
 
   // Hand-computed anchor for the Uniswap V2 formula:
-  //   in_with_fee = 10 * 9970 / 10000 = 9
-  //   out = 1000 * 9 / (1000 + 9) = 9000 / 1009 = 8 (integer division)
-  EXPECT_EQ(expected_out, 8u);
+  //   in_with_fee = 10'000 * 9970 / 10'000 = 9'970
+  //   out = 1'000'000 * 9'970 / (1'000'000 + 9'970)
+  //       = 9'970'000'000 / 1'009'970
+  //       = 9'871 (integer division)
+  //
+  // The anchor is computed by hand above; the EXPECT below confirms
+  // that `expectedSwapOutput` agrees with it. If either changes, this
+  // will fail loudly rather than drift.
+  EXPECT_EQ(expected_out, 9'871u);
 
   uint64_t alice_native_before = balanceOf(alice_.publicKey);
   uint64_t alice_token_before = state_->getTokenBalance(alice_.publicKey, token_b);
@@ -874,27 +879,24 @@ TEST_F(Core_ExecutorFixture, SwapXForY)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // Native decreases by amount_in + fee. No native comes back —
-  // the output is token_b.
   EXPECT_EQ(balanceOf(alice_.publicKey),
             alice_native_before - amount_in - 1);
-  // token_b increases by the swap output.
   EXPECT_EQ(state_->getTokenBalance(alice_.publicKey, token_b),
             alice_token_before + expected_out);
 
   AmmPool pool_after;
   ASSERT_TRUE(state_->getAmmPool(pool_id, pool_after));
-  EXPECT_EQ(pool_after.reserve_a, 1000u + amount_in);
-  EXPECT_EQ(pool_after.reserve_b, 1000u - expected_out);
+  EXPECT_EQ(pool_after.reserve_a, 1'000'000u + amount_in);
+  EXPECT_EQ(pool_after.reserve_b, 1'000'000u - expected_out);
 }
 
 TEST_F(Core_ExecutorFixture, SwapSlippageExceeded)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000'000);
 
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
-                                token_b, 1000);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1'000'000,
+                                token_b, 1'000'000);
   ASSERT_NE(pool_id, 0u);
 
   uint64_t alice_native_before = balanceOf(alice_.publicKey);
@@ -907,12 +909,12 @@ TEST_F(Core_ExecutorFixture, SwapSlippageExceeded)
                        .type(TxType::Swap)
                        .from(alice_)
                        .to(alice_.publicKey)
-                       .amount(10)
+                       .amount(10'000)
                        .fee(1)
                        .nonce(1)
                        .tokenId(NATIVE_TOKEN_ID)
                        .chainId(EXEC_CHAIN_ID)
-                       .payload(makeSwapPayload(pool_id, /*min_amount_out=*/100))
+                       .payload(makeSwapPayload(pool_id, /*min_amount_out=*/100'000))
                        .build();
 
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
@@ -1179,15 +1181,15 @@ TEST_F(Core_ExecutorFixture, FullTransferSequence)
 TEST_F(Core_ExecutorFixture, AMMSwapAfterCreate)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000'000);
 
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
-                                token_b, 1000);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1'000'000,
+                                token_b, 1'000'000);
   ASSERT_NE(pool_id, 0u);
 
-  const uint64_t amount_in = 100;
+  const uint64_t amount_in = 100'000;
   const uint64_t expected_out =
-      expectedSwapOutput(1000, 1000, amount_in, AMM_DEFAULT_FEE_BPS);
+      expectedSwapOutput(1'000'000, 1'000'000, amount_in, AMM_DEFAULT_FEE_BPS);
 
   Transaction tx = TransactionBuilder()
                        .type(TxType::Swap)
@@ -1205,11 +1207,11 @@ TEST_F(Core_ExecutorFixture, AMMSwapAfterCreate)
 
   AmmPool pool;
   ASSERT_TRUE(state_->getAmmPool(pool_id, pool));
-  EXPECT_EQ(pool.reserve_a, 1000u + amount_in);
-  EXPECT_EQ(pool.reserve_b, 1000u - expected_out);
+  EXPECT_EQ(pool.reserve_a, 1'000'000u + amount_in);
+  EXPECT_EQ(pool.reserve_b, 1'000'000u - expected_out);
 
   // k grew (fees accumulate) or stayed equal (no fee). It must never shrink.
-  __uint128_t k_before = static_cast<__uint128_t>(1000) * 1000;
+  __uint128_t k_before = static_cast<__uint128_t>(1'000'000) * 1'000'000;
   __uint128_t k_after = pool.k();
   EXPECT_GE(k_after, k_before);
 }
@@ -1267,14 +1269,9 @@ TEST_F(Core_ExecutorFixture, OrderLifecycle)
 
 TEST_F(Core_ExecutorFixture, MintAfterTransferRespectsMaxSupply)
 {
-  // The bug that the supply counter fixes: mint to cap, transfer
-  // tokens away, mint again. The old code checked the minter's
-  // balance, so transferring away reduced the apparent usage and
-  // allowed minting past the cap.
   const Id token =
       createTokenDirect(alice_, "Capped", "CAP", /*max_supply=*/1000);
 
-  // Mint the full cap to Alice.
   {
     Transaction tx = TransactionBuilder()
                          .type(TxType::MintToken)
@@ -1291,8 +1288,6 @@ TEST_F(Core_ExecutorFixture, MintAfterTransferRespectsMaxSupply)
 
   EXPECT_EQ(state_->getTokenSupply(token), 1000u);
 
-  // Transfer half to Bob. Alice's balance is now 500, but the token's
-  // total supply is still 1000.
   {
     Transaction tx = TransactionBuilder()
                          .type(TxType::Transfer)
@@ -1311,9 +1306,6 @@ TEST_F(Core_ExecutorFixture, MintAfterTransferRespectsMaxSupply)
   EXPECT_EQ(state_->getTokenBalance(bob_.publicKey, token), 500u);
   EXPECT_EQ(state_->getTokenSupply(token), 1000u);
 
-  // Now try to mint 1 more. With the old balance-based check, Alice's
-  // balance (500) + 1 <= 1000 would pass. With the supply-based check,
-  // supply (1000) + 1 > 1000 fails.
   {
     Transaction tx = TransactionBuilder()
                          .type(TxType::MintToken)
@@ -1375,9 +1367,6 @@ TEST_F(Core_ExecutorFixture, BurnReducesTokenSupply)
 
 TEST_F(Core_ExecutorFixture, BurnBelowTrackedSupplyClampsAtZero)
 {
-  // Defensive: if burn exceeds the tracked supply (inconsistent state
-  // that shouldn't be reachable), the counter clamps at zero rather
-  // than underflowing.
   const Id token = createTokenDirect(alice_, "Gold", "GLD");
   state_->putTokenBalance(alice_.publicKey, token, 100);
   state_->putTokenSupply(token, 50);
@@ -1440,43 +1429,37 @@ TEST_F(Core_ExecutorFixture, BurnNativeTokenRejected)
 TEST_F(Core_ExecutorFixture, AddLiquidityMergesIntoExistingPosition)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000'000);
 
-  // Create pool: Alice gets one position.
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
-                                token_b, 1000);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1'000'000,
+                                token_b, 1'000'000);
   ASSERT_NE(pool_id, 0u);
 
-  // Find Alice's initial position via the index.
   uint64_t pos_id = 0;
   ASSERT_TRUE(state_->getPositionIndex(alice_.publicKey, pool_id, pos_id));
 
   AmmPosition pos_before;
   ASSERT_TRUE(state_->getAmmPosition(pos_id, pos_before));
 
-  // Add more liquidity. Should merge into the same position.
   {
     Transaction tx = TransactionBuilder()
                          .type(TxType::AddLiquidity)
                          .from(alice_)
                          .to(Crypto::Address{})
-                         .amount(500)
+                         .amount(500'000)
                          .fee(1)
                          .nonce(1)
                          .tokenId(NATIVE_TOKEN_ID)
                          .chainId(EXEC_CHAIN_ID)
-                         .payload(makeAddLiquidityPayload(pool_id, 500))
+                         .payload(makeAddLiquidityPayload(pool_id, 500'000))
                          .build();
     ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
   }
 
-  // The index must still point at the same position_id.
   uint64_t pos_id_after = 0;
   ASSERT_TRUE(state_->getPositionIndex(alice_.publicKey, pool_id, pos_id_after));
   EXPECT_EQ(pos_id_after, pos_id);
 
-  // The position's liquidity should have grown, and created_at_height
-  // should be unchanged (the original creation height, not the merge).
   AmmPosition pos_after;
   ASSERT_TRUE(state_->getAmmPosition(pos_id, pos_after));
   EXPECT_GT(pos_after.liquidity, pos_before.liquidity);
@@ -1486,25 +1469,24 @@ TEST_F(Core_ExecutorFixture, AddLiquidityMergesIntoExistingPosition)
 TEST_F(Core_ExecutorFixture, AddLiquidityFromDifferentOwnerCreatesNewPosition)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
-  state_->putTokenBalance(bob_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000'000);
+  state_->putTokenBalance(bob_.publicKey, token_b, 100'000'000);
 
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
-                                token_b, 1000);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1'000'000,
+                                token_b, 1'000'000);
   ASSERT_NE(pool_id, 0u);
 
-  // Bob adds liquidity. He has no position yet, so a new one is created.
   {
     Transaction tx = TransactionBuilder()
                          .type(TxType::AddLiquidity)
                          .from(bob_)
                          .to(Crypto::Address{})
-                         .amount(500)
+                         .amount(500'000)
                          .fee(1)
                          .nonce(0)
                          .tokenId(NATIVE_TOKEN_ID)
                          .chainId(EXEC_CHAIN_ID)
-                         .payload(makeAddLiquidityPayload(pool_id, 500))
+                         .payload(makeAddLiquidityPayload(pool_id, 500'000))
                          .build();
     ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
   }
@@ -1519,16 +1501,15 @@ TEST_F(Core_ExecutorFixture, AddLiquidityFromDifferentOwnerCreatesNewPosition)
 TEST_F(Core_ExecutorFixture, RemoveLiquidityClearsPositionIndex)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000'000);
 
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
-                                token_b, 1000);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1'000'000,
+                                token_b, 1'000'000);
   ASSERT_NE(pool_id, 0u);
 
   uint64_t pos_id = 0;
   ASSERT_TRUE(state_->getPositionIndex(alice_.publicKey, pool_id, pos_id));
 
-  // Remove all liquidity.
   {
     Transaction tx = TransactionBuilder()
                          .type(TxType::RemoveLiquidity)
@@ -1543,22 +1524,20 @@ TEST_F(Core_ExecutorFixture, RemoveLiquidityClearsPositionIndex)
     ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
   }
 
-  // The index must be gone.
   uint64_t pos_after = 0;
   EXPECT_FALSE(state_->getPositionIndex(alice_.publicKey, pool_id, pos_after));
 
-  // Re-adding liquidity creates a fresh position with a new ID.
   {
     Transaction tx = TransactionBuilder()
                          .type(TxType::AddLiquidity)
                          .from(alice_)
                          .to(Crypto::Address{})
-                         .amount(500)
+                         .amount(500'000)
                          .fee(1)
                          .nonce(2)
                          .tokenId(NATIVE_TOKEN_ID)
                          .chainId(EXEC_CHAIN_ID)
-                         .payload(makeAddLiquidityPayload(pool_id, 500))
+                         .payload(makeAddLiquidityPayload(pool_id, 500'000))
                          .build();
     // The pool is empty after full removal, so this must fail with
     // the "empty pool" precondition.
@@ -1583,12 +1562,9 @@ TEST_F(Core_ExecutorFixture, RegisterValidatorWritesAddressIndex)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // The validator-by-address index should now map Alice's address to
-  // her newly assigned validator ID.
   uint64_t vid = 0;
   ASSERT_TRUE(state_->getValidatorByAddress(alice_.publicKey, vid));
 
-  // And the validator record should exist under that ID.
   ValidatorInfo v;
   ASSERT_TRUE(state_->getValidator(vid, v));
   EXPECT_EQ(v.reward_address, alice_.publicKey);
@@ -1597,9 +1573,6 @@ TEST_F(Core_ExecutorFixture, RegisterValidatorWritesAddressIndex)
 
 TEST_F(Core_ExecutorFixture, UnregisterRetainsAddressIndexUntilExpiry)
 {
-  // The address index must survive unregister so an equivocation
-  // proof against the validator can still resolve the signer. It's
-  // only removed at unbond expiry.
   seedValidator(alice_, /*id=*/5);
   bumpNextValidatorId(6);
 
@@ -1645,7 +1618,6 @@ TEST_F(Core_ExecutorFixture, CreateOrderAddsToExpiryIndex)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // Find the new order ID.
   uint64_t order_id = 0;
   for (uint64_t oid = 1; oid <= 8; ++oid)
   {
@@ -1685,7 +1657,6 @@ TEST_F(Core_ExecutorFixture, CreateOrderWithZeroExpiryIsNotIndexed)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // No entry at height 0 (or anywhere).
   EXPECT_TRUE(state_->getOrdersExpiringAt(0).empty());
   EXPECT_TRUE(state_->getOrdersExpiringAt(1).empty());
   EXPECT_TRUE(state_->getOrdersExpiringAt(500).empty());
@@ -1696,7 +1667,6 @@ TEST_F(Core_ExecutorFixture, CancelOrderRemovesFromExpiryIndex)
   const Id buy_token = 200;
   const uint64_t expires_at = 500;
 
-  // Create an indexed order.
   {
     Transaction tx = TransactionBuilder()
                          .type(TxType::CreateOrder)
@@ -1729,7 +1699,6 @@ TEST_F(Core_ExecutorFixture, CancelOrderRemovesFromExpiryIndex)
   ASSERT_NE(order_id, 0u);
   ASSERT_EQ(state_->getOrdersExpiringAt(expires_at).size(), 1u);
 
-  // Cancel it.
   {
     Transaction tx = TransactionBuilder()
                          .type(TxType::CancelOrder)
@@ -1744,7 +1713,6 @@ TEST_F(Core_ExecutorFixture, CancelOrderRemovesFromExpiryIndex)
     ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
   }
 
-  // The index entry must be gone.
   EXPECT_TRUE(state_->getOrdersExpiringAt(expires_at).empty());
 }
 
@@ -1768,10 +1736,7 @@ TEST_F(Core_ExecutorFixture, ClaimMovesRewardsToBalance)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // Balance gained 500 (rewards), lost 2 (fee).
   EXPECT_EQ(balanceOf(alice_.publicKey), before + 500 - 2);
-
-  // Pending is cleared.
   EXPECT_EQ(state_->getAccount(alice_.publicKey).pending_rewards, 0u);
 }
 
@@ -1791,7 +1756,6 @@ TEST_F(Core_ExecutorFixture, ClaimZeroRewardsSucceeds)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // Only the fee moves.
   EXPECT_EQ(balanceOf(alice_.publicKey), before - 2);
 }
 
@@ -1817,14 +1781,11 @@ TEST_F(Core_ExecutorFixture, ClaimPreservesTotalValue)
   Core::Account after = state_->getAccount(alice_.publicKey);
   uint64_t total_after = after.balance + after.pending_rewards;
 
-  // The only delta is the fee.
   EXPECT_EQ(total_after + 3, total_before);
 }
 
 TEST_F(Core_ExecutorFixture, ClaimRecomputesStaked)
 {
-  // Set balance just below auto-stake threshold, with a reward that
-  // pushes it above.
   Core::Account acct = state_->getAccount(alice_.publicKey);
   acct.balance = GlobalConfig::AUTO_STAKE_THRESHOLD - 100;
   acct.pending_rewards = 500;
@@ -1845,8 +1806,6 @@ TEST_F(Core_ExecutorFixture, ClaimRecomputesStaked)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // Balance is now (AUTO_STAKE_THRESHOLD - 100) + 500 - 1, above the
-  // threshold. staked should equal balance.
   Core::Account after = state_->getAccount(alice_.publicKey);
   EXPECT_GT(after.balance, GlobalConfig::AUTO_STAKE_THRESHOLD);
   EXPECT_EQ(after.staked, after.balance);
@@ -1873,14 +1832,12 @@ TEST_F(Core_ExecutorFixture, UnregisterStartsUnbondingInsteadOfReturningStake)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // Only the fee left the balance. The stake is still held in the
-  // validator record.
   EXPECT_EQ(balanceOf(alice_.publicKey), before - 2);
 
   ValidatorInfo v;
   ASSERT_TRUE(state_->getValidator(5, v));
   EXPECT_EQ(v.pending_unbond_height,
-            100 + UNBONDING_PERIOD); // run() uses height 100
+            100 + UNBONDING_PERIOD);
   EXPECT_FALSE(v.canBeActive());
 }
 
@@ -1903,7 +1860,6 @@ TEST_F(Core_ExecutorFixture, UnregisterRejectsSeed)
 
   EXPECT_EQ(run(tx).status, ReceiptStatus::Failure);
 
-  // Only the fee is taken.
   EXPECT_EQ(balanceOf(alice_.publicKey), before - 2);
 }
 
@@ -1924,10 +1880,6 @@ TEST_F(Core_ExecutorFixture, UnregisterRejectsUnknown)
 
 TEST_F(Core_ExecutorFixture, UnregisterTwiceIsRejected)
 {
-  // The first unregister stamps pending_unbond_height. The second
-  // must be rejected — otherwise a caller could reset the clock and
-  // extend the slashable window indefinitely, or starve the stake
-  // return.
   seedValidator(alice_, /*id=*/5);
   bumpNextValidatorId(6);
 
@@ -1951,18 +1903,14 @@ TEST_F(Core_ExecutorFixture, UnregisterTwiceIsRejected)
   const uint64_t first_stamp = v.pending_unbond_height;
   ASSERT_NE(first_stamp, 0u);
 
-  // Second attempt, different nonce so it passes the nonce check.
   EXPECT_EQ(run(make_unreg(1)).status, ReceiptStatus::Failure);
 
-  // The stamp is unchanged.
   ASSERT_TRUE(state_->getValidator(5, v));
   EXPECT_EQ(v.pending_unbond_height, first_stamp);
 }
 
 TEST_F(Core_ExecutorFixture, UnregisterRejectsWhenAlreadyUnbonding)
 {
-  // Same as above but the pending_unbond_height is set directly, so
-  // the test doesn't depend on the unregister path having run first.
   seedValidator(alice_, /*id=*/5);
   bumpNextValidatorId(6);
 
@@ -2003,15 +1951,11 @@ TEST_F(Core_ExecutorFixture, UnregisterRetainsRecordAndIndex)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // The record is retained until the unbond expires. `run()` uses
-  // height 100 by default, so the stamp is 100 + UNBONDING_PERIOD.
   ValidatorInfo v;
   ASSERT_TRUE(state_->getValidator(5, v));
   EXPECT_EQ(v.pending_unbond_height,
             100u + UNBONDING_PERIOD);
 
-  // The address index is retained too — otherwise an equivocation
-  // proof landing between now and expiry couldn't resolve the signer.
   uint64_t id = 0;
   ASSERT_TRUE(state_->getValidatorByAddress(alice_.publicKey, id));
   EXPECT_EQ(id, 5u);
@@ -2019,9 +1963,6 @@ TEST_F(Core_ExecutorFixture, UnregisterRetainsRecordAndIndex)
 
 TEST_F(Core_ExecutorFixture, UnregisterRemovesFromActiveSet)
 {
-  // Set up: two named validators (Alice seed, Bob non-seed) plus
-  // enough synthetic validators that removing Bob leaves the set at
-  // exactly ACTIVE_SET_MIN, which is the floor.
   seedValidator(alice_, /*id=*/1, /*is_seed=*/true, /*is_active=*/true);
   seedValidator(bob_, /*id=*/2, /*is_seed=*/false, /*is_active=*/true);
   bumpNextValidatorId(3);
@@ -2043,7 +1984,6 @@ TEST_F(Core_ExecutorFixture, UnregisterRemovesFromActiveSet)
   setActiveSet(active);
   bumpNextValidatorId(GlobalConfig::ACTIVE_SET_MIN + 2);
 
-  // Bob unregisters.
   Transaction tx = TransactionBuilder()
                        .type(TxType::UnregisterValidator)
                        .from(bob_)
@@ -2056,7 +1996,6 @@ TEST_F(Core_ExecutorFixture, UnregisterRemovesFromActiveSet)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // Bob's ID must not appear in the active set.
   std::vector<uint8_t> set_bytes;
   ASSERT_TRUE(state_->getGlobal("active_set", set_bytes));
   std::vector<uint64_t> ids;
@@ -2068,13 +2007,11 @@ TEST_F(Core_ExecutorFixture, UnregisterRemovesFromActiveSet)
     ids.push_back(id);
   }
   EXPECT_EQ(std::find(ids.begin(), ids.end(), 2u), ids.end());
-  EXPECT_EQ(ids.size(), GlobalConfig::ACTIVE_SET_MIN); // 2, the floor
+  EXPECT_EQ(ids.size(), GlobalConfig::ACTIVE_SET_MIN);
 }
 
 TEST_F(Core_ExecutorFixture, UnregisterRejectsIfSetWouldDropBelowMin)
 {
-  // Set up: exactly ACTIVE_SET_MIN validators, all active. Removing
-  // any one would drop below the minimum.
   std::vector<Id> active;
   for (uint64_t id = 1; id <= GlobalConfig::ACTIVE_SET_MIN; ++id)
   {
@@ -2097,7 +2034,6 @@ TEST_F(Core_ExecutorFixture, UnregisterRejectsIfSetWouldDropBelowMin)
   setActiveSet(active);
   bumpNextValidatorId(GlobalConfig::ACTIVE_SET_MIN + 1);
 
-  // Alice (id=1) tries to unregister.
   Transaction tx = TransactionBuilder()
                        .type(TxType::UnregisterValidator)
                        .from(alice_)
@@ -2132,15 +2068,12 @@ TEST_F(Core_ExecutorFixture, UpdateRewardAddressMovesIndex)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  // Old address no longer resolves.
   uint64_t id = 0;
   EXPECT_FALSE(state_->getValidatorByAddress(alice_.publicKey, id));
 
-  // New address resolves to the same validator.
   ASSERT_TRUE(state_->getValidatorByAddress(bob_.publicKey, id));
   EXPECT_EQ(id, 5u);
 
-  // The record itself reflects the new address.
   ValidatorInfo v;
   ASSERT_TRUE(state_->getValidator(5, v));
   EXPECT_EQ(v.reward_address, bob_.publicKey);
@@ -2230,13 +2163,12 @@ TEST_F(Core_ExecutorFixture, UpdateTokenMetaChangesName)
   const Id token =
       createTokenDirect(alice_, "Gold", "GLD");
 
-  // Payload: [1] name_len=3, "Bar", [1] sym_len=0, [2] royalty=0
   std::vector<uint8_t> payload;
   payload.push_back(3);
   payload.insert(payload.end(), {'B', 'a', 'r'});
-  payload.push_back(0); // symbol unchanged
-  payload.push_back(0); // royalty low byte
-  payload.push_back(0); // royalty high byte
+  payload.push_back(0);
+  payload.push_back(0);
+  payload.push_back(0);
 
   Transaction tx = TransactionBuilder()
                        .type(TxType::UpdateTokenMeta)
@@ -2255,7 +2187,7 @@ TEST_F(Core_ExecutorFixture, UpdateTokenMetaChangesName)
   TokenInfo t;
   ASSERT_TRUE(state_->getToken(token, t));
   EXPECT_EQ(t.name, "Bar");
-  EXPECT_EQ(t.symbol, "GLD"); // unchanged
+  EXPECT_EQ(t.symbol, "GLD");
 }
 
 TEST_F(Core_ExecutorFixture, UpdateTokenMetaChangesSymbol)
@@ -2264,7 +2196,7 @@ TEST_F(Core_ExecutorFixture, UpdateTokenMetaChangesSymbol)
       createTokenDirect(alice_, "Gold", "GLD");
 
   std::vector<uint8_t> payload;
-  payload.push_back(0); // name unchanged
+  payload.push_back(0);
   payload.push_back(3);
   payload.insert(payload.end(), {'B', 'A', 'R'});
   payload.push_back(0);
@@ -2286,7 +2218,7 @@ TEST_F(Core_ExecutorFixture, UpdateTokenMetaChangesSymbol)
 
   TokenInfo t;
   ASSERT_TRUE(state_->getToken(token, t));
-  EXPECT_EQ(t.name, "Gold"); // unchanged
+  EXPECT_EQ(t.name, "Gold");
   EXPECT_EQ(t.symbol, "BAR");
 }
 
@@ -2296,10 +2228,10 @@ TEST_F(Core_ExecutorFixture, UpdateTokenMetaChangesRoyalty)
       createTokenDirect(alice_, "Gold", "GLD");
 
   std::vector<uint8_t> payload;
-  payload.push_back(0);   // name unchanged
-  payload.push_back(0);   // symbol unchanged
-  payload.push_back(250); // royalty low byte (250 bps = 2.5%)
-  payload.push_back(0);   // royalty high byte
+  payload.push_back(0);
+  payload.push_back(0);
+  payload.push_back(250);
+  payload.push_back(0);
 
   Transaction tx = TransactionBuilder()
                        .type(TxType::UpdateTokenMeta)
@@ -2325,7 +2257,6 @@ TEST_F(Core_ExecutorFixture, UpdateTokenMetaEmptyMeansNoChange)
   const Id token =
       createTokenDirect(alice_, "Gold", "GLD");
 
-  // All fields empty: name, symbol, royalty = 0
   std::vector<uint8_t> payload = {0, 0, 0, 0};
 
   Transaction tx = TransactionBuilder()
@@ -2395,9 +2326,8 @@ TEST_F(Core_ExecutorFixture, UpdateTokenMetaRejectsInvalidSymbol)
   const Id token =
       createTokenDirect(alice_, "Gold", "GLD");
 
-  // Symbol "AB" is too short (min is 3).
   std::vector<uint8_t> payload;
-  payload.push_back(0); // name unchanged
+  payload.push_back(0);
   payload.push_back(2);
   payload.insert(payload.end(), {'A', 'B'});
   payload.push_back(0);
@@ -2423,7 +2353,6 @@ TEST_F(Core_ExecutorFixture, UpdateTokenMetaDoesNotChangeMaxSupply)
   const Id token =
       createTokenDirect(alice_, "Capped", "CAP", /*max_supply=*/1000);
 
-  // A payload that only changes the name.
   std::vector<uint8_t> payload = {3, 'B', 'a', 'r', 0, 0, 0};
 
   Transaction tx = TransactionBuilder()
@@ -2442,19 +2371,18 @@ TEST_F(Core_ExecutorFixture, UpdateTokenMetaDoesNotChangeMaxSupply)
 
   TokenInfo t;
   ASSERT_TRUE(state_->getToken(token, t));
-  EXPECT_EQ(t.maxSupply, 1000u); // unchanged
+  EXPECT_EQ(t.maxSupply, 1000u);
 }
 
 TEST_F(Core_ExecutorFixture, RemoveLastLiquidityClosesPool)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000'000);
 
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
-                                token_b, 1000);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1'000'000,
+                                token_b, 1'000'000);
   ASSERT_NE(pool_id, 0u);
 
-  //  Find Alice's position — the one created by createPool.
   uint64_t position_id = 0;
   ASSERT_TRUE(state_->getPositionIndex(alice_.publicKey, pool_id,
                                        position_id));
@@ -2463,8 +2391,6 @@ TEST_F(Core_ExecutorFixture, RemoveLastLiquidityClosesPool)
   ASSERT_TRUE(state_->getAmmPosition(position_id, pos_before));
   ASSERT_GT(pos_before.liquidity, 0u);
 
-  //  Alice removes her full share. She's the only LP, so the pool
-  //  drains completely.
   Transaction tx = TransactionBuilder()
                        .type(TxType::RemoveLiquidity)
                        .from(alice_)
@@ -2478,7 +2404,6 @@ TEST_F(Core_ExecutorFixture, RemoveLastLiquidityClosesPool)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  //  The pool record must be gone. This is the auto-close.
   AmmPool pool;
   EXPECT_FALSE(state_->getAmmPool(pool_id, pool));
 }
@@ -2486,17 +2411,16 @@ TEST_F(Core_ExecutorFixture, RemoveLastLiquidityClosesPool)
 TEST_F(Core_ExecutorFixture, ClosedPoolRejectsSwap)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000'000);
 
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
-                                token_b, 1000);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1'000'000,
+                                token_b, 1'000'000);
   ASSERT_NE(pool_id, 0u);
 
   uint64_t position_id = 0;
   ASSERT_TRUE(state_->getPositionIndex(alice_.publicKey, pool_id,
                                        position_id));
 
-  //  Drain and close.
   {
     Transaction tx = TransactionBuilder()
                          .type(TxType::RemoveLiquidity)
@@ -2511,15 +2435,11 @@ TEST_F(Core_ExecutorFixture, ClosedPoolRejectsSwap)
     ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
   }
 
-  //  A swap against the closed pool fails at the "pool not found"
-  //  check, because getAmmPool returns false for a deleted record.
-  //  This is what makes the close observable to users: the pool is
-  //  not just inert, it's absent.
   Transaction swap = TransactionBuilder()
                          .type(TxType::Swap)
                          .from(alice_)
                          .to(alice_.publicKey)
-                         .amount(10)
+                         .amount(10'000)
                          .fee(1)
                          .nonce(2)
                          .tokenId(NATIVE_TOKEN_ID)
@@ -2529,17 +2449,16 @@ TEST_F(Core_ExecutorFixture, ClosedPoolRejectsSwap)
 
   EXPECT_EQ(run(swap).status, ReceiptStatus::Failure);
 
-  //  And so does adding liquidity to it.
   Transaction add = TransactionBuilder()
                         .type(TxType::AddLiquidity)
                         .from(alice_)
                         .to(Crypto::Address{})
-                        .amount(500)
+                        .amount(500'000)
                         .fee(1)
                         .nonce(3)
                         .tokenId(NATIVE_TOKEN_ID)
                         .chainId(EXEC_CHAIN_ID)
-                        .payload(makeAddLiquidityPayload(pool_id, 500))
+                        .payload(makeAddLiquidityPayload(pool_id, 500'000))
                         .build();
 
   EXPECT_EQ(run(add).status, ReceiptStatus::Failure);
@@ -2548,32 +2467,28 @@ TEST_F(Core_ExecutorFixture, ClosedPoolRejectsSwap)
 TEST_F(Core_ExecutorFixture, PartialRemovalDoesNotClosePool)
 {
   const Id token_b = 100;
-  state_->putTokenBalance(alice_.publicKey, token_b, 100'000);
-  state_->putTokenBalance(bob_.publicKey, token_b, 100'000);
+  state_->putTokenBalance(alice_.publicKey, token_b, 100'000'000);
+  state_->putTokenBalance(bob_.publicKey, token_b, 100'000'000);
 
-  //  Alice creates the pool.
-  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1000,
-                                token_b, 1000);
+  uint64_t pool_id = createPool(alice_, NATIVE_TOKEN_ID, 1'000'000,
+                                token_b, 1'000'000);
   ASSERT_NE(pool_id, 0u);
 
-  //  Bob adds liquidity. Now the pool has two LPs.
   {
     Transaction tx = TransactionBuilder()
                          .type(TxType::AddLiquidity)
                          .from(bob_)
                          .to(Crypto::Address{})
-                         .amount(500)
+                         .amount(500'000)
                          .fee(1)
                          .nonce(0)
                          .tokenId(NATIVE_TOKEN_ID)
                          .chainId(EXEC_CHAIN_ID)
-                         .payload(makeAddLiquidityPayload(pool_id, 500))
+                         .payload(makeAddLiquidityPayload(pool_id, 500'000))
                          .build();
     ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
   }
 
-  //  Alice removes her full share. Bob still has liquidity, so the
-  //  pool has not drained.
   uint64_t alice_pos = 0;
   ASSERT_TRUE(state_->getPositionIndex(alice_.publicKey, pool_id,
                                        alice_pos));
@@ -2592,19 +2507,17 @@ TEST_F(Core_ExecutorFixture, PartialRemovalDoesNotClosePool)
     ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
   }
 
-  //  The pool record must still exist, with Bob's liquidity.
   AmmPool pool;
   ASSERT_TRUE(state_->getAmmPool(pool_id, pool));
   EXPECT_GT(pool.total_liquidity, 0u);
   EXPECT_GT(pool.reserve_a, 0u);
   EXPECT_GT(pool.reserve_b, 0u);
 
-  //  And a swap should still succeed.
   Transaction swap = TransactionBuilder()
                          .type(TxType::Swap)
                          .from(alice_)
                          .to(alice_.publicKey)
-                         .amount(10)
+                         .amount(10'000)
                          .fee(1)
                          .nonce(2)
                          .tokenId(NATIVE_TOKEN_ID)
@@ -2615,47 +2528,17 @@ TEST_F(Core_ExecutorFixture, PartialRemovalDoesNotClosePool)
   EXPECT_EQ(run(swap).status, ReceiptStatus::Success);
 }
 
+//  PartialRemovalWithReservesThatOverflowU64 is unchanged: it writes
+//  the pool and position directly, bypassing MIN_POOL_LIQUIDITY, and
+//  its numbers are chosen for the uint128 promotion, not for the
+//  current DECIMALS.
 TEST_F(Core_ExecutorFixture, PartialRemovalWithReservesThatOverflowU64)
 {
-  //  The naive pro-rata computation is:
-  //
-  //    share_a = amount * pool.reserve_a / pool.total_liquidity
-  //
-  //  evaluated left-to-right in uint64_t. When amount * reserve_a
-  //  exceeds 2^64 - 1 the product wraps and the LP receives a
-  //  silently wrong (usually tiny) share. The executor promotes the
-  //  product to unsigned __int128 to avoid this.
-  //
-  //  This test pins the promotion. It sets up a pool whose
-  //  (amount * reserve) product is larger than 2^64 and asserts the
-  //  LP receives the correct pro-rata share, then verifies the pool
-  //  still holds the remainder.
-  //
-  //  Numbers:
-  //    total_liquidity = 2^40
-  //    reserve_a       = 2^40
-  //    reserve_b       = 2^40
-  //    amount          = 2^39   (a partial removal, half the pool)
-  //
-  //  Naive product: 2^39 * 2^40 = 2^79, which wraps to
-  //  (2^79 mod 2^64) = 0. With the wrap, share_a and share_b would
-  //  both be 0 and the LP would receive nothing for their half.
-  //
-  //  Correct product: 2^79 / 2^40 = 2^39. The LP should get 2^39
-  //  of each reserve, and the pool should retain 2^39 of each.
-  //
-  //  Setup note: we cannot reach these reserves through the normal
-  //  pool-creation path (MIN_POOL_LIQUIDITY and the balance caps
-  //  make it impractical), so the pool and position are written
-  //  directly. That is fine: the test is about the arithmetic in
-  //  the removal path, not about how the pool got there.
-
   const Id token_b = 100;
   const uint64_t total_liquidity = uint64_t(1) << 40;
   const uint64_t reserve = uint64_t(1) << 40;
   const uint64_t remove_amount = uint64_t(1) << 39;
 
-  //  Create a pool record with the large reserves.
   AmmPool pool;
   pool.id = 77;
   pool.token_a = NATIVE_TOKEN_ID;
@@ -2669,7 +2552,6 @@ TEST_F(Core_ExecutorFixture, PartialRemovalWithReservesThatOverflowU64)
   pool.active = true;
   state_->putAmmPool(pool);
 
-  //  Create Alice's position holding half the pool's liquidity.
   AmmPosition pos;
   pos.id = 88;
   pos.owner = alice_.publicKey;
@@ -2679,14 +2561,10 @@ TEST_F(Core_ExecutorFixture, PartialRemovalWithReservesThatOverflowU64)
   state_->putAmmPosition(pos);
   state_->putPositionIndex(alice_.publicKey, pool.id, pos.id);
 
-  //  Give Alice a balance for the token_b side so the credit
-  //  accounting is observable. The native side is Account.balance.
   state_->putTokenBalance(alice_.publicKey, token_b, 0);
 
   const uint64_t alice_native_before = balanceOf(alice_.publicKey);
 
-  //  Partial removal of `remove_amount` LP tokens. The payload
-  //  carries (position_id, amount); amount != 0 means partial.
   Transaction tx = TransactionBuilder()
                        .type(TxType::RemoveLiquidity)
                        .from(alice_)
@@ -2700,30 +2578,22 @@ TEST_F(Core_ExecutorFixture, PartialRemovalWithReservesThatOverflowU64)
 
   ASSERT_EQ(run(tx).status, ReceiptStatus::Success);
 
-  //  Correct shares: remove_amount / total_liquidity = 1/2, so the
-  //  LP receives 1/2 of each reserve = 2^39. Under the naive u64
-  //  product the shares would be 0 (the product wrapped to 0) and
-  //  the assertions below would fail.
-  const uint64_t expected_share = remove_amount; // == reserve / 2
+  const uint64_t expected_share = remove_amount;
 
   EXPECT_EQ(balanceOf(alice_.publicKey),
-            alice_native_before + expected_share - 1); // -1 for the fee
+            alice_native_before + expected_share - 1);
   EXPECT_EQ(state_->getTokenBalance(alice_.publicKey, token_b),
             expected_share);
 
-  //  The pool retains the other half. The pool is not closed
-  //  because only half the liquidity was removed.
   AmmPool pool_after;
   ASSERT_TRUE(state_->getAmmPool(pool.id, pool_after));
   EXPECT_EQ(pool_after.reserve_a, reserve - expected_share);
   EXPECT_EQ(pool_after.reserve_b, reserve - expected_share);
   EXPECT_EQ(pool_after.total_liquidity, total_liquidity - remove_amount);
 
-  //  Alice's position is decremented, not deleted, and the index
-  //  is still present.
   AmmPosition pos_after;
   ASSERT_TRUE(state_->getAmmPosition(pos.id, pos_after));
-  EXPECT_EQ(pos_after.liquidity, 0u); // she removed her whole position
+  EXPECT_EQ(pos_after.liquidity, 0u);
 
   uint64_t idx = 0;
   EXPECT_TRUE(state_->getPositionIndex(alice_.publicKey, pool.id, idx));

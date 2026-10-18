@@ -14,12 +14,14 @@
 #include "Core/Account.h"
 #include "Core/AmmPool.h"
 #include "Core/AmmPosition.h"
+#include "Core/BridgeTypes.h"
 #include "Core/Order.h"
 #include "Core/Receipt.h"
 #include "Core/TokenTypes.h"
 #include "Core/ValidatorTypes.h"
 #include "Core/KeyRotation.h"
 #include "Core/NftTypes.h"
+#include "Core/BridgeWatcherTypes.h"
 #include "Crypto/Types.h"
 #include "SparseMerkleTree.h"
 #include "StateDB.h"
@@ -430,6 +432,95 @@ namespace State
     void putReceipt(const Crypto::Hash &tx_hash, const Core::Receipt &receipt);
 
     //  =====================================================================
+    //  Bridge
+    //  =====================================================================
+    //
+    //  Consumed-deposit records, withdrawal records, per-chain
+    //  registrations, and registered-watcher records. The
+    //  operational signer set for a source chain is the active
+    //  watcher set for that chain, resolved from the watcher
+    //  records on each verification; there is no separately-stored
+    //  signer set.
+
+    //  ---- Consumed deposits ----
+
+    bool getBridgeConsumed(uint64_t source_chain_id,
+                           const Crypto::Hash &source_tx_hash,
+                           uint32_t source_output_index,
+                           uint64_t &mint_height_out) const;
+
+    void putBridgeConsumed(uint64_t source_chain_id,
+                           const Crypto::Hash &source_tx_hash,
+                           uint32_t source_output_index,
+                           uint64_t mint_height);
+
+    //  ---- Withdrawals ----
+
+    bool getBridgeWithdrawal(uint64_t withdrawal_id,
+                             Core::BridgeWithdrawal &out) const;
+
+    void putBridgeWithdrawal(const Core::BridgeWithdrawal &w);
+
+    void deleteBridgeWithdrawal(uint64_t withdrawal_id);
+
+    //  Iterate pending withdrawals in creation order, starting from
+    //  `from_height` (inclusive), yielding at most `max_results`.
+    //
+    //  The callback returns true to continue, false to stop. The
+    //  iteration uses the (height, id) index so a caller can persist
+    //  the last-seen height and resume without scanning the whole
+    //  set.
+    //
+    //  `from_height == 0` means "from genesis", which is what a
+    //  fresh watcher uses on its first run. After that, the watcher
+    //  passes its last-processed height to avoid re-processing.
+    void forEachPendingBridgeWithdrawal(
+        uint64_t from_height,
+        size_t max_results,
+        const std::function<bool(const Core::BridgeWithdrawal &)> &fn) const;
+
+    //  ---- Chain registry ----
+
+    bool getBridgeChainRegistration(uint64_t source_chain_id,
+                                    Core::BridgeChainRegistration &out) const;
+
+    void putBridgeChainRegistration(
+        const Core::BridgeChainRegistration &reg);
+
+    void deleteBridgeChainRegistration(uint64_t source_chain_id);
+
+    //  ---- Watchers ----
+
+    bool getBridgeWatcher(uint64_t watcher_id,
+                          Core::BridgeWatcherInfo &out) const;
+
+    void putBridgeWatcher(const Core::BridgeWatcherInfo &w);
+
+    void deleteBridgeWatcher(uint64_t watcher_id);
+
+    bool getBridgeWatcherIdByAddress(const Crypto::Address &addr,
+                                     uint64_t &watcher_id_out) const;
+
+    void forEachBridgeWatcher(
+        const std::function<void(const Core::BridgeWatcherInfo &)> &fn) const;
+
+    //  Iterate the active watchers for a specific source chain at
+    //  the given height. Uses isInActiveSet to filter. Used by the
+    //  executor and the RPC.
+    void forEachActiveBridgeWatcherForChain(
+        uint64_t source_chain_id,
+        uint64_t current_height,
+        const std::function<void(const Core::BridgeWatcherInfo &)> &fn) const;
+
+    //  Count the active watchers for a source chain at a height.
+    //  Cheap when the caller only needs the threshold; the executor
+    //  uses it to decide whether the active set is large enough to
+    //  verify a watcher attestation.
+    size_t countActiveBridgeWatchersForChain(
+        uint64_t source_chain_id,
+        uint64_t current_height) const;
+
+    //  =====================================================================
     //  Global state
     //  =====================================================================
 
@@ -626,6 +717,14 @@ namespace State
     void readForEachWithPrefixReverse(uint32_t table_id,
                                       const std::vector<uint8_t> &prefix,
                                       const EntryVisitor &visitor) const;
+
+    //  Iterate every row whose key is >= seek_key, in ascending key
+    //  order. Same three-layer dispatch as the other readForEach
+    //  helpers: bound txn wins, then held read txn, then DB
+    //  autocommit.
+    void readForEachFromKey(uint32_t table_id,
+                            const std::vector<uint8_t> &seek_key,
+                            const StateDB::EntryVisitor &visitor) const;
 
     size_t readTableCount(uint32_t table_id) const;
 

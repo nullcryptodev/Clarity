@@ -134,12 +134,15 @@ namespace State
       //  StateAccess::indexFill.
       TBL_FILL_HISTORY = 34,
 
-      TBL_NFTS = 35,
-      TBL_NFT_COLLECTIONS = 36,
-      TBL_INDEX_NFTS_BY_OWNER = 37,
-      TBL_INDEX_NFTS_BY_COLLECTION = 38,
+      TBL_INDEX_BRIDGE_WITHDRAWALS_BY_HEIGHT = 35,
+      TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER = 36,
 
-      TBL_COUNT = 39,
+      TBL_NFTS = 37,
+      TBL_NFT_COLLECTIONS = 38,
+      TBL_INDEX_NFTS_BY_OWNER = 39,
+      TBL_INDEX_NFTS_BY_COLLECTION = 40,
+
+      TBL_COUNT = 41,
     };
 
     //  Per-table diagnostic information. Reported by the metrics
@@ -199,6 +202,10 @@ namespace State
                                     const std::vector<uint8_t> &prefix,
                                     const EntryVisitor &visitor) const;
 
+      void forEachFromKey(uint32_t tableId,
+                          const std::vector<uint8_t> &seek_key,
+                          const EntryVisitor &visitor) const;
+
       void commit();
       void abort();
 
@@ -254,6 +261,9 @@ namespace State
       void forEachWithPrefixReverse(uint32_t tableId,
                                     const std::vector<uint8_t> &prefix,
                                     const EntryVisitor &visitor) const;
+      void forEachFromKey(uint32_t tableId,
+                          const std::vector<uint8_t> &seek_key,
+                          const EntryVisitor &visitor) const;
 
       size_t dbiStat(uint32_t tableId) const;
 
@@ -347,6 +357,23 @@ namespace State
     void forEachEntryWithPrefixReverse(uint32_t tableId,
                                        const std::vector<uint8_t> &prefix,
                                        const EntryVisitor &visitor) const;
+
+    //  Iterate every entry whose key is >= `seek_key`, in ascending
+    //  key order. `seek_key` is the full key to seek to; there is no
+    //  prefix match. This is the primitive for "give me all rows at
+    //  or after this point" — used by the bridge's withdrawal
+    //  height scan, where the key is (height BE, id BE) and seeking
+    //  to (from_height, 0) yields every pending withdrawal at or
+    //  after `from_height`.
+    //
+    //  Contrast with forEachEntryWithPrefix, which stops at the end
+    //  of the prefix match. forEachEntryFromKey has no upper bound;
+    //  the visitor controls termination (return false to stop) and
+    //  the caller is expected to have a max_results or a natural
+    //  end.
+    void forEachEntryFromKey(uint32_t tableId,
+                             const std::vector<uint8_t> &seek_key,
+                             const EntryVisitor &visitor) const;
 
     //  =====================================================================
     //  Read txn lifecycle

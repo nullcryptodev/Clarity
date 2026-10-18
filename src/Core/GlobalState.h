@@ -42,6 +42,24 @@ namespace Core
   inline constexpr std::string_view GLOBAL_APY_ACTIVITY_BPS = "apy_activity_bps";
   inline constexpr std::string_view GLOBAL_APY_POT_BPS = "apy_pot_bps";
 
+  //  ---- Bridge ----
+  //
+  //  Chain-agnostic bridge counters and flags. Per-chain
+  //  configuration (wrapped token id, fingerprint, decimals, etc.)
+  //  lives in the chain registration, not here. The operational
+  //  signer set (active watchers) is resolved from state per
+  //  verification and isn't stored as a global.
+  //
+  //  The governance signer set is the validator set. There is no
+  //  GLOBAL_BRIDGE_GOVERNANCE_SET; governance transactions verify
+  //  against the active validators directly.
+
+  inline constexpr std::string_view GLOBAL_BRIDGE_PAUSED = "bridge_paused";
+  inline constexpr std::string_view GLOBAL_BRIDGE_NEXT_WITHDRAWAL_ID = "bridge_next_withdrawal_id";
+  inline constexpr std::string_view GLOBAL_BRIDGE_WITHDRAWALS_PENDING = "bridge_withdrawals_pending";
+  inline constexpr std::string_view GLOBAL_BRIDGE_CONSUMED_COUNT = "bridge_consumed_count";
+  inline constexpr std::string_view GLOBAL_BRIDGE_NEXT_WATCHER_ID = "bridge_next_watcher_id";
+
   // ---- Value encoders / decoders ----
   //
   //  Global state values are stored as raw bytes. Each type has a
@@ -78,6 +96,14 @@ namespace Core
     uint16_t apyActivityBps() const;
     uint16_t apyPotBps() const;
 
+    //  ---- Bridge ----
+
+    bool bridgePaused() const;
+    uint64_t bridgeNextWithdrawalId() const;
+    uint64_t bridgeWithdrawalsPending() const;
+    uint64_t bridgeConsumedCount() const;
+    uint64_t bridgeNextWatcherId() const;
+
   private:
     const State::StateAccess &access_;
   };
@@ -99,6 +125,14 @@ namespace Core
     void setLastRotationHeight(uint64_t v);
     void setApyActivityBps(uint16_t v);
     void setApyPotBps(uint16_t v);
+
+    //  ---- Bridge ----
+
+    void setBridgePaused(bool v);
+    void setBridgeNextWithdrawalId(uint64_t v);
+    void setBridgeWithdrawalsPending(uint64_t v);
+    void setBridgeConsumedCount(uint64_t v);
+    void setBridgeNextWatcherId(uint64_t v);
 
   private:
     State::StateAccess &access_;

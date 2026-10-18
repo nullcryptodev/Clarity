@@ -170,6 +170,31 @@ namespace State
       out[21] = uint8_t(fill_index >> 8);
       out[22] = uint8_t(fill_index);
     }
+
+    //  Bridge withdrawal height index. Key:
+    //
+    //    height(8 BE) || withdrawal_id(8 BE)
+    //
+    //  Big-endian so lexicographic byte order equals numeric order;
+    //  this is what makes the ascending prefix scan yield creation
+    //  order, and what makes a (from_height) prefix scan correct.
+
+    void encodeBridgeWithdrawalHeightKey(uint64_t height,
+                                         uint64_t withdrawal_id,
+                                         uint8_t out[16])
+    {
+      for (int i = 0; i < 8; ++i)
+        out[i] = uint8_t(height >> ((7 - i) * 8));
+      for (int i = 0; i < 8; ++i)
+        out[8 + i] = uint8_t(withdrawal_id >> ((7 - i) * 8));
+    }
+
+    void encodeBridgeWithdrawalHeightPrefix(uint64_t from_height,
+                                            uint8_t out[8])
+    {
+      for (int i = 0; i < 8; ++i)
+        out[i] = uint8_t(from_height >> ((7 - i) * 8));
+    }
   } // anonymous namespace
 
   //  =========================================================================
@@ -295,6 +320,24 @@ namespace State
       return;
     }
     db_.forEachEntryWithPrefixReverse(table_id, prefix, visitor);
+  }
+
+  void StateAccess::readForEachFromKey(
+      uint32_t table_id,
+      const std::vector<uint8_t> &seek_key,
+      const StateDB::EntryVisitor &visitor) const
+  {
+    if (txn_)
+    {
+      txn_->forEachFromKey(table_id, seek_key, visitor);
+      return;
+    }
+    if (read_txn_)
+    {
+      read_txn_->forEachFromKey(table_id, seek_key, visitor);
+      return;
+    }
+    db_.forEachEntryFromKey(table_id, seek_key, visitor);
   }
 
   size_t StateAccess::readTableCount(uint32_t table_id) const
@@ -2194,6 +2237,277 @@ namespace State
   }
 
   //  =========================================================================
+  //  Bridge
+  //  =========================================================================
+
+  //  ---- Consumed deposits ----
+
+  bool StateAccess::getBridgeConsumed(uint64_t source_chain_id,
+                                      const Crypto::Hash &source_tx_hash,
+                                      uint32_t source_output_index,
+                                      uint64_t &mint_height_out) const
+  {
+    Crypto::Hash key = Keys::bridgeConsumed(source_chain_id, source_tx_hash,
+                                            source_output_index);
+    auto value = smt_.get(key);
+    if (!value.has_value() || value->size() != 8)
+      return false;
+
+    mint_height_out = Common::readU64(value->data());
+    return true;
+  }
+
+  void StateAccess::putBridgeConsumed(uint64_t source_chain_id,
+                                      const Crypto::Hash &source_tx_hash,
+                                      uint32_t source_output_index,
+                                      uint64_t mint_height)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::bridgeConsumed(source_chain_id, source_tx_hash,
+                                            source_output_index);
+    std::vector<uint8_t> value(8);
+    Common::writeU64(value.data(), mint_height);
+    smt_.update(key, value, version_);
+  }
+
+  //  ---- Withdrawals ----
+
+  bool StateAccess::getBridgeWithdrawal(uint64_t withdrawal_id,
+                                        Core::BridgeWithdrawal &out) const
+  {
+    Crypto::Hash key = Keys::bridgeWithdrawal(withdrawal_id);
+    auto value = smt_.get(key);
+    if (!value.has_value())
+      return false;
+    return Core::BridgeWithdrawal::deserializeState(
+        value->data(), value->size(), out);
+  }
+
+  void StateAccess::putBridgeWithdrawal(const Core::BridgeWithdrawal &w)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::bridgeWithdrawal(w.id);
+    auto value = w.serializeState();
+    smt_.update(key, value, version_);
+
+    uint8_t height_key[16];
+    encodeBridgeWithdrawalHeightKey(w.created_at_height, w.id, height_key);
+    putSentinel(StateDB::TBL_INDEX_BRIDGE_WITHDRAWALS_BY_HEIGHT,
+                height_key, sizeof(height_key));
+  }
+
+  void StateAccess::deleteBridgeWithdrawal(uint64_t withdrawal_id)
+  {
+    Core::BridgeWithdrawal w;
+    const bool have = getBridgeWithdrawal(withdrawal_id, w);
+
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::bridgeWithdrawal(withdrawal_id);
+    smt_.remove(key, version_);
+
+    if (!have)
+      return;
+
+    uint8_t height_key[16];
+    encodeBridgeWithdrawalHeightKey(w.created_at_height, withdrawal_id,
+                                    height_key);
+    deleteRow(StateDB::TBL_INDEX_BRIDGE_WITHDRAWALS_BY_HEIGHT,
+              height_key, sizeof(height_key));
+  }
+
+  void StateAccess::forEachPendingBridgeWithdrawal(
+      uint64_t from_height,
+      size_t max_results,
+      const std::function<bool(const Core::BridgeWithdrawal &)> &fn) const
+  {
+    //  Seek to the first row at or after (from_height, 0). The
+    //  index key is (height BE, id BE); the smallest key with
+    //  height >= from_height is (from_height, 0). MDBX_SET_RANGE
+    //  positions at the first existing key >= that point, so
+    //  "no withdrawal at from_height" naturally advances to the
+    //  next height.
+    uint8_t seek_bytes[16];
+    encodeBridgeWithdrawalHeightKey(from_height, 0, seek_bytes);
+    std::vector<uint8_t> seek_key(seek_bytes, seek_bytes + sizeof(seek_bytes));
+
+    size_t yielded = 0;
+
+    auto visitor = [&](const std::vector<uint8_t> &key,
+                       const std::vector<uint8_t> &) -> bool
+    {
+      if (key.size() != 16)
+        return true;
+
+      uint64_t withdrawal_id = 0;
+      for (int i = 0; i < 8; ++i)
+        withdrawal_id = (withdrawal_id << 8) | key[8 + i];
+
+      Core::BridgeWithdrawal w;
+      if (!getBridgeWithdrawal(withdrawal_id, w))
+        return true; // stale index row; skip and continue
+
+      if (!fn(w))
+        return false;
+
+      ++yielded;
+      if (max_results != 0 && yielded >= max_results)
+        return false;
+
+      return true;
+    };
+
+    readForEachFromKey(StateDB::TBL_INDEX_BRIDGE_WITHDRAWALS_BY_HEIGHT,
+                       seek_key, visitor);
+  }
+
+  //  ---- Chain registry ----
+
+  bool StateAccess::getBridgeChainRegistration(
+      uint64_t source_chain_id,
+      Core::BridgeChainRegistration &out) const
+  {
+    Crypto::Hash key = Keys::bridgeChainRegistration(source_chain_id);
+    auto value = smt_.get(key);
+    if (!value.has_value())
+      return false;
+    return Core::BridgeChainRegistration::deserializeState(
+        value->data(), value->size(), out);
+  }
+
+  void StateAccess::putBridgeChainRegistration(
+      const Core::BridgeChainRegistration &reg)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::bridgeChainRegistration(reg.source_chain_id);
+    auto value = reg.serializeState();
+    smt_.update(key, value, version_);
+  }
+
+  void StateAccess::deleteBridgeChainRegistration(uint64_t source_chain_id)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::bridgeChainRegistration(source_chain_id);
+    smt_.remove(key, version_);
+  }
+
+  //  ---- Watchers ----
+
+  bool StateAccess::getBridgeWatcher(uint64_t watcher_id,
+                                     Core::BridgeWatcherInfo &out) const
+  {
+    Crypto::Hash key = Keys::bridgeWatcher(watcher_id);
+    auto value = smt_.get(key);
+    if (!value.has_value())
+      return false;
+    return Core::BridgeWatcherInfo::deserializeState(
+        value->data(), value->size(), out);
+  }
+
+  void StateAccess::putBridgeWatcher(const Core::BridgeWatcherInfo &w)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::bridgeWatcher(w.id);
+    auto value = w.serializeState();
+    smt_.update(key, value, version_);
+
+    //  The owner-address index row. Keyed by reward_address; value
+    //  is the watcher_id (8 LE). Used to look up by address and to
+    //  enforce "one active watcher per (validator, chain)" at
+    //  registration time.
+    putU64Row(StateDB::TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER,
+              w.reward_address.data.data(), w.reward_address.data.size(),
+              w.id);
+  }
+
+  void StateAccess::deleteBridgeWatcher(uint64_t watcher_id)
+  {
+    Core::BridgeWatcherInfo w;
+    const bool have = getBridgeWatcher(watcher_id, w);
+
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::bridgeWatcher(watcher_id);
+    smt_.remove(key, version_);
+
+    if (!have)
+      return;
+
+    deleteRow(StateDB::TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER,
+              w.reward_address.data.data(), w.reward_address.data.size());
+  }
+
+  bool StateAccess::getBridgeWatcherIdByAddress(const Crypto::Address &addr,
+                                                uint64_t &watcher_id_out) const
+  {
+    std::vector<uint8_t> value;
+    if (!readRow(StateDB::TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER,
+                 addr.data.data(), addr.data.size(), value))
+      return false;
+    if (value.size() != 8)
+      return false;
+
+    watcher_id_out = Common::readU64(value.data());
+    return true;
+  }
+
+  void StateAccess::forEachBridgeWatcher(
+      const std::function<void(const Core::BridgeWatcherInfo &)> &fn) const
+  {
+    //  Walk the owner-address index, look up each watcher by id.
+    //  The index is keyed by address (32 bytes) and the value is
+    //  the watcher id (8 LE).
+    auto visitor = [&](const std::vector<uint8_t> &key,
+                       const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != 32 || value.size() != 8)
+        return true;
+
+      const uint64_t watcher_id = Common::readU64(value.data());
+
+      Core::BridgeWatcherInfo w;
+      if (!getBridgeWatcher(watcher_id, w))
+        return true;
+
+      fn(w);
+      return true;
+    };
+
+    readForEach(StateDB::TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER, visitor);
+  }
+
+  void StateAccess::forEachActiveBridgeWatcherForChain(
+      uint64_t source_chain_id,
+      uint64_t current_height,
+      const std::function<void(const Core::BridgeWatcherInfo &)> &fn) const
+  {
+    forEachBridgeWatcher([&](const Core::BridgeWatcherInfo &w)
+                         {
+      if (w.source_chain_id != source_chain_id)
+        return;
+      if (!w.isInActiveSet(current_height))
+        return;
+      fn(w); });
+  }
+
+  size_t StateAccess::countActiveBridgeWatchersForChain(
+      uint64_t source_chain_id,
+      uint64_t current_height) const
+  {
+    size_t count = 0;
+    forEachActiveBridgeWatcherForChain(
+        source_chain_id, current_height,
+        [&](const Core::BridgeWatcherInfo &)
+        { ++count; });
+    return count;
+  }
+
+  //  =========================================================================
   //  Global state
   //  =========================================================================
 
@@ -2487,25 +2801,18 @@ namespace State
 
   bool StateAccess::versionIsAvailable(uint64_t version) const noexcept
   {
-    //  The window is unbounded by default (UINT64_MAX), which makes
-    //  every version "available" — the correct behavior before
-    //  setHistoryWindow is called, and for tests.
     if (history_window_ == UINT64_MAX)
       return true;
 
-    //  The current version is always available.
     if (version >= version_)
       return true;
 
-    //  Versions older than (current - window) have been pruned.
     if (version_ > history_window_)
     {
       const uint64_t oldest = version_ - history_window_;
       return version >= oldest;
     }
 
-    //  The window extends back past genesis, so every version is
-    //  available.
     return true;
   }
 

@@ -193,5 +193,61 @@ namespace State
                       addr.data.data(), addr.data.size());
       return addr;
     }
+
+    //  -------------------------------------------------------------------
+    //  Bridge
+    //  -------------------------------------------------------------------
+    //
+    //  The bridge's keys. bridgeConsumed, bridgeWithdrawal, and
+    //  bridgeChainRegistration are the per-deposit guard, the
+    //  withdrawal record, and the per-chain registry. bridgeWatcher
+    //  and bridgeWatcherByAddress are the registered-watcher
+    //  records (see BridgeWatcherTypes.h).
+    //
+    //  There is no bridgeSignerSet key. The operational signer set
+    //  is the active watcher set, resolved from state on each
+    //  verification; it isn't stored under a single key.
+
+    inline Crypto::Hash bridgeConsumed(uint64_t source_chain_id,
+                                       const Crypto::Hash &source_tx_hash,
+                                       uint32_t source_output_index) noexcept
+    {
+      uint8_t buf[8 + 32 + 4];
+      for (int i = 0; i < 8; ++i)
+        buf[i] = uint8_t(source_chain_id >> (i * 8));
+      std::memcpy(buf + 8, source_tx_hash.data.data(), 32);
+      for (int i = 0; i < 4; ++i)
+        buf[40 + i] = uint8_t(source_output_index >> (i * 8));
+      return Crypto::hashDomain("brgc", buf, sizeof(buf));
+    }
+
+    inline Crypto::Hash bridgeWithdrawal(uint64_t withdrawal_id) noexcept
+    {
+      uint8_t buf[8];
+      for (int i = 0; i < 8; ++i)
+        buf[i] = uint8_t(withdrawal_id >> (i * 8));
+      return Crypto::hashDomain("brgw", buf, 8);
+    }
+
+    inline Crypto::Hash bridgeChainRegistration(uint64_t source_chain_id) noexcept
+    {
+      uint8_t buf[8];
+      for (int i = 0; i < 8; ++i)
+        buf[i] = uint8_t(source_chain_id >> (i * 8));
+      return Crypto::hashDomain("brgr", buf, 8);
+    }
+
+    inline Crypto::Hash bridgeWatcher(uint64_t watcher_id) noexcept
+    {
+      uint8_t buf[8];
+      for (int i = 0; i < 8; ++i)
+        buf[i] = uint8_t(watcher_id >> (i * 8));
+      return Crypto::hashDomain("brwt", buf, 8);
+    }
+
+    inline Crypto::Hash bridgeWatcherByAddress(const Crypto::Address &address) noexcept
+    {
+      return Crypto::hashDomain("brga", address.data.data(), 32);
+    }
   } // namespace Keys
 }

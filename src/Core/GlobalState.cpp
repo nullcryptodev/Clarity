@@ -105,6 +105,33 @@ namespace Core
     return static_cast<uint16_t>(readGlobalU64(access_, GLOBAL_APY_POT_BPS));
   }
 
+  //  ---- Bridge reader ----
+
+  bool GlobalStateReader::bridgePaused() const
+  {
+    return readGlobalU64(access_, GLOBAL_BRIDGE_PAUSED) != 0;
+  }
+
+  uint64_t GlobalStateReader::bridgeNextWithdrawalId() const
+  {
+    return readGlobalU64(access_, GLOBAL_BRIDGE_NEXT_WITHDRAWAL_ID);
+  }
+
+  uint64_t GlobalStateReader::bridgeWithdrawalsPending() const
+  {
+    return readGlobalU64(access_, GLOBAL_BRIDGE_WITHDRAWALS_PENDING);
+  }
+
+  uint64_t GlobalStateReader::bridgeConsumedCount() const
+  {
+    return readGlobalU64(access_, GLOBAL_BRIDGE_CONSUMED_COUNT);
+  }
+
+  uint64_t GlobalStateReader::bridgeNextWatcherId() const
+  {
+    return readGlobalU64(access_, GLOBAL_BRIDGE_NEXT_WATCHER_ID);
+  }
+
   //  Writer
 
   namespace
@@ -173,6 +200,33 @@ namespace Core
   void GlobalStateWriter::setApyPotBps(uint16_t v)
   {
     writeGlobalU64(access_, GLOBAL_APY_POT_BPS, v);
+  }
+
+  //  ---- Bridge writer ----
+
+  void GlobalStateWriter::setBridgePaused(bool v)
+  {
+    writeGlobalU64(access_, GLOBAL_BRIDGE_PAUSED, v ? 1 : 0);
+  }
+
+  void GlobalStateWriter::setBridgeNextWithdrawalId(uint64_t v)
+  {
+    writeGlobalU64(access_, GLOBAL_BRIDGE_NEXT_WITHDRAWAL_ID, v);
+  }
+
+  void GlobalStateWriter::setBridgeWithdrawalsPending(uint64_t v)
+  {
+    writeGlobalU64(access_, GLOBAL_BRIDGE_WITHDRAWALS_PENDING, v);
+  }
+
+  void GlobalStateWriter::setBridgeConsumedCount(uint64_t v)
+  {
+    writeGlobalU64(access_, GLOBAL_BRIDGE_CONSUMED_COUNT, v);
+  }
+
+  void GlobalStateWriter::setBridgeNextWatcherId(uint64_t v)
+  {
+    writeGlobalU64(access_, GLOBAL_BRIDGE_NEXT_WATCHER_ID, v);
   }
 
 } // namespace Core

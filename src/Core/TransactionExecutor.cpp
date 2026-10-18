@@ -15,6 +15,7 @@
 #include "GlobalState.h"
 #include "RewardTypes.h"
 #include "KeyRotation.h"
+#include "BridgeWatcherTypes.h"
 
 #include "State/Keys.h"
 #include "State/StateAccess.h"
@@ -23,6 +24,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 
 namespace Core
 {
@@ -84,6 +86,109 @@ namespace Core
       state.putGlobal(name, bytes);
     }
 
+    //  ---- Bridge helpers ----
+    //
+    //  Read a 2-byte LE count followed by `count` 66-byte entries
+    //  ([2] signer_index LE || [64] signature). The whole block must
+    //  be exactly 2 + count * 66 bytes. On any malformation, return
+    //  false and leave `out` empty.
+    //
+    //  The parser is separate from the verifier so that a caller
+    //  that wants only structural validation (e.g. mempool admission
+    //  for a BridgeMint before checking signatures) can call it
+    //  without doing any crypto.
+    struct BridgeSignatureEntry
+    {
+      uint16_t signer_index{0};
+      Crypto::Signature signature{};
+    };
+
+    bool parseBridgeSignatureBlock(const uint8_t *data, size_t len,
+                                   std::vector<BridgeSignatureEntry> &out)
+    {
+      out.clear();
+      if (len < 2)
+        return false;
+
+      const uint16_t count =
+          uint16_t(data[0]) | (uint16_t(data[1]) << 8);
+
+      //  Bound the allocation before computing size * 66.
+      //  BRIDGE_MAX_WATCHERS is 100, so a count above that is
+      //  rejected without allocation.
+      if (count > BRIDGE_MAX_WATCHERS)
+        return false;
+
+      const size_t expected = 2 + static_cast<size_t>(count) * 66;
+      if (len != expected)
+        return false;
+
+      out.reserve(count);
+      for (uint16_t i = 0; i < count; ++i)
+      {
+        const uint8_t *p = data + 2 + i * 66;
+        BridgeSignatureEntry e;
+        e.signer_index = uint16_t(p[0]) | (uint16_t(p[1]) << 8);
+        std::memcpy(e.signature.data.data(), p + 2, 64);
+        out.push_back(e);
+      }
+
+      return true;
+    }
+
+    //  Build the domain-separated signing message:
+    //
+    //    Blake2b(domain4 || message)
+    //
+    //  The 4-byte domain tag separates bridge operations from each
+    //  other (and from the rest of the chain's hashing), which is
+    //  what prevents a signature harvested from one operation from
+    //  being replayed in another.
+    Crypto::Hash bridgeSigningHash(std::string_view domain,
+                                   const uint8_t *message, size_t message_len)
+    {
+      return Crypto::hashDomain(domain.data(), message, message_len);
+    }
+
+    //  Encode the canonical message that a mint attestation covers.
+    //
+    //    LE64(source_chain_id) || source_tx_hash(32) ||
+    //    LE32(source_output_index) || destination(32) ||
+    //    LE64(amount)
+    std::vector<uint8_t> encodeBridgeMintMessage(
+        uint64_t source_chain_id,
+        const Crypto::Hash &source_tx_hash,
+        uint32_t source_output_index,
+        const Crypto::Address &destination,
+        uint64_t amount)
+    {
+      std::vector<uint8_t> out;
+      out.reserve(8 + 32 + 4 + 32 + 8);
+
+      for (int i = 0; i < 8; ++i)
+        out.push_back(uint8_t(source_chain_id >> (i * 8)));
+      out.insert(out.end(), source_tx_hash.data.begin(), source_tx_hash.data.end());
+      for (int i = 0; i < 4; ++i)
+        out.push_back(uint8_t(source_output_index >> (i * 8)));
+      out.insert(out.end(), destination.data.begin(), destination.data.end());
+      for (int i = 0; i < 8; ++i)
+        out.push_back(uint8_t(amount >> (i * 8)));
+
+      return out;
+    }
+
+    //  Read a 2-byte LE count from a payload at `off`, and advance
+    //  `off` past it. Returns 0 and does NOT advance on truncation
+    //  (caller must check `off <= payload.size()` afterwards).
+    uint16_t readU16At(const std::vector<uint8_t> &p, size_t &off)
+    {
+      if (off + 2 > p.size())
+        return 0;
+      const uint16_t v = uint16_t(p[off]) | (uint16_t(p[off + 1]) << 8);
+      off += 2;
+      return v;
+    }
+
     //  Debit an account's balance of a token (native or custom).
     //  Returns false if the balance is insufficient.
     bool debitToken(State::StateAccess &state,
@@ -142,7 +247,7 @@ namespace Core
         v |= uint64_t(p[off + i]) << (i * 8);
       return v;
     }
-  }
+  } // anonymous namespace
 
   //  Dispatch
 
@@ -300,6 +405,38 @@ namespace Core
 
     case TxType::RefillCollectionReward:
       receipt = executeRefillCollectionReward(state, tx, ctx);
+      break;
+
+    case TxType::BridgeMint:
+      receipt = executeBridgeMint(state, tx, ctx);
+      break;
+
+    case TxType::BridgeBurn:
+      receipt = executeBridgeBurn(state, tx, ctx);
+      break;
+
+    case TxType::BridgePause:
+      receipt = executeBridgePause(state, tx, ctx);
+      break;
+
+    case TxType::BridgeUnpause:
+      receipt = executeBridgeUnpause(state, tx, ctx);
+      break;
+
+    case TxType::BridgeAckWithdrawal:
+      receipt = executeBridgeAckWithdrawal(state, tx, ctx);
+      break;
+
+    case TxType::BridgeRegisterChain:
+      receipt = executeBridgeRegisterChain(state, tx, ctx);
+      break;
+
+    case TxType::RegisterBridgeWatcher:
+      receipt = executeRegisterBridgeWatcher(state, tx, ctx);
+      break;
+
+    case TxType::UnregisterBridgeWatcher:
+      receipt = executeUnregisterBridgeWatcher(state, tx, ctx);
       break;
 
     default:
@@ -877,6 +1014,17 @@ namespace Core
     if (tx.token_id == NATIVE_TOKEN_ID)
       return failure;
 
+    TokenInfo token;
+    if (!state.getToken(tx.token_id, token))
+      return failure;
+
+    //  Bridged tokens are not user-burnable. The only way to
+    //  destroy a bridged token is BridgeBurn, which produces a
+    //  withdrawal record; a user BurnToken would decrement supply
+    //  without producing one, destroying value with no release.
+    if (token.isBridged())
+      return failure;
+
     uint64_t sender_balance = state.getTokenBalance(tx.from, tx.token_id);
     if (sender_balance < tx.amount)
       return failure;
@@ -1268,21 +1416,6 @@ namespace Core
 
   //  Remove Liquidity
 
-  //  Remove Liquidity
-  //
-  //  Removes a portion (or all) of an LP position. `amount` in the
-  //  payload is the number of LP tokens to remove; if it is 0, the
-  //  entire position is removed.
-  //
-  //  Partial removal: the position's liquidity is decremented by
-  //  `amount`, the reserves are decremented by the pro-rata share
-  //  of `amount`, and the position record is re-written with the
-  //  reduced liquidity. The position index entry is kept.
-  //
-  //  Full removal: the position's liquidity is zeroed, the position
-  //  index entry is deleted, and (if this drains the pool) the pool
-  //  record is deleted. The position record itself is left in place
-  //  with liquidity = 0; see the note in DEX.md.
   Receipt TransactionExecutor::executeRemoveLiquidity(State::StateAccess &state,
                                                       const Transaction &tx,
                                                       const TxExecutionContext & /*ctx*/)
@@ -2623,6 +2756,889 @@ namespace Core
     return {ReceiptStatus::Success, tx.fee};
   }
 
+  //  =========================================================================
+  //  Bridge — shared verifiers
+  //  =========================================================================
+  //
+  //  Two verifier flavors:
+  //
+  //    verifyBridgeSignatures    — operational attestations (mint,
+  //                                ack). Signs against the active
+  //                                watcher set for a source chain.
+  //                                Threshold is bftQuorum(active_watchers).
+  //
+  //    verifyGovernanceSignatures — governance decisions (pause,
+  //                                 unpause, register-chain). Signs
+  //                                 against the active validator set.
+  //                                 Threshold is bftQuorum(active_validators).
+  //
+  //  Both accept the same `[2] count || N*66` signature block. The
+  //  only difference is which set the signer_index resolves against.
+
+  bool TransactionExecutor::verifyBridgeSignatures(
+      State::StateAccess &state,
+      uint64_t source_chain_id,
+      std::string_view domain,
+      const uint8_t *message, size_t message_len,
+      const uint8_t *signatures, size_t signatures_len,
+      const TxExecutionContext &ctx)
+  {
+    if (domain.size() != 4)
+      return false;
+
+    //  Resolve the active watcher set at this height. The
+    //  accessor returns each watcher's full record, filtered by
+    //  isInActiveSet(height).
+    std::vector<Core::BridgeWatcherInfo> active;
+    state.forEachActiveBridgeWatcherForChain(
+        source_chain_id, ctx.current_height,
+        [&](const Core::BridgeWatcherInfo &w)
+        { active.push_back(w); });
+
+    //  Sort by watcher id so signer_index is deterministic across
+    //  nodes. The owner-address index iteration is hash-ordered,
+    //  not id-ordered, so a caller that builds a signature block
+    //  with `signer_index = position in the active set` needs the
+    //  set to be in the same order on the verifier.
+    std::sort(active.begin(), active.end(),
+              [](const Core::BridgeWatcherInfo &a,
+                 const Core::BridgeWatcherInfo &b)
+              { return a.id < b.id; });
+
+    //  Chain registration must be present; it carries the
+    //  per-chain minimum active-watcher count.
+    Core::BridgeChainRegistration reg;
+    if (!state.getBridgeChainRegistration(source_chain_id, reg))
+      return false;
+    if (active.size() < reg.active_watcher_min)
+      return false;
+
+    const size_t threshold = Core::bftQuorum(active.size());
+
+    std::vector<BridgeSignatureEntry> sigs;
+    if (!parseBridgeSignatureBlock(signatures, signatures_len, sigs))
+      return false;
+
+    if (sigs.size() < threshold)
+      return false;
+
+    std::vector<bool> seen(active.size(), false);
+    for (const auto &e : sigs)
+    {
+      if (e.signer_index >= active.size())
+        return false;
+      if (seen[e.signer_index])
+        return false;
+      seen[e.signer_index] = true;
+    }
+
+    const Crypto::Hash hash =
+        bridgeSigningHash(domain, message, message_len);
+
+    for (const auto &e : sigs)
+    {
+      const Id validator_id = active[e.signer_index].validator_id;
+      auto pk = state.validatorKeyAtHeight(validator_id, ctx.current_height);
+      if (!pk.has_value())
+      {
+        return false;
+      }
+      const bool ok = Crypto::verify(hash, *pk, e.signature);
+      if (!ok)
+        return false;
+    }
+
+    return true;
+  }
+
+  bool TransactionExecutor::verifyGovernanceSignatures(
+      State::StateAccess &state,
+      std::string_view domain,
+      const uint8_t *message, size_t message_len,
+      const uint8_t *signatures, size_t signatures_len,
+      const TxExecutionContext &ctx)
+  {
+    if (domain.size() != 4)
+    {
+      return false;
+    }
+
+    std::vector<Id> active = loadActiveSet(state);
+    std::sort(active.begin(), active.end());
+
+    if (active.empty())
+      return false;
+
+    const size_t threshold = Core::bftQuorum(active.size());
+
+    std::vector<BridgeSignatureEntry> sigs;
+    if (!parseBridgeSignatureBlock(signatures, signatures_len, sigs))
+    {
+      return false;
+    }
+
+    if (sigs.size() < threshold)
+      return false;
+
+    std::vector<bool> seen(active.size(), false);
+    for (const auto &e : sigs)
+    {
+      if (e.signer_index >= active.size())
+        return false;
+      if (seen[e.signer_index])
+        return false;
+      seen[e.signer_index] = true;
+    }
+
+    const Crypto::Hash hash =
+        bridgeSigningHash(domain, message, message_len);
+
+    for (const auto &e : sigs)
+    {
+      const Id validator_id = active[e.signer_index];
+
+      auto pk = state.validatorKeyAtHeight(validator_id, ctx.current_height);
+      if (!pk.has_value())
+      {
+        return false;
+      }
+
+      const bool ok = Crypto::verify(hash, *pk, e.signature);
+      if (!ok)
+        return false;
+    }
+
+    return true;
+  }
+
+  //  =========================================================================
+  //  Bridge — BridgeMint
+  //  =========================================================================
+  //
+  //  Payload layout (little-endian):
+  //    [8]  source_chain_id
+  //    [32] source_tx_hash
+  //    [4]  source_output_index
+  //    [32] destination_address
+  //    [8]  amount                 — Clarity atomic units
+  //    [2]  signer_count           — LE
+  //    [N]  signatures             — each: [2] index LE || [64] sig
+  //
+  //  The signature block covers the mint message built by
+  //  encodeBridgeMintMessage. Signatures verify against the active
+  //  bridge watcher set for `source_chain_id` at `ctx.current_height`,
+  //  with threshold bftQuorum(active_watchers).
+  //
+  //  Mint checks, in order:
+  //    1. Bridge not paused.
+  //    2. Source chain registered and enabled.
+  //    3. Wrapped token exists and its fingerprint matches.
+  //    4. Deposit not already consumed.
+  //    5. Watcher signatures verify (active set, threshold, replay).
+  //    6. Mint to destination, write consumed-deposit record,
+  //       bump consumed count.
+  //
+  //  All failure modes return a Failure receipt; no state is
+  //  modified until every check passes.
+
+  Receipt TransactionExecutor::executeBridgeMint(State::StateAccess &state,
+                                                 const Transaction &tx,
+                                                 const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    //  Payload minimum: the fixed fields before the signature block.
+    if (tx.payload.size() < 8 + 32 + 4 + 32 + 8 + 2)
+      return failure;
+
+    size_t off = 0;
+
+    uint64_t source_chain_id = 0;
+    for (int i = 0; i < 8; ++i)
+      source_chain_id |= uint64_t(tx.payload[off + i]) << (i * 8);
+    off += 8;
+
+    Crypto::Hash source_tx_hash;
+    std::memcpy(source_tx_hash.data.data(), tx.payload.data() + off, 32);
+    off += 32;
+
+    const uint32_t source_output_index = readU32At(tx.payload, off);
+    off += 4;
+
+    Crypto::Address destination;
+    std::memcpy(destination.data.data(), tx.payload.data() + off, 32);
+    off += 32;
+
+    const uint64_t amount = readU64At(tx.payload, off);
+    off += 8;
+
+    //  The signature block, including its 2-byte count, is the
+    //  remainder of the payload. parseBridgeSignatureBlock expects
+    //  the count at data[0], so do NOT advance `off` past it here.
+    const size_t sig_block_off = off;
+    const size_t sig_block_len = tx.payload.size() - sig_block_off;
+
+    //  Peek at the count without consuming it, purely to bound-check.
+    if (sig_block_len < 2)
+      return failure;
+    const uint16_t signer_count =
+        uint16_t(tx.payload[sig_block_off]) |
+        (uint16_t(tx.payload[sig_block_off + 1]) << 8);
+    if (sig_block_len != 2 + static_cast<size_t>(signer_count) * 66)
+      return failure;
+
+    const uint8_t *sigs_ptr = tx.payload.data() + sig_block_off;
+    const size_t sigs_len = sig_block_len;
+
+    if (amount == 0)
+      return failure;
+    if (destination.isNull())
+      return failure;
+
+    //  Global bridge pause.
+    GlobalStateReader reader(state);
+    if (reader.bridgePaused())
+      return failure;
+
+    //  Chain registration.
+    Core::BridgeChainRegistration reg;
+    if (!state.getBridgeChainRegistration(source_chain_id, reg))
+      return failure;
+    if (!reg.isWellFormed() || !reg.enabled)
+      return failure;
+
+    //  Wrapped token fingerprint.
+    Core::TokenInfo token;
+    if (!state.getToken(reg.wrapped_token_id, token))
+      return failure;
+    if (!token.isBridged() ||
+        !token.fingerprint.has_value() ||
+        *token.fingerprint != reg.fingerprint)
+      return failure;
+
+    //  Replay guard: the deposit must not have been minted before.
+    uint64_t existing_mint_height = 0;
+    if (state.getBridgeConsumed(source_chain_id, source_tx_hash,
+                                source_output_index, existing_mint_height))
+      return failure;
+
+    //  Build the message the federation signed, and verify.
+    const std::vector<uint8_t> message = encodeBridgeMintMessage(
+        source_chain_id, source_tx_hash, source_output_index,
+        destination, amount);
+
+    if (!verifyBridgeSignatures(
+            state, source_chain_id, "bmin",
+            message.data(), message.size(),
+            sigs_ptr, sigs_len, ctx))
+      return failure;
+
+    //  All checks passed. Apply state changes.
+
+    //  Mint to the destination.
+    const uint64_t existing_balance =
+        state.getTokenBalance(destination, reg.wrapped_token_id);
+    state.putTokenBalance(destination, reg.wrapped_token_id,
+                          existing_balance + amount);
+
+    //  Bump the wrapped token's supply.
+    const uint64_t supply = state.getTokenSupply(reg.wrapped_token_id);
+    state.putTokenSupply(reg.wrapped_token_id, supply + amount);
+
+    //  Consumed-deposit record.
+    state.putBridgeConsumed(source_chain_id, source_tx_hash,
+                            source_output_index, ctx.current_height);
+
+    //  Aggregate counter.
+    GlobalStateWriter writer(state);
+    writer.setBridgeConsumedCount(reader.bridgeConsumedCount() + 1);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  //  =========================================================================
+  //  Bridge — BridgeBurn
+  //  =========================================================================
+  //
+  //  Payload layout:
+  //    [8]  source_chain_id
+  //    [1]  blob_len
+  //    [N]  destination_blob      — N == blob_len
+  //    [8]  amount                — Clarity atomic units
+  //
+  //  No signature block. A burn is authorized by the user's own
+  //  signature over the tx's signing hash; the standard pipeline
+  //  verifies it before dispatch.
+  //
+  //  No watcher-set check either. Whether the watcher set can
+  //  currently mint is a mint-time concern; a burn just queues a
+  //  withdrawal. The withdrawal record is durable even if the
+  //  watcher set is temporarily below threshold, so the release
+  //  will happen once the set recovers. This asymmetry is
+  //  deliberate: a fake mint steals value, a burn doesn't.
+
+  Receipt TransactionExecutor::executeBridgeBurn(State::StateAccess &state,
+                                                 const Transaction &tx,
+                                                 const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    if (tx.payload.size() < 8 + 1 + 8)
+      return failure;
+
+    size_t off = 0;
+
+    uint64_t source_chain_id = 0;
+    for (int i = 0; i < 8; ++i)
+      source_chain_id |= uint64_t(tx.payload[off + i]) << (i * 8);
+    off += 8;
+
+    const uint8_t blob_len = tx.payload[off];
+    off += 1;
+
+    if (tx.payload.size() != 8 + 1 + static_cast<size_t>(blob_len) + 8)
+      return failure;
+
+    std::vector<uint8_t> destination_blob(blob_len);
+    if (blob_len > 0)
+    {
+      std::memcpy(destination_blob.data(), tx.payload.data() + off, blob_len);
+      off += blob_len;
+    }
+
+    const uint64_t amount = readU64At(tx.payload, off);
+
+    if (amount == 0)
+      return failure;
+
+    GlobalStateReader reader(state);
+    if (reader.bridgePaused())
+      return failure;
+
+    Core::BridgeChainRegistration reg;
+    if (!state.getBridgeChainRegistration(source_chain_id, reg))
+      return failure;
+    if (!reg.isWellFormed() || !reg.enabled)
+      return failure;
+
+    //  The burned token must be the wrapped token for this chain.
+    if (tx.token_id != reg.wrapped_token_id)
+      return failure;
+
+    //  Destination blob bounds.
+    if (blob_len < reg.destination_blob_min_len ||
+        blob_len > reg.destination_blob_max_len)
+      return failure;
+
+    //  Balance check.
+    const uint64_t balance = state.getTokenBalance(tx.from, tx.token_id);
+    if (balance < amount)
+      return failure;
+
+    //  All checks passed. Apply state changes.
+
+    state.putTokenBalance(tx.from, tx.token_id, balance - amount);
+
+    const uint64_t supply = state.getTokenSupply(tx.token_id);
+    state.putTokenSupply(tx.token_id,
+                         supply >= amount ? supply - amount : 0);
+
+    uint64_t next_id = reader.bridgeNextWithdrawalId();
+    if (next_id == 0)
+      next_id = 1;
+
+    Core::BridgeWithdrawal w;
+    w.id = next_id;
+    w.source_chain_id = source_chain_id;
+    w.wrapped_token_id = tx.token_id;
+    w.burner = tx.from;
+    w.amount = amount;
+    w.destination_blob = std::move(destination_blob);
+    w.created_at_height = ctx.current_height;
+
+    if (!w.isWellFormed())
+      return failure;
+
+    state.putBridgeWithdrawal(w);
+
+    GlobalStateWriter writer(state);
+    writer.setBridgeNextWithdrawalId(next_id + 1);
+    writer.setBridgeWithdrawalsPending(reader.bridgeWithdrawalsPending() + 1);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  //  =========================================================================
+  //  Bridge — Pause / Unpause (governance)
+  //  =========================================================================
+  //
+  //  Payload layout (both):
+  //    [8]  current_height        — binds the pause to a specific
+  //                                 height, prevents a signature
+  //                                 harvested from one pause from
+  //                                 being replayed at a different
+  //                                 height
+  //    [2]  signer_count          — LE
+  //    [N]  signatures            — governance signatures
+  //
+  //  Message:
+  //    Blake2b("bpau" || LE64(current_height))   — for pause
+  //    Blake2b("bunp"  || LE64(current_height))   — for unpause
+  //
+  //  Governance signatures verify against the active validator set,
+  //  with bftQuorum threshold. The operational watcher set has no
+  //  authority to freeze or unfreeze the bridge.
+
+  Receipt TransactionExecutor::executeBridgePause(State::StateAccess &state,
+                                                  const Transaction &tx,
+                                                  const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    if (tx.payload.size() < 8 + 2)
+      return failure;
+
+    size_t off = 0;
+
+    uint64_t bound_height = 0;
+    for (int i = 0; i < 8; ++i)
+      bound_height |= uint64_t(tx.payload[off + i]) << (i * 8);
+    off += 8;
+
+    //  The signature block, including its 2-byte count, is the
+    //  remainder of the payload. parseBridgeSignatureBlock expects
+    //  the count at data[0], so do NOT advance `off` past it here.
+    const size_t sig_block_off = off;
+    const size_t sig_block_len = tx.payload.size() - sig_block_off;
+
+    if (sig_block_len < 2)
+      return failure;
+    const uint16_t signer_count =
+        uint16_t(tx.payload[sig_block_off]) |
+        (uint16_t(tx.payload[sig_block_off + 1]) << 8);
+    if (sig_block_len != 2 + static_cast<size_t>(signer_count) * 66)
+      return failure;
+
+    const uint8_t *sigs_ptr = tx.payload.data() + sig_block_off;
+    const size_t sigs_len = sig_block_len;
+
+    //  Build the signed message.
+    std::vector<uint8_t> message;
+    message.reserve(8);
+    for (int i = 0; i < 8; ++i)
+      message.push_back(uint8_t(bound_height >> (i * 8)));
+
+    if (!verifyGovernanceSignatures(
+            state, "bpau",
+            message.data(), message.size(),
+            sigs_ptr, sigs_len, ctx))
+      return failure;
+
+    //  Apply.
+    GlobalStateWriter writer(state);
+    writer.setBridgePaused(true);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  Receipt TransactionExecutor::executeBridgeUnpause(State::StateAccess &state,
+                                                    const Transaction &tx,
+                                                    const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    if (tx.payload.size() < 8 + 2)
+      return failure;
+
+    size_t off = 0;
+
+    uint64_t bound_height = 0;
+    for (int i = 0; i < 8; ++i)
+      bound_height |= uint64_t(tx.payload[off + i]) << (i * 8);
+    off += 8;
+
+    //  The signature block, including its 2-byte count, is the
+    //  remainder of the payload. parseBridgeSignatureBlock expects
+    //  the count at data[0], so do NOT advance `off` past it here.
+    const size_t sig_block_off = off;
+    const size_t sig_block_len = tx.payload.size() - sig_block_off;
+
+    if (sig_block_len < 2)
+      return failure;
+    const uint16_t signer_count =
+        uint16_t(tx.payload[sig_block_off]) |
+        (uint16_t(tx.payload[sig_block_off + 1]) << 8);
+    if (sig_block_len != 2 + static_cast<size_t>(signer_count) * 66)
+      return failure;
+
+    const uint8_t *sigs_ptr = tx.payload.data() + sig_block_off;
+    const size_t sigs_len = sig_block_len;
+
+    std::vector<uint8_t> message;
+    message.reserve(8);
+    for (int i = 0; i < 8; ++i)
+      message.push_back(uint8_t(bound_height >> (i * 8)));
+
+    if (!verifyGovernanceSignatures(
+            state, "bunp",
+            message.data(), message.size(),
+            sigs_ptr, sigs_len, ctx))
+      return failure;
+
+    GlobalStateWriter writer(state);
+    writer.setBridgePaused(false);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  //  =========================================================================
+  //  Bridge — AckWithdrawal
+  //  =========================================================================
+  //
+  //  Payload layout:
+  //    [8]  withdrawal_id         — the withdrawal being acked
+  //    [2]  signer_count          — LE
+  //    [N]  signatures            — operational watcher signatures
+  //
+  //  Message:
+  //    Blake2b("back" || LE64(withdrawal_id))
+  //
+  //  The ack is watcher-signed against the operational set for the
+  //  withdrawal's chain — the same set that signs mints. The chain
+  //  is resolved from the withdrawal record, not from the payload.
+  //
+  //  On success: delete the withdrawal record and its height index
+  //  row; decrement the pending counter.
+
+  Receipt TransactionExecutor::executeBridgeAckWithdrawal(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    if (tx.payload.size() < 8 + 2)
+      return failure;
+
+    size_t off = 0;
+
+    uint64_t withdrawal_id = 0;
+    for (int i = 0; i < 8; ++i)
+      withdrawal_id |= uint64_t(tx.payload[off + i]) << (i * 8);
+    off += 8;
+
+    //  The signature block, including its 2-byte count, is the
+    //  remainder of the payload. parseBridgeSignatureBlock expects
+    //  the count at data[0], so do NOT advance `off` past it here.
+    const size_t sig_block_off = off;
+    const size_t sig_block_len = tx.payload.size() - sig_block_off;
+
+    //  Peek at the count without consuming it, purely to bound-check.
+    if (sig_block_len < 2)
+      return failure;
+    const uint16_t signer_count =
+        uint16_t(tx.payload[sig_block_off]) |
+        (uint16_t(tx.payload[sig_block_off + 1]) << 8);
+    if (sig_block_len != 2 + static_cast<size_t>(signer_count) * 66)
+      return failure;
+
+    const uint8_t *sigs_ptr = tx.payload.data() + sig_block_off;
+    const size_t sigs_len = sig_block_len;
+
+    GlobalStateReader reader(state);
+    if (reader.bridgePaused())
+      return failure;
+
+    Core::BridgeWithdrawal w;
+    if (!state.getBridgeWithdrawal(withdrawal_id, w))
+      return failure;
+    if (!w.isWellFormed())
+      return failure;
+
+    Core::BridgeChainRegistration reg;
+    if (!state.getBridgeChainRegistration(w.source_chain_id, reg))
+      return failure;
+
+    //  Message: the withdrawal id.
+    std::vector<uint8_t> message;
+    message.reserve(8);
+    for (int i = 0; i < 8; ++i)
+      message.push_back(uint8_t(withdrawal_id >> (i * 8)));
+
+    if (!verifyBridgeSignatures(
+            state, w.source_chain_id, "back",
+            message.data(), message.size(),
+            sigs_ptr, sigs_len, ctx))
+      return failure;
+
+    //  Apply: delete the record (which also deletes its height-index
+    //  row), decrement the pending counter.
+    state.deleteBridgeWithdrawal(withdrawal_id);
+
+    GlobalStateWriter writer(state);
+    const uint64_t pending = reader.bridgeWithdrawalsPending();
+    writer.setBridgeWithdrawalsPending(pending > 0 ? pending - 1 : 0);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  //  =========================================================================
+  //  Bridge — RegisterChain (governance)
+  //  =========================================================================
+  //
+  //  Payload layout:
+  //    [1]  registration_len      — LE (1 byte)
+  //    [N]  registration_blob     — BridgeChainRegistration::serializeState()
+  //    [2]  signer_count
+  //    [N]  signatures            — governance signatures
+  //
+  //  The signature covers the registration blob, so the signers
+  //  commit to the exact bytes that will be stored.
+
+  Receipt TransactionExecutor::executeBridgeRegisterChain(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    if (tx.payload.size() < 1 + 2)
+      return failure;
+
+    size_t off = 0;
+
+    const uint8_t reg_len = tx.payload[off];
+    off += 1;
+
+    if (off + reg_len + 2 > tx.payload.size())
+      return failure;
+
+    Core::BridgeChainRegistration reg;
+    if (!Core::BridgeChainRegistration::deserializeState(
+            tx.payload.data() + off, reg_len, reg))
+      return failure;
+    off += reg_len;
+
+    //  The signature block, including its 2-byte count, is the
+    //  remainder of the payload. parseBridgeSignatureBlock expects
+    //  the count at data[0], so do NOT advance `off` past it here.
+    const size_t sig_block_off = off;
+    const size_t sig_block_len = tx.payload.size() - sig_block_off;
+
+    if (sig_block_len < 2)
+      return failure;
+    const uint16_t signer_count =
+        uint16_t(tx.payload[sig_block_off]) |
+        (uint16_t(tx.payload[sig_block_off + 1]) << 8);
+    if (sig_block_len != 2 + static_cast<size_t>(signer_count) * 66)
+      return failure;
+
+    const uint8_t *sigs_ptr = tx.payload.data() + sig_block_off;
+    const size_t sigs_len = sig_block_len;
+
+    //  The message covered by the signatures is the registration
+    //  blob (from the payload) — which is what will be written.
+    const uint8_t *msg_ptr = tx.payload.data() + 1; // skip len prefix
+    const size_t msg_len = reg_len;
+
+    if (!verifyGovernanceSignatures(
+            state, "brgr",
+            msg_ptr, msg_len,
+            sigs_ptr, sigs_len, ctx))
+      return failure;
+
+    //  Reject if a registration already exists for this chain id
+    //  (registrations are immutable; to change one, deregister and
+    //  re-register, or use a future "update" transaction).
+    Core::BridgeChainRegistration existing;
+    if (state.getBridgeChainRegistration(reg.source_chain_id, existing))
+      return failure;
+
+    state.putBridgeChainRegistration(reg);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  //  =========================================================================
+  //  Bridge — RegisterBridgeWatcher
+  //  =========================================================================
+  //
+  //  Payload layout:
+  //    [8]  source_chain_id (LE)
+  //    [8]  stake           (LE)
+  //
+  //  No signature block. The watcher registers themselves; the
+  //  authorization is "caller is a validator with enough balance to
+  //  lock the stake." Registration is one-shot per (validator,
+  //  chain); a second one while the first is unbonding-expired is
+  //  allowed (re-registration), a second one while active is not.
+  //
+  //  The registration does not verify the caller's authority beyond
+  //  "has a validator record whose reward_address equals tx.from,"
+  //  because the validator record itself is the authority.
+
+  Receipt TransactionExecutor::executeRegisterBridgeWatcher(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    if (tx.payload.size() != 8 + 8)
+      return failure;
+
+    uint64_t source_chain_id = 0;
+    for (int i = 0; i < 8; ++i)
+      source_chain_id |= uint64_t(tx.payload[i]) << (i * 8);
+
+    uint64_t stake = 0;
+    for (int i = 0; i < 8; ++i)
+      stake |= uint64_t(tx.payload[8 + i]) << (i * 8);
+
+    if (stake < BRIDGE_WATCHER_MIN_STAKE)
+      return failure;
+
+    //  Caller must be a registered validator.
+    uint64_t validator_id = 0;
+    if (!state.getValidatorByAddress(tx.from, validator_id))
+      return failure;
+
+    //  Chain must be registered and enabled.
+    Core::BridgeChainRegistration reg;
+    if (!state.getBridgeChainRegistration(source_chain_id, reg))
+      return failure;
+    if (!reg.isWellFormed() || !reg.enabled)
+      return failure;
+
+    //  Caller must not already have an active (or unbonding) watcher
+    //  for this chain. The lookup is by owner address, which is the
+    //  validator's reward_address for a legacy validator and the
+    //  explicit reward_address for a modern one.
+    uint64_t existing = 0;
+    if (state.getBridgeWatcherIdByAddress(tx.from, existing))
+    {
+      Core::BridgeWatcherInfo w;
+      if (state.getBridgeWatcher(existing, w) &&
+          w.source_chain_id == source_chain_id &&
+          !w.isUnbondExpired(ctx.current_height))
+        return failure;
+    }
+
+    //  Caller must not be pending-unbond as a validator; the
+    //  watcher stake and the validator stake would both be locked
+    //  at departure and the accounting gets confusing.
+    Core::ValidatorInfo v;
+    if (!state.getValidator(validator_id, v))
+      return failure;
+    if (v.pending_unbond_height != 0)
+      return failure;
+
+    //  Debit the stake. Locks it out of the balance until the
+    //  watcher unbonds (or gets slashed), matching the validator
+    //  stake model.
+    Core::Account acct = state.getAccount(tx.from);
+    if (acct.balance < stake)
+      return failure;
+    acct.balance -= stake;
+    acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
+    state.putAccount(tx.from, acct);
+
+    //  Allocate the watcher id.
+    GlobalStateReader reader(state);
+    uint64_t next_id = reader.bridgeNextWatcherId();
+    if (next_id == 0)
+      next_id = 1;
+
+    Core::BridgeWatcherInfo w;
+    w.id = next_id;
+    w.validator_id = validator_id;
+    w.source_chain_id = source_chain_id;
+    w.reward_address = tx.from;
+    w.registered_at_height = ctx.current_height;
+    w.stake = stake;
+    w.last_seen_height = ctx.current_height;
+    w.is_active = true;
+    w.became_active_at = ctx.current_height;
+    w.last_active_at = ctx.current_height;
+
+    if (!w.isWellFormed())
+      return failure;
+
+    state.putBridgeWatcher(w);
+
+    GlobalStateWriter writer(state);
+    writer.setBridgeNextWatcherId(next_id + 1);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  //  =========================================================================
+  //  Bridge — UnregisterBridgeWatcher
+  //  =========================================================================
+  //
+  //  Payload layout:
+  //    [8]  source_chain_id (LE)
+  //
+  //  Starts the watcher's unbonding. The watcher is removed from
+  //  the active set immediately (is_active = false) but the record
+  //  and stake stay until pending_unbond_height. During the window
+  //  the stake is slashable; at expiry the record is deleted and
+  //  the stake is returned to the owner.
+  //
+  //  Refused if removing this watcher would drop the active set
+  //  below the registration's active_watcher_min.
+
+  Receipt TransactionExecutor::executeUnregisterBridgeWatcher(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    if (tx.payload.size() != 8)
+      return failure;
+
+    uint64_t source_chain_id = 0;
+    for (int i = 0; i < 8; ++i)
+      source_chain_id |= uint64_t(tx.payload[i]) << (i * 8);
+
+    uint64_t watcher_id = 0;
+    if (!state.getBridgeWatcherIdByAddress(tx.from, watcher_id))
+      return failure;
+
+    Core::BridgeWatcherInfo w;
+    if (!state.getBridgeWatcher(watcher_id, w))
+      return failure;
+    if (w.source_chain_id != source_chain_id)
+      return failure;
+    if (w.pending_unbond_height != 0)
+      return failure;
+
+    Core::BridgeChainRegistration reg;
+    if (!state.getBridgeChainRegistration(source_chain_id, reg))
+      return failure;
+
+    //  Refuse if removing this watcher would drop the active set
+    //  below the registration's minimum. The caller can retry once
+    //  more watchers register.
+    const size_t active_count =
+        state.countActiveBridgeWatchersForChain(
+            source_chain_id, ctx.current_height);
+
+    if (active_count <= reg.active_watcher_min)
+      return failure;
+
+    //  Mark unbonding. Record stays until pending_unbond_height;
+    //  stake is locked and slashable for the whole window.
+    w.is_active = false;
+    w.last_active_at = ctx.current_height;
+    w.pending_unbond_height =
+        ctx.current_height + BRIDGE_WATCHER_UNBONDING_PERIOD;
+    state.putBridgeWatcher(w);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
   //  System Slash
 
   Receipt TransactionExecutor::executeSystemSlash(State::StateAccess &state,
@@ -2755,4 +3771,5 @@ namespace Core
 
     return true;
   }
+
 } // namespace Core

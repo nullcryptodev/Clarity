@@ -10,6 +10,11 @@
 #include <gtest/gtest.h>
 
 #include "Crypto/Blake2b.h"
+#include "Crypto/Helpers.h"
+
+#include "Core/BridgeTypes.h"
+#include "Core/BridgeWatcherTypes.h"
+#include "Core/GlobalState.h"
 
 #include "TransactionBuilder.h"
 #include "Utils.h"
@@ -69,6 +74,12 @@ namespace Tests
 
     void TearDown() override
     {
+      //  Release the lazy reader (and its autocommit read txn)
+      //  before closing the DB. The reader holds a StateAccess
+      //  referencing db_; if db_ is closed first, the reader's
+      //  destructor releases a txn against a dead environment.
+      state_reader_.reset();
+
       if (db_)
       {
         db_->close();
@@ -106,11 +117,43 @@ namespace Tests
       std::fill(fund_addr.data.begin(), fund_addr.data.end(), 0x01);
       cfg.accounts.push_back({fund_addr, INITIAL, "test fund"});
 
-      cfg.validators.push_back({1, addressOf(seed1), seed1.publicKey, true});
-      cfg.validators.push_back({2, addressOf(seed2), seed2.publicKey, true});
+      //  Both validators explicitly set the consensus key to their
+      //  own public key. GenesisValidator's 5th field is
+      //  `consensus_key`; the fixture sets it explicitly rather than
+      //  letting applyGenesis fall back to `reward_address` — the
+      //  fallback happens to produce the same value here (addressOf
+      //  copies the public key), but the explicit assignment
+      //  decouples the fixture's signing identity from whatever
+      //  `addressOf` decides to return in the future.
+      //
+      //  The bridge tests sign with seed1_/seed2_; the fixture
+      //  needs the on-chain consensus key at genesis to be exactly
+      //  seed1_.publicKey / seed2_.publicKey so the mints, acks,
+      //  and governance transactions all verify.
+      cfg.validators.push_back({/*id=*/1,
+                                /*reward_address=*/addressOf(seed1),
+                                /*node_key=*/seed1.publicKey,
+                                /*is_seed=*/true,
+                                /*consensus_key=*/seed1.publicKey});
+      cfg.validators.push_back({/*id=*/2,
+                                /*reward_address=*/addressOf(seed2),
+                                /*node_key=*/seed2.publicKey,
+                                /*is_seed=*/true,
+                                /*consensus_key=*/seed2.publicKey});
 
       cfg.initial_total_supply = INITIAL;
       cfg.initial_active_set_size = 2;
+
+      //  Enable the bridge. Under the watcher model, applyGenesis
+      //  registers the two seed validators as initial bridge
+      //  watchers, writes the wrapped-CCX token, and writes the CCX
+      //  chain registration. Without these two lines, every bridge
+      //  test sees an empty bridge state ("chain registration not
+      //  present") and every bridge transaction fails its first
+      //  check.
+      cfg.bridge.enabled = true;
+      cfg.bridge.ccx_chain_id = Core::BRIDGE_CCX_CHAIN_ID;
+
       return cfg;
     }
 
@@ -119,6 +162,7 @@ namespace Tests
     template <typename Fn>
     void withState(Fn &&fn)
     {
+      state_reader_.reset();
       auto t = db_->beginWrite();
       State::StateAccess s(*db_, t, 0);
       fn(s);
@@ -129,6 +173,7 @@ namespace Tests
     template <typename Fn>
     void readState(Fn &&fn) const
     {
+      state_reader_.reset();
       auto t = db_->beginWrite();
       State::StateAccess s(*db_, t, 0);
       fn(s);
@@ -142,6 +187,20 @@ namespace Tests
       uint64_t result = 0;
       readState([&](State::StateAccess &s)
                 { result = s.getAccount(addr).balance; });
+      return result;
+    }
+
+    //  Balance of a non-native token. `balanceOf` reads
+    //  Account::balance (native CLRTY); token balances live in
+    //  the token-balance table and need their own accessor.
+    //  Returns 0 if the address has never held the token (which
+    //  is the correct default — a missing balance row is zero,
+    //  not an error).
+    uint64_t balanceOfToken(const Crypto::Address &addr, Id token_id) const
+    {
+      uint64_t result = 0;
+      readState([&](State::StateAccess &s)
+                { result = s.getTokenBalance(addr, token_id); });
       return result;
     }
 
@@ -261,6 +320,213 @@ namespace Tests
           s.putGlobal("next_validator_id", bytes); });
     }
 
+    //  ---- Bridge test helpers ----
+
+    Id wrappedCcxTokenId() const
+    {
+      Core::BridgeChainRegistration reg;
+      bool found = false;
+      readState([&](State::StateAccess &s)
+                { found = s.getBridgeChainRegistration(
+                      Core::BRIDGE_CCX_CHAIN_ID, reg); });
+      EXPECT_TRUE(found) << "CCX chain registration not present";
+      return static_cast<Id>(reg.wrapped_token_id);
+    }
+
+    void fundWrappedCcx(const Crypto::Address &addr, uint64_t amount)
+    {
+      const Id token_id = wrappedCcxTokenId();
+      fundToken(addr, token_id, amount);
+    }
+
+    void fundToken(const Crypto::Address &addr,
+                   Id token_id,
+                   uint64_t amount)
+    {
+      withState([&](State::StateAccess &s)
+                {
+        const uint64_t cur = s.getTokenBalance(addr, token_id);
+        s.putTokenBalance(addr, token_id, cur + amount);
+        const uint64_t supply = s.getTokenSupply(token_id);
+        s.putTokenSupply(token_id, supply + amount); });
+    }
+
+    //  A GlobalStateReader backed by an autocommit StateAccess.
+    //
+    //  Uses autocommit mode (StateAccess(db, version)) rather than
+    //  txn-bound mode (StateAccess(db, txn, version)) because a
+    //  txn-bound StateAccess requires a live write txn, and holding
+    //  a write txn open for the fixture's lifetime blocks every
+    //  other writer — including applyBlock's simulation, which
+    //  opens its own write txn. Autocommit StateAccess holds a
+    //  read txn internally; many readers coexist with one writer,
+    //  so makeGlobalReader and applyBlock can both work in the
+    //  same test.
+    //
+    //  This replaces the previous implementation, which bound a
+    //  write txn into the reader and reliably deadlocked on the
+    //  first test that both called makeGlobalReader and then
+    //  called applyBlock.
+    //
+    //  Lifetime contract: the returned GlobalStateReader holds a
+    //  reference to `*state_reader_`. If the caller does
+    //  `auto r = makeGlobalReader();` and then opens a write txn
+    //  before using `r`, the write throws (StateDB forbids it).
+    //  In practice every caller uses the reader inline or
+    //  immediately after, so the read txn is short-lived.
+    //
+    //  If a caller needs to interleave reads and writes, use
+    //  readState() instead — it opens and closes its own txn
+    //  around the callback, guaranteeing the reader's lifetime
+    //  is bounded by the callback.
+    Core::GlobalStateReader makeGlobalReader()
+    {
+      if (!state_reader_)
+      {
+        state_reader_ = std::make_unique<State::StateAccess>(*db_, 0);
+      }
+      return Core::GlobalStateReader(*state_reader_);
+    }
+
+    //  Sign a BridgeMint payload with the given (index, keypair)
+    //  pairs. Returns the [2] count || N*66 signature block.
+    //
+    //  The `signers` argument is a vector of (active-set index,
+    //  keypair) pairs. Under the watcher model the active watcher
+    //  set for the CCX chain is the two seeds sorted by watcher id
+    //  (which are 1 and 2, so positions 0 and 1). A quorum mint
+    //  signs with {{0, seed1_}, {1, seed2_}}.
+    std::vector<uint8_t> signBridgeMintMessage(
+        uint64_t source_chain_id,
+        const Crypto::Hash &source_tx_hash,
+        uint32_t source_output_index,
+        const Crypto::Address &destination,
+        uint64_t amount,
+        const std::vector<std::pair<uint16_t, Crypto::KeyPair>> &signers)
+    {
+      //  Build the canonical message the executor verifies against.
+      std::vector<uint8_t> message;
+      message.reserve(8 + 32 + 4 + 32 + 8);
+      for (int i = 0; i < 8; ++i)
+        message.push_back(uint8_t(source_chain_id >> (i * 8)));
+      message.insert(message.end(),
+                     source_tx_hash.data.begin(),
+                     source_tx_hash.data.end());
+      for (int i = 0; i < 4; ++i)
+        message.push_back(uint8_t(source_output_index >> (i * 8)));
+      message.insert(message.end(),
+                     destination.data.begin(),
+                     destination.data.end());
+      for (int i = 0; i < 8; ++i)
+        message.push_back(uint8_t(amount >> (i * 8)));
+
+      //  Compute BOTH hashes — the one we'll sign, and the one we
+      //  THINK the executor computes. If they differ, this is our bug.
+      const Crypto::Hash fixture_hash =
+          Crypto::hashDomain("bmin", message.data(), message.size());
+
+      //  Emulate the executor's path: domain is std::string_view, then
+      //  hashDomain(domain.data(), message, len).
+      std::string_view domain_sv = "bmin";
+      const Crypto::Hash executor_hash =
+          Crypto::hashDomain(domain_sv.data(), message.data(), message.size());
+
+      const Crypto::Hash signing_hash = fixture_hash;
+
+      //  Encode the signature block: [2] count LE || N * [2 index || 64 sig].
+      std::vector<uint8_t> block;
+      const uint16_t count = static_cast<uint16_t>(signers.size());
+      block.push_back(uint8_t(count));
+      block.push_back(uint8_t(count >> 8));
+
+      for (const auto &[idx, kp] : signers)
+      {
+        block.push_back(uint8_t(idx));
+        block.push_back(uint8_t(idx >> 8));
+        const Crypto::Signature sig =
+            Crypto::sign(signing_hash, kp.secretKey);
+        block.insert(block.end(), sig.data.begin(), sig.data.end());
+      }
+      return block;
+    }
+
+    //  Build a complete BridgeMint transaction.
+    Transaction makeBridgeMintTx(
+        const Crypto::KeyPair &submitter,
+        uint64_t source_chain_id,
+        const Crypto::Hash &source_tx_hash,
+        uint32_t source_output_index,
+        const Crypto::Address &destination,
+        uint64_t amount,
+        const std::vector<uint8_t> &signature_block,
+        uint64_t nonce)
+    {
+      std::vector<uint8_t> payload;
+      payload.reserve(8 + 32 + 4 + 32 + 8 + signature_block.size());
+
+      for (int i = 0; i < 8; ++i)
+        payload.push_back(uint8_t(source_chain_id >> (i * 8)));
+      payload.insert(payload.end(),
+                     source_tx_hash.data.begin(),
+                     source_tx_hash.data.end());
+      for (int i = 0; i < 4; ++i)
+        payload.push_back(uint8_t(source_output_index >> (i * 8)));
+      payload.insert(payload.end(),
+                     destination.data.begin(),
+                     destination.data.end());
+      for (int i = 0; i < 8; ++i)
+        payload.push_back(uint8_t(amount >> (i * 8)));
+      payload.insert(payload.end(),
+                     signature_block.begin(),
+                     signature_block.end());
+
+      return TransactionBuilder()
+          .type(Core::TxType::BridgeMint)
+          .from(submitter)
+          .to(Crypto::Address{})
+          .amount(0)
+          .fee(1)
+          .nonce(nonce)
+          .tokenId(NATIVE_TOKEN_ID)
+          .chainId(genesis_config_.chain_id)
+          .payload(std::move(payload))
+          .build();
+    }
+
+    //  Build a BridgeBurn transaction.
+    Transaction makeBridgeBurnTx(
+        const Crypto::KeyPair &from,
+        uint64_t source_chain_id,
+        const std::vector<uint8_t> &destination_blob,
+        uint64_t amount,
+        Id wrapped_token_id,
+        uint64_t nonce)
+    {
+      std::vector<uint8_t> payload;
+      payload.reserve(8 + 1 + destination_blob.size() + 8);
+
+      for (int i = 0; i < 8; ++i)
+        payload.push_back(uint8_t(source_chain_id >> (i * 8)));
+      payload.push_back(static_cast<uint8_t>(destination_blob.size()));
+      payload.insert(payload.end(),
+                     destination_blob.begin(),
+                     destination_blob.end());
+      for (int i = 0; i < 8; ++i)
+        payload.push_back(uint8_t(amount >> (i * 8)));
+
+      return TransactionBuilder()
+          .type(Core::TxType::BridgeBurn)
+          .from(from)
+          .to(Crypto::Address{})
+          .amount(0)
+          .fee(1)
+          .nonce(nonce)
+          .tokenId(wrapped_token_id)
+          .chainId(genesis_config_.chain_id)
+          .payload(std::move(payload))
+          .build();
+    }
+
     //  Set a validator's last_seen_height directly. Used by the
     //  emergency-rotation tests to make a validator "offline" without
     //  having to mine 20 blocks.
@@ -338,16 +604,6 @@ namespace Tests
 
       for (size_t i = 0; i < receipts.size(); ++i)
       {
-        //  Leaf layout matches BlockProcessor::verifyReceiptsRoot:
-        //    "rcpt" || txid(32) || Receipt::serializeState()
-        //
-        //  Receipt::serializeState() is
-        //    status(1) || fee_paid(8 LE) || fill_count(4 LE) || fills
-        //
-        //  A receipt with no fills therefore contributes four extra
-        //  zero bytes compared to the pre-fill layout. That is the
-        //  change that made every block test fail the receipts_root
-        //  check until this helper was updated to match.
         const auto receipt_bytes = receipts[i].serializeState();
 
         std::vector<uint8_t> buf;
@@ -394,28 +650,6 @@ namespace Tests
           .build();
     }
 
-    //  Build the payload bytes for a CreateOrder transaction.
-    //
-    //  Layout, matching TransactionExecutor::validateCreateOrderStructure
-    //  and executeCreateOrder:
-    //
-    //    [4]  buy_token (LE)
-    //    [8]  min_buy_amount (LE)
-    //    [1]  mode
-    //    [4]  pool_id (LE)
-    //    [8]  expires_at_height (LE)
-    //    [1]  condition_count
-    //    [N]  conditions (13 bytes each)
-    //
-    //  `pool_id` is meaningful only for Active orders and must be
-    //  zero for Passive orders. The validator enforces this; the
-    //  helper does not, so a test that wants to construct an
-    //  invalid order can do so.
-    //
-    //  This helper is intentionally separate from
-    //  makeSignedCreateOrder so a test that wants to inspect or
-    //  corrupt the payload can build it without building a full
-    //  transaction.
     static std::vector<uint8_t> encodeCreateOrderPayload(
         Id buy_token,
         uint64_t min_buy_amount,
@@ -426,46 +660,29 @@ namespace Tests
       std::vector<uint8_t> payload;
       payload.reserve(26);
 
-      //  buy_token, u32 LE
       payload.push_back(uint8_t(buy_token));
       payload.push_back(uint8_t(buy_token >> 8));
       payload.push_back(uint8_t(buy_token >> 16));
       payload.push_back(uint8_t(buy_token >> 24));
 
-      //  min_buy_amount, u64 LE
       for (int i = 0; i < 8; ++i)
         payload.push_back(uint8_t(min_buy_amount >> (i * 8)));
 
-      //  mode, u8
       payload.push_back(static_cast<uint8_t>(mode));
 
-      //  pool_id, u32 LE
       payload.push_back(uint8_t(pool_id));
       payload.push_back(uint8_t(pool_id >> 8));
       payload.push_back(uint8_t(pool_id >> 16));
       payload.push_back(uint8_t(pool_id >> 24));
 
-      //  expires_at_height, u64 LE
       for (int i = 0; i < 8; ++i)
         payload.push_back(uint8_t(expires_at_height >> (i * 8)));
 
-      //  condition_count, u8
       payload.push_back(0);
 
       return payload;
     }
 
-    //  Build a signed CreateOrder transaction.
-    //
-    //  Parameter order mirrors the fields a caller usually thinks
-    //  about: who is selling, what they are selling, for what, and
-    //  under what conditions. The two token ids are named by the
-    //  order's own frame (sell_token, buy_token), not the canonical
-    //  pair frame; the executor handles the canonicalization.
-    //
-    //  `pool_id` names the AMM pool for an Active order and must be
-    //  zero for a Passive order. It defaults to zero so existing
-    //  Passive-order call sites do not need to change.
     Core::Transaction makeSignedCreateOrder(
         const Crypto::KeyPair &from,
         Id sell_token, uint64_t sell_amount,
@@ -520,15 +737,12 @@ namespace Tests
 
     Crypto::Address validatorAddress(Id id)
     {
-      // Genesis validators are in the config.
       for (const auto &v : genesis_config_.validators)
       {
         if (v.id == id)
           return v.reward_address;
       }
 
-      // Post-genesis validators (like the slash-test targets) are only
-      // in state.
       Crypto::Address result;
       readState([&](State::StateAccess &s)
                 {
@@ -540,20 +754,6 @@ namespace Tests
 
     // ---- Real quorum signatures ----
 
-    // Produces a set of quorum signatures over the block's hash,
-    // signed by the given keypairs. `block` must already have its
-    // final `commit_round`, `emergency_rotation`, `timeout_certificate`,
-    // and `state_root` set — the signature covers the block hash,
-    // which covers all of those.
-    //
-    // Signature i is produced by keys[i], and is tagged with
-    // signer_index i. The caller is responsible for passing a key list
-    // whose i-th entry corresponds to active_set[i]; that's what
-    // BlockProcessor::checkQuorum verifies against.
-    //
-    // Empty key set: returns an empty signature list. bftQuorum(0)
-    // evaluates to 1 by the formula, and the old code would then index
-    // keys[0] on a zero-length vector. That was a segfault.
     std::vector<Crypto::ValidatorSignature>
     makeQuorumForBlock(const Core::Block &block,
                        const std::vector<Crypto::KeyPair> &keys)
@@ -563,10 +763,6 @@ namespace Tests
 
       size_t needed = Core::bftQuorum(keys.size());
 
-      //  Defensive: bftQuorum(n) can exceed n for pathological n
-      //  (bftQuorum(0) = 1). The empty case is handled above; this
-      //  cap protects against a future change to bftQuorum's formula
-      //  that would make it exceed n for some small n > 0.
       if (needed > keys.size())
         needed = keys.size();
 
@@ -590,11 +786,6 @@ namespace Tests
       return sigs;
     }
 
-    //  Resolve the signing key for each active-set entry. Every
-    //  validator in the set must have a key registered; a missing key
-    //  produces a default-constructed KeyPair whose signature will
-    //  fail verification. That's a loud failure at checkQuorum, which
-    //  is where test bugs should surface.
     std::vector<Crypto::KeyPair> quorumKeysFor(
         const std::vector<Id> &active_set)
     {
@@ -612,20 +803,6 @@ namespace Tests
 
     // ---- Timeout certificate builder ----
 
-    //  Build a valid timeout certificate for the given committed set,
-    //  height, and round. Every vote is signed by the corresponding
-    //  validator's registered key. Returns an empty certificate if
-    //  the committed set is too small (< 4) — that's below the
-    //  minimum verifyTimeoutCertificate will accept, so building one
-    //  is a test bug, not a runtime failure. Callers that pass a
-    //  too-small set will see isWellFormed reject the resulting
-    //  block with the same "certificate empty" error they'd get for
-    //  a genuinely missing certificate, which is a good enough
-    //  failure mode.
-    //
-    //  Signer indices are positions in the committed set, matching
-    //  what verifyTimeoutCertificate expects. Signer ids are the
-    //  validator ids at those positions, matching Vote's convention.
     Consensus::TimeoutCertificate makeTimeoutCertificate(
         const std::vector<Id> &committed_set,
         uint64_t height,
@@ -663,21 +840,7 @@ namespace Tests
     }
 
     // ---- Block builder ----
-    //
-    //  `emergency_rotation` is set before simulation so that the
-    //  dry-run applyBlock derives the same emergency active set the
-    //  real application will. The certificate and its hash must be
-    //  set before the quorum signatures are produced, because the
-    //  block hash covers both, and the signatures cover the block
-    //  hash.
-    //
-    //  `committed_set` is the set the certificate's signers are drawn
-    //  from. For a non-emergency block it's ignored (no certificate
-    //  is built). For an emergency block it MUST be the committed
-    //  set, not the emergency set — the certificate is evidence that
-    //  the committed set stalled, so its signatures come from the
-    //  committed set. Passing the emergency set here would produce a
-    //  certificate that verifyTimeoutCertificate rejects.
+
     Core::Block makeProcessableBlock(uint64_t height,
                                      const Crypto::Hash &parent,
                                      const std::vector<Core::Transaction> &txs,
@@ -693,11 +856,6 @@ namespace Tests
       b.header.active_validator_count =
           static_cast<uint32_t>(active_set.size());
 
-      //  Emergency certificate. Set before anything that reads the
-      //  block hash (simulation, signing). A block with
-      //  emergency_rotation > 0 but no certificate fails
-      //  BlockHeader::isWellFormed, which is correct — the flag is a
-      //  claim that needs evidence.
       if (emergency_rotation > 0)
       {
         const std::vector<Id> &cert_set =
@@ -720,9 +878,6 @@ namespace Tests
       b.participants = active_set;
       b.quorum_signatures.clear();
 
-      // Set a placeholder state_root so the header passes isWellFormed
-      // during simulation. It will be overwritten with the simulation
-      // result if the simulation succeeds.
       b.header.state_root.data[0] = 0x01;
 
       Crypto::Hash sim_state_root;
@@ -745,12 +900,6 @@ namespace Tests
         sim_tx_hashes = sim_result.tx_hashes;
         sim_epoch_fills = sim_result.epoch_fills;
 
-        // If the simulation failed, use the state root *before* the txs
-        // ran. This produces a block whose header is well-formed and
-        // whose state_root matches the pre-tx state. When the caller
-        // applies the block for real, the block processor will re-run
-        // the failing txs and hit the same failure, returning the
-        // original error ("transaction failed at index N").
         if (!sim_valid)
         {
           sim_state_root = sim_state.stateRoot();
@@ -770,8 +919,6 @@ namespace Tests
         b.header.receipts_root = Crypto::Hash{};
       }
 
-      //  Epoch-fills commitment. Empty vector yields the null hash,
-      //  which is the "no epoch fills" marker for non-epoch blocks.
       b.header.epoch_fills_root =
           Core::BlockProcessor::computeEpochFillsRoot(sim_epoch_fills);
 
@@ -806,9 +953,6 @@ namespace Tests
       return applyPrebuiltBlock(b, dry_run);
     }
 
-    //  Apply a pre-built block. Used by the emergency-rotation tests,
-    //  which need to control the header's emergency_rotation field
-    //  before application.
     Core::BlockResult applyPrebuiltBlock(const Core::Block &b,
                                          bool dry_run = false)
     {
@@ -830,10 +974,6 @@ namespace Tests
       return r;
     }
 
-    // Register a non-seed validator with a known keypair so its
-    // quorum signature can be produced by the fixture. Also inserts
-    // the key into validator_keys_ so makeProcessableBlock can sign
-    // for it.
     void registerValidatorWithKey(Id id,
                                   const Crypto::KeyPair &kp,
                                   uint64_t stake = 1'000'000'000ULL,
@@ -862,10 +1002,6 @@ namespace Tests
       validator_keys_[id] = kp;
     }
 
-    //  Register a pool candidate. Not active, but eligible to be
-    //  promoted by the emergency rotation. The last_seen_height is
-    //  set recent so the candidate passes isOffline() — a fresh
-    //  registration is by definition online.
     void registerPoolValidator(Id id,
                                const Crypto::KeyPair &kp,
                                uint64_t stake = 1'000'000'000ULL)
@@ -874,12 +1010,6 @@ namespace Tests
                                /*is_seed=*/false, /*is_active=*/false);
     }
 
-    //  Build a block for the two matching-engine tests. Runs a
-    //  dry-run simulation to fill in the header's state_root and
-    //  receipts_root, then re-signs so the quorum signatures cover
-    //  the final header. The resulting block has a well-formed
-    //  header and roots that match what the non-dry-run apply path
-    //  will compute.
     Core::Block buildSignedBlockForTest(
         uint64_t height,
         const Crypto::Hash &parent,
@@ -915,20 +1045,12 @@ namespace Tests
       block.transactions = txs;
       block.participants = active_set;
 
-      //  Non-null placeholder roots so isWellFormed passes during
-      //  simulation. They are overwritten below with the values the
-      //  dry-run actually computes.
       block.header.state_root.data[0] = 0x01;
       block.header.epoch_fills_root.data[0] = 0x01;
 
-      //  Sign with the placeholder roots so the block hash is
-      //  well-defined for the simulation. The signature is
-      //  provisional and is replaced after the real roots are
-      //  written in.
       block.quorum_signatures =
           makeQuorumForBlock(block, quorumKeysFor(active_set));
 
-      //  Dry-run to compute the real roots. Aborts; nothing persists.
       {
         auto txn = db_->beginWrite();
         State::StateAccess st(*db_, txn, 0);
@@ -957,7 +1079,6 @@ namespace Tests
         txn.abort();
       }
 
-      //  Re-sign: both roots are part of the block hash.
       block.quorum_signatures =
           makeQuorumForBlock(block, quorumKeysFor(active_set));
 
@@ -979,6 +1100,12 @@ namespace Tests
 
     Core::GenesisConfig genesis_config_;
     Crypto::Hash genesis_hash_;
+
+    //  Lazy reader. Holds an autocommit read txn; destroyed at
+    //  TearDown (before db_ closes) and can be reset between reads
+    //  if a test needs to interleave reads and writes. See
+    //  makeGlobalReader for the full lifetime contract.
+    mutable std::unique_ptr<State::StateAccess> state_reader_;
   };
 
   class Core_ChainFixture : public testing::Test
@@ -1074,7 +1201,6 @@ namespace Tests
 
     void TearDown() override
     {
-      // No commit, every test starts clean.
       state_.reset();
       if (txn_ && txn_->isOpen())
         txn_->abort();
@@ -1142,8 +1268,6 @@ namespace Tests
       return Core::TransactionExecutor::execute(*state_, tx, ctx);
     }
 
-    // Execute a CreatePool tx and return the newly-created pool's ID.
-    // Returns 0 if the tx failed.
     uint64_t createPool(const Crypto::KeyPair &creator,
                         Id token_a,
                         uint64_t amount_a,
@@ -1169,7 +1293,6 @@ namespace Tests
       if (r.status != Core::ReceiptStatus::Success)
         return 0;
 
-      // Probe pool IDs for the one we just made.
       for (uint64_t id = 1; id <= 8; ++id)
       {
         Core::AmmPool p;
@@ -1184,8 +1307,6 @@ namespace Tests
       return 0;
     }
 
-    // Give an address a custom-token balance directly. Used to set
-    // up mint/burn/AMM tests without going through CreateToken.
     void setTokenBalance(const Crypto::Address &addr,
                          Id token,
                          uint64_t amount)
@@ -1193,7 +1314,6 @@ namespace Tests
       state_->putTokenBalance(addr, token, amount);
     }
 
-    // Write a minimal valid token directly. Used as a setup step.
     Id createTokenDirect(const Crypto::KeyPair &creator,
                          const std::string &name,
                          const std::string &symbol,
@@ -1210,10 +1330,7 @@ namespace Tests
       state_->putToken(t);
       return token_id;
     }
-    // Write a validator record and its address index directly. Used
-    // as a setup step for the unregister and update tests, since
-    // running the full RegisterValidator path requires a valid
-    // signature and enough balance.
+
     void seedValidator(const Crypto::KeyPair &owner,
                        uint64_t id,
                        bool is_seed = false,
@@ -1232,7 +1349,6 @@ namespace Tests
       state_->putValidatorByAddress(owner.publicKey, id);
     }
 
-    // Set the active set to a given list.
     void setActiveSet(const std::vector<Id> &ids)
     {
       std::vector<uint8_t> bytes;
@@ -1245,7 +1361,6 @@ namespace Tests
       state_->putGlobal("active_set", bytes);
     }
 
-    // Advance next_validator_id to a value past the given id.
     void bumpNextValidatorId(uint64_t next)
     {
       std::vector<uint8_t> bytes(8);
@@ -1254,7 +1369,6 @@ namespace Tests
       state_->putGlobal("next_validator_id", bytes);
     }
 
-    // Set an account's pending rewards directly.
     void setPendingRewards(const Crypto::Address &addr, uint64_t amount)
     {
       Core::Account acct = state_->getAccount(addr);
@@ -1271,14 +1385,6 @@ namespace Tests
     Crypto::KeyPair carol_;
   };
 
-  //  Member order matters: temp_ is declared first so it is
-  //  destroyed last. state_ and txn_ must be destroyed before
-  //  temp_'s destructor closes the DB, because StateAccess holds
-  //  a StateDB::ReadTxn and a reference to txn_, and Txn holds a
-  //  live MDBX_txn. If temp_ were declared last, its destructor
-  //  would run first and close the env out from under the other
-  //  two, which aborts inside MDBX.
-
   class Core_MatchingEngineTest : public testing::Test
   {
   protected:
@@ -1293,9 +1399,6 @@ namespace Tests
       carol_ = makeAddress(0xC0);
       dave_ = makeAddress(0xD0);
 
-      //  Fund both sides. Native CLRTY (id 0) lives in
-      //  Account.balance; token 1 and token 2 live in the
-      //  token-balance table.
       Account a;
       a.balance = 1'000'000;
       state_->putAccount(alice_, a);
@@ -1312,8 +1415,6 @@ namespace Tests
       d.balance = 1'000'000;
       state_->putAccount(dave_, d);
 
-      //  Two tokens. Token 1 is the pair's base (lower id),
-      //  token 2 is the quote (higher id).
       TokenInfo t1;
       t1.id = 1;
       t1.symbol = "T1";
@@ -1337,38 +1438,17 @@ namespace Tests
       state_->putTokenBalance(bob_, 2, 1'000'000);
       state_->putTokenBalance(carol_, 2, 1'000'000);
       state_->putTokenBalance(dave_, 2, 1'000'000);
-
-      //  Seed the sequence counter so the first test order gets
-      //  sequence 1 and the second gets 2. Without an explicit
-      //  seed, nextOrderSequence() reads 0 from a missing global
-      //  and returns 1 on the first call; either way the tests
-      //  below do not depend on the absolute value, only on the
-      //  ordering, so leaving this comment is enough.
     }
 
     void TearDown() override
     {
-      //  Destroy the txn-bound StateAccess first, so its
-      //  ReadTxn (if any) is released. Then abort the txn if it is
-      //  still open. Txn's destructor would abort anyway, but
-      //  being explicit means a test failure inside a test body
-      //  cannot leave a half-committed txn behind that confuses
-      //  the next test.
       state_.reset();
 
       if (txn_ && txn_->isOpen())
         txn_->abort();
       txn_.reset();
-
-      //  temp_ goes out of scope last and cleans up the DB
-      //  directory. Its destructor calls db_->close() and
-      //  remove_all(path_).
     }
 
-    //  Build a Passive order. The caller is responsible for
-    //  charging the sell-token lock separately when the test
-    //  needs the lock to have been taken (which is what the real
-    //  TransactionExecutor does before calling the matcher).
     Order makeOrder(Id id, const Crypto::Address &owner,
                     uint32_t sell, uint32_t buy,
                     uint64_t sell_amount, uint64_t min_buy_amount)
@@ -1388,9 +1468,6 @@ namespace Tests
       return o;
     }
 
-    //  Place a resting maker: persist the record, allocate a
-    //  sequence, add to the book. Mirrors what TransactionExecutor
-    //  does for a Passive order that did not cross.
     void restOrder(Order &o)
     {
       state_->putOrder(o);
@@ -1398,9 +1475,6 @@ namespace Tests
       state_->addToOrderBook(o, seq);
     }
 
-    //  Debit the sell-token lock, mirroring TransactionExecutor's
-    //  lock step. Tests that care about balance invariants call
-    //  this; tests that only care about book mechanics can skip it.
     void lockSellToken(const Crypto::Address &owner,
                        uint32_t sell_token,
                        uint64_t amount)
@@ -1418,44 +1492,23 @@ namespace Tests
       }
     }
 
-    //  Sum of spendable + locked across all four accounts and both
-    //  tokens. Used to assert the supply invariant after every
-    //  fill. The test fixtures never mint or burn mid-test, so this
-    //  is constant modulo fees, and the matcher charges no fee on a
-    //  fill (only on cancellation).
     uint64_t totalSupply() const
     {
       uint64_t sum = 0;
 
       for (const auto &addr : {alice_, bob_, carol_, dave_})
       {
-        //  Native
         sum += state_->getAccount(addr).balance;
-
-        //  Tokens 1 and 2
         sum += state_->getTokenBalance(addr, 1);
         sum += state_->getTokenBalance(addr, 2);
       }
 
-      //  Locked amounts live on the order records themselves.
-      //  Every open order has (sell_amount - filled_amount) of its
-      //  sell token still locked.
       state_->forEachOrder([&](const Order &o)
                            { sum += o.remainingAmount(); });
 
       return sum;
     }
 
-    //  Member order is load-bearing. Do not reorder.
-    //  Member order is load-bearing. Do not reorder.
-    //
-    //  TempDB is constructed with 1 GB. The default 64 MB is not
-    //  enough for TakerStopsAtMaxBookLevels, which seeds
-    //  MAX_BOOK_LEVELS_PER_TAKER + 2 resting orders and then crosses
-    //  most of them: each order is an SMT write (256 levels of
-    //  historical rows), each fill writes two order records, and the
-    //  book index adds a row plus a companion sequence key per
-    //  resting order. 64 MB fills up around order 100.
     TempDB temp_{1ULL * 1024 * 1024 * 1024};
     std::unique_ptr<StateDB::Txn> txn_;
     std::unique_ptr<StateAccess> state_;

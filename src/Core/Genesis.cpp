@@ -6,6 +6,9 @@
 #include "Genesis.h"
 
 #include "Account.h"
+#include "BridgeTypes.h"
+#include "BridgeWatcherTypes.h"
+#include "Bridge/ConcealCCX.h"
 #include "GlobalState.h"
 #include "KeyRotation.h"
 #include "RewardTypes.h"
@@ -28,11 +31,6 @@
 
 namespace
 {
-  //  Parse a 64-character hex string into a Crypto::Hash. Throws if
-  //  the input is malformed (wrong length, non-hex characters). The
-  //  pinned genesis hash constants are compile-time-defined 64-char
-  //  hex strings, so a throw here means the constants themselves are
-  //  wrong, not that runtime data is bad.
   Crypto::Hash hashFromHex(const char *hex)
   {
     Crypto::Hash h;
@@ -43,24 +41,6 @@ namespace
     return h;
   }
 
-  //  Resolve an address from a GlobalConfig constant.
-  //
-  //  The config may hold either a bech32m address (the normal case,
-  //  e.g. "rclrty1qpmfjm75...") or a 64-character hex string (the
-  //  legacy form, used for the community and treasury fund
-  //  placeholders). This helper accepts both and throws on anything
-  //  else, so a misconfigured constant fails loudly at genesis
-  //  construction rather than silently producing a garbage address.
-  //
-  //  Detection:
-  //    - exactly 64 characters, all hex digits → parse as hex
-  //    - decodes as a bech32m address for the expected network → use it
-  //    - anything else → throw
-  //
-  //  The expected network is passed explicitly because the three
-  //  genesis configs share this code path but use different HRPs.
-  //  A mainnet address in a regtest config is a hard error rather
-  //  than a silent misparse.
   Crypto::Address addressFromConfig(const char *value,
                                     Wallet::Network expected_network,
                                     const char *label)
@@ -83,14 +63,9 @@ namespace
       return true;
     };
 
-    //  Hex form. Preserves the existing behaviour for the fund
-    //  addresses, which are still placeholder hex constants.
     if (isHex64(s))
       return Crypto::addrFromHex(value);
 
-    //  Bech32m form. The decoder validates the HRP against
-    //  `expected_network`, so a mainnet HRP in a regtest config is
-    //  rejected rather than silently accepted.
     const auto decoded = Wallet::decodeAddress(s, expected_network);
     if (!decoded.has_value())
     {
@@ -103,17 +78,20 @@ namespace
 
     return *decoded;
   }
+
+  std::vector<uint8_t> u64Bytes(uint64_t v)
+  {
+    std::vector<uint8_t> out(8);
+    for (int i = 0; i < 8; ++i)
+      out[i] = uint8_t(v >> (i * 8));
+    return out;
+  }
 } // anonymous namespace
 
 namespace Core
 {
   //  =========================================================================
   //  Network configurations
-  //
-  //  Each returns a GenesisConfig describing the initial accounts,
-  //  validators, and globals for one network. The three are
-  //  structurally identical; only the chain id, the addresses, and
-  //  the fund amounts differ.
   //  =========================================================================
 
   GenesisConfig mainnetGenesis()
@@ -136,17 +114,6 @@ namespace Core
                             GlobalConfig::SEED_FUND_AMOUNT_TWO,
                             "seed validator 2"});
 
-    //  Seed validators.
-    //
-    //  The consensus key is set explicitly to SEED_NODE. If it were
-    //  left null, applyGenesis would fall back to the reward address,
-    //  and the daemon's signing key would not match the validator
-    //  record — every vote would fail verification.
-    //
-    //  Brace-init order is {id, reward_address, node_key, is_seed,
-    //  consensus_key}. The consensus_key field is at the END of
-    //  GenesisValidator so that earlier configs which do not set it
-    //  continue to compile and get the fallback behaviour.
     cfg.validators.push_back({1,
                               addressFromConfig(GlobalConfig::SEED_ADDRESS_MAINNET, net, "seed validator 1 reward"),
                               Crypto::pubkeyFromHex(GlobalConfig::SEED_NODE),
@@ -161,6 +128,9 @@ namespace Core
 
     cfg.initial_total_supply = GlobalConfig::GENESIS_SUPPLY;
     cfg.initial_active_set_size = GlobalConfig::INITIAL_SET_SIZE;
+
+    cfg.bridge.enabled = true;
+    cfg.bridge.ccx_chain_id = BRIDGE_CCX_CHAIN_ID;
 
     return cfg;
   }
@@ -200,6 +170,9 @@ namespace Core
     cfg.initial_total_supply = GlobalConfig::GENESIS_SUPPLY;
     cfg.initial_active_set_size = GlobalConfig::INITIAL_SET_SIZE;
 
+    cfg.bridge.enabled = true;
+    cfg.bridge.ccx_chain_id = BRIDGE_CCX_CHAIN_ID;
+
     return cfg;
   }
 
@@ -238,6 +211,9 @@ namespace Core
     cfg.initial_total_supply = GlobalConfig::GENESIS_SUPPLY;
     cfg.initial_active_set_size = GlobalConfig::INITIAL_SET_SIZE;
 
+    cfg.bridge.enabled = true;
+    cfg.bridge.ccx_chain_id = BRIDGE_CCX_CHAIN_ID;
+
     return cfg;
   }
 
@@ -245,45 +221,36 @@ namespace Core
   //  Application
   // ============================================================================
 
-  namespace
-  {
-    std::vector<uint8_t> u64Bytes(uint64_t v)
-    {
-      std::vector<uint8_t> out(8);
-      for (int i = 0; i < 8; ++i)
-        out[i] = uint8_t(v >> (i * 8));
-      return out;
-    }
-  } // anonymous namespace
-
   void applyGenesis(State::StateAccess &state, const GenesisConfig &config)
   {
-    //  Ordering matters here.
+    //  =====================================================================
+    //  Idempotency contract
     //
-    //  Global state is written FIRST, before any per-entity state.
-    //  The reason is that some per-entity writes — specifically,
-    //  putAccount — read and increment the globals "total_staked"
-    //  and "staker_count". If those globals are zeroed *after* the
-    //  accounts are created, the increments are lost and the globals
-    //  become inconsistent with the state they describe.
+    //  This function must be safe to call more than once on the same
+    //  state and produce the same resulting root each time. That is
+    //  *not* the same as "every write is an assignment":
     //
-    //  The invariant this establishes: at every point during genesis,
-    //  the accumulated globals are consistent with the per-entity
-    //  records written so far.
+    //    - putAccount() maintains the globals `total_staked` and
+    //      `staker_count` by an *incremental* update:
+    //          total += copy.staked - old.staked
+    //      On a fresh DB old.staked == 0 so this adds the full
+    //      amount; on a second call old.staked already equals the
+    //      new staked amount, so it adds zero. If we simply wrote
+    //      `0` to those globals at the top and relied on putAccount
+    //      to rebuild them, the second call would leave them at 0
+    //      while the first left them at sum-of-genesis-stakes —
+    //      different roots, broken idempotency.
     //
-    //  Bootstrapping the globals first has a second effect: it makes
-    //  the function idempotent. Running applyGenesis twice on the
-    //  same state produces the same result, because the second run's
-    //  global writes reset the accumulators before the accounts loop
-    //  re-adds them. Without this ordering, a second run would double
-    //  the accumulated values.
+    //    - The bridge block needs a deterministic wrapped-token id
+    //      regardless of whatever `next_token_id` happens to be in
+    //      the DB. At genesis, that id is always 1 (nothing else
+    //      has been minted yet), so we hard-code it as a local
+    //      constant rather than reading the global back.
     //
-    //  Every write below goes through the SMT. Under the compressed
-    //  radix tree, the root produced by applyGenesis is the genesis
-    //  state root that every node must agree on. The tree's shape
-    //  changed in the compressed-tree rewrite; the *set* of writes
-    //  did not. A node that runs applyGenesis under the same tree
-    //  implementation produces the same root.
+    //  So: every write here is either a plain assignment derived
+    //  from `config`, or an incremental update whose final value
+    //  we then overwrite with the correct config-derived total.
+    //  =====================================================================
 
     // ---- Global state ----
 
@@ -296,10 +263,8 @@ namespace Core
 
     state.putGlobal("chain_id", u64Bytes(config.chain_id));
     state.putGlobal("total_supply", u64Bytes(config.initial_total_supply));
-    state.putGlobal("total_staked", u64Bytes(0));
     state.putGlobal("pot", u64Bytes(0));
     state.putGlobal("epoch_number", u64Bytes(0));
-    state.putGlobal("staker_count", u64Bytes(0));
     state.putGlobal("next_validator_id", u64Bytes(max_seed_id + 1));
     state.putGlobal("next_token_id", u64Bytes(1));
     state.putGlobal("next_order_id", u64Bytes(1));
@@ -314,13 +279,6 @@ namespace Core
                     u64Bytes(config.initial_active_set_size));
 
     // ---- Native token metadata ----
-    //
-    //  Created before any user tokens so that token_id 0 exists in
-    //  the token table from genesis onward. Every balance check
-    //  that treats NATIVE_TOKEN_ID specially still works, but the
-    //  token record being present means forEachToken and the token
-    //  count metric both include it — matching what a reader would
-    //  expect from "the chain has a native currency".
 
     {
       TokenInfo native;
@@ -337,13 +295,15 @@ namespace Core
 
     // ---- Initial accounts ----
     //
-    //  putAccount reads the globals "total_staked" and "staker_count"
-    //  and increments them as accounts are added. Those globals were
-    //  just initialized to zero above, so the increments accumulate
-    //  correctly. At the end of this loop, total_staked equals the
-    //  sum of the genesis accounts' staked balances, and staker_count
-    //  equals the number of genesis accounts above the auto-stake
-    //  threshold that were not opted out.
+    //  putAccount maintains `total_staked` and `staker_count` as a
+    //  side-effect. On a fresh DB that side-effect produces the
+    //  correct totals; on a second call it produces zero. To make
+    //  the function idempotent we recompute the totals directly
+    //  from `config.accounts` and overwrite the globals once the
+    //  loop has finished.
+
+    uint64_t genesis_total_staked = 0;
+    uint64_t genesis_staker_count = 0;
 
     for (const auto &acc : config.accounts)
     {
@@ -354,28 +314,16 @@ namespace Core
       a.created_at_height = 0;
       a.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
       state.putAccount(acc.address, a);
+
+      genesis_total_staked += a.staked;
+      if (a.staked > 0)
+        ++genesis_staker_count;
     }
 
+    state.putGlobal("total_staked", u64Bytes(genesis_total_staked));
+    state.putGlobal("staker_count", u64Bytes(genesis_staker_count));
+
     // ---- Seed validators ----
-    //
-    //  For each seed, write the validator record, the index entry
-    //  that maps its reward_address back to its id, and a single-
-    //  entry consensus-key history.
-    //
-    //  The history entry covers from height 0 (genesis) onward and
-    //  records the key the validator will sign with until a
-    //  RotateConsensusKey transaction seals it and appends a new
-    //  entry. A validator that never rotates has a history of
-    //  exactly this one entry, and validatorKeyAtHeight returns
-    //  this key for every height.
-    //
-    //  Validator records do NOT touch the staker globals: a validator
-    //  and a staker are different concepts (a validator's stake is
-    //  tracked in ValidatorInfo::stake, a staker's is tracked in
-    //  Account::staked). The reward addresses of the seed validators
-    //  happen to also be stakers because their accounts have nonzero
-    //  balances — that's already accounted for in the accounts loop
-    //  above.
 
     for (const auto &v : config.validators)
     {
@@ -383,10 +331,6 @@ namespace Core
       vi.id = v.id;
       vi.reward_address = v.reward_address;
 
-      //  Consensus key: use whatever the genesis config declares.
-      //  The genesis builders above always set it explicitly, so the
-      //  fallback is only reachable from a custom GenesisConfig that
-      //  doesn't populate the field.
       vi.consensus_key = v.consensus_key.isNull() ? v.reward_address
                                                   : v.consensus_key;
 
@@ -404,7 +348,6 @@ namespace Core
       vi.infraction_count = 0;
       vi.last_infraction_height = 0;
 
-      // ---- Stats ----
       vi.pings_responded_this_epoch = 0;
       vi.pings_sent_this_epoch = 0;
       vi.total_blocks_produced = 0;
@@ -415,27 +358,95 @@ namespace Core
 
       state.putValidatorByAddress(v.reward_address, v.id);
 
-      //  Seed the consensus-key history with a single entry
-      //  covering from genesis onward. This is the anchor that
-      //  validatorKeyAtHeight resolves against for every
-      //  pre-rotation height.
       {
         std::vector<KeyRotation> history;
         KeyRotation entry;
         entry.key = vi.effectiveConsensusKey();
         entry.valid_from_height = 0;
-        entry.valid_until_height = 0; // current
+        entry.valid_until_height = 0;
         history.push_back(entry);
         state.putValidatorKeyHistory(v.id, history);
       }
     }
 
+    // ---- Bridge ----
+
+    if (config.bridge.enabled)
+    {
+      const Id wrapped_token_id = 1;
+
+      {
+        TokenInfo wrapped;
+        wrapped.id = wrapped_token_id;
+        wrapped.name = std::string(CcxBridge::CCX_WRAPPED_NAME);
+        wrapped.symbol = std::string(CcxBridge::CCX_WRAPPED_SYMBOL);
+        wrapped.decimals = CcxBridge::CCX_WRAPPED_DECIMALS;
+        wrapped.creator = Crypto::Address{};
+        wrapped.backing = BackingModel::Backed;
+        wrapped.maxSupply = 0;
+        wrapped.royaltyBps = 0;
+        wrapped.fingerprint = CcxBridge::wrappedTokenFingerprint();
+
+        state.putToken(wrapped);
+        state.putTokenSupply(wrapped_token_id, 0);
+      }
+
+      state.putGlobal(
+          "next_token_id",
+          u64Bytes(static_cast<uint64_t>(wrapped_token_id) + 1));
+
+      {
+        BridgeChainRegistration reg;
+        reg.source_chain_id = config.bridge.ccx_chain_id;
+        reg.wrapped_token_id = static_cast<uint32_t>(wrapped_token_id);
+        reg.fingerprint = CcxBridge::wrappedTokenFingerprint();
+        reg.source_decimals = CcxBridge::CCX_SOURCE_DECIMALS;
+        reg.clarity_decimals = CcxBridge::CCX_CLARITY_DECIMALS;
+        reg.confirmation_depth = CcxBridge::CCX_CONFIRMATION_DEPTH;
+        reg.destination_blob_min_len =
+            static_cast<uint8_t>(CcxBridge::CCX_DESTINATION_MIN_BYTES);
+        reg.destination_blob_max_len =
+            static_cast<uint8_t>(CcxBridge::CCX_DESTINATION_MAX_BYTES);
+        reg.enabled = true;
+        reg.active_watcher_min = BRIDGE_CCX_ACTIVE_WATCHER_MIN;
+
+        if (!reg.isWellFormed())
+          throw std::runtime_error(
+              "genesis: bridge chain registration is ill-formed");
+
+        state.putBridgeChainRegistration(reg);
+      }
+
+      uint64_t next_watcher_id = 1;
+      for (const auto &v : config.validators)
+      {
+        BridgeWatcherInfo w;
+        w.id = next_watcher_id++;
+        w.validator_id = v.id;
+        w.source_chain_id = config.bridge.ccx_chain_id;
+        w.reward_address = v.reward_address;
+        w.registered_at_height = 0;
+        w.stake = BRIDGE_WATCHER_MIN_STAKE;
+        w.last_seen_height = 0;
+        w.is_active = true;
+        w.became_active_at = 0;
+        w.last_active_at = 0;
+
+        if (!w.isWellFormed())
+          throw std::runtime_error(
+              "genesis: bridge watcher record for seed is ill-formed");
+
+        state.putBridgeWatcher(w);
+      }
+
+      state.putGlobal("bridge_paused", u64Bytes(0));
+      state.putGlobal("bridge_next_withdrawal_id", u64Bytes(1));
+      state.putGlobal("bridge_withdrawals_pending", u64Bytes(0));
+      state.putGlobal("bridge_consumed_count", u64Bytes(0));
+      state.putGlobal("bridge_next_watcher_id", u64Bytes(next_watcher_id));
+    }
+
     // ---- Active set ----
-    //
-    //  Written last, after the validator records it references exist.
-    //  Nothing downstream reads the active set during genesis, so this
-    //  is mostly a convention — but it keeps the write order
-    //  "dependencies first" as a rule.
 
     {
       std::vector<uint8_t> set_bytes;
@@ -510,13 +521,6 @@ namespace Core
 
     try
     {
-      //  Use the regtest history window for the genesis computation,
-      //  regardless of the config's chain id. Genesis is written at
-      //  version 0, which the tree never writes to the historical
-      //  tables anyway, and the window only matters for reads at
-      //  versions >= 1. Setting it explicitly here makes the
-      //  computation independent of whatever default the calling
-      //  network would otherwise pick.
       State::StateDB db(temp_dir.string(), 64ULL * 1024 * 1024);
       State::StateAccess state(db, /*version=*/0);
       state.setHistoryWindow(GlobalConfig::REGTEST_SMT_HISTORY_BLOCKS);

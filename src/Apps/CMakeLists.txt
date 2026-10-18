@@ -4,3 +4,5 @@
 add_subdirectory(Daemon)
 add_subdirectory(Wallet)
 add_subdirectory(Tools)
+
+add_subdirectory(Bridge)

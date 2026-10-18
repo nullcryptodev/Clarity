@@ -96,6 +96,10 @@ namespace State
       return "index_order_book";
     case TBL_FILL_HISTORY:
       return "fill_history";
+    case TBL_INDEX_BRIDGE_WITHDRAWALS_BY_HEIGHT:
+      return "index_bridge_withdrawals_by_height";
+    case TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER:
+      return "index_bridge_watchers_by_owner";
     default:
       return "<unknown>";
     }
@@ -508,6 +512,52 @@ namespace State
     mdbx_cursor_close(cursor);
   }
 
+  void StateDB::Txn::forEachFromKey(
+      uint32_t tableId,
+      const std::vector<uint8_t> &seek_key,
+      const EntryVisitor &visitor) const
+  {
+    if (!open_)
+      throw StateDBError("Txn::forEachFromKey on closed txn");
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(txn_, owner_->tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    MDBX_val mkey, mval;
+    if (seek_key.empty())
+    {
+      //  Empty seek key means "start at the beginning". This matches
+      //  MDBX_SET_RANGE's behavior when the key is empty, but doing
+      //  it explicitly avoids relying on that.
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_FIRST);
+    }
+    else
+    {
+      mkey.iov_base = const_cast<void *>(static_cast<const void *>(seek_key.data()));
+      mkey.iov_len = seek_key.size();
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_SET_RANGE);
+    }
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_NEXT);
+    }
+
+    mdbx_cursor_close(cursor);
+  }
+
   void StateDB::Txn::commit()
   {
     if (!open_)
@@ -777,6 +827,49 @@ namespace State
         break;
 
       rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+    }
+
+    mdbx_cursor_close(cursor);
+  }
+
+  void StateDB::ReadTxn::forEachFromKey(
+      uint32_t tableId,
+      const std::vector<uint8_t> &seek_key,
+      const EntryVisitor &visitor) const
+  {
+    if (!open_)
+      throw StateDBError("ReadTxn::forEachFromKey on closed txn");
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(txn_, owner_->tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    MDBX_val mkey, mval;
+    if (seek_key.empty())
+    {
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_FIRST);
+    }
+    else
+    {
+      mkey.iov_base = const_cast<void *>(static_cast<const void *>(seek_key.data()));
+      mkey.iov_len = seek_key.size();
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_SET_RANGE);
+    }
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_NEXT);
     }
 
     mdbx_cursor_close(cursor);
@@ -1276,6 +1369,49 @@ namespace State
         break;
 
       rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_PREV);
+    }
+
+    mdbx_cursor_close(cursor);
+  }
+
+  void StateDB::forEachEntryFromKey(
+      uint32_t tableId,
+      const std::vector<uint8_t> &seek_key,
+      const EntryVisitor &visitor) const
+  {
+    AutocommitScope scope(const_cast<StateDB *>(this), env_,
+                          "forEachEntryFromKey: txn_begin");
+
+    MDBX_cursor *cursor = nullptr;
+    int rc = mdbx_cursor_open(scope.txn, tableHandle(tableId), &cursor);
+    if (rc != MDBX_SUCCESS)
+      return;
+
+    MDBX_val mkey, mval;
+    if (seek_key.empty())
+    {
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_FIRST);
+    }
+    else
+    {
+      mkey.iov_base = const_cast<void *>(static_cast<const void *>(seek_key.data()));
+      mkey.iov_len = seek_key.size();
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_SET_RANGE);
+    }
+
+    while (rc == MDBX_SUCCESS)
+    {
+      std::vector<uint8_t> key(
+          static_cast<const uint8_t *>(mkey.iov_base),
+          static_cast<const uint8_t *>(mkey.iov_base) + mkey.iov_len);
+      std::vector<uint8_t> value(
+          static_cast<const uint8_t *>(mval.iov_base),
+          static_cast<const uint8_t *>(mval.iov_base) + mval.iov_len);
+
+      if (!visitor(key, value))
+        break;
+
+      rc = mdbx_cursor_get(cursor, &mkey, &mval, MDBX_NEXT);
     }
 
     mdbx_cursor_close(cursor);
