@@ -751,4 +751,40 @@ namespace Rpc
 
     return out;
   }
+
+  Common::Json encodeBridgeChainRegistration(
+      const Core::BridgeChainRegistration &reg,
+      const std::string & /*hrp*/)
+  {
+    Common::Json j = Common::Json::object();
+    putU64(j, "source_chain_id", reg.source_chain_id);
+    putU64(j, "wrapped_token_id", reg.wrapped_token_id);
+    putHash(j, "fingerprint", reg.fingerprint);
+    j["source_decimals"] = static_cast<uint64_t>(reg.source_decimals);
+    j["clarity_decimals"] = static_cast<uint64_t>(reg.clarity_decimals);
+    putU64(j, "confirmation_depth", reg.confirmation_depth);
+    j["destination_blob_min_len"] =
+        static_cast<uint64_t>(reg.destination_blob_min_len);
+    j["destination_blob_max_len"] =
+        static_cast<uint64_t>(reg.destination_blob_max_len);
+    j["enabled"] = reg.enabled;
+    putU64(j, "active_watcher_min", reg.active_watcher_min);
+    return j;
+  }
+
+  Common::Json encodeBridgeWithdrawal(
+      const Core::BridgeWithdrawal &w,
+      const std::string &hrp)
+  {
+    Common::Json j = Common::Json::object();
+    putU64(j, "withdrawal_id", w.id);
+    putU64(j, "source_chain_id", w.source_chain_id);
+    putU64(j, "wrapped_token_id", w.wrapped_token_id);
+    putAddress(j, "burner", w.burner, hrp);
+    putU64(j, "amount", w.amount);
+    j["destination_blob"] = encodeBytesHex(w.destination_blob);
+    putU64(j, "created_at_height", w.created_at_height);
+    j["well_formed"] = w.isWellFormed();
+    return j;
+  }
 } // namespace Rpc

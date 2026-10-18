@@ -254,4 +254,97 @@ namespace Core
     }
     return "unknown";
   }
+
+  std::vector<uint8_t> BridgeAttestation::serializeState() const
+  {
+    std::vector<uint8_t> out;
+    out.reserve(STATE_SIZE);
+
+    out.push_back(uint8_t(signer_index));
+    out.push_back(uint8_t(signer_index >> 8));
+    out.insert(out.end(), signature.data.begin(), signature.data.end());
+    out.insert(out.end(), destination.data.begin(), destination.data.end());
+    for (int i = 0; i < 8; ++i)
+      out.push_back(uint8_t(amount >> (i * 8)));
+    for (int i = 0; i < 8; ++i)
+      out.push_back(uint8_t(attested_at_height >> (i * 8)));
+
+    return out;
+  }
+
+  bool BridgeAttestation::deserializeState(const uint8_t *data, size_t len,
+                                           BridgeAttestation &out)
+  {
+    if (len != STATE_SIZE)
+      return false;
+
+    size_t off = 0;
+    out.signer_index = uint16_t(data[off]) | (uint16_t(data[off + 1]) << 8);
+    off += 2;
+
+    std::memcpy(out.signature.data.data(), data + off, 64);
+    off += 64;
+
+    std::memcpy(out.destination.data.data(), data + off, 32);
+    off += 32;
+
+    out.amount = 0;
+    for (int i = 0; i < 8; ++i)
+      out.amount |= uint64_t(data[off + i]) << (i * 8);
+    off += 8;
+
+    out.attested_at_height = 0;
+    for (int i = 0; i < 8; ++i)
+      out.attested_at_height |= uint64_t(data[off + i]) << (i * 8);
+
+    return true;
+  }
+
+  void BridgeAttestation::serialize(Serialization::ISerializer &s)
+  {
+    s(signer_index, "signer_index");
+    s(signature, "signature");
+    s(destination, "destination");
+    s(amount, "amount");
+    s(attested_at_height, "attested_at_height");
+  }
+
+  void BridgeAttestation::serialize(Serialization::ISerializer &s) const
+  {
+    s(signer_index, "signer_index");
+    s(signature, "signature");
+    s(destination, "destination");
+    s(amount, "amount");
+    s(attested_at_height, "attested_at_height");
+  }
+
+  const char *bridgeAttestStatusName(BridgeAttestStatus s) noexcept
+  {
+    switch (s)
+    {
+    case BridgeAttestStatus::Ok:
+      return "Ok";
+    case BridgeAttestStatus::Paused:
+      return "Paused";
+    case BridgeAttestStatus::ChainNotRegistered:
+      return "ChainNotRegistered";
+    case BridgeAttestStatus::ChainDisabled:
+      return "ChainDisabled";
+    case BridgeAttestStatus::PayloadMalformed:
+      return "PayloadMalformed";
+    case BridgeAttestStatus::DepositAlreadyConsumed:
+      return "DepositAlreadyConsumed";
+    case BridgeAttestStatus::SignerIndexOutOfRange:
+      return "SignerIndexOutOfRange";
+    case BridgeAttestStatus::SignerNotActiveWatcher:
+      return "SignerNotActiveWatcher";
+    case BridgeAttestStatus::BadSignature:
+      return "BadSignature";
+    case BridgeAttestStatus::AlreadyAttested:
+      return "AlreadyAttested";
+    case BridgeAttestStatus::ConflictingAttestation:
+      return "ConflictingAttestation";
+    }
+    return "Unknown";
+  }
 }

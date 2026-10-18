@@ -39,6 +39,17 @@ namespace Wallet
   {
     std::string host{"127.0.0.1"};
     uint16_t port{9633};
+
+    //  Optional HTTP Basic auth. When `user` is empty, no
+    //  Authorization header is sent. The password is intentionally
+    //  a plain string (not a file path) — the caller is responsible
+    //  for reading it from wherever it lives (file, env, prompt)
+    //  and for not logging it. The endpoint is normally constructed
+    //  once at startup, used by RpcClient for the lifetime of the
+    //  process, and destroyed on shutdown; it is not part of any
+    //  serialization format.
+    std::string user;
+    std::string password;
   };
 
   //  An error returned by the server (in the JSON-RPC "error" field)
@@ -326,5 +337,110 @@ namespace Wallet
       State::ProofKeyType key_type,
       const std::vector<uint8_t> &key_bytes,
       uint64_t version,
+      std::string *error_out = nullptr);
+
+  //  =========================================================================
+  //  Bridge RPC wrappers
+  //
+  //  Typed accessors for the bridge state the watcher daemon needs
+  //  to drive submission. All of these call Clarity JSON-RPC
+  //  methods that the node exposes (or will expose — see the
+  //  comment on each).
+  //
+  //  None of these are used by the wallet app today; they are
+  //  added here so the bridge app can share the same transport,
+  //  timeout, and auth configuration as the rest of the wallet's
+  //  RPC surface.
+  //  =========================================================================
+
+  //  Fetch the BridgeChainRegistration for a given source chain
+  //  id. Used by the daemon to (a) check the chain is registered
+  //  before submitting a mint, and (b) obtain the wrapped token id
+  //  for the burn path.
+  //
+  //  Sends: { "source_chain_id": "0x..." }
+  //  Expects: a BridgeChainRegistration JSON object.
+  //
+  //  On BridgeChainNotRegistered, `is_not_registered` is set to
+  //  true and the function returns nullopt.
+  std::optional<Common::Json> getBridgeChainRegistration(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      bool *is_not_registered,
+      std::string *error_out = nullptr);
+
+  //  Fetch a single bridge withdrawal record by id.
+  //
+  //  Sends: { "withdrawal_id": "0x..." }
+  //  Expects: a BridgeWithdrawal JSON object.
+  //
+  //  On BridgeWithdrawalNotFound, `is_not_found` is set to true
+  //  and the function returns nullopt.
+  std::optional<Common::Json> getBridgeWithdrawal(
+      RpcClient &rpc,
+      uint64_t withdrawal_id,
+      bool *is_not_found,
+      std::string *error_out = nullptr);
+
+  //  List the active watchers for a source chain. Used to
+  //  resolve the signer set when building a mint attestation.
+  //
+  //  Sends: { "source_chain_id": "0x...", "height": "0x..." }
+  //  Expects: { "watchers": [ { "id": ..., "validator_id": ...,
+  //                            "reward_address": ... }, ... ] }
+  //
+  //  The height parameter selects the active set as of that
+  //  height, matching the executor's resolution at
+  //  ctx.current_height. Pass 0 for "current head".
+  std::optional<Common::Json> getActiveWatchers(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      uint64_t height,
+      std::string *error_out = nullptr);
+
+  //  Resolve a reward address to its bridge watcher id, if
+  //  registered. Used by the startup path to fill in
+  //  WatcherSession::watcher_id without operator intervention.
+  //
+  //  Sends: { "address": <bech32m> }
+  //  Expects: { "watcher_id": "0x..." }
+  //
+  //  On BridgeWatcherNotFound, `is_not_found` is set to true and
+  //  the function returns nullopt. A null watcher_id (0) is
+  //  treated the same as not-found: the caller should fall back
+  //  to prompting.
+  std::optional<Common::Json> getBridgeWatcherIdByAddress(
+      RpcClient &rpc,
+      const std::string &address_bech32m,
+      bool *is_not_found,
+      std::string *error_out = nullptr);
+
+  //  Check whether a specific deposit has already been minted.
+  //  Used by the submission loop to short-circuit before
+  //  submitting a transaction the executor would reject anyway.
+  //
+  //  Sends: { "source_chain_id": "0x...",
+  //           "source_tx_hash": "0x...",
+  //           "source_output_index": "0x..." }
+  //  Expects: { "consumed": true|false,
+  //             "mint_height": "0x..." (present iff consumed) }
+  //
+  //  Returns the mint height on success (with consumed=true), 0
+  //  on success with consumed=false, or nullopt on RPC failure.
+  //  The `is_consumed` out-param distinguishes "not consumed" from
+  //  "RPC call failed" — both return nullopt otherwise.
+  std::optional<uint64_t> getBridgeConsumed(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      const Crypto::Hash &source_tx_hash,
+      uint32_t source_output_index,
+      bool *is_consumed,
+      std::string *error_out = nullptr);
+
+  std::optional<Common::Json> getBridgeAttestations(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      const Crypto::Hash &source_tx_hash,
+      uint32_t source_output_index,
       std::string *error_out = nullptr);
 } // namespace Wallet

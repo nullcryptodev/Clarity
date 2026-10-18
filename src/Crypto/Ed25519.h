@@ -41,4 +41,43 @@ namespace Crypto
                    const std::vector<PublicKey> &pks,
                    const std::vector<Signature> &sigs) noexcept;
 
+  //  =====================================================================
+  //  CryptoNote output-key derivation
+  //
+  //  These two primitives are what the bridge needs to identify which
+  //  vout of a scanned CCX deposit transaction pays to the custody
+  //  address. They are byte-for-byte compatible with conceald's
+  //  crypto::generate_key_derivation / crypto::derive_public_key,
+  //  including the Conceal-specific ge_mul8 cofactor step and the
+  //  exact "KeyDerivation || varint(index)" hash input.
+  //
+  //  The implementation is a thin adapter over the vendored ref10
+  //  curve arithmetic (extern/cryptonote-ref10/crypto-ops.{c,h}) and
+  //  the vendored keccak-1600 (extern/cryptonote-ref10/hash-ops.c,
+  //  keccak.c). No other CCX code is required.
+  //
+  //  Why vendored rather than reimplemented: the derivation is a
+  //  silent-failure primitive. A wrong ge_mul8 (or a missing one),
+  //  a wrong varint layout, or a wrong hash produces a well-formed
+  //  32-byte key that never matches the on-chain output — i.e. "no
+  //  deposit found" for a real deposit. The vendored code is the
+  //  same code that produced the on-chain outputs, so byte-for-byte
+  //  parity is guaranteed by construction.
+  //  =====================================================================
+
+  struct KeyDerivation : ByteArray<32>
+  {
+    using ByteArray::ByteArray;
+    KeyDerivation() = default;
+  };
+
+  bool generateKeyDerivation(const PublicKey &txPubKey,
+                             const SecretKey &viewSecretKey,
+                             KeyDerivation &out) noexcept;
+
+  bool derivePublicKey(const KeyDerivation &derivation,
+                       size_t outputIndex,
+                       const PublicKey &spendPubKey,
+                       PublicKey &out) noexcept;
+
 } // namespace Crypto

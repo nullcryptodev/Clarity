@@ -27,4 +27,5 @@ namespace Rpc
   void registerOrderMethods(JsonRpcDispatcher &d);
   void registerNodeMethods(JsonRpcDispatcher &d);
   void registerNftMethods(JsonRpcDispatcher &d);
+  void registerBridgeMethods(JsonRpcDispatcher &d);
 }

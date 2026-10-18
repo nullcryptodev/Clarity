@@ -436,11 +436,17 @@ namespace State
     //  =====================================================================
     //
     //  Consumed-deposit records, withdrawal records, per-chain
-    //  registrations, and registered-watcher records. The
-    //  operational signer set for a source chain is the active
-    //  watcher set for that chain, resolved from the watcher
-    //  records on each verification; there is no separately-stored
-    //  signer set.
+    //  registrations, registered-watcher records, and per-watcher
+    //  deposit attestations. The operational signer set for a
+    //  source chain is the active watcher set for that chain,
+    //  resolved from the watcher records on each verification;
+    //  there is no separately-stored signer set.
+    //
+    //  Attestations are recorded on-chain by BridgeAttest
+    //  transactions. Each active watcher submits exactly one per
+    //  deposit; the submission assembler reads them back and
+    //  assembles a BridgeMint signature block once a quorum has
+    //  agreed on the same (destination, amount) pair.
 
     //  ---- Consumed deposits ----
 
@@ -519,6 +525,80 @@ namespace State
     size_t countActiveBridgeWatchersForChain(
         uint64_t source_chain_id,
         uint64_t current_height) const;
+
+    //  ---- Attestations ----
+    //
+    //  A BridgeAttestation is keyed by
+    //  (source_chain_id, source_tx_hash, source_output_index,
+    //   validator_id). The composite key is used because:
+    //
+    //    - A deposit is identified by (chain, tx_hash, output_index);
+    //    - Each active watcher submits exactly one attestation per
+    //      deposit (enforced by the executor's AlreadyAttested
+    //      check);
+    //    - A future fetch for "all attestations on a deposit" wants
+    //      the tx_hash-prefixed range.
+    //
+    //  Key layout (52 bytes):
+    //    [8]  source_chain_id (LE)
+    //    [32] source_tx_hash
+    //    [4]  source_output_index (LE)
+    //    [8]  validator_id (LE)
+
+    //  Write one attestation. Throws StateDBError if the
+    //  attestation is not well-formed (the executor validates
+    //  before calling; this is a belt-and-braces check for direct
+    //  callers).
+    void putBridgeAttestation(
+        uint64_t source_chain_id,
+        const Crypto::Hash &source_tx_hash,
+        uint32_t source_output_index,
+        uint64_t validator_id,
+        const Core::BridgeAttestation &attestation);
+
+    //  Read one attestation for (deposit, validator_id). Returns
+    //  false if no such attestation exists.
+    bool getBridgeAttestation(
+        uint64_t source_chain_id,
+        const Crypto::Hash &source_tx_hash,
+        uint32_t source_output_index,
+        uint64_t validator_id,
+        Core::BridgeAttestation &out) const;
+
+    //  Iterate every attestation for a single deposit, in
+    //  validator_id order. The visitor returns false to stop.
+    void forEachBridgeAttestationForDeposit(
+        uint64_t source_chain_id,
+        const Crypto::Hash &source_tx_hash,
+        uint32_t source_output_index,
+        const std::function<bool(uint64_t validator_id,
+                                 const Core::BridgeAttestation &)> &fn) const;
+
+    //  Count attestations for a deposit without materializing them.
+    //  Cheap enough to call on every scan iteration.
+    size_t countBridgeAttestationsForDeposit(
+        uint64_t source_chain_id,
+        const Crypto::Hash &source_tx_hash,
+        uint32_t source_output_index) const;
+
+    //  Iterate every attestation in the table, in key order. Used
+    //  by the getBridgeAttestations RPC method's full-dump form.
+    void forEachBridgeAttestation(
+        const std::function<bool(uint64_t source_chain_id,
+                                 const Crypto::Hash &source_tx_hash,
+                                 uint32_t source_output_index,
+                                 uint64_t validator_id,
+                                 const Core::BridgeAttestation &)> &fn) const;
+
+    //  Compose the composite key used by the attestation table.
+    //  Exposed so the executor (and tests) can reason about the
+    //  layout without duplicating it. The returned array is exactly
+    //  the 52 bytes the table stores.
+    static std::array<uint8_t, 52> bridgeAttestationKey(
+        uint64_t source_chain_id,
+        const Crypto::Hash &source_tx_hash,
+        uint32_t source_output_index,
+        uint64_t validator_id);
 
     //  =====================================================================
     //  Global state

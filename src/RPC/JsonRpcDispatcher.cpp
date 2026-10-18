@@ -65,6 +65,7 @@ namespace Rpc
     registerOrderMethods(*this);
     registerNftMethods(*this);
     registerNodeMethods(*this);
+    registerBridgeMethods(*this);
     registerAdminMethods(*this);
 
     // methods is registered last so its handler can capture

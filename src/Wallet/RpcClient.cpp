@@ -7,6 +7,8 @@
 
 #include "RPC/JsonRpcError.h"
 
+#include "Common/Base.h"
+
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/write.hpp>
@@ -46,6 +48,19 @@ namespace Wallet
 
   namespace
   {
+
+    std::string encodeHashHex(const Crypto::Hash &h)
+    {
+      static const char HEX[] = "0123456789abcdef";
+      std::string out = "0x";
+      out.reserve(66);
+      for (size_t i = 0; i < h.data.size(); ++i)
+      {
+        out.push_back(HEX[h.data[i] >> 4]);
+        out.push_back(HEX[h.data[i] & 0xF]);
+      }
+      return out;
+    }
 
     constexpr char HEX_LOWER[] = "0123456789abcdef";
 
@@ -216,6 +231,14 @@ namespace Wallet
       http_req.set(http::field::host, endpoint_.host);
       http_req.set(http::field::user_agent, "clrty-wallet/0.1");
       http_req.set(http::field::content_type, "application/json");
+
+      if (!endpoint_.user.empty())
+      {
+        http_req.set(
+            http::field::authorization,
+            "Basic " + Common::encodeBase64(endpoint_.user + ":" + endpoint_.password));
+      }
+
       http_req.body() = req.dump();
       http_req.prepare_payload();
 
@@ -925,5 +948,217 @@ namespace Wallet
     }
 
     return pr;
+  }
+
+  //  ---- Bridge RPC wrappers ----
+
+  std::optional<Common::Json> getBridgeChainRegistration(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      bool *is_not_registered,
+      std::string *error_out)
+  {
+    if (is_not_registered)
+      *is_not_registered = false;
+
+    Common::Json params = Common::Json::object();
+    params["source_chain_id"] = encodeU64Hex(source_chain_id);
+
+    auto res = rpc.call("getBridgeChainRegistration", params);
+    if (!res.ok())
+    {
+      //  BridgeChainNotRegistered = 1061 (see Rpc/JsonRpcError.h).
+      //  Matching on the code rather than the message string keeps
+      //  this stable when the server's wording changes.
+      if (is_not_registered && res.error.has_value() &&
+          res.error->code == 1061)
+      {
+        *is_not_registered = true;
+        return std::nullopt;
+      }
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<Common::Json> getBridgeWithdrawal(
+      RpcClient &rpc,
+      uint64_t withdrawal_id,
+      bool *is_not_found,
+      std::string *error_out)
+  {
+    if (is_not_found)
+      *is_not_found = false;
+
+    Common::Json params = Common::Json::object();
+    params["withdrawal_id"] = encodeU64Hex(withdrawal_id);
+
+    auto res = rpc.call("getBridgeWithdrawal", params);
+    if (!res.ok())
+    {
+      //  BridgeWithdrawalNotFound = 1062.
+      if (is_not_found && res.error.has_value() &&
+          res.error->code == 1062)
+      {
+        *is_not_found = true;
+        return std::nullopt;
+      }
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<Common::Json> getActiveWatchers(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      uint64_t height,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["source_chain_id"] = encodeU64Hex(source_chain_id);
+    params["height"] = encodeU64Hex(height);
+
+    auto res = rpc.call("getActiveWatchers", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<Common::Json> getBridgeWatcherIdByAddress(
+      RpcClient &rpc,
+      const std::string &address_bech32m,
+      bool *is_not_found,
+      std::string *error_out)
+  {
+    if (is_not_found)
+      *is_not_found = false;
+
+    Common::Json params = Common::Json::object();
+    params["address"] = address_bech32m;
+
+    auto res = rpc.call("getBridgeWatcherIdByAddress", params);
+    if (!res.ok())
+    {
+      //  BridgeWatcherNotFound = 1063.
+      if (is_not_found && res.error.has_value() &&
+          res.error->code == 1063)
+      {
+        *is_not_found = true;
+        return std::nullopt;
+      }
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  std::optional<uint64_t> getBridgeConsumed(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      const Crypto::Hash &source_tx_hash,
+      uint32_t source_output_index,
+      bool *is_consumed,
+      std::string *error_out)
+  {
+    if (is_consumed)
+      *is_consumed = false;
+
+    Common::Json params = Common::Json::object();
+    params["source_chain_id"] = encodeU64Hex(source_chain_id);
+    params["source_tx_hash"] = encodeHashHex(source_tx_hash);
+    params["source_output_index"] =
+        encodeU64Hex(static_cast<uint64_t>(source_output_index));
+
+    auto res = rpc.call("getBridgeConsumed", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    if (!res.result.is_object())
+    {
+      if (error_out)
+        *error_out = "getBridgeConsumed: response is not an object";
+      return std::nullopt;
+    }
+
+    const auto &obj = res.result;
+
+    if (!obj.contains("consumed") || !obj["consumed"].is_boolean())
+    {
+      if (error_out)
+        *error_out = "getBridgeConsumed: response missing or malformed "
+                     "'consumed'";
+      return std::nullopt;
+    }
+
+    const bool consumed = obj["consumed"].get<bool>();
+    if (!consumed)
+      return uint64_t(0);
+
+    if (is_consumed)
+      *is_consumed = true;
+
+    if (!obj.contains("mint_height") || !obj["mint_height"].is_string())
+    {
+      if (error_out)
+        *error_out = "getBridgeConsumed: 'consumed' is true but "
+                     "'mint_height' is missing or malformed";
+      return std::nullopt;
+    }
+
+    auto height = parseHexU64(obj["mint_height"].get<std::string>());
+    if (!height.has_value())
+    {
+      if (error_out)
+        *error_out = "getBridgeConsumed: 'mint_height' is not valid hex";
+      return std::nullopt;
+    }
+
+    return *height;
+  }
+
+  std::optional<Common::Json> getBridgeAttestations(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      const Crypto::Hash &source_tx_hash,
+      uint32_t source_output_index,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["source_chain_id"] = encodeU64Hex(source_chain_id);
+    params["source_tx_hash"] = encodeHashHex(source_tx_hash);
+    params["source_output_index"] =
+        encodeU64Hex(static_cast<uint64_t>(source_output_index));
+
+    auto res = rpc.call("getBridgeAttestations", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+    return res.result;
   }
 } // namespace Wallet

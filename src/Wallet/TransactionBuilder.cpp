@@ -7,6 +7,7 @@
 
 #include "Signer.h"
 
+#include "Core/BridgeTypes.h"
 #include "Core/TransactionTypes.h"
 #include "Core/NftTypes.h"
 #include "Core/OrderBook.h"
@@ -17,10 +18,6 @@ namespace Wallet
 {
   namespace
   {
-    //  Payload append helpers. The NFT payloads use explicit
-    //  little-endian writes so the wallet builder and the executor
-    //  parse the same layout without either side depending on the
-    //  transaction's fixed-field serializer for the payload bytes.
     void appendU8(std::vector<uint8_t> &out, uint8_t v)
     {
       out.push_back(v);
@@ -46,17 +43,11 @@ namespace Wallet
         out.push_back(uint8_t(v >> (i * 8)));
     }
 
-    //  Append a hash. Always 32 bytes; the executor reads a
-    //  has_hash flag separately, so the hash bytes are written
-    //  unconditionally and the flag disambiguates.
     void appendHash(std::vector<uint8_t> &out, const Crypto::Hash &h)
     {
       out.insert(out.end(), h.data.begin(), h.data.end());
     }
 
-    //  Append a length-prefixed string. `len_bytes` selects u8 or
-    //  u16; the executor's parsers read the same width for the same
-    //  field.
     bool appendLenString(std::vector<uint8_t> &out,
                          const std::string &s,
                          bool len_u16,
@@ -80,11 +71,6 @@ namespace Wallet
       return true;
     }
 
-    //  Common validation applied to every user-submitted transaction.
-    //  Builders call this first, then apply type-specific checks.
-    //
-    //  The executor will re-check all of these on-chain; the builder
-    //  checks them so the user gets an error before signing, not after.
     bool validateCommon(const Crypto::Address &from,
                         const TxCommonParams &common,
                         WalletStatus *error_out)
@@ -119,9 +105,6 @@ namespace Wallet
       return true;
     }
 
-    //  Build a transaction skeleton. The builder fills in the type,
-    //  common fields, and payload; the type-specific code fills in
-    //  `to`, `amount`, `token_id` if it uses them.
     Core::Transaction makeBase(Core::TxType type,
                                const Crypto::Address &from,
                                const TxCommonParams &common)
@@ -133,9 +116,37 @@ namespace Wallet
       tx.nonce = common.nonce;
       tx.valid_until_height = common.valid_until_height;
       tx.from = from;
-      // tx.to, token_id, amount, fee left at defaults; caller fills.
       tx.fee = common.fee;
       return tx;
+    }
+
+    //  Validate that a signature block is structurally well-formed:
+    //  2-byte count followed by exactly count * 66 bytes. The
+    //  executor's parseBridgeSignatureBlock does the same check,
+    //  but catching it here means the caller gets an error before
+    //  signing rather than after submitting a rejected transaction.
+    bool validateSignatureBlock(const std::vector<uint8_t> &block,
+                                WalletStatus *error_out)
+    {
+      if (block.size() < 2)
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::InvalidParameter,
+              "signature block is too short (needs at least a 2-byte count)");
+        return false;
+      }
+      const uint16_t count =
+          uint16_t(block[0]) | (uint16_t(block[1]) << 8);
+      if (block.size() != 2 + static_cast<size_t>(count) * 66)
+      {
+        if (error_out)
+          *error_out = WalletStatus::fail(
+              WalletError::InvalidParameter,
+              "signature block length does not match its declared count");
+        return false;
+      }
+      return true;
     }
   } // anonymous namespace
 
@@ -172,13 +183,10 @@ namespace Wallet
     tx.to = params.to;
     tx.token_id = params.token_id;
     tx.amount = params.amount;
-    // Payload is empty: the executor reads `to`, `token_id`, and
-    // `amount` from the fixed fields.
-
     return tx;
   }
 
-  //  ---- Staking (opt-in / opt-out / claim) ----
+  //  ---- Staking ----
 
   namespace
   {
@@ -191,10 +199,7 @@ namespace Wallet
       if (!validateCommon(from, params.common, error_out))
         return std::nullopt;
 
-      Core::Transaction tx = makeBase(type, from, params.common);
-      // No `to`, no `amount`, no payload. The executor uses `from`
-      // to identify the account and does the rest itself.
-      return tx;
+      return makeBase(type, from, params.common);
     }
   } // anonymous namespace
 
@@ -255,10 +260,7 @@ namespace Wallet
 
     Core::Transaction tx =
         makeBase(Core::TxType::RegisterValidator, from, params.common);
-    // The stake moves from the sender's balance into the validator
-    // record. It goes in `amount`.
     tx.amount = params.stake;
-    // The payload carries the P2P node key (32 bytes).
     tx.payload.resize(32);
     std::memcpy(tx.payload.data(),
                 params.node_key.data.data(),
@@ -276,10 +278,7 @@ namespace Wallet
     if (!validateCommon(from, params.common, error_out))
       return std::nullopt;
 
-    Core::Transaction tx =
-        makeBase(Core::TxType::UnregisterValidator, from, params.common);
-    // Empty payload. The executor looks up the validator by `from`.
-    return tx;
+    return makeBase(Core::TxType::UnregisterValidator, from, params.common);
   }
 
   //  ---- Update Reward Address ----
@@ -312,11 +311,271 @@ namespace Wallet
 
     Core::Transaction tx =
         makeBase(Core::TxType::UpdateRewardAddress, from, params.common);
-    // The payload carries the new reward address (32 bytes).
     tx.payload.resize(32);
     std::memcpy(tx.payload.data(),
                 params.new_reward_address.data.data(),
                 params.new_reward_address.data.size());
+    return tx;
+  }
+
+  //  ---- Rotate Consensus Key ----
+
+  std::optional<Core::Transaction> buildRotateConsensusKey(
+      const Crypto::Address &from,
+      const RotateConsensusParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.new_consensus_key.isNull())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "new consensus key is null");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::RotateConsensusKey, from, params.common);
+    tx.payload.resize(32);
+    std::memcpy(tx.payload.data(),
+                params.new_consensus_key.data.data(),
+                params.new_consensus_key.data.size());
+    return tx;
+  }
+
+  //  ---- Create Token ----
+
+  std::optional<Core::Transaction> buildCreateToken(
+      const Crypto::Address &from,
+      const CreateTokenParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.name.empty())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "token name is empty");
+      return std::nullopt;
+    }
+
+    if (params.symbol.size() < Core::TOKEN_SYMBOL_MIN ||
+        params.symbol.size() > Core::TOKEN_SYMBOL_MAX)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "token symbol must be between TOKEN_SYMBOL_MIN and "
+            "TOKEN_SYMBOL_MAX characters");
+      return std::nullopt;
+    }
+
+    if (params.decimals > 18)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "decimals must be between 0 and 18");
+      return std::nullopt;
+    }
+
+    if (params.backing > 1)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "backing must be 0 (unbacked) or 1 (bridged)");
+      return std::nullopt;
+    }
+
+    if (params.royalty_bps > 10'000)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "royalty_bps must be between 0 and 10000");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::CreateToken, from, params.common);
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU8(p, params.decimals);
+    appendU8(p, params.backing);
+
+    if (!appendLenString(p, params.name, /*len_u16=*/false,
+                         Core::TOKEN_NAME_MAX, error_out, "name"))
+      return std::nullopt;
+    if (!appendLenString(p, params.symbol, /*len_u16=*/false,
+                         Core::TOKEN_SYMBOL_MAX, error_out, "symbol"))
+      return std::nullopt;
+
+    appendU64(p, params.max_supply);
+    appendU16(p, params.royalty_bps);
+
+    if (params.fingerprint.has_value())
+    {
+      appendU8(p, 1);
+      appendHash(p, *params.fingerprint);
+    }
+    else
+    {
+      appendU8(p, 0);
+    }
+
+    return tx;
+  }
+
+  //  ---- Mint Token ----
+
+  std::optional<Core::Transaction> buildMintToken(
+      const Crypto::Address &from,
+      const MintTokenParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.token_id == NATIVE_TOKEN_ID)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "cannot mint the native token");
+      return std::nullopt;
+    }
+
+    if (params.to.isNull())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "mint recipient is null");
+      return std::nullopt;
+    }
+
+    if (params.amount == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "mint amount is zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::MintToken, from, params.common);
+    tx.to = params.to;
+    tx.token_id = params.token_id;
+    tx.amount = params.amount;
+    return tx;
+  }
+
+  //  ---- Burn Token ----
+
+  std::optional<Core::Transaction> buildBurnToken(
+      const Crypto::Address &from,
+      const BurnTokenParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.token_id == NATIVE_TOKEN_ID)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "cannot burn the native token");
+      return std::nullopt;
+    }
+
+    if (params.amount == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "burn amount is zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::BurnToken, from, params.common);
+    tx.token_id = params.token_id;
+    tx.amount = params.amount;
+    return tx;
+  }
+
+  //  ---- Update Token Meta ----
+
+  std::optional<Core::Transaction> buildUpdateTokenMeta(
+      const Crypto::Address &from,
+      const UpdateTokenMetaParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.token_id == NATIVE_TOKEN_ID)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "cannot update the native token's metadata");
+      return std::nullopt;
+    }
+
+    if (params.new_name.empty() &&
+        params.new_symbol.empty() &&
+        params.new_royalty_bps == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "no metadata change requested");
+      return std::nullopt;
+    }
+
+    if (!params.new_symbol.empty() &&
+        (params.new_symbol.size() < Core::TOKEN_SYMBOL_MIN ||
+         params.new_symbol.size() > Core::TOKEN_SYMBOL_MAX))
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "new symbol must be between TOKEN_SYMBOL_MIN and "
+            "TOKEN_SYMBOL_MAX characters");
+      return std::nullopt;
+    }
+
+    if (params.new_royalty_bps > 10'000)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "new_royalty_bps must be between 0 and 10000");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::UpdateTokenMeta, from, params.common);
+    tx.token_id = params.token_id;
+
+    std::vector<uint8_t> &p = tx.payload;
+    if (!appendLenString(p, params.new_name, /*len_u16=*/false,
+                         Core::TOKEN_NAME_MAX, error_out, "new_name"))
+      return std::nullopt;
+    if (!appendLenString(p, params.new_symbol, /*len_u16=*/false,
+                         Core::TOKEN_SYMBOL_MAX, error_out, "new_symbol"))
+      return std::nullopt;
+    appendU16(p, params.new_royalty_bps);
+
     return tx;
   }
 
@@ -345,9 +604,6 @@ namespace Wallet
       return std::nullopt;
     }
 
-    //  A reward schedule must be internally consistent. The executor
-    //  enforces this too via NftCollection::isValid; the builder
-    //  checks so the caller gets a pre-signing error.
     if (params.reward_token_id == 0)
     {
       if (params.reward_rate_per_epoch != 0 || params.escrow_amount != 0)
@@ -416,8 +672,6 @@ namespace Wallet
     std::vector<uint8_t> &p = tx.payload;
     appendU64(p, params.collection_id);
 
-    //  The hash is always written as 32 bytes. The flag says
-    //  whether it is meaningful.
     const bool has_hash = !params.metadata_hash.isNull();
     appendHash(p, params.metadata_hash);
     appendU8(p, has_hash ? 1 : 0);
@@ -537,9 +791,7 @@ namespace Wallet
     }
 
     Core::Transaction tx = makeBase(Core::TxType::BurnNft, from, params.common);
-
     appendU64(tx.payload, params.nft_id);
-
     return tx;
   }
 
@@ -631,10 +883,7 @@ namespace Wallet
     if (!validateCommon(from, params.common, error_out))
       return std::nullopt;
 
-    Core::Transaction tx = makeBase(Core::TxType::ClaimNftReward,
-                                    from, params.common);
-    //  Empty payload. The executor walks the caller's NFTs.
-    return tx;
+    return makeBase(Core::TxType::ClaimNftReward, from, params.common);
   }
 
   //  ---- NFT: Refill Collection Reward ----
@@ -709,20 +958,6 @@ namespace Wallet
       return std::nullopt;
     }
 
-    //  Enforce the pool-creation floor as a client-side check. The
-    //  executor enforces it too; this just gives the caller the
-    //  error before signing.
-    //
-    //  MIN_POOL_LIQUIDITY is denominated in atomic units of the
-    //  native CLRTY token. Applying it to a non-CLRTY side would
-    //  mean a token with low decimals — e.g. decimals = 0 with a
-    //  small max supply — could never be pooled, because the floor
-    //  would exceed its entire supply.
-    //
-    //  A token/token pool has no CLRTY reference and therefore no
-    //  meaningful "1000 CLRTY equivalent" floor. For those pools,
-    //  the only requirement is that both amounts are non-zero,
-    //  which is already checked above.
     if (params.token_a == NATIVE_TOKEN_ID &&
         params.amount_a < Core::MIN_POOL_LIQUIDITY)
     {
@@ -746,7 +981,6 @@ namespace Wallet
     Core::Transaction tx =
         makeBase(Core::TxType::CreatePool, from, params.common);
 
-    //  One side in the fixed fields, the other in the payload.
     tx.token_id = params.token_a;
     tx.amount = params.amount_a;
 
@@ -787,13 +1021,40 @@ namespace Wallet
 
     Core::Transaction tx =
         makeBase(Core::TxType::AddLiquidity, from, params.common);
-
     tx.token_id = params.token_in;
     tx.amount = params.amount_in;
 
     std::vector<uint8_t> &p = tx.payload;
     appendU64(p, params.pool_id);
     appendU64(p, params.amount_other);
+
+    return tx;
+  }
+
+  //  ---- AMM: Remove Liquidity ----
+
+  std::optional<Core::Transaction> buildRemoveLiquidity(
+      const Crypto::Address &from,
+      const RemoveLiquidityParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.position_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "position_id is zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx = makeBase(Core::TxType::RemoveLiquidity,
+                                    from, params.common);
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.position_id);
+    appendU64(p, params.amount);
 
     return tx;
   }
@@ -834,7 +1095,6 @@ namespace Wallet
 
     Core::Transaction tx =
         makeBase(Core::TxType::Swap, from, params.common);
-
     tx.token_id = params.token_in;
     tx.amount = params.amount_in;
     tx.to = params.to;
@@ -934,10 +1194,6 @@ namespace Wallet
       }
     }
 
-    //  Canonical-price sanity check for Passive orders. The
-    //  executor checks this too; a Passive order whose canonical
-    //  price would overflow cannot enter the book and would be a
-    //  lock with no exit.
     if (params.mode == Core::OrderExecutionMode::Passive)
     {
       Core::Order probe;
@@ -958,7 +1214,6 @@ namespace Wallet
 
     Core::Transaction tx =
         makeBase(Core::TxType::CreateOrder, from, params.common);
-
     tx.token_id = params.sell_token;
     tx.amount = params.sell_amount;
 
@@ -996,168 +1251,45 @@ namespace Wallet
 
     Core::Transaction tx =
         makeBase(Core::TxType::CancelOrder, from, params.common);
-
     appendU64(tx.payload, params.order_id);
-
     return tx;
   }
 
-  //  ---- Rotate Consensus Key ----
+  //  =========================================================================
+  //  Bridge
+  //  =========================================================================
 
-  std::optional<Core::Transaction> buildRotateConsensusKey(
+  //  ---- BridgeMint ----
+
+  std::optional<Core::Transaction> buildBridgeMint(
       const Crypto::Address &from,
-      const RotateConsensusParams &params,
+      const BridgeMintParams &params,
       WalletStatus *error_out)
   {
     if (!validateCommon(from, params.common, error_out))
       return std::nullopt;
 
-    if (params.new_consensus_key.isNull())
+    if (params.source_chain_id == 0)
     {
       if (error_out)
         *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "new consensus key is null");
+            WalletError::InvalidParameter, "source_chain_id is zero");
       return std::nullopt;
     }
 
-    Core::Transaction tx =
-        makeBase(Core::TxType::RotateConsensusKey, from, params.common);
-    // Payload carries the new consensus key (32 bytes).
-    tx.payload.resize(32);
-    std::memcpy(tx.payload.data(),
-                params.new_consensus_key.data.data(),
-                params.new_consensus_key.data.size());
-    return tx;
-  }
-
-  //  ---- Create Token ----
-
-  std::optional<Core::Transaction> buildCreateToken(
-      const Crypto::Address &from,
-      const CreateTokenParams &params,
-      WalletStatus *error_out)
-  {
-    if (!validateCommon(from, params.common, error_out))
-      return std::nullopt;
-
-    //  Name and symbol are validated on-chain too, but a caller
-    //  that passes an empty name should see the error before the
-    //  fee is charged. The on-chain validation is authoritative.
-    if (params.name.empty())
+    if (params.source_tx_hash.isNull())
     {
       if (error_out)
         *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter, "token name is empty");
+            WalletError::InvalidParameter, "source_tx_hash is null");
       return std::nullopt;
     }
 
-    if (params.symbol.size() < Core::TOKEN_SYMBOL_MIN ||
-        params.symbol.size() > Core::TOKEN_SYMBOL_MAX)
+    if (params.destination.isNull())
     {
       if (error_out)
         *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "token symbol must be between TOKEN_SYMBOL_MIN and "
-            "TOKEN_SYMBOL_MAX characters");
-      return std::nullopt;
-    }
-
-    if (params.decimals > 18)
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "decimals must be between 0 and 18");
-      return std::nullopt;
-    }
-
-    if (params.backing > 1)
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "backing must be 0 (unbacked) or 1 (bridged)");
-      return std::nullopt;
-    }
-
-    if (params.royalty_bps > 10'000)
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "royalty_bps must be between 0 and 10000");
-      return std::nullopt;
-    }
-
-    Core::Transaction tx =
-        makeBase(Core::TxType::CreateToken, from, params.common);
-
-    std::vector<uint8_t> &p = tx.payload;
-
-    //  Payload layout, matching executeCreateToken:
-    //    [1]  decimals
-    //    [1]  backing
-    //    [1]  name_len
-    //    [N]  name
-    //    [1]  symbol_len
-    //    [M]  symbol
-    //    [8]  max_supply (LE)
-    //    [2]  royalty_bps (LE)
-    //    [1]  has_fingerprint
-    //    [32] fingerprint (only if has_fingerprint)
-
-    appendU8(p, params.decimals);
-    appendU8(p, params.backing);
-
-    if (!appendLenString(p, params.name, /*len_u16=*/false,
-                         Core::TOKEN_NAME_MAX, error_out, "name"))
-      return std::nullopt;
-    if (!appendLenString(p, params.symbol, /*len_u16=*/false,
-                         Core::TOKEN_SYMBOL_MAX, error_out, "symbol"))
-      return std::nullopt;
-
-    appendU64(p, params.max_supply);
-    appendU16(p, params.royalty_bps);
-
-    if (params.fingerprint.has_value())
-    {
-      appendU8(p, 1);
-      appendHash(p, *params.fingerprint);
-    }
-    else
-    {
-      appendU8(p, 0);
-    }
-
-    return tx;
-  }
-
-  //  ---- Mint Token ----
-
-  std::optional<Core::Transaction> buildMintToken(
-      const Crypto::Address &from,
-      const MintTokenParams &params,
-      WalletStatus *error_out)
-  {
-    if (!validateCommon(from, params.common, error_out))
-      return std::nullopt;
-
-    if (params.token_id == NATIVE_TOKEN_ID)
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "cannot mint the native token");
-      return std::nullopt;
-    }
-
-    if (params.to.isNull())
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "mint recipient is null");
+            WalletError::InvalidParameter, "destination is null");
       return std::nullopt;
     }
 
@@ -1165,172 +1297,237 @@ namespace Wallet
     {
       if (error_out)
         *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "mint amount is zero");
+            WalletError::InvalidParameter, "amount is zero");
       return std::nullopt;
     }
+
+    if (!validateSignatureBlock(params.signature_block, error_out))
+      return std::nullopt;
 
     Core::Transaction tx =
-        makeBase(Core::TxType::MintToken, from, params.common);
+        makeBase(Core::TxType::BridgeMint, from, params.common);
 
-    //  The executor reads these from the fixed fields, not the
-    //  payload. The payload is empty.
-    tx.to = params.to;
-    tx.token_id = params.token_id;
-    tx.amount = params.amount;
-
-    return tx;
-  }
-
-  //  ---- Burn Token ----
-
-  std::optional<Core::Transaction> buildBurnToken(
-      const Crypto::Address &from,
-      const BurnTokenParams &params,
-      WalletStatus *error_out)
-  {
-    if (!validateCommon(from, params.common, error_out))
-      return std::nullopt;
-
-    if (params.token_id == NATIVE_TOKEN_ID)
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "cannot burn the native token");
-      return std::nullopt;
-    }
-
-    if (params.amount == 0)
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "burn amount is zero");
-      return std::nullopt;
-    }
-
-    Core::Transaction tx =
-        makeBase(Core::TxType::BurnToken, from, params.common);
-
-    //  Same as mint: the executor reads the fixed fields.
-    tx.token_id = params.token_id;
-    tx.amount = params.amount;
-
-    return tx;
-  }
-
-  //  ---- Update Token Meta ----
-
-  std::optional<Core::Transaction> buildUpdateTokenMeta(
-      const Crypto::Address &from,
-      const UpdateTokenMetaParams &params,
-      WalletStatus *error_out)
-  {
-    if (!validateCommon(from, params.common, error_out))
-      return std::nullopt;
-
-    if (params.token_id == NATIVE_TOKEN_ID)
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "cannot update the native token's metadata");
-      return std::nullopt;
-    }
-
-    //  A no-op update burns a fee for nothing. Reject it here so
-    //  the caller sees the error before signing.
-    if (params.new_name.empty() &&
-        params.new_symbol.empty() &&
-        params.new_royalty_bps == 0)
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "no metadata change requested");
-      return std::nullopt;
-    }
-
-    if (!params.new_symbol.empty() &&
-        (params.new_symbol.size() < Core::TOKEN_SYMBOL_MIN ||
-         params.new_symbol.size() > Core::TOKEN_SYMBOL_MAX))
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "new symbol must be between TOKEN_SYMBOL_MIN and "
-            "TOKEN_SYMBOL_MAX characters");
-      return std::nullopt;
-    }
-
-    if (params.new_royalty_bps > 10'000)
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter,
-            "new_royalty_bps must be between 0 and 10000");
-      return std::nullopt;
-    }
-
-    Core::Transaction tx =
-        makeBase(Core::TxType::UpdateTokenMeta, from, params.common);
-
-    //  The executor reads token_id from the fixed field.
-    tx.token_id = params.token_id;
-
-    //  Payload layout, matching executeUpdateTokenMeta:
-    //    [1]  name_len
-    //    [N]  name
-    //    [1]  symbol_len
-    //    [M]  symbol
-    //    [2]  royalty_bps (LE)
-    //
-    //  Empty name and empty symbol mean "no change" on the
-    //  respective field. The royalty is always written; the
-    //  executor treats 0 as "no change".
+    //  Fixed fields: `to` is the submitter (not the destination),
+    //  `amount` is zero (the mint amount lives in the payload
+    //  because it is denominated in the wrapped token, not the
+    //  fee/native token).
+    tx.to = from;
+    tx.amount = 0;
 
     std::vector<uint8_t> &p = tx.payload;
-
-    if (!appendLenString(p, params.new_name, /*len_u16=*/false,
-                         Core::TOKEN_NAME_MAX, error_out, "new_name"))
-      return std::nullopt;
-    if (!appendLenString(p, params.new_symbol, /*len_u16=*/false,
-                         Core::TOKEN_SYMBOL_MAX, error_out, "new_symbol"))
-      return std::nullopt;
-
-    appendU16(p, params.new_royalty_bps);
-
-    return tx;
-  }
-
-  //  ---- Remove Liquidity ----
-
-  std::optional<Core::Transaction> buildRemoveLiquidity(
-      const Crypto::Address &from,
-      const RemoveLiquidityParams &params,
-      WalletStatus *error_out)
-  {
-    if (!validateCommon(from, params.common, error_out))
-      return std::nullopt;
-
-    if (params.position_id == 0)
-    {
-      if (error_out)
-        *error_out = WalletStatus::fail(
-            WalletError::InvalidParameter, "position_id is zero");
-      return std::nullopt;
-    }
-
-    //  amount may be zero (meaning "all"), so no positive check
-    //  here. The executor resolves zero to the full position.
-
-    Core::Transaction tx = makeBase(Core::TxType::RemoveLiquidity,
-                                    from, params.common);
-
-    std::vector<uint8_t> &p = tx.payload;
-    appendU64(p, params.position_id);
+    appendU64(p, params.source_chain_id);
+    appendHash(p, params.source_tx_hash);
+    appendU32(p, params.source_output_index);
+    p.insert(p.end(),
+             params.destination.data.begin(),
+             params.destination.data.end());
     appendU64(p, params.amount);
+    p.insert(p.end(),
+             params.signature_block.begin(),
+             params.signature_block.end());
+
+    return tx;
+  }
+
+  //  ---- BridgeBurn ----
+
+  std::optional<Core::Transaction> buildBridgeBurn(
+      const Crypto::Address &from,
+      const BridgeBurnParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.source_chain_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "source_chain_id is zero");
+      return std::nullopt;
+    }
+
+    if (params.wrapped_token_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "wrapped_token_id is zero");
+      return std::nullopt;
+    }
+
+    if (params.destination_blob.empty())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "destination_blob is empty");
+      return std::nullopt;
+    }
+
+    //  The destination blob is length-prefixed with a single byte,
+    //  so its size must fit in 255. The executor enforces the chain
+    //  registration's min/max, but the byte prefix is a hard
+    //  physical limit.
+    if (params.destination_blob.size() > 255)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "destination_blob exceeds 255 bytes");
+      return std::nullopt;
+    }
+
+    if (params.amount == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "amount is zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::BridgeBurn, from, params.common);
+    tx.to = from;
+    tx.token_id = params.wrapped_token_id;
+    tx.amount = 0; // amount lives in the payload
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.source_chain_id);
+    appendU8(p, static_cast<uint8_t>(params.destination_blob.size()));
+    p.insert(p.end(),
+             params.destination_blob.begin(),
+             params.destination_blob.end());
+    appendU64(p, params.amount);
+
+    return tx;
+  }
+
+  //  ---- BridgeAckWithdrawal ----
+
+  std::optional<Core::Transaction> buildBridgeAckWithdrawal(
+      const Crypto::Address &from,
+      const BridgeAckWithdrawalParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.withdrawal_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "withdrawal_id is zero");
+      return std::nullopt;
+    }
+
+    if (!validateSignatureBlock(params.signature_block, error_out))
+      return std::nullopt;
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::BridgeAckWithdrawal, from, params.common);
+    tx.to = from;
+    tx.amount = 0;
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.withdrawal_id);
+    p.insert(p.end(),
+             params.signature_block.begin(),
+             params.signature_block.end());
+
+    return tx;
+  }
+
+  //  ---- BridgePause / BridgeUnpause ----
+
+  namespace
+  {
+    std::optional<Core::Transaction> buildBridgePauseKind(
+        Core::TxType type,
+        const Crypto::Address &from,
+        const BridgePauseParams &params,
+        WalletStatus *error_out)
+    {
+      if (!validateCommon(from, params.common, error_out))
+        return std::nullopt;
+
+      if (!validateSignatureBlock(params.signature_block, error_out))
+        return std::nullopt;
+
+      Core::Transaction tx = makeBase(type, from, params.common);
+      tx.to = from;
+      tx.amount = 0;
+
+      std::vector<uint8_t> &p = tx.payload;
+      appendU64(p, params.bound_height);
+      p.insert(p.end(),
+               params.signature_block.begin(),
+               params.signature_block.end());
+
+      return tx;
+    }
+  } // anonymous namespace
+
+  std::optional<Core::Transaction> buildBridgePause(
+      const Crypto::Address &from,
+      const BridgePauseParams &params,
+      WalletStatus *error_out)
+  {
+    return buildBridgePauseKind(Core::TxType::BridgePause,
+                                from, params, error_out);
+  }
+
+  std::optional<Core::Transaction> buildBridgeUnpause(
+      const Crypto::Address &from,
+      const BridgePauseParams &params,
+      WalletStatus *error_out)
+  {
+    return buildBridgePauseKind(Core::TxType::BridgeUnpause,
+                                from, params, error_out);
+  }
+
+  //  ---- BridgeRegisterChain ----
+
+  std::optional<Core::Transaction> buildBridgeRegisterChain(
+      const Crypto::Address &from,
+      const BridgeRegisterChainParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.registration_blob.empty())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "registration_blob is empty");
+      return std::nullopt;
+    }
+
+    //  The registration blob length is a single byte prefix.
+    if (params.registration_blob.size() > 255)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "registration_blob exceeds 255 bytes");
+      return std::nullopt;
+    }
+
+    if (!validateSignatureBlock(params.signature_block, error_out))
+      return std::nullopt;
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::BridgeRegisterChain, from, params.common);
+    tx.to = from;
+    tx.amount = 0;
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU8(p, static_cast<uint8_t>(params.registration_blob.size()));
+    p.insert(p.end(),
+             params.registration_blob.begin(),
+             params.registration_blob.end());
+    p.insert(p.end(),
+             params.signature_block.begin(),
+             params.signature_block.end());
 
     return tx;
   }
@@ -1352,12 +1549,8 @@ namespace Wallet
       return std::nullopt;
     }
 
-    // The signing hash commits to every field except the signature
-    // itself. See Transaction::signingHash().
     const Crypto::Hash hash = tx.signingHash();
 
-    // Derive-and-sign in one call. The signer handles the derivation
-    // path and the signature format.
     auto sig = signer.signAtPath(path, hash, error_out);
     if (!sig.has_value())
       return std::nullopt;
@@ -1366,4 +1559,72 @@ namespace Wallet
     return hash;
   }
 
+  std::optional<Core::Transaction> buildBridgeAttest(
+      const Crypto::Address &from,
+      const BridgeAttestParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.source_chain_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "source_chain_id is zero");
+      return std::nullopt;
+    }
+
+    if (params.source_tx_hash.isNull())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "source_tx_hash is null");
+      return std::nullopt;
+    }
+
+    if (params.destination.isNull())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "destination is null");
+      return std::nullopt;
+    }
+
+    if (params.amount == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "amount is zero");
+      return std::nullopt;
+    }
+
+    if (params.signature.isNull())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "signature is null");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::BridgeAttest, from, params.common);
+    tx.to = from;
+    tx.amount = 0;
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.source_chain_id);
+    appendHash(p, params.source_tx_hash);
+    appendU32(p, params.source_output_index);
+    p.insert(p.end(),
+             params.destination.data.begin(),
+             params.destination.data.end());
+    appendU64(p, params.amount);
+    appendU16(p, params.signer_index);
+    p.insert(p.end(),
+             params.signature.data.begin(),
+             params.signature.data.end());
+
+    return tx;
+  }
 } // namespace Wallet

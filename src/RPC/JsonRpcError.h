@@ -23,13 +23,15 @@ namespace Rpc
   //    -32000..-32099   Server-defined reserved (per spec)
   //    -32000            Reserved by us for "server" class errors
   //
-  //    1000..1299        Clarity application errors
+  //      1000..1299      Clarity application errors
   //      1000..1049      Transaction submission
   //      1050..1099      State lookup
   //      1100..1149      Chain lookup
-  //      1150..1199      Consensus / validator lookup
-  //      1200..1249      AMM / order lookup
-  //      1250..1299      Reserved
+  //      1050..1099      State lookup
+  //      1050..1060      Account, token, validator, pool, order,
+  //                      receipt, proof, NFT
+  //      1061..1070      Bridge
+  //      1071..1099      Reserved
   //
   //  Codes are stable forever. If a method gains a new failure mode,
   //  it gets a new code. Never reuse.
@@ -94,6 +96,17 @@ namespace Rpc
     ProofNotAvailable = 1058,
     NftNotFound = 1059,
     NftCollectionNotFound = 1060,
+
+    //  ---- Application: bridge (1061..1070) ----
+    //
+    //  Grouped with state lookup because they all read bridge state
+    //  that lives in the StateAccess. A future bridge-write error
+    //  block (submission rejection, etc.) would go after these.
+
+    BridgeChainNotRegistered = 1061,
+    BridgeWithdrawalNotFound = 1062,
+    BridgeWatcherNotFound = 1063,
+    BridgeReadInternal = 1064,
 
     // ---- Application: chain lookup (1100..1149) ----
 

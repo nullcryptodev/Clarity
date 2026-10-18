@@ -3,6 +3,7 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <gtest/gtest.h>
@@ -10,6 +11,7 @@
 #include "Tests/Utils.h"
 
 #include "Crypto/Ed25519.h"
+#include "Crypto/Keccak.h"
 #include "Crypto/Types.h"
 
 extern "C"
@@ -229,58 +231,84 @@ TEST(Crypto_Ed25519, VerifyRejectsWrongKey)
 
 TEST(Crypto_Ed25519Verify, RejectsNullPubkey)
 {
-    Crypto::SecretKey sk;
-    for (auto &b : sk.data)
-        b = 0x42;
-    auto kp = Crypto::generateKeyPairFromSeed(sk);
+  Crypto::SecretKey sk;
+  for (auto &b : sk.data)
+    b = 0x42;
+  auto kp = Crypto::generateKeyPairFromSeed(sk);
 
-    Crypto::Hash msg;
-    for (auto &b : msg.data)
-        b = 0x77;
-    auto sig = Crypto::sign(msg, kp.secretKey);
+  Crypto::Hash msg;
+  for (auto &b : msg.data)
+    b = 0x77;
+  auto sig = Crypto::sign(msg, kp.secretKey);
 
-    Crypto::PublicKey null_pk{};
-    EXPECT_FALSE(Crypto::verify(msg, null_pk, sig));
+  Crypto::PublicKey null_pk{};
+  EXPECT_FALSE(Crypto::verify(msg, null_pk, sig));
 }
 
 TEST(Crypto_Ed25519Verify, RejectsNullSignature)
 {
-    Crypto::SecretKey sk;
-    for (auto &b : sk.data)
-        b = 0x42;
-    auto kp = Crypto::generateKeyPairFromSeed(sk);
+  Crypto::SecretKey sk;
+  for (auto &b : sk.data)
+    b = 0x42;
+  auto kp = Crypto::generateKeyPairFromSeed(sk);
 
-    Crypto::Hash msg;
-    for (auto &b : msg.data)
-        b = 0x77;
+  Crypto::Hash msg;
+  for (auto &b : msg.data)
+    b = 0x77;
 
-    Crypto::Signature null_sig{};
-    EXPECT_FALSE(Crypto::verify(msg, kp.publicKey, null_sig));
+  Crypto::Signature null_sig{};
+  EXPECT_FALSE(Crypto::verify(msg, kp.publicKey, null_sig));
 }
 
 TEST(Crypto_Ed25519Verify, RejectsBothNull)
 {
-    Crypto::Hash msg;
-    for (auto &b : msg.data)
-        b = 0x77;
+  Crypto::Hash msg;
+  for (auto &b : msg.data)
+    b = 0x77;
 
-    Crypto::PublicKey null_pk{};
-    Crypto::Signature null_sig{};
-    EXPECT_FALSE(Crypto::verify(msg, null_pk, null_sig));
+  Crypto::PublicKey null_pk{};
+  Crypto::Signature null_sig{};
+  EXPECT_FALSE(Crypto::verify(msg, null_pk, null_sig));
 }
 
 TEST(Crypto_Ed25519Verify, StillAcceptsValidSignature)
 {
-    // Regression: the null checks must not break the valid path.
-    Crypto::SecretKey sk;
-    for (auto &b : sk.data)
-        b = 0x42;
-    auto kp = Crypto::generateKeyPairFromSeed(sk);
+  // Regression: the null checks must not break the valid path.
+  Crypto::SecretKey sk;
+  for (auto &b : sk.data)
+    b = 0x42;
+  auto kp = Crypto::generateKeyPairFromSeed(sk);
 
-    Crypto::Hash msg;
-    for (auto &b : msg.data)
-        b = 0x77;
-    auto sig = Crypto::sign(msg, kp.secretKey);
+  Crypto::Hash msg;
+  for (auto &b : msg.data)
+    b = 0x77;
+  auto sig = Crypto::sign(msg, kp.secretKey);
 
-    EXPECT_TRUE(Crypto::verify(msg, kp.publicKey, sig));
+  EXPECT_TRUE(Crypto::verify(msg, kp.publicKey, sig));
+}
+
+// ============================================================================
+//  Keccak padding — pins the variant cn_fast_hash depends on
+// ============================================================================
+//
+//  CCX's cn_fast_hash uses ORIGINAL Keccak padding (0x01), not NIST
+//  SHA3 padding (0x06). The empty-string digests differ:
+//
+//    Keccak-256("")  = c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470
+//    SHA3-256("")    = a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a
+//
+//  If this fails with the SHA3 digest, Crypto::keccak's default
+//  padding is 0x06 and the derivation shim must pass 0x01 explicitly.
+//  If it fails with neither, keccak itself is wrong and everything
+//  downstream is wrong.
+
+TEST(Crypto_Keccak, EmptyStringIsKeccak256NotSha3)
+{
+  uint8_t out[32];
+  Crypto::keccak(nullptr, 0, out, 32, 0x01);
+
+  EXPECT_EQ(toHex(out, 32),
+            "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+      << "cn_fast_hash uses original-Keccak padding (0x01), "
+         "not SHA3 padding (0x06)";
 }

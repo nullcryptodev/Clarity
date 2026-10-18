@@ -7,8 +7,12 @@
 
 #include "Core/Bridge/ConcealCCX.h"
 
+#include "Common/Base.h"
 #include "Common/Json.h"
 #include "Common/StringTools.h"
+#include "Common/Varint.h"
+
+#include "Crypto/Ed25519.h"
 
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -18,12 +22,15 @@
 #include <boost/beast/version.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <exception>
+#include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Bridge
@@ -34,71 +41,119 @@ namespace Bridge
   namespace net = boost::asio;
   using tcp = net::ip::tcp;
 
-  // ===========================================================================
-  // Constants
-  //
-  // The payment ID that identifies deposits to the bridge.
-  //
-  // A CCX payment ID is a caller-chosen 8-byte value attached to a
-  // transaction's extra field. Deposits to the bridge address are
-  // filtered on it; every deposit the bridge will mint has this
-  // exact payment ID. The value is ASCII "clrty-br":
-  //
-  // c l r t y - b r
-  // 63 6c 72 74 79 2d 62 72
-  //
-  // Chosen so it's obvious in a block explorer ("this is a Clarity
-  // bridge deposit") and doesn't collide with payment-ID namespaces
-  // used by exchanges or other services. Changing it would
-  // invalidate every previously-identified deposit; it's fixed for
-  // the lifetime of this deployment.
-  // ===========================================================================
-
   namespace
   {
     constexpr uint8_t CCX_BRIDGE_PAYMENT_ID[8] = {
         0x63, 0x6c, 0x72, 0x74, 0x79, 0x2d, 0x62, 0x72};
 
-    // Transaction extra tag for a payment ID (CryptoNote
-    // TX_EXTRA_TAG_PAYMENT_ID = 0x00).
     constexpr uint8_t TX_EXTRA_TAG_PAYMENT_ID = 0x00;
+    constexpr uint8_t TX_EXTRA_TAG_PUBKEY = 0x01;
+    constexpr uint8_t TX_EXTRA_TAG_NONCE = 0x02;
+    constexpr uint8_t TX_EXTRA_TAG_MERGE_MINING = 0x03;
+    constexpr uint8_t TX_EXTRA_TAG_ADDITIONAL_PUBKEYS = 0x04;
 
-    // Chunk size for the scan's batched block queries. conceald
-    // caps /get_raw_transactions_by_heights at BLOCK_LIST_MAX_COUNT
-    // (1000 in RpcServer.cpp); we use the same value so a scan
-    // never has to be rejected for being too large.
     constexpr uint32_t CCX_BLOCK_CHUNK_SIZE = 1000;
-
-    // Timeout for the two HTTP helpers below. Longer than
-    // RpcClient's default (5s) because a raw-transactions query
-    // over 1000 blocks can genuinely take a while on a busy node.
     constexpr int CCX_HTTP_TIMEOUT_SECONDS = 30;
 
-    // =======================================================================
-    // HTTP helpers — two shapes
-    //
-    // conceald exposes two HTTP surfaces that this adapter uses:
-    //
-    // JSON-RPC: POST to /, body:
-    // {"jsonrpc":"2.0","id":1,"method":"f_block_json","params":{...}}
-    //
-    // Raw: POST to /getinfo (etc.), body: {...params...}
-    //
-    // Wallet::RpcClient only speaks the first shape (its call
-    // hardcodes path="/" and wraps in the JSON-RPC envelope). The
-    // raw shape needs a different path per method, so it doesn't fit
-    // RpcClient's interface at all. Rather than growing RpcClient
-    // with a second mode — it's a wallet concern, not a bridge
-    // concern — the two helpers below duplicate ~80 lines of the
-    // transport setup. The alternative (a shared HTTP client library
-    // used by both) is more code than the duplication, so the
-    // duplication is the deliberate choice.
-    //
-    // Both helpers return std::nullopt on any failure; the caller
-    // is responsible for surfacing a specific error message (they
-    // have different error text for "reachable but returns garbage"
-    // vs "not reachable").
-    // =======================================================================
+    void dbg(const std::string &msg)
+    {
+      std::cerr << "[ccx] " << msg << "\n";
+    }
+
+    std::string hexPreview(const std::vector<uint8_t> &bytes,
+                           size_t max_bytes = 32)
+    {
+      static const char HEX[] = "0123456789abcdef";
+      std::string out;
+      out.reserve(std::min(bytes.size(), max_bytes) * 2 + 3);
+      const size_t n = std::min(bytes.size(), max_bytes);
+      for (size_t i = 0; i < n; ++i)
+      {
+        out.push_back(HEX[bytes[i] >> 4]);
+        out.push_back(HEX[bytes[i] & 0xF]);
+      }
+      if (bytes.size() > max_bytes)
+        out += "...";
+      return out;
+    }
+
+    bool parseHexBytes(const std::string &s, uint8_t *out, size_t out_len)
+    {
+      size_t i = 0;
+      if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+        i = 2;
+      if (s.size() - i != out_len * 2)
+        return false;
+      auto nib = [](char c) -> int
+      {
+        if (c >= '0' && c <= '9')
+          return c - '0';
+        if (c >= 'a' && c <= 'f')
+          return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+          return c - 'A' + 10;
+        return -1;
+      };
+      for (size_t j = 0; j < out_len; ++j)
+      {
+        const int hi = nib(s[i + j * 2]);
+        const int lo = nib(s[i + j * 2 + 1]);
+        if (hi < 0 || lo < 0)
+          return false;
+        out[j] = static_cast<uint8_t>((hi << 4) | lo);
+      }
+      return true;
+    }
+
+    bool jsonToBytes(const Common::Json &j, std::vector<uint8_t> &out)
+    {
+      out.clear();
+      if (j.is_array())
+      {
+        out.reserve(j.size());
+        for (const auto &b : j)
+        {
+          if (b.is_number_unsigned())
+            out.push_back(static_cast<uint8_t>(b.get<uint32_t>()));
+          else if (b.is_number_integer())
+            out.push_back(static_cast<uint8_t>(b.get<int>()));
+          else
+            return false;
+        }
+        return true;
+      }
+      if (j.is_string())
+      {
+        const std::string s = j.get<std::string>();
+        std::string cleaned = s;
+        if (cleaned.size() >= 2 && cleaned[0] == '0' &&
+            (cleaned[1] == 'x' || cleaned[1] == 'X'))
+          cleaned = cleaned.substr(2);
+        if ((cleaned.size() & 1) != 0)
+          return false;
+        out.reserve(cleaned.size() / 2);
+        auto nib = [](char c) -> int
+        {
+          if (c >= '0' && c <= '9')
+            return c - '0';
+          if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+          if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+          return -1;
+        };
+        for (size_t i = 0; i < cleaned.size(); i += 2)
+        {
+          const int hi = nib(cleaned[i]);
+          const int lo = nib(cleaned[i + 1]);
+          if (hi < 0 || lo < 0)
+            return false;
+          out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+        }
+        return true;
+      }
+      return false;
+    }
 
     Common::Json doHttpPost(const Wallet::RpcEndpoint &ep,
                             const std::string &path,
@@ -166,10 +221,6 @@ namespace Bridge
       }
     }
 
-    // JSON-RPC 2.0 POST to /. Envelopes the body and unwraps the
-    // result field on success; on a JSON-RPC error object,
-    // populates error_out with the error's message and returns
-    // nullopt.
     std::optional<Common::Json> jsonRpcCall(
         const Wallet::RpcEndpoint &ep,
         const std::string &method,
@@ -200,7 +251,6 @@ namespace Bridge
         return std::nullopt;
       }
 
-      // JSON-RPC error object.
       if (resp.contains("error") && !resp["error"].is_null())
       {
         const auto &err = resp["error"];
@@ -228,9 +278,6 @@ namespace Bridge
       return resp["result"];
     }
 
-    // Raw POST to a specific path. Caller is responsible for
-    // checking status on the response; the raw handlers
-    // communicate success in the body, not via HTTP codes.
     std::optional<Common::Json> rawCall(
         const Wallet::RpcEndpoint &ep,
         const std::string &path,
@@ -258,50 +305,178 @@ namespace Bridge
       return resp;
     }
 
-    // =======================================================================
-    // Payment-ID extraction
-    //
-    // A CCX transaction's extra field is a byte array of
-    // tag-length-value records. The payment-ID record is:
-    //
-    // [0x00] tag
-    // [0x00..0x08] (8 bytes, BE) payment ID
-    //
-    // Walk the extra bytes, find the tag, read the following 8
-    // bytes. If no record with tag 0x00 is present, the transaction
-    // has no payment ID and is not a bridge deposit.
-    //
-    // This is the standard CryptoNote layout; it hasn't changed in
-    // Conceal's fork. If a future hardfork changed the tag or the
-    // length, this function is the only place that would need
-    // updating.
-    // =======================================================================
-
     bool extractPaymentId(const std::vector<uint8_t> &extra,
                           std::vector<uint8_t> &out)
     {
       out.clear();
 
+      dbg("extractPaymentId: extra.size()=" + std::to_string(extra.size()) +
+          " preview=" + hexPreview(extra, 80));
+
+      size_t i = 0;
+      while (i < extra.size())
+      {
+        const uint8_t tag = extra[i];
+        dbg("extractPaymentId: tag=0x" + std::to_string(tag) +
+            " at offset " + std::to_string(i));
+        ++i;
+
+        if (tag == TX_EXTRA_TAG_PAYMENT_ID)
+        {
+          if (i + 8 > extra.size())
+          {
+            dbg("extractPaymentId: tag 0x00 but fewer than 8 bytes remain");
+            return false;
+          }
+          out.assign(extra.begin() + i, extra.begin() + i + 8);
+          dbg("extractPaymentId: found top-level payment ID " +
+              hexPreview(out));
+          return true;
+        }
+
+        if (tag == TX_EXTRA_TAG_PUBKEY)
+        {
+          if (i + 32 > extra.size())
+          {
+            dbg("extractPaymentId: tag 0x01 but fewer than 32 bytes remain");
+            return false;
+          }
+          dbg("extractPaymentId: skipping 32-byte tx pubkey");
+          i += 32;
+          continue;
+        }
+
+        if (tag == TX_EXTRA_TAG_NONCE)
+        {
+          if (i >= extra.size())
+          {
+            dbg("extractPaymentId: tag 0x02 but no length byte");
+            return false;
+          }
+
+          const uint8_t len = extra[i++];
+          dbg("extractPaymentId: nonce length=" + std::to_string(len));
+
+          if (i + len > extra.size())
+          {
+            dbg("extractPaymentId: nonce length exceeds remaining bytes");
+            return false;
+          }
+
+          const size_t nonce_start = i;
+          const size_t nonce_end = i + len;
+
+          size_t j = nonce_start;
+          while (j < nonce_end)
+          {
+            const uint8_t sub_tag = extra[j];
+            dbg("extractPaymentId: nonce sub_tag=0x" +
+                std::to_string(sub_tag) + " at offset " + std::to_string(j));
+            ++j;
+
+            if (sub_tag == TX_EXTRA_TAG_PAYMENT_ID)
+            {
+              if (j + 8 > nonce_end)
+              {
+                dbg("extractPaymentId: nonce payment ID shorter than 8 bytes");
+                return false;
+              }
+              out.assign(extra.begin() + j, extra.begin() + j + 8);
+              dbg("extractPaymentId: found nonce payment ID " +
+                  hexPreview(out));
+              return true;
+            }
+
+            if (j >= nonce_end)
+            {
+              dbg("extractPaymentId: sub_tag 0x" +
+                  std::to_string(sub_tag) + " with no length");
+              return false;
+            }
+            const uint8_t sub_len = extra[j++];
+            dbg("extractPaymentId: sub_tag 0x" +
+                std::to_string(sub_tag) + " length=" +
+                std::to_string(sub_len));
+            if (j + sub_len > nonce_end)
+            {
+              dbg("extractPaymentId: sub_tag length exceeds nonce data");
+              return false;
+            }
+            j += sub_len;
+          }
+
+          i = nonce_end;
+          continue;
+        }
+
+        if (tag == TX_EXTRA_TAG_MERGE_MINING ||
+            tag == TX_EXTRA_TAG_ADDITIONAL_PUBKEYS)
+        {
+          if (i >= extra.size())
+          {
+            dbg("extractPaymentId: tag 0x" + std::to_string(tag) +
+                " but no length byte");
+            return false;
+          }
+          const uint8_t len = extra[i++];
+          dbg("extractPaymentId: tag 0x" + std::to_string(tag) +
+              " length=" + std::to_string(len));
+          if (i + len > extra.size())
+          {
+            dbg("extractPaymentId: tag length exceeds remaining bytes");
+            return false;
+          }
+          i += len;
+          continue;
+        }
+
+        dbg("extractPaymentId: unknown tag 0x" + std::to_string(tag) +
+            " — abandoning parse");
+        return false;
+      }
+
+      dbg("extractPaymentId: exhausted extra without finding a payment ID");
+      return false;
+    }
+
+    bool paymentIdEquals(const uint8_t a[8], const uint8_t b[8])
+    {
+      return std::memcmp(a, b, 8) == 0;
+    }
+
+    bool extractTxPubkey(const std::vector<uint8_t> &extra,
+                         Crypto::PublicKey &out)
+    {
       size_t i = 0;
       while (i < extra.size())
       {
         const uint8_t tag = extra[i++];
 
+        if (tag == TX_EXTRA_TAG_PUBKEY)
+        {
+          if (i + 32 > extra.size())
+          {
+            dbg("extractTxPubkey: tag 0x01 but fewer than 32 bytes remain");
+            return false;
+          }
+          std::memcpy(out.data.data(), &extra[i], 32);
+          dbg("extractTxPubkey: found tx pubkey " +
+              hexPreview(std::vector<uint8_t>(
+                  out.data.begin(), out.data.end())));
+          return true;
+        }
+
         if (tag == TX_EXTRA_TAG_PAYMENT_ID)
         {
           if (i + 8 > extra.size())
             return false;
-          out.assign(extra.begin() + i, extra.begin() + i + 8);
-          return true;
+          i += 8;
+          continue;
         }
 
-        if (tag == 0x01)
-        {
-          //  Tag 0x01 (tx public key) is followed by 32 raw bytes,
-          //  no length prefix.
-          i += 32;
-        }
-        else if (tag == 0x02 || tag == 0x04)
+        if (tag == TX_EXTRA_TAG_NONCE ||
+            tag == TX_EXTRA_TAG_MERGE_MINING ||
+            tag == TX_EXTRA_TAG_ADDITIONAL_PUBKEYS)
         {
           if (i >= extra.size())
             return false;
@@ -309,159 +484,325 @@ namespace Bridge
           if (i + len > extra.size())
             return false;
           i += len;
+          continue;
         }
-        else
-        {
-          return false;
-        }
+
+        dbg("extractTxPubkey: unknown tag 0x" + std::to_string(tag) +
+            " — abandoning parse");
+        return false;
       }
+
+      dbg("extractTxPubkey: exhausted extra without finding a tx pubkey");
       return false;
     }
 
-    // Compare two 8-byte arrays for equality. Used for the payment
-    // ID match. Exposed because it's clearer than std::equal with
-    // raw pointers.
-    bool paymentIdEquals(const uint8_t a[8], const uint8_t b[8])
+    size_t writeVarint(uint8_t *out, size_t value)
     {
-      return std::memcmp(a, b, 8) == 0;
+      size_t n = 0;
+      do
+      {
+        uint8_t b = static_cast<uint8_t>(value & 0x7F);
+        value >>= 7;
+        if (value != 0)
+          b |= 0x80;
+        out[n++] = b;
+      } while (value != 0);
+      return n;
     }
-
-    // =======================================================================
-    // Deposit reference → ObservedDeposit
-    //
-    // The scan yields ObservedDeposit records. This helper fills
-    // one from the JSON that conceald returns.
-    // =======================================================================
 
     bool populateDepositFromJson(
         const Common::Json &tx,
         const std::vector<uint8_t> &payment_id,
+        const std::vector<uint8_t> &bridge_deposit_address,
+        const std::optional<Crypto::SecretKey> &custody_view_key,
+        const std::optional<Crypto::PublicKey> &custody_spend_pub,
         ObservedDeposit &out)
     {
-      if (payment_id.size() != 8)
-        return false;
-      if (!paymentIdEquals(payment_id.data(), CCX_BRIDGE_PAYMENT_ID))
-        return false;
+      dbg("populate: --- entering populateDepositFromJson ---");
 
-      // source_tx_hash.
-      if (!tx.contains("hash") || !tx["hash"].is_string())
-        return false;
-      const std::string hash_hex = tx["hash"].get<std::string>();
-      if (hash_hex.size() != 64)
-        return false;
-      auto nib = [](char c) -> int
+      if (payment_id.size() != 8)
       {
-        if (c >= '0' && c <= '9')
-          return c - '0';
-        if (c >= 'a' && c <= 'f')
-          return c - 'a' + 10;
-        if (c >= 'A' && c <= 'F')
-          return c - 'A' + 10;
-        return -1;
-      };
-      for (size_t i = 0; i < 32; ++i)
-      {
-        const int hi = nib(hash_hex[i * 2]);
-        const int lo = nib(hash_hex[i * 2 + 1]);
-        if (hi < 0 || lo < 0)
-          return false;
-        out.source_tx_hash.data[i] =
-            static_cast<uint8_t>((hi << 4) | lo);
+        dbg("populate: payment_id.size()=" +
+            std::to_string(payment_id.size()) + " (expected 8)");
+        return false;
       }
 
-      // source_output_index. conceald's raw-transactions response
-      // provides output_indexes (a parallel array to the
-      // transaction's outputs) — for the bridge there's exactly
-      // one relevant output index, but conceald represents this
-      // as a vector. We use the first index; the bridge address
-      // has one spendable output per deposit by construction.
-      //
-      // If output_indexes is missing or empty, we fall back to
-      // 0, which is the safe default (the executor's replay
-      // guard keys on (source_chain_id, tx_hash, index), and
-      // index 0 is what the bridge's own output-0 convention
-      // uses).
-      out.source_output_index = 0;
-      if (tx.contains("output_indexes") &&
-          tx["output_indexes"].is_array() &&
-          !tx["output_indexes"].empty())
+      if (!paymentIdEquals(payment_id.data(), CCX_BRIDGE_PAYMENT_ID))
       {
-        const auto &idxs = tx["output_indexes"];
-        if (idxs[0].is_number_unsigned())
-          out.source_output_index = idxs[0].get<uint32_t>();
-        else if (idxs[0].is_number_integer())
-          out.source_output_index =
-              static_cast<uint32_t>(idxs[0].get<int64_t>());
-        else if (idxs[0].is_string())
+        dbg("populate: payment ID mismatch (got " +
+            hexPreview(payment_id) + ", expected 636c7274792d6272)");
+        return false;
+      }
+      dbg("populate: payment ID matches CCX_BRIDGE_PAYMENT_ID");
+
+      if (bridge_deposit_address.size() != 64)
+      {
+        dbg("populate: bridge_deposit_address.size()=" +
+            std::to_string(bridge_deposit_address.size()) +
+            " (expected 64)");
+        return false;
+      }
+
+      dbg("populate: hash field check — contains=" +
+          std::string(tx.contains("hash") ? "yes" : "no") +
+          " is_string=" +
+          std::string(tx.contains("hash") && tx["hash"].is_string() ? "yes" : "no") +
+          " is_array=" +
+          std::string(tx.contains("hash") && tx["hash"].is_array() ? "yes" : "no"));
+
+      if (!tx.contains("hash"))
+      {
+        dbg("populate: no hash field");
+        return false;
+      }
+
+      if (tx["hash"].is_string())
+      {
+        const std::string hash_hex = tx["hash"].get<std::string>();
+        dbg("populate: hash string \"" + hash_hex + "\" (len " +
+            std::to_string(hash_hex.size()) + ")");
+        if (!parseHexBytes(hash_hex, out.source_tx_hash.data.data(),
+                           out.source_tx_hash.data.size()))
         {
-          // conceald emits numbers, but a string is possible if
-          // the RPC layer serializes 64-bit values as hex. Parse
-          // either form.
-          const std::string s = idxs[0].get<std::string>();
-          errno = 0;
-          char *end = nullptr;
-          const unsigned long v = std::strtoul(s.c_str(), &end, 0);
-          if (errno == 0 && end != s.c_str() && *end == '\0')
-            out.source_output_index = static_cast<uint32_t>(v);
+          dbg("populate: hash hex parse failed");
+          return false;
         }
       }
+      else if (tx["hash"].is_array())
+      {
+        const auto &arr = tx["hash"];
+        dbg("populate: hash is array, size=" + std::to_string(arr.size()));
+        if (arr.size() != 32)
+        {
+          dbg("populate: hash array size != 32");
+          return false;
+        }
+        for (size_t i = 0; i < 32; ++i)
+        {
+          if (arr[i].is_number_unsigned())
+            out.source_tx_hash.data[i] =
+                static_cast<uint8_t>(arr[i].get<uint32_t>());
+          else if (arr[i].is_number_integer())
+            out.source_tx_hash.data[i] =
+                static_cast<uint8_t>(arr[i].get<int>());
+          else
+          {
+            dbg("populate: hash array element not numeric");
+            return false;
+          }
+        }
+      }
+      else
+      {
+        dbg("populate: hash field is neither string nor array");
+        return false;
+      }
+      dbg("populate: source_tx_hash parsed ok");
 
-      // block_height.
+      dbg("populate: transaction field check — contains=" +
+          std::string(tx.contains("transaction") ? "yes" : "no") +
+          " is_object=" +
+          std::string(tx.contains("transaction") && tx["transaction"].is_object() ? "yes" : "no"));
+
+      if (!tx.contains("transaction") || !tx["transaction"].is_object())
+      {
+        dbg("populate: no transaction object");
+        return false;
+      }
+
+      dbg("populate: transaction.vout field check — contains=" +
+          std::string(tx["transaction"].contains("vout") ? "yes" : "no") +
+          " is_array=" +
+          std::string(tx["transaction"].contains("vout") && tx["transaction"]["vout"].is_array() ? "yes" : "no"));
+
+      if (!tx["transaction"].contains("vout") ||
+          !tx["transaction"]["vout"].is_array())
+      {
+        dbg("populate: vout is not an array");
+        return false;
+      }
+
+      const auto &outputs = tx["transaction"]["vout"];
+      dbg("populate: vout array size=" +
+          std::to_string(outputs.size()));
+
+      if (outputs.empty())
+      {
+        dbg("populate: vout array is empty");
+        return false;
+      }
+
+      const bool have_keys =
+          custody_view_key.has_value() && custody_spend_pub.has_value();
+
+      if (have_keys)
+      {
+        dbg("populate: using per-output derivation (view+spend configured)");
+
+        if (!tx["transaction"].contains("extra"))
+        {
+          dbg("populate: no transaction.extra — cannot derive");
+          return false;
+        }
+
+        std::vector<uint8_t> extra;
+        if (!jsonToBytes(tx["transaction"]["extra"], extra))
+        {
+          dbg("populate: extra could not be parsed as bytes");
+          return false;
+        }
+
+        Crypto::PublicKey tx_pub;
+        if (!extractTxPubkey(extra, tx_pub))
+        {
+          dbg("populate: no tx pubkey in extra — cannot derive");
+          return false;
+        }
+
+        Crypto::KeyDerivation derivation;
+        if (!Crypto::generateKeyDerivation(tx_pub, *custody_view_key,
+                                           derivation))
+        {
+          dbg("populate: generateKeyDerivation failed "
+              "(invalid tx pubkey or view key)");
+          return false;
+        }
+
+        bool found = false;
+        for (size_t i = 0; i < outputs.size(); ++i)
+        {
+          Crypto::PublicKey expected;
+          if (!Crypto::derivePublicKey(derivation, i,
+                                       *custody_spend_pub, expected))
+          {
+            dbg("populate: derivePublicKey failed at index " +
+                std::to_string(i));
+            continue;
+          }
+
+          const auto &o = outputs[i];
+          if (!o.is_object() ||
+              !o.contains("target") ||
+              !o["target"].is_object() ||
+              !o["target"].contains("data") ||
+              !o["target"]["data"].is_object() ||
+              !o["target"]["data"].contains("key"))
+          {
+            continue;
+          }
+
+          std::vector<uint8_t> onchain_key;
+          if (!jsonToBytes(o["target"]["data"]["key"], onchain_key))
+            continue;
+          if (onchain_key.size() != 32)
+            continue;
+
+          if (std::memcmp(onchain_key.data(),
+                          expected.data.data(), 32) != 0)
+            continue;
+
+          out.source_output_index = static_cast<uint32_t>(i);
+          if (o["amount"].is_number_unsigned())
+            out.amount_source_atomic = o["amount"].get<uint64_t>();
+          else if (o["amount"].is_number_integer())
+            out.amount_source_atomic = static_cast<uint64_t>(
+                o["amount"].get<int64_t>());
+          else
+          {
+            dbg("populate: matched vout[" + std::to_string(i) +
+                "] but amount is not numeric");
+            return false;
+          }
+
+          dbg("populate: matched vout[" + std::to_string(i) +
+              "] amount=" + std::to_string(out.amount_source_atomic));
+          found = true;
+          break;
+        }
+
+        if (!found)
+        {
+          dbg("populate: payment ID matched but no output pays to "
+              "the custody address — refusing to mint. Check that "
+              "the configured deposit address and view key match.");
+          return false;
+        }
+      }
+      else
+      {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+        {
+          std::cerr
+              << "[ccx] WARNING: custody view/spend keys not configured; "
+                 "using sum-of-outputs fallback. Minted amounts will be "
+                 "WRONG (sum of all vouts, not the deposit output). "
+                 "Configure --view-key-file and --bridge-address to fix.\n";
+        }
+
+        out.source_output_index = 0;
+        out.amount_source_atomic = 0;
+
+        for (size_t i = 0; i < outputs.size(); ++i)
+        {
+          const auto &o = outputs[i];
+          if (!o.is_object())
+            continue;
+          if (!o.contains("amount"))
+            continue;
+          if (o["amount"].is_number_unsigned())
+          {
+            out.amount_source_atomic += o["amount"].get<uint64_t>();
+          }
+          else if (o["amount"].is_number_integer())
+          {
+            out.amount_source_atomic += static_cast<uint64_t>(
+                o["amount"].get<int64_t>());
+          }
+        }
+
+        dbg("populate: sum-of-outputs total=" +
+            std::to_string(out.amount_source_atomic));
+      }
+
+      if (out.amount_source_atomic == 0)
+      {
+        dbg("populate: amount_source_atomic is 0");
+        return false;
+      }
+
+      dbg("populate: height field check — contains=" +
+          std::string(tx.contains("height") ? "yes" : "no") +
+          " is_number_unsigned=" +
+          std::string(tx.contains("height") && tx["height"].is_number_unsigned() ? "yes" : "no") +
+          " is_number_integer=" +
+          std::string(tx.contains("height") && tx["height"].is_number_integer() ? "yes" : "no"));
+
       if (tx.contains("height") && tx["height"].is_number_unsigned())
+      {
         out.block_height = tx["height"].get<uint64_t>();
+      }
       else if (tx.contains("height") && tx["height"].is_number_integer())
+      {
         out.block_height = static_cast<uint64_t>(
             tx["height"].get<int64_t>());
+      }
       else
+      {
+        dbg("populate: height field missing or wrong type");
         return false;
-
-      // amount. The raw-transactions response exposes the
-      // per-output amount in the transaction sub-object
-      // (tx.transaction.outputs[i].amount), or in the flat
-      // amount_out field on some conceald builds. Try both.
-      // For the bridge, output 0 is the deposit output.
-      bool have_amount = false;
-      if (tx.contains("amount_out") &&
-          tx["amount_out"].is_number_unsigned())
-      {
-        out.amount_source_atomic = tx["amount_out"].get<uint64_t>();
-        have_amount = true;
-      }
-      else if (tx.contains("transaction") &&
-               tx["transaction"].is_object() &&
-               tx["transaction"].contains("outputs") &&
-               tx["transaction"]["outputs"].is_array() &&
-               !tx["transaction"]["outputs"].empty())
-      {
-        const auto &first_out = tx["transaction"]["outputs"][0];
-        if (first_out.is_object() && first_out.contains("amount") &&
-            first_out["amount"].is_number_unsigned())
-        {
-          out.amount_source_atomic =
-              first_out["amount"].get<uint64_t>();
-          have_amount = true;
-        }
       }
 
-      if (!have_amount)
-        return false;
+      dbg("populate: block_height=" + std::to_string(out.block_height));
 
-      // deposit_blob: the CCX-side reference. Not consumed by the
-      // current bridge (the mint identifies the deposit by
-      // (tx_hash, output_index)), but the field is part of the
-      // interface and future-proofs the deposit record against a
-      // second adapter that needs extra context.
       out.deposit_blob.clear();
-
       out.source_chain_id = Core::CcxBridge::CCX_CHAIN_ID;
+
+      dbg("populate: SUCCESS — deposit populated");
       return true;
     }
 
   } // anonymous namespace
-
-  // ===========================================================================
-  // Identity
-  // ===========================================================================
 
   std::string CcxAdapter::name() const
   {
@@ -478,16 +819,8 @@ namespace Bridge
     return Core::CcxBridge::CCX_CHAIN_ID;
   }
 
-  // ===========================================================================
-  // Defaults
-  // ===========================================================================
-
   std::string CcxAdapter::default_rpc_endpoint() const
   {
-    // conceald's default RPC endpoint. The same default the
-    // wallet's startup wizard uses for the Clarity node (but a
-    // different port: 16000 is conceald's default RPC port;
-    // 9633 is the Clarity node's).
     return "127.0.0.1:16000";
   }
 
@@ -500,10 +833,6 @@ namespace Bridge
   {
     return Core::CcxBridge::CCX_SOURCE_DECIMALS;
   }
-
-  // ===========================================================================
-  // RPC
-  // ===========================================================================
 
   bool CcxAdapter::probe_rpc(Wallet::RpcClient &rpc,
                              std::string *error_out) const
@@ -553,10 +882,6 @@ namespace Bridge
       return out;
     }
 
-    // Bind a const ref once. Inside this block every field read
-    // is against j, which is the actual nlohmann::json, not the
-    // optional. That's the cleanest way to avoid the deref-per-line
-    // pattern.
     const Common::Json &j = *resp;
 
     if (j.contains("status") && j["status"].is_string() &&
@@ -582,21 +907,6 @@ namespace Bridge
     return out;
   }
 
-  // ===========================================================================
-  // Deposit scan
-  //
-  // Uses /get_raw_transactions_by_heights in chunks of
-  // CCX_BLOCK_CHUNK_SIZE blocks. The response contains, per
-  // transaction, the raw TransactionPrefix JSON (with extra as
-  // a byte array) which is where we find the payment ID.
-  //
-  // Alternative considered: f_block_json per block + a
-  // f_transaction_json per transaction. Rejected: it's O(txs)
-  // round trips instead of O(1), and a scan from genesis would
-  // be prohibitively slow. The batch call exists in conceald
-  // precisely for this use case.
-  // ===========================================================================
-
   void CcxAdapter::scan_deposits(
       Wallet::RpcClient &rpc,
       const Crypto::PublicKey & /*bridge_view_pubkey*/,
@@ -604,8 +914,25 @@ namespace Bridge
       uint64_t to_height,
       const std::function<bool(const ObservedDeposit &)> &on_deposit) const
   {
+    dbg("scan_deposits: from=" + std::to_string(from_height) +
+        " to=" + std::to_string(to_height) +
+        " bridge_addr_size=" + std::to_string(bridge_deposit_address_.size()) +
+        " have_custody_keys=" +
+        std::string(custody_view_key_.has_value() &&
+                            custody_spend_pub_.has_value()
+                        ? "yes"
+                        : "no"));
+
+    if (bridge_deposit_address_.size() != 64)
+      throw BridgeError(
+          "scan_deposits: bridge deposit address not set; call "
+          "set_deposit_address first");
+
     if (to_height < from_height)
+    {
+      dbg("scan_deposits: to < from, returning");
       return;
+    }
 
     const auto ep = rpc.endpoint();
 
@@ -615,12 +942,14 @@ namespace Bridge
       const uint64_t chunk_end =
           std::min<uint64_t>(cursor + CCX_BLOCK_CHUNK_SIZE - 1,
                              to_height);
+      dbg("scan_deposits: chunk [" + std::to_string(cursor) + ", " +
+          std::to_string(chunk_end) + "]");
 
       Common::Json params = Common::Json::object();
       params["range"] = true;
       Common::Json heights = Common::Json::array();
       heights.push_back(cursor);
-      heights.push_back(chunk_end + 1); // exclusive end (conceald's convention)
+      heights.push_back(chunk_end + 1);
       params["heights"] = heights;
       params["include_miner_txs"] = false;
 
@@ -630,14 +959,18 @@ namespace Bridge
 
       if (!resp.has_value())
       {
+        dbg("scan_deposits: rawCall failed: " + err);
         throw BridgeError(
             std::string("get_raw_transactions_by_heights failed on [") +
             std::to_string(cursor) + ", " + std::to_string(chunk_end) + "]: " + err);
       }
 
       if (!resp->is_object())
+      {
+        dbg("scan_deposits: response is not object");
         throw BridgeError(
             "get_raw_transactions_by_heights returned non-object");
+      }
 
       const Common::Json &j = *resp;
 
@@ -649,6 +982,7 @@ namespace Bridge
             j.contains("status") && j["status"].is_string()
                 ? j["status"].get<std::string>()
                 : std::string("(missing)");
+        dbg("scan_deposits: status not OK: " + status);
         throw BridgeError(
             "get_raw_transactions_by_heights status=" + status);
       }
@@ -656,46 +990,107 @@ namespace Bridge
       if (!j.contains("transactions") ||
           !j["transactions"].is_array())
       {
+        dbg("scan_deposits: response missing 'transactions' array");
         throw BridgeError(
             "get_raw_transactions_by_heights response missing "
             "'transactions'");
       }
 
+      dbg("scan_deposits: response has " +
+          std::to_string(j["transactions"].size()) + " transactions");
+
       for (const auto &tx : j["transactions"])
       {
-        if (!tx.is_object())
-          continue;
+        dbg("scan_deposits: --- transaction ---");
+        dbg("scan_deposits: tx keys=" +
+            std::string(tx.is_object() ? "object" : "not-object"));
 
-        // Extract payment ID from the transaction's extra.
-        // tx.transaction.extra is an array of byte values
-        // (0..255) in conceald's JSON encoder.
+        if (tx.is_object())
+        {
+          std::string keys;
+          for (auto it = tx.begin(); it != tx.end(); ++it)
+          {
+            if (!keys.empty())
+              keys += ", ";
+            keys += it.key();
+          }
+          dbg("scan_deposits: tx top-level keys: " + keys);
+
+          if (tx.contains("hash"))
+          {
+            const auto &h = tx["hash"];
+            if (h.is_string())
+              dbg("scan_deposits: tx.hash (string) = " +
+                  h.get<std::string>());
+            else if (h.is_array())
+            {
+              std::string hex;
+              static const char HEX[] = "0123456789abcdef";
+              for (const auto &b : h)
+              {
+                uint8_t v = 0;
+                if (b.is_number_unsigned())
+                  v = static_cast<uint8_t>(b.get<uint32_t>());
+                else if (b.is_number_integer())
+                  v = static_cast<uint8_t>(b.get<int>());
+                hex.push_back(HEX[v >> 4]);
+                hex.push_back(HEX[v & 0xF]);
+              }
+              dbg("scan_deposits: tx.hash (array) = " + hex);
+            }
+            else
+              dbg("scan_deposits: tx.hash (unknown type)");
+          }
+        }
+
         if (!tx.contains("transaction") ||
             !tx["transaction"].is_object() ||
-            !tx["transaction"].contains("extra") ||
-            !tx["transaction"]["extra"].is_array())
+            !tx["transaction"].contains("extra"))
+        {
+          dbg("scan_deposits: no transaction.extra — skipping");
           continue;
+        }
 
         std::vector<uint8_t> extra;
-        const auto &extra_arr = tx["transaction"]["extra"];
-        extra.reserve(extra_arr.size());
-        for (const auto &b : extra_arr)
+        if (!jsonToBytes(tx["transaction"]["extra"], extra))
         {
-          if (b.is_number_unsigned())
-            extra.push_back(static_cast<uint8_t>(b.get<uint32_t>()));
-          else if (b.is_number_integer())
-            extra.push_back(static_cast<uint8_t>(b.get<int>()));
+          dbg("scan_deposits: extra could not be parsed as bytes");
+          continue;
         }
+        dbg("scan_deposits: extra size=" +
+            std::to_string(extra.size()));
 
         std::vector<uint8_t> payment_id;
         if (!extractPaymentId(extra, payment_id))
+        {
+          dbg("scan_deposits: extractPaymentId returned false");
           continue;
+        }
+        dbg("scan_deposits: payment ID = " + hexPreview(payment_id));
 
         ObservedDeposit deposit;
-        if (!populateDepositFromJson(tx, payment_id, deposit))
+        if (!populateDepositFromJson(tx, payment_id,
+                                     bridge_deposit_address_,
+                                     custody_view_key_,
+                                     custody_spend_pub_,
+                                     deposit))
+        {
+          dbg("scan_deposits: populateDepositFromJson returned false");
           continue;
+        }
+
+        dbg("scan_deposits: deposit populated: "
+            "hash=" +
+            deposit.source_tx_hash.toString().substr(0, 16) +
+            "... index=" + std::to_string(deposit.source_output_index) +
+            " amount=" + std::to_string(deposit.amount_source_atomic) +
+            " height=" + std::to_string(deposit.block_height));
 
         if (!on_deposit(deposit))
-          return; // caller asked us to stop
+        {
+          dbg("scan_deposits: on_deposit returned false — stopping");
+          return;
+        }
       }
 
       if (chunk_end == to_height)
@@ -704,35 +1099,12 @@ namespace Bridge
     }
   }
 
-  // ===========================================================================
-  // Release submission
-  // ===========================================================================
-
   ReleaseSubmission CcxAdapter::submit_release(
       Wallet::RpcClient &rpc,
       const ReleaseRequest & /*request*/,
       uint64_t /*amount_source_atomic*/,
       const std::vector<uint8_t> & /*signature_block*/) const
   {
-    // Release submission is not implemented in v1 because the
-    // signing service that would produce signature_block is a
-    // separate process, out of scope for this batch. When it
-    // lands, this becomes:
-    //
-    // 1. Fetch the CCX-side inputs to spend (from the release
-    // custody address — outputs previously deposited by
-    // earlier releases).
-    // 2. Build a CCX transaction spending one or more of those
-    // inputs to request.destination_blob's address, with
-    // the fee and signature block that the signing service
-    // produced.
-    // 3. Serialize the transaction to hex.
-    // 4. POST {"tx_as_hex": "<hex>"} to /sendrawtransaction.
-    // 5. Return the response's tx hash and depth.
-    //
-    // The current stub returns ok=false with a clear reason.
-    // Callers (currently the scan loop's withdrawal-drain TODO)
-    // will surface the reason.
     ReleaseSubmission out;
     out.ok = false;
     out.reason =
@@ -742,23 +1114,11 @@ namespace Bridge
     return out;
   }
 
-  // ===========================================================================
-  // Conversion
-  //
-  // Source → clarity: floor(source / 10^(source_decimals - clarity_decimals)).
-  // With CCX's 6 and Clarity's 5, that's source / 10.
-  //
-  // Clarity → source: multiply by the same divisor. Exact — no
-  // rounding, because we're going from fewer decimals to more.
-  // ===========================================================================
-
   uint64_t CcxAdapter::to_clarity_atomic(uint64_t amount_source_atomic,
                                          uint8_t clarity_decimals) const
   {
     if (clarity_decimals >= Core::CcxBridge::CCX_SOURCE_DECIMALS)
     {
-      // Unusual configuration: clarity has at least as many
-      // decimals as CCX. The conversion is exact (multiply).
       const uint8_t diff =
           clarity_decimals - Core::CcxBridge::CCX_SOURCE_DECIMALS;
       uint64_t mul = 1;
@@ -797,28 +1157,144 @@ namespace Bridge
     return amount_clarity_atomic * mul;
   }
 
-  // ===========================================================================
-  // Destination validation
-  // ===========================================================================
-
   bool CcxAdapter::validate_destination(
       const std::vector<uint8_t> &destination_blob) const
   {
-    // Delegate to the CCX bridge's own codec. A valid destination
-    // is exactly 64 bytes (spend pubkey || view pubkey), and
-    // neither key is null. See Core/Bridge/ConcealCCX.h.
     Crypto::PublicKey spend, view;
     return Core::CcxBridge::decodeDestination(destination_blob,
                                               spend, view);
   }
 
-  // ===========================================================================
-  //  Static registration
-  //
-  //  Populates ChainAdapterRegistry with a single CcxAdapter
-  //  instance. Runs once at program startup (before main()),
-  //  via the static object's constructor.
-  // ===========================================================================
+  void CcxAdapter::set_deposit_address(
+      const std::vector<uint8_t> &blob)
+  {
+    if (blob.size() != Core::CcxBridge::CCX_DESTINATION_BYTES)
+    {
+      bridge_deposit_address_.clear();
+      custody_spend_pub_.reset();
+      return;
+    }
+
+    bridge_deposit_address_ = blob;
+
+    if (custody_view_key_.has_value())
+    {
+      Crypto::PublicKey sp;
+      std::memcpy(sp.data.data(), blob.data(), 32);
+      custody_spend_pub_ = sp;
+      dbg("set_deposit_address: spend_pub re-derived from address");
+    }
+  }
+
+  void CcxAdapter::set_deposit_ident_secret(
+      const Crypto::SecretKey &secret)
+  {
+    custody_view_key_ = secret;
+
+    if (bridge_deposit_address_.size() >= 32)
+    {
+      Crypto::PublicKey sp;
+      std::memcpy(sp.data.data(), bridge_deposit_address_.data(), 32);
+      custody_spend_pub_ = sp;
+      dbg("set_deposit_ident_secret: view key set; spend_pub derived "
+          "from address: " +
+          sp.toString().substr(0, 16) + "...");
+    }
+    else
+    {
+      custody_spend_pub_.reset();
+      dbg("set_deposit_ident_secret: WARNING — no bridge address set, "
+          "derivation path inactive until set_deposit_address is called");
+    }
+  }
+
+  std::optional<std::vector<uint8_t>>
+  CcxAdapter::parse_deposit_address(const std::string &base58_address,
+                                    std::string *error_out) const
+  {
+    if (base58_address.empty())
+    {
+      if (error_out)
+        *error_out = "empty bridge address";
+      return std::nullopt;
+    }
+
+    std::string decoded_str;
+    if (!Common::decodeBase58(std::string_view(base58_address),
+                              decoded_str))
+    {
+      if (error_out)
+        *error_out = "address is not valid base58";
+      return std::nullopt;
+    }
+
+    if (decoded_str.size() < 1 + 64 + 4)
+    {
+      if (error_out)
+        *error_out = "address is too short (" +
+                     std::to_string(decoded_str.size()) + " bytes)";
+      return std::nullopt;
+    }
+
+    const auto varint = Common::read_varint_from_string<uint64_t>(
+        std::string_view(decoded_str));
+    if (!varint.success())
+    {
+      if (error_out)
+        *error_out = "address has a malformed varint prefix: " +
+                     Common::VarintReadResult<uint64_t>::errorToString(
+                         varint.error);
+      return std::nullopt;
+    }
+
+    const size_t varint_len = varint.bytesRead;
+
+    if (decoded_str.size() != varint_len + 68)
+    {
+      if (error_out)
+        *error_out = "address has unexpected length (" +
+                     std::to_string(decoded_str.size()) + " bytes; expected " +
+                     std::to_string(varint_len + 68) + ")";
+      return std::nullopt;
+    }
+
+    const auto *decoded =
+        reinterpret_cast<const uint8_t *>(decoded_str.data());
+
+    std::vector<uint8_t> out(
+        decoded + varint_len,
+        decoded + varint_len + 64);
+
+    bool all_zero = true;
+    for (uint8_t b : out)
+    {
+      if (b != 0)
+      {
+        all_zero = false;
+        break;
+      }
+    }
+    if (all_zero)
+    {
+      if (error_out)
+        *error_out = "bridge address decodes to all-zero pubkeys";
+      return std::nullopt;
+    }
+
+    return out;
+  }
+
+  bool CcxAdapter::validate_deposit_address(
+      const std::vector<uint8_t> &blob) const
+  {
+    if (blob.size() != Core::CcxBridge::CCX_DESTINATION_BYTES)
+      return false;
+
+    Crypto::PublicKey spend, view;
+    std::memcpy(spend.data.data(), blob.data(), 32);
+    std::memcpy(view.data.data(), blob.data() + 32, 32);
+    return !spend.isNull() && !view.isNull();
+  }
 
   namespace
   {
@@ -831,8 +1307,6 @@ namespace Bridge
       }
     };
 
-    //  The static object whose constructor does the registration.
-    //  The `[[maybe_unused]]` is for compilers.
     [[maybe_unused]] static CcxAdapterRegistrar g_ccx_registrar;
   } // anonymous namespace
 } // namespace Bridge

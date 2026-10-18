@@ -156,11 +156,11 @@ namespace Core
     //    LE32(source_output_index) || destination(32) ||
     //    LE64(amount)
     std::vector<uint8_t> encodeBridgeMintMessage(
-        uint64_t source_chain_id,
-        const Crypto::Hash &source_tx_hash,
-        uint32_t source_output_index,
-        const Crypto::Address &destination,
-        uint64_t amount)
+        uint64_t source_chain_id,           // 8 bytes LE
+        const Crypto::Hash &source_tx_hash, // 32 bytes
+        uint32_t source_output_index,       // 4 bytes LE
+        const Crypto::Address &destination, // 32 bytes
+        uint64_t amount)                    // 8 bytes LE
     {
       std::vector<uint8_t> out;
       out.reserve(8 + 32 + 4 + 32 + 8);
@@ -429,6 +429,10 @@ namespace Core
 
     case TxType::BridgeRegisterChain:
       receipt = executeBridgeRegisterChain(state, tx, ctx);
+      break;
+
+    case TxType::BridgeAttest:
+      receipt = executeBridgeAttest(state, tx, ctx);
       break;
 
     case TxType::RegisterBridgeWatcher:
@@ -3456,6 +3460,293 @@ namespace Core
 
     state.putBridgeChainRegistration(reg);
 
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  //  =========================================================================
+  //  Bridge — BridgeAttest
+  //  =========================================================================
+  //
+  //  Payload layout:
+  //    [8]  source_chain_id
+  //    [32] source_tx_hash
+  //    [4]  source_output_index
+  //    [32] destination_address
+  //    [8]  amount
+  //    [2]  signer_index (LE, position in sorted active watcher set)
+  //    [64] signature (ed25519 over the canonical mint message)
+  //
+  //  Total: 8 + 32 + 4 + 32 + 8 + 2 + 64 = 150 bytes, exact.
+  //
+  //  Each active watcher submits one BridgeAttest per deposit. The
+  //  transaction records the attestation in TBL_BRIDGE_ATTESTATIONS.
+  //  The submission assembler later reads the attestations back,
+  //  verifies that they form a quorum and agree on (destination,
+  //  amount), and assembles the [2] count || N*66 block that a
+  //  BridgeMint transaction carries.
+  //
+  //  The executor's job is to validate *one* attestation in
+  //  isolation:
+  //    - the bridge is not paused;
+  //    - the chain is registered and enabled;
+  //    - the deposit is not already consumed (minting already
+  //      happened; attesting to it is pointless);
+  //    - the signer_index is within the active watcher set;
+  //    - the resolved consensus key at ctx.current_height signs
+  //      the canonical message;
+  //    - no other attestation exists for the same (deposit,
+  //      validator_id) — resubmission is rejected;
+  //    - no other attestation exists for the same deposit with a
+  //      *different* (destination, amount) — this would be a
+  //      federation split and must not be silently recorded.
+  //
+  //  The last check is the important one. The executor does not
+  //  know which of two conflicting attestations is "the truth" —
+  //  both are signed by legitimate watchers. It refuses to record
+  //  the second, and the deposit never gets minted until the
+  //  federation resolves the conflict offline (a slash + a fresh
+  //  attestation, or a governance action). That's the correct
+  //  shape: silently picking one side would make the bridge a
+  //  silent authority over federation disputes.
+
+  Receipt TransactionExecutor::executeBridgeAttest(State::StateAccess &state,
+                                                   const Transaction &tx,
+                                                   const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    std::cerr << "[attest] ==== executeBridgeAttest ====\n";
+    std::cerr << "[attest] current_height=" << ctx.current_height
+              << " chain_id=" << ctx.chain_id << "\n";
+    std::cerr << "[attest] tx.from=" << tx.from.toString().substr(0, 16) << "\n";
+    std::cerr << "[attest] payload.size()=" << tx.payload.size() << "\n";
+
+    if (tx.payload.size() != 8 + 32 + 4 + 32 + 8 + 2 + 64)
+    {
+      std::cerr << "[attest] FAIL: payload size wrong\n";
+      return failure;
+    }
+
+    size_t off = 0;
+
+    uint64_t source_chain_id = 0;
+    for (int i = 0; i < 8; ++i)
+      source_chain_id |= uint64_t(tx.payload[off + i]) << (i * 8);
+    off += 8;
+
+    Crypto::Hash source_tx_hash;
+    std::memcpy(source_tx_hash.data.data(), tx.payload.data() + off, 32);
+    off += 32;
+
+    const uint32_t source_output_index = readU32At(tx.payload, off);
+    off += 4;
+
+    Crypto::Address destination;
+    std::memcpy(destination.data.data(), tx.payload.data() + off, 32);
+    off += 32;
+
+    const uint64_t amount = readU64At(tx.payload, off);
+    off += 8;
+
+    const uint16_t signer_index =
+        uint16_t(tx.payload[off]) | (uint16_t(tx.payload[off + 1]) << 8);
+    off += 2;
+
+    Crypto::Signature signature;
+    std::memcpy(signature.data.data(), tx.payload.data() + off, 64);
+    off += 64;
+
+    std::cerr << "[attest] parsed: chain=0x" << std::hex << source_chain_id << std::dec
+              << " tx_hash=" << source_tx_hash.toString().substr(0, 16)
+              << " out_idx=" << source_output_index
+              << " amount=" << amount
+              << " signer_idx=" << signer_index << "\n";
+    std::cerr << "[attest] dest(first 8B): ";
+    for (int i = 0; i < 8; ++i)
+      std::cerr << std::hex << (int)destination.data[i];
+    std::cerr << std::dec << "\n";
+
+    if (amount == 0)
+    {
+      std::cerr << "[attest] FAIL: amount==0\n";
+      return failure;
+    }
+    if (destination.isNull())
+    {
+      std::cerr << "[attest] FAIL: dest null\n";
+      return failure;
+    }
+
+    GlobalStateReader reader(state);
+    if (reader.bridgePaused())
+    {
+      std::cerr << "[attest] FAIL: bridge paused\n";
+      return failure;
+    }
+
+    Core::BridgeChainRegistration reg;
+    if (!state.getBridgeChainRegistration(source_chain_id, reg))
+    {
+      std::cerr << "[attest] FAIL: chain not registered\n";
+      return failure;
+    }
+    std::cerr << "[attest] reg: enabled=" << (reg.enabled ? 1 : 0)
+              << " active_watcher_min=" << reg.active_watcher_min
+              << " wrapped_token=" << reg.wrapped_token_id << "\n";
+    if (!reg.isWellFormed() || !reg.enabled)
+    {
+      std::cerr << "[attest] FAIL: reg malformed/disabled\n";
+      return failure;
+    }
+
+    uint64_t existing_mint_height = 0;
+    if (state.getBridgeConsumed(source_chain_id, source_tx_hash,
+                                source_output_index, existing_mint_height))
+    {
+      std::cerr << "[attest] FAIL: deposit already consumed at height "
+                << existing_mint_height << "\n";
+      return failure;
+    }
+
+    std::vector<Core::BridgeWatcherInfo> active;
+    state.forEachActiveBridgeWatcherForChain(
+        source_chain_id, ctx.current_height,
+        [&](const Core::BridgeWatcherInfo &w)
+        { active.push_back(w); });
+
+    std::cerr << "[attest] active set before sort (size=" << active.size() << "):\n";
+    for (const auto &w : active)
+    {
+      std::cerr << "[attest]   watcher.id=" << w.id
+                << " validator_id=" << w.validator_id
+                << " stake=" << w.stake
+                << " is_active=" << w.is_active << "\n";
+    }
+
+    std::sort(active.begin(), active.end(),
+              [](const Core::BridgeWatcherInfo &a, const Core::BridgeWatcherInfo &b)
+              { return a.id < b.id; });
+
+    std::cerr << "[attest] active set after sort:\n";
+    for (size_t i = 0; i < active.size(); ++i)
+    {
+      std::cerr << "[attest]   [" << i << "] watcher.id=" << active[i].id
+                << " validator_id=" << active[i].validator_id << "\n";
+    }
+
+    if (active.size() < reg.active_watcher_min)
+    {
+      std::cerr << "[attest] FAIL: active.size()=" << active.size()
+                << " < min=" << reg.active_watcher_min << "\n";
+      return failure;
+    }
+
+    if (signer_index >= active.size())
+    {
+      std::cerr << "[attest] FAIL: signer_index=" << signer_index
+                << " >= active.size()=" << active.size() << "\n";
+      return failure;
+    }
+
+    const Id validator_id = active[signer_index].validator_id;
+    std::cerr << "[attest] signer_index=" << signer_index
+              << " -> watcher.id=" << active[signer_index].id
+              << " validator_id=" << validator_id << "\n";
+
+    auto pk = state.validatorKeyAtHeight(validator_id, ctx.current_height);
+    if (!pk.has_value())
+    {
+      std::cerr << "[attest] FAIL: no consensus key for validator "
+                << validator_id << " at height " << ctx.current_height << "\n";
+      return failure;
+    }
+
+    std::cerr << "[attest] consensus pk (first 16B): ";
+    for (int i = 0; i < 16; ++i)
+      std::cerr << std::hex << (int)pk->data[i];
+    std::cerr << std::dec << "\n";
+
+    const std::vector<uint8_t> message = encodeBridgeMintMessage(
+        source_chain_id, source_tx_hash, source_output_index,
+        destination, amount);
+
+    std::cerr << "[attest] message size=" << message.size() << " hex: ";
+    for (size_t i = 0; i < message.size(); ++i)
+      std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)message[i];
+    std::cerr << std::dec << "\n";
+
+    const Crypto::Hash hash =
+        bridgeSigningHash("bmin", message.data(), message.size());
+
+    std::cerr << "[attest] signing hash=" << hash.toString() << "\n";
+
+    std::cerr << "[attest] sig (first 16B): ";
+    for (int i = 0; i < 16; ++i)
+      std::cerr << std::hex << (int)signature.data[i];
+    std::cerr << std::dec << "\n";
+
+    if (!Crypto::verify(hash, *pk, signature))
+    {
+      std::cerr << "[attest] FAIL: signature verification failed\n";
+      return failure;
+    }
+
+    std::cerr << "[attest] signature OK\n";
+
+    //  Duplicate check
+    {
+      Core::BridgeAttestation existing;
+      if (state.getBridgeAttestation(
+              source_chain_id, source_tx_hash, source_output_index,
+              validator_id, existing))
+      {
+        std::cerr << "[attest] FAIL: already attested by validator "
+                  << validator_id << "\n";
+        return failure;
+      }
+    }
+
+    //  Conflict check
+    bool has_conflict = false;
+    state.forEachBridgeAttestationForDeposit(
+        source_chain_id, source_tx_hash, source_output_index,
+        [&](uint64_t other_vid, const Core::BridgeAttestation &other) -> bool
+        {
+          if (other.destination != destination || other.amount != amount)
+          {
+            std::cerr << "[attest] CONFLICT: other validator=" << other_vid
+                      << " other.dest=" << other.destination.toString().substr(0, 16)
+                      << " other.amount=" << other.amount << "\n";
+            has_conflict = true;
+            return false;
+          }
+          return true;
+        });
+
+    if (has_conflict)
+    {
+      std::cerr << "[attest] FAIL: conflicting attestation\n";
+      return failure;
+    }
+
+    Core::BridgeAttestation attestation;
+    attestation.signer_index = signer_index;
+    attestation.signature = signature;
+    attestation.destination = destination;
+    attestation.amount = amount;
+    attestation.attested_at_height = ctx.current_height;
+
+    if (!attestation.isWellFormed())
+    {
+      std::cerr << "[attest] FAIL: attestation not well-formed\n";
+      return failure;
+    }
+
+    state.putBridgeAttestation(source_chain_id, source_tx_hash,
+                               source_output_index, validator_id,
+                               attestation);
+
+    std::cerr << "[attest] SUCCESS: recorded attestation\n";
     return {ReceiptStatus::Success, tx.fee};
   }
 

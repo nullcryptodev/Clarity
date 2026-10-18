@@ -195,6 +195,47 @@ namespace State
       for (int i = 0; i < 8; ++i)
         out[i] = uint8_t(from_height >> ((7 - i) * 8));
     }
+
+    //  Bridge-attestation key composition. The full 52-byte key is
+    //
+    //    [8]  source_chain_id (LE)
+    //    [32] source_tx_hash
+    //    [4]  source_output_index (LE)
+    //    [8]  validator_id (LE)
+    //
+    //  and the 44-byte prefix (everything except validator_id) is
+    //  what the per-deposit range scan seeks.
+
+    std::array<uint8_t, 52> bridgeAttestationKeyImpl(
+        uint64_t source_chain_id,
+        const Crypto::Hash &source_tx_hash,
+        uint32_t source_output_index,
+        uint64_t validator_id)
+    {
+      std::array<uint8_t, 52> key{};
+      for (int i = 0; i < 8; ++i)
+        key[i] = uint8_t(source_chain_id >> (i * 8));
+      std::memcpy(key.data() + 8, source_tx_hash.data.data(), 32);
+      for (int i = 0; i < 4; ++i)
+        key[40 + i] = uint8_t(source_output_index >> (i * 8));
+      for (int i = 0; i < 8; ++i)
+        key[44 + i] = uint8_t(validator_id >> (i * 8));
+      return key;
+    }
+
+    std::array<uint8_t, 44> bridgeAttestationPrefixImpl(
+        uint64_t source_chain_id,
+        const Crypto::Hash &source_tx_hash,
+        uint32_t source_output_index)
+    {
+      std::array<uint8_t, 44> prefix{};
+      for (int i = 0; i < 8; ++i)
+        prefix[i] = uint8_t(source_chain_id >> (i * 8));
+      std::memcpy(prefix.data() + 8, source_tx_hash.data.data(), 32);
+      for (int i = 0; i < 4; ++i)
+        prefix[40 + i] = uint8_t(source_output_index >> (i * 8));
+      return prefix;
+    }
   } // anonymous namespace
 
   //  =========================================================================
@@ -2505,6 +2546,157 @@ namespace State
         [&](const Core::BridgeWatcherInfo &)
         { ++count; });
     return count;
+  }
+
+  //  ---- Attestations ----
+  //
+  //  Key layout (52 bytes):
+  //    [8]  source_chain_id (LE)
+  //    [32] source_tx_hash
+  //    [4]  source_output_index (LE)
+  //    [8]  validator_id (LE)
+  //
+  //  The 44-byte prefix (everything except validator_id) is what
+  //  the per-deposit range scan seeks.
+  //
+  //  Attestation records are NOT written into the SMT. They are
+  //  federation state — a per-deposit vote tally — and do not
+  //  affect any other transaction's validity. Storing them in the
+  //  key-value table (rather than the SMT) also means the state
+  //  root does not change when a watcher attests, which is what
+  //  makes attestations cheap to record and trivially prunable
+  //  once the deposit is minted.
+
+  std::array<uint8_t, 52> StateAccess::bridgeAttestationKey(
+      uint64_t source_chain_id,
+      const Crypto::Hash &source_tx_hash,
+      uint32_t source_output_index,
+      uint64_t validator_id)
+  {
+    return bridgeAttestationKeyImpl(
+        source_chain_id, source_tx_hash, source_output_index, validator_id);
+  }
+
+  void StateAccess::putBridgeAttestation(
+      uint64_t source_chain_id,
+      const Crypto::Hash &source_tx_hash,
+      uint32_t source_output_index,
+      uint64_t validator_id,
+      const Core::BridgeAttestation &attestation)
+  {
+    if (!attestation.isWellFormed())
+      throw StateDBError("putBridgeAttestation: malformed attestation");
+
+    const auto key = bridgeAttestationKeyImpl(
+        source_chain_id, source_tx_hash, source_output_index, validator_id);
+    const auto value = attestation.serializeState();
+    putBlobRow(StateDB::TBL_BRIDGE_ATTESTATIONS,
+               key.data(), key.size(),
+               value.data(), value.size());
+  }
+
+  bool StateAccess::getBridgeAttestation(
+      uint64_t source_chain_id,
+      const Crypto::Hash &source_tx_hash,
+      uint32_t source_output_index,
+      uint64_t validator_id,
+      Core::BridgeAttestation &out) const
+  {
+    const auto key = bridgeAttestationKeyImpl(
+        source_chain_id, source_tx_hash, source_output_index, validator_id);
+
+    std::vector<uint8_t> value;
+    if (!readRow(StateDB::TBL_BRIDGE_ATTESTATIONS,
+                 key.data(), key.size(), value))
+      return false;
+
+    return Core::BridgeAttestation::deserializeState(
+        value.data(), value.size(), out);
+  }
+
+  void StateAccess::forEachBridgeAttestationForDeposit(
+      uint64_t source_chain_id,
+      const Crypto::Hash &source_tx_hash,
+      uint32_t source_output_index,
+      const std::function<bool(uint64_t, const Core::BridgeAttestation &)> &fn) const
+  {
+    const auto prefix = bridgeAttestationPrefixImpl(
+        source_chain_id, source_tx_hash, source_output_index);
+    const std::vector<uint8_t> prefix_vec(prefix.begin(), prefix.end());
+
+    auto visitor = [&fn](const std::vector<uint8_t> &key,
+                         const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != 52)
+        return true;
+
+      uint64_t validator_id = 0;
+      for (int i = 0; i < 8; ++i)
+        validator_id |= uint64_t(key[44 + i]) << (i * 8);
+
+      Core::BridgeAttestation a;
+      if (!Core::BridgeAttestation::deserializeState(
+              value.data(), value.size(), a))
+        return true;
+
+      return fn(validator_id, a);
+    };
+
+    readForEachWithPrefix(StateDB::TBL_BRIDGE_ATTESTATIONS,
+                          prefix_vec, visitor);
+  }
+
+  size_t StateAccess::countBridgeAttestationsForDeposit(
+      uint64_t source_chain_id,
+      const Crypto::Hash &source_tx_hash,
+      uint32_t source_output_index) const
+  {
+    size_t count = 0;
+    forEachBridgeAttestationForDeposit(
+        source_chain_id, source_tx_hash, source_output_index,
+        [&](uint64_t, const Core::BridgeAttestation &) -> bool
+        {
+          ++count;
+          return true;
+        });
+    return count;
+  }
+
+  void StateAccess::forEachBridgeAttestation(
+      const std::function<bool(uint64_t, const Crypto::Hash &, uint32_t,
+                               uint64_t, const Core::BridgeAttestation &)> &fn) const
+  {
+    auto visitor = [&fn](const std::vector<uint8_t> &key,
+                         const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != 52)
+        return true;
+
+      uint64_t source_chain_id = 0;
+      for (int i = 0; i < 8; ++i)
+        source_chain_id |= uint64_t(key[i]) << (i * 8);
+
+      Crypto::Hash tx_hash;
+      std::memcpy(tx_hash.data.data(), key.data() + 8, 32);
+
+      uint32_t output_index = 0;
+      for (int i = 0; i < 4; ++i)
+        output_index |= uint32_t(key[40 + i]) << (i * 8);
+
+      uint64_t validator_id = 0;
+      for (int i = 0; i < 8; ++i)
+        validator_id |= uint64_t(key[44 + i]) << (i * 8);
+
+      Core::BridgeAttestation a;
+      if (!Core::BridgeAttestation::deserializeState(
+              value.data(), value.size(), a))
+        return true;
+
+      return fn(source_chain_id, tx_hash, output_index,
+                validator_id, a);
+    };
+
+    readForEach(StateDB::TBL_BRIDGE_ATTESTATIONS, visitor);
   }
 
   //  =========================================================================

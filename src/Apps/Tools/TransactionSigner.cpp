@@ -25,6 +25,34 @@
 //
 //    transaction_signer sign opt-out-staking --keystore <path> --fee <clrty> --nonce <n> [...]
 //
+//  Bridge:
+//
+//    transaction_signer sign bridge-mint --keystore <path> \
+//        --source-chain-id <n> --source-tx-hash <hex32> --output-index <n> \
+//        --destination <addr> --amount <clrty> --signature-block <hex> \
+//        --fee <clrty> --nonce <n> [...]
+//
+//    transaction_signer sign bridge-burn --keystore <path> \
+//        --source-chain-id <n> --wrapped-token-id <n> \
+//        --destination-blob <hex> --amount <clrty> \
+//        --fee <clrty> --nonce <n> [...]
+//
+//    transaction_signer sign bridge-ack --keystore <path> \
+//        --withdrawal-id <n> --signature-block <hex> \
+//        --fee <clrty> --nonce <n> [...]
+//
+//    transaction_signer sign bridge-pause --keystore <path> \
+//        --bound-height <n> --signature-block <hex> \
+//        --fee <clrty> --nonce <n> [...]
+//
+//    transaction_signer sign bridge-unpause --keystore <path> \
+//        --bound-height <n> --signature-block <hex> \
+//        --fee <clrty> --nonce <n> [...]
+//
+//    transaction_signer sign bridge-register-chain --keystore <path> \
+//        --registration-blob <hex> --signature-block <hex> \
+//        --fee <clrty> --nonce <n> [...]
+//
 //  Output discipline:
 //    stdout  — the raw hex (with --raw), or a summary (default).
 //    stderr  — prompts, warnings, errors, and the password input.
@@ -52,6 +80,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -68,6 +97,14 @@ namespace
     ClaimRewards,
     OptInStaking,
     OptOutStaking,
+
+    // Bridge
+    BridgeMint,
+    BridgeBurn,
+    BridgeAck,
+    BridgePause,
+    BridgeUnpause,
+    BridgeRegisterChain,
   };
 
   struct SignArgs
@@ -93,6 +130,35 @@ namespace
 
     // UpdateRewardAddress
     std::string new_address;
+
+    // ---- Bridge ----
+
+    // BridgeMint / BridgeBurn share source_chain_id.
+    uint64_t source_chain_id{0};
+
+    // BridgeMint
+    std::string source_tx_hash_hex;
+    uint32_t source_output_index{0};
+    std::string destination;          // bech32m address
+    std::string mint_signature_block; // hex
+
+    // BridgeBurn
+    uint64_t wrapped_token_id{0};
+    std::string destination_blob_hex;
+
+    // BridgeAck
+    uint64_t withdrawal_id{0};
+
+    // BridgePause / BridgeUnpause
+    uint64_t bound_height{0};
+
+    // BridgeRegisterChain
+    std::string registration_blob_hex;
+
+    // Signature block shared by all governance / attestation
+    // transactions. Stored once; used by whichever subcommand is
+    // active.
+    std::string signature_block_hex;
   };
 
   // ===========================================================================
@@ -116,12 +182,22 @@ namespace
     if (s == "opt-out-staking")
       return SignType::OptOutStaking;
 
+    if (s == "bridge-mint")
+      return SignType::BridgeMint;
+    if (s == "bridge-burn")
+      return SignType::BridgeBurn;
+    if (s == "bridge-ack")
+      return SignType::BridgeAck;
+    if (s == "bridge-pause")
+      return SignType::BridgePause;
+    if (s == "bridge-unpause")
+      return SignType::BridgeUnpause;
+    if (s == "bridge-register-chain")
+      return SignType::BridgeRegisterChain;
+
     throw std::runtime_error("unknown transaction type: " + s);
   }
 
-  //  Parse a CLRTY decimal amount into atomic units. Uses the
-  //  wallet's parser so we get consistent behavior with the rest of
-  //  the codebase.
   uint64_t parseAmountOrDie(const std::string &s, const char *flag)
   {
     auto v = Wallet::parseAmount(s);
@@ -134,7 +210,6 @@ namespace
     return *v;
   }
 
-  //  Parse a plain uint64 (nonce, token_id).
   uint64_t parseU64OrDie(const std::string &s, const char *flag)
   {
     if (s.empty())
@@ -148,6 +223,68 @@ namespace
           std::string(flag) + ": invalid integer '" + s + "'");
     }
     return static_cast<uint64_t>(v);
+  }
+
+  uint32_t parseU32OrDie(const std::string &s, const char *flag)
+  {
+    const uint64_t v = parseU64OrDie(s, flag);
+    if (v > 0xFFFFFFFFull)
+      throw std::runtime_error(std::string(flag) + ": value exceeds uint32");
+    return static_cast<uint32_t>(v);
+  }
+
+  //  Parse a hex string (with or without 0x prefix) into bytes.
+  std::vector<uint8_t> parseHexBytesOrDie(const std::string &s,
+                                          const char *flag)
+  {
+    size_t start = 0;
+    if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+      start = 2;
+
+    const size_t n = s.size() - start;
+    if (n == 0 || (n & 1) != 0)
+      throw std::runtime_error(
+          std::string(flag) + ": hex string must have an even number of "
+                              "digits after any 0x prefix");
+
+    auto nib = [](char c) -> int
+    {
+      if (c >= '0' && c <= '9')
+        return c - '0';
+      if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+      if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+      return -1;
+    };
+
+    std::vector<uint8_t> out;
+    out.reserve(n / 2);
+    for (size_t i = start; i < s.size(); i += 2)
+    {
+      const int hi = nib(s[i]);
+      const int lo = nib(s[i + 1]);
+      if (hi < 0 || lo < 0)
+        throw std::runtime_error(
+            std::string(flag) + ": contains non-hex characters");
+      out.push_back(static_cast<uint8_t>((hi << 4) | lo));
+    }
+    return out;
+  }
+
+  //  Parse a 32-byte hash. Accepts 64 hex chars, with or without 0x.
+  Crypto::Hash parseHashOrDie(const std::string &s, const char *flag)
+  {
+    auto bytes = parseHexBytesOrDie(s, flag);
+    if (bytes.size() != 32)
+    {
+      throw std::runtime_error(
+          std::string(flag) + ": expected 32 bytes (64 hex chars), got " +
+          std::to_string(bytes.size()) + " bytes");
+    }
+    Crypto::Hash h;
+    std::memcpy(h.data.data(), bytes.data(), 32);
+    return h;
   }
 
   // ===========================================================================
@@ -187,7 +324,6 @@ namespace
       }
       if (arg == "--password")
       {
-        // Explicitly rejected. See file header.
         throw std::runtime_error(
             "--password is not accepted; use --password-file or "
             "let the tool prompt");
@@ -250,6 +386,68 @@ namespace
         continue;
       }
 
+      //  ---- Bridge (shared) ----
+      if (arg == "--source-chain-id")
+      {
+        args.source_chain_id = parseU64OrDie(next(), "--source-chain-id");
+        continue;
+      }
+      if (arg == "--signature-block")
+      {
+        args.signature_block_hex = next();
+        continue;
+      }
+
+      //  ---- BridgeMint ----
+      if (arg == "--source-tx-hash")
+      {
+        args.source_tx_hash_hex = next();
+        continue;
+      }
+      if (arg == "--output-index")
+      {
+        args.source_output_index = parseU32OrDie(next(), "--output-index");
+        continue;
+      }
+      if (arg == "--destination")
+      {
+        args.destination = next();
+        continue;
+      }
+
+      //  ---- BridgeBurn ----
+      if (arg == "--wrapped-token-id")
+      {
+        args.wrapped_token_id = parseU64OrDie(next(), "--wrapped-token-id");
+        continue;
+      }
+      if (arg == "--destination-blob")
+      {
+        args.destination_blob_hex = next();
+        continue;
+      }
+
+      //  ---- BridgeAck ----
+      if (arg == "--withdrawal-id")
+      {
+        args.withdrawal_id = parseU64OrDie(next(), "--withdrawal-id");
+        continue;
+      }
+
+      //  ---- BridgePause / BridgeUnpause ----
+      if (arg == "--bound-height")
+      {
+        args.bound_height = parseU64OrDie(next(), "--bound-height");
+        continue;
+      }
+
+      //  ---- BridgeRegisterChain ----
+      if (arg == "--registration-blob")
+      {
+        args.registration_blob_hex = next();
+        continue;
+      }
+
       throw std::runtime_error("unknown argument: " + arg);
     }
 
@@ -261,8 +459,6 @@ namespace
     if (args.fee == 0)
       throw std::runtime_error("--fee is required and must be non-zero");
 
-    //  Per-type required args. This is where we catch "you forgot
-    //  --to" before opening the keystore.
     switch (args.type)
     {
     case SignType::Transfer:
@@ -288,7 +484,55 @@ namespace
     case SignType::ClaimRewards:
     case SignType::OptInStaking:
     case SignType::OptOutStaking:
-      // No type-specific required args.
+      break;
+
+    case SignType::BridgeMint:
+      if (args.source_chain_id == 0)
+        throw std::runtime_error("bridge-mint requires --source-chain-id");
+      if (args.source_tx_hash_hex.empty())
+        throw std::runtime_error("bridge-mint requires --source-tx-hash");
+      if (args.destination.empty())
+        throw std::runtime_error("bridge-mint requires --destination");
+      if (args.amount == 0)
+        throw std::runtime_error("bridge-mint requires --amount (non-zero)");
+      if (args.signature_block_hex.empty())
+        throw std::runtime_error("bridge-mint requires --signature-block");
+      break;
+
+    case SignType::BridgeBurn:
+      if (args.source_chain_id == 0)
+        throw std::runtime_error("bridge-burn requires --source-chain-id");
+      if (args.wrapped_token_id == 0)
+        throw std::runtime_error("bridge-burn requires --wrapped-token-id");
+      if (args.destination_blob_hex.empty())
+        throw std::runtime_error("bridge-burn requires --destination-blob");
+      if (args.amount == 0)
+        throw std::runtime_error("bridge-burn requires --amount (non-zero)");
+      break;
+
+    case SignType::BridgeAck:
+      if (args.withdrawal_id == 0)
+        throw std::runtime_error("bridge-ack requires --withdrawal-id");
+      if (args.signature_block_hex.empty())
+        throw std::runtime_error("bridge-ack requires --signature-block");
+      break;
+
+    case SignType::BridgePause:
+    case SignType::BridgeUnpause:
+      //  bound_height may be zero (a pause bound at height 0 is
+      //  unusual but valid). signature_block is required.
+      if (args.signature_block_hex.empty())
+        throw std::runtime_error(
+            "bridge-pause/bridge-unpause requires --signature-block");
+      break;
+
+    case SignType::BridgeRegisterChain:
+      if (args.registration_blob_hex.empty())
+        throw std::runtime_error(
+            "bridge-register-chain requires --registration-blob");
+      if (args.signature_block_hex.empty())
+        throw std::runtime_error(
+            "bridge-register-chain requires --signature-block");
       break;
     }
 
@@ -316,7 +560,6 @@ namespace
   //  Address parsing
   // ===========================================================================
 
-  //  Parse a bech32m address for the network the keystore is bound to.
   Crypto::Address parseAddressOrDie(const std::string &s,
                                     Wallet::Network network,
                                     const char *flag_name)
@@ -331,41 +574,17 @@ namespace
     return *addr;
   }
 
-  //  Parse a 64-character hex string into a Crypto::PublicKey.
-  //  Used for --node-key. Unlike addresses, this is raw hex, not
-  //  bech32m.
   Crypto::PublicKey parsePublicKeyHexOrDie(const std::string &s,
                                            const char *flag_name)
   {
-    if (s.size() != 64)
+    auto bytes = parseHexBytesOrDie(s, flag_name);
+    if (bytes.size() != 32)
     {
       throw std::runtime_error(
-          std::string(flag_name) + ": must be 64 hex characters (32 bytes)");
+          std::string(flag_name) + ": must be 32 bytes (64 hex chars)");
     }
-
-    auto nib = [](char c) -> int
-    {
-      if (c >= '0' && c <= '9')
-        return c - '0';
-      if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-      if (c >= 'A' && c <= 'F')
-        return c - 'A' + 10;
-      return -1;
-    };
-
     Crypto::PublicKey pk;
-    for (size_t i = 0; i < 32; ++i)
-    {
-      const int hi = nib(s[i * 2]);
-      const int lo = nib(s[i * 2 + 1]);
-      if (hi < 0 || lo < 0)
-      {
-        throw std::runtime_error(
-            std::string(flag_name) + ": contains non-hex characters");
-      }
-      pk.data[i] = static_cast<uint8_t>((hi << 4) | lo);
-    }
+    std::memcpy(pk.data.data(), bytes.data(), 32);
     return pk;
   }
 
@@ -434,6 +653,8 @@ namespace
               << " CLRTY\n";
     std::cout << "  nonce:     " << tx.nonce << "\n";
     std::cout << "  chain_id:  0x" << std::hex << tx.chain_id << std::dec << "\n";
+    if (!tx.payload.empty())
+      std::cout << "  payload:   " << tx.payload.size() << " bytes\n";
     std::cout << "  size:      " << tx.serializedSize() << " bytes\n";
     std::cout << "  txid:      0x" << signing_hash.toString() << "\n";
     std::cout << "\n";
@@ -462,6 +683,8 @@ namespace
               << " CLRTY\n";
     std::cout << "  nonce:     " << tx.nonce << "\n";
     std::cout << "  chain_id:  0x" << std::hex << tx.chain_id << std::dec << "\n";
+    if (!tx.payload.empty())
+      std::cout << "  payload:   " << tx.payload.size() << " bytes\n";
     std::cout << "  size:      " << tx.serializedSize() << " bytes\n";
     std::cout << "  signing hash:  0x" << tx.signingHash().toString() << "\n";
     std::cout << "\n";
@@ -585,6 +808,91 @@ namespace
       tx = Wallet::buildOptOutStaking(*from_addr, p, &st);
       break;
     }
+
+      // ---- Bridge ----
+
+    case SignType::BridgeMint:
+    {
+      Wallet::BridgeMintParams p;
+      p.common.chain_id = chain_id;
+      p.common.nonce = args.nonce;
+      p.common.fee = args.fee;
+      p.source_chain_id = args.source_chain_id;
+      p.source_tx_hash = parseHashOrDie(args.source_tx_hash_hex,
+                                        "--source-tx-hash");
+      p.source_output_index = args.source_output_index;
+      p.destination = parseAddressOrDie(args.destination, network,
+                                        "--destination");
+      p.amount = args.amount;
+      p.signature_block = parseHexBytesOrDie(args.signature_block_hex,
+                                             "--signature-block");
+      tx = Wallet::buildBridgeMint(*from_addr, p, &st);
+      break;
+    }
+    case SignType::BridgeBurn:
+    {
+      Wallet::BridgeBurnParams p;
+      p.common.chain_id = chain_id;
+      p.common.nonce = args.nonce;
+      p.common.fee = args.fee;
+      p.source_chain_id = args.source_chain_id;
+      p.wrapped_token_id =
+          static_cast<Id>(args.wrapped_token_id);
+      p.destination_blob = parseHexBytesOrDie(args.destination_blob_hex,
+                                              "--destination-blob");
+      p.amount = args.amount;
+      tx = Wallet::buildBridgeBurn(*from_addr, p, &st);
+      break;
+    }
+    case SignType::BridgeAck:
+    {
+      Wallet::BridgeAckWithdrawalParams p;
+      p.common.chain_id = chain_id;
+      p.common.nonce = args.nonce;
+      p.common.fee = args.fee;
+      p.withdrawal_id = args.withdrawal_id;
+      p.signature_block = parseHexBytesOrDie(args.signature_block_hex,
+                                             "--signature-block");
+      tx = Wallet::buildBridgeAckWithdrawal(*from_addr, p, &st);
+      break;
+    }
+    case SignType::BridgePause:
+    {
+      Wallet::BridgePauseParams p;
+      p.common.chain_id = chain_id;
+      p.common.nonce = args.nonce;
+      p.common.fee = args.fee;
+      p.bound_height = args.bound_height;
+      p.signature_block = parseHexBytesOrDie(args.signature_block_hex,
+                                             "--signature-block");
+      tx = Wallet::buildBridgePause(*from_addr, p, &st);
+      break;
+    }
+    case SignType::BridgeUnpause:
+    {
+      Wallet::BridgePauseParams p;
+      p.common.chain_id = chain_id;
+      p.common.nonce = args.nonce;
+      p.common.fee = args.fee;
+      p.bound_height = args.bound_height;
+      p.signature_block = parseHexBytesOrDie(args.signature_block_hex,
+                                             "--signature-block");
+      tx = Wallet::buildBridgeUnpause(*from_addr, p, &st);
+      break;
+    }
+    case SignType::BridgeRegisterChain:
+    {
+      Wallet::BridgeRegisterChainParams p;
+      p.common.chain_id = chain_id;
+      p.common.nonce = args.nonce;
+      p.common.fee = args.fee;
+      p.registration_blob = parseHexBytesOrDie(args.registration_blob_hex,
+                                               "--registration-blob");
+      p.signature_block = parseHexBytesOrDie(args.signature_block_hex,
+                                             "--signature-block");
+      tx = Wallet::buildBridgeRegisterChain(*from_addr, p, &st);
+      break;
+    }
     }
 
     if (!tx.has_value())
@@ -629,7 +937,7 @@ namespace
     std::cout
         << "Usage: transaction_signer sign <type> [options]\n"
         << "\n"
-        << "Types:\n"
+        << "Wallet types:\n"
         << "  transfer                 send CLRTY or a custom token\n"
         << "  register-validator       register this account as a validator\n"
         << "  unregister-validator     remove this account's validator\n"
@@ -637,6 +945,14 @@ namespace
         << "  claim-rewards            move pending rewards into balance\n"
         << "  opt-in-staking           enable auto-staking\n"
         << "  opt-out-staking          disable auto-staking\n"
+        << "\n"
+        << "Bridge types:\n"
+        << "  bridge-mint              mint wrapped tokens from a deposit\n"
+        << "  bridge-burn              burn wrapped tokens, enqueue withdrawal\n"
+        << "  bridge-ack               ack a released withdrawal\n"
+        << "  bridge-pause             pause the bridge (governance)\n"
+        << "  bridge-unpause           unpause the bridge (governance)\n"
+        << "  bridge-register-chain    register a new source chain\n"
         << "\n"
         << "Common options:\n"
         << "  --keystore <path>        encrypted keystore to sign with (required)\n"
@@ -646,10 +962,22 @@ namespace
         << "  --raw                    print only the hex on stdout\n"
         << "  --dry-run                show the transaction without signing\n"
         << "\n"
-        << "Type-specific options:\n"
+        << "Wallet-specific options:\n"
         << "  transfer:              --to <addr> --amount <clrty> [--token <id>]\n"
         << "  register-validator:    --stake <clrty> --node-key <hex>\n"
         << "  update-reward-address: --new-address <addr>\n"
+        << "\n"
+        << "Bridge-specific options:\n"
+        << "  bridge-mint:           --source-chain-id <n> --source-tx-hash <hex32>\n"
+        << "                         --output-index <n> --destination <addr>\n"
+        << "                         --amount <clrty> --signature-block <hex>\n"
+        << "  bridge-burn:           --source-chain-id <n> --wrapped-token-id <n>\n"
+        << "                         --destination-blob <hex> --amount <clrty>\n"
+        << "  bridge-ack:            --withdrawal-id <n> --signature-block <hex>\n"
+        << "  bridge-pause:          --bound-height <n> --signature-block <hex>\n"
+        << "  bridge-unpause:        --bound-height <n> --signature-block <hex>\n"
+        << "  bridge-register-chain: --registration-blob <hex>\n"
+        << "                         --signature-block <hex>\n"
         << "\n"
         << "The signed hex is printed on stdout. Submit it with:\n"
         << "  curl -s http://127.0.0.1:9633 -H 'Content-Type: application/json' \\\n"

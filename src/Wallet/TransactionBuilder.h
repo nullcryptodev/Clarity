@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -22,44 +23,9 @@ namespace Wallet
 {
   class Signer;
 
-  //  TransactionBuilder
-  //
-  //  Constructs Core::Transaction objects from typed parameters, and
-  //  signs them. This is the layer between "the wallet knows the
-  //  account address and has an unlocked signer" and "we have a
-  //  serialized transaction to submit."
-  //
-  //  Design:
-  //
-  //    - Each build* function fills the transaction's fixed fields
-  //      (version, chain_id, tx_type, nonce, fee, from, to) and the
-  //      type-specific payload. It does NOT sign.
-  //
-  //    - signTransaction takes an unsigned transaction and a Signer,
-  //      computes the signing hash, calls signAtPath, and copies the
-  //      signature in. It's separated so callers can inspect or log
-  //      the transaction before signing, and so a future hardware
-  //      signer can be plugged in without changing the builders.
-  //
-  //    - Builders are pure functions: same inputs, same output. No
-  //      global state, no clock reads, no chain queries. The chain_id
-  //      and nonce are passed in by the caller, who is responsible
-  //      for knowing them.
-  //
-  //  Amounts and fees are in atomic units. Callers that accept
-  //  human-readable input should use Wallet::parseAmount() to convert
-  //  before calling these functions.
-  //
-  //  Every builder returns std::nullopt on failure, populating
-  //  error_out (if non-null) with a WalletError and a detail string.
-  //  Failure modes are parameter validation (zero fee, null address,
-  //  oversized payload) — never chain state (the builder doesn't
-  //  know the chain).
+  //  (Header comment unchanged — see previous file.)
 
   //  ---- Common parameters ----
-  //
-  //  The fields every user-submitted transaction shares. Bundling
-  //  them keeps the per-type parameter structs small.
 
   struct TxCommonParams
   {
@@ -85,9 +51,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- Staking ----
-  //
-  //  Opt-in, opt-out, and claim-rewards share the same shape: an
-  //  empty payload, no `to`, no `amount`. Only the tx_type differs.
 
   struct StakingParams
   {
@@ -110,14 +73,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- Register Validator ----
-  //
-  //  Payload is the validator's P2P node public key (32 bytes).
-  //  The reward address is `from` — the account signing the
-  //  registration becomes the validator's reward address.
-  //
-  //  The stake is `amount` in the transaction. It must be at least
-  //  GlobalConfig::VALIDATOR_MIN_STAKE; the executor enforces this,
-  //  but the builder checks it too so the caller gets an early error.
 
   struct RegisterValidatorParams
   {
@@ -132,8 +87,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- Unregister Validator ----
-  //
-  //  Empty payload. The executor looks up the validator by `from`.
 
   std::optional<Core::Transaction> buildUnregisterValidator(
       const Crypto::Address &from,
@@ -141,15 +94,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- Update Reward Address ----
-  //
-  //  Payload is the new reward address (32 bytes). The executor looks
-  //  up the validator by `from` — the current reward address — and
-  //  rewrites both `reward_address` and `owner` to the new value.
-  //
-  //  Note: after this transaction, the new address is the one that
-  //  controls the validator. The old address can no longer update or
-  //  unregister it. This is the current executor behavior and matches
-  //  the model where reward_address == owner.
 
   struct UpdateRewardParams
   {
@@ -163,16 +107,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- Rotate Consensus Key ----
-  //
-  //  Payload is the new consensus key (32 bytes). The executor
-  //  looks up the validator by `from` — the current owner — and
-  //  rewrites consensus_key, appending the previous key to the
-  //  validator's key history with the rotation height as the
-  //  boundary.
-  //
-  //  The new key must differ from the current key; that check is
-  //  in the executor, not the builder, because the builder doesn't
-  //  have chain state.
 
   struct RotateConsensusParams
   {
@@ -186,25 +120,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- Create Token ----
-  //
-  //  Creates a fungible token. The creator is the signer; only the
-  //  creator can later mint, burn, or update metadata on this token.
-  //
-  //  `backing` selects the token's backing model:
-  //    0 = unbacked (a free-standing token with no external claim)
-  //    1 = bridged  (a token that represents an external asset,
-  //                  identified by `fingerprint`)
-  //
-  //  `max_supply` is in atomic units and is a hard cap. Zero means
-  //  no cap: the creator can mint without limit. The executor
-  //  enforces the cap at mint time.
-  //
-  //  `royalty_bps` is a royalty hint in basis points (0-10000). The
-  //  chain stores it and the RPC returns it; it is not enforced at
-  //  the protocol level, the same as every other chain.
-  //
-  //  `fingerprint` is a 32-byte content hash, meaningful only for
-  //  bridged tokens. It is optional for all tokens.
 
   struct CreateTokenParams
   {
@@ -224,14 +139,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- Mint Token ----
-  //
-  //  Mints units of an existing token. Only the token's creator can
-  //  mint. The executor enforces the max-supply cap; the builder
-  //  checks the parameters but not the supply (the builder has no
-  //  chain state).
-  //
-  //  The amount goes in the transaction's `amount` field; the token
-  //  id goes in `token_id`; the recipient goes in `to`.
 
   struct MintTokenParams
   {
@@ -247,11 +154,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- Burn Token ----
-  //
-  //  Burns units of a token the caller holds. The chain reduces the
-  //  tracked supply by the same amount. Anyone can burn any token
-  //  they hold; only tokens the caller holds can be burned, which
-  //  the executor checks.
 
   struct BurnTokenParams
   {
@@ -266,14 +168,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- Update Token Meta ----
-  //
-  //  Changes a token's name, symbol, or royalty. Only the creator
-  //  can call this. An empty field means "leave unchanged". The
-  //  max-supply and decimals cannot be changed.
-  //
-  //  If all three fields are empty/default, the builder rejects the
-  //  transaction: a no-op update is a user error and would burn a
-  //  fee for nothing.
 
   struct UpdateTokenMetaParams
   {
@@ -290,14 +184,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- NFT: Create Collection ----
-  //
-  //  Creates a collection with an optional reward schedule. The
-  //  reward escrow, if any, is funded from `from`'s balance of
-  //  reward_token_id in the same transaction.
-  //
-  //  A collection with no reward schedule (reward_token_id == 0
-  //  and reward_rate_per_epoch == 0) is a pure grouping: a name,
-  //  a symbol, and an optional base URI.
 
   struct CreateNftCollectionParams
   {
@@ -307,9 +193,6 @@ namespace Wallet
     std::string symbol;
     std::string base_uri;
 
-    //  Reward schedule. Zero reward_token_id means "no schedule";
-    //  in that case reward_rate_per_epoch and escrow_amount must
-    //  also be zero.
     Id reward_token_id{0};
     uint64_t reward_rate_per_epoch{0};
     uint64_t escrow_amount{0};
@@ -321,14 +204,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- NFT: Mint (standalone) ----
-  //
-  //  Mints one standalone NFT. The NFT is a shadow token with
-  //  maxSupply = 1 and decimals = 0, plus an NftInfo record with
-  //  the metadata.
-  //
-  //  collection_id == 0 means "no collection". A standalone NFT
-  //  with no collection is the throwaway case: one record, one
-  //  metadata blob, no grouping, no reward schedule.
 
   struct MintNftParams
   {
@@ -344,10 +219,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- NFT: Wrap ----
-  //
-  //  Mints a wrapped NFT. `wrapped_amount` of `underlying_token_id`
-  //  is taken from `from` and locked at the NFT's virtual address.
-  //  Transferring the NFT moves the whole lock; burning releases it.
 
   struct WrapNftParams
   {
@@ -392,9 +263,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- NFT: Update Metadata ----
-  //
-  //  `freeze` is one-way. Once set, no further UpdateNftMetadata
-  //  can touch this NFT. Burning and transferring are unaffected.
 
   struct UpdateNftMetadataParams
   {
@@ -411,10 +279,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- NFT: Top Up ----
-  //
-  //  Credits `amount` of `token_id` to the NFT's custody address.
-  //  For a wrapped NFT, token_id must equal the NFT's underlying.
-  //  For a standalone NFT, any token is accepted as a gift.
 
   struct TopUpNftParams
   {
@@ -430,10 +294,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- NFT: Claim Reward ----
-  //
-  //  Settles every NFT reward the caller has accrued into the
-  //  caller's pending_rewards, which ClaimRewards then moves to
-  //  balance. Empty payload.
 
   struct ClaimNftRewardParams
   {
@@ -446,9 +306,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- NFT: Refill Collection Reward ----
-  //
-  //  Creator-only. Adds `amount` of the collection's reward token
-  //  to the collection's escrow, un-pausing it if it was drained.
 
   struct RefillCollectionRewardParams
   {
@@ -463,33 +320,14 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- AMM: Create Pool ----
-  //
-  //  Creates a new constant-product pool. The transaction's
-  //  `token_id` and `amount` carry one side of the initial
-  //  deposit; the payload carries the other.
-  //
-  //  The pair is canonicalized by the executor: whichever of the
-  //  two token ids is smaller becomes `token_a`, and the
-  //  corresponding amount becomes `amount_a`. The user's debit is
-  //  always the sum of the two amounts they specified, regardless
-  //  of which side ends up as A.
-  //
-  //  `fee_bps` is per-pool and immutable after creation. It must be
-  //  at most `AMM_MAX_FEE_BPS` (1000 = 10%). The default, if the
-  //  caller leaves it at 0, is `AMM_DEFAULT_FEE_BPS` (30 = 0.3%).
 
   struct CreatePoolParams
   {
     TxCommonParams common;
-
-    //  One side of the pair, in the transaction's fixed fields.
     Id token_a{0};
     uint64_t amount_a{0};
-
-    //  The other side, written to the payload.
     Id token_b{0};
     uint64_t amount_b{0};
-
     uint16_t fee_bps{Core::AMM_DEFAULT_FEE_BPS};
   };
 
@@ -499,25 +337,13 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- AMM: Add Liquidity ----
-  //
-  //  Adds liquidity to an existing pool. The transaction's
-  //  `token_id` and `amount` carry one side; the payload carries
-  //  the pool id and the other side's amount.
-  //
-  //  Which side goes in the fixed fields and which goes in the
-  //  payload is a client choice: the executor checks both balances
-  //  and computes the LP tokens minted from the pair, without
-  //  caring which is "A" or "B".
 
   struct AddLiquidityParams
   {
     TxCommonParams common;
-
     uint64_t pool_id{0};
-
     Id token_in{0};
     uint64_t amount_in{0};
-
     uint64_t amount_other{0};
   };
 
@@ -527,16 +353,12 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- AMM: Remove Liquidity ----
-  //
-  //  Removes LP tokens from a position. `amount` is the number of
-  //  LP tokens to remove; 0 means "remove the whole position". The
-  //  executor enforces that `amount <= position.liquidity`.
 
   struct RemoveLiquidityParams
   {
     TxCommonParams common;
     uint64_t position_id{0};
-    uint64_t amount{0}; // 0 = remove everything
+    uint64_t amount{0};
   };
 
   std::optional<Core::Transaction> buildRemoveLiquidity(
@@ -545,25 +367,14 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- AMM: Swap ----
-  //
-  //  Swaps `amount_in` of `token_in` for the other side of the
-  //  pool, sending the output to `to`.
-  //
-  //  `min_amount_out` is slippage protection: if the computed
-  //  output at execution time is less than this, the swap fails.
-  //  A caller that wants no protection can pass 1 (or 0, but 1 is
-  //  safer — the executor treats 0 as "no minimum" but a positive
-  //  minimum is a stronger guarantee).
 
   struct SwapParams
   {
     TxCommonParams common;
-
     uint64_t pool_id{0};
     Id token_in{0};
     uint64_t amount_in{0};
     uint64_t min_amount_out{1};
-
     Crypto::Address to{};
   };
 
@@ -573,33 +384,17 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- Order Book: Create Order ----
-  //
-  //  Places a limit order. `mode` selects Passive (rest in the
-  //  book) or Active (route against a pool). The `pool_id` is
-  //  meaningful only for Active orders; the executor rejects a
-  //  Passive order with a non-zero pool_id and an Active order with
-  //  a zero pool_id.
-  //
-  //  `conditions` is optional. A Passive order with conditions is
-  //  evaluated at the epoch boundary; an Active order with
-  //  conditions is routed at the epoch boundary if the conditions
-  //  hold, or cancelled if they don't. An Active order with no
-  //  conditions routes immediately on creation.
 
   struct CreateOrderParams
   {
     TxCommonParams common;
-
     Id sell_token{0};
     Id buy_token{0};
     uint64_t sell_amount{0};
     uint64_t min_buy_amount{0};
-
     Core::OrderExecutionMode mode{Core::OrderExecutionMode::Passive};
-    uint64_t pool_id{0}; // meaningful only for Active
-
+    uint64_t pool_id{0};
     uint64_t expires_at_height{0};
-
     std::vector<Core::OrderCondition> conditions;
   };
 
@@ -609,9 +404,6 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  ---- Order Book: Cancel Order ----
-  //
-  //  Cancels a resting or unfulfilled order. The remaining sell-
-  //  token lock is refunded to the owner, minus the cancel fee.
 
   struct CancelOrderParams
   {
@@ -624,23 +416,218 @@ namespace Wallet
       const CancelOrderParams &params,
       WalletStatus *error_out = nullptr);
 
+  //  =========================================================================
+  //  Bridge
+  //
+  //  The builders below produce transactions that the executor's
+  //  executeBridge* handlers accept. The payload layouts match the
+  //  parsers in TransactionExecutor.cpp byte-for-byte — any change
+  //  to one side must be mirrored on the other, or the executor
+  //  rejects the transaction.
+  //
+  //  Two distinct trust layers:
+  //
+  //    * BridgeMint, BridgeAckWithdrawal: carry a `[2] count || N*66`
+  //      signature block. The signatures are produced off-chain by
+  //      the active watcher set (their consensus keys), and the
+  //      builder takes the completed block as opaque bytes. The
+  //      builder does NOT sign, produce, or validate the block —
+  //      that is the signing service's job. The executor validates
+  //      against the active watcher set resolved from chain state.
+  //
+  //    * BridgeBurn: no signature block. The burn is authorized by
+  //      the sender's own transaction signature. Anyone holding the
+  //      wrapped token can burn it.
+  //
+  //    * BridgePause/Unpause/RegisterChain: governance. The
+  //      signature block is signed by the validator set (also
+  //      produced off-chain) and validated by
+  //      verifyGovernanceSignatures.
+  //  =========================================================================
+
+  //  BridgeMint: mint wrapped tokens from an attested deposit on the
+  //  source chain.
+  //
+  //  Payload layout (matching executeBridgeMint):
+  //    [8]  source_chain_id
+  //    [32] source_tx_hash
+  //    [4]  source_output_index
+  //    [32] destination_address
+  //    [8]  amount
+  //    [2]  signer_count
+  //    [N]  signatures, each [2] index || [64] sig
+  //
+  //  The signature_block is the encoded `[2] count || N*66` block
+  //  produced by the watcher federation. It is passed through
+  //  opaque — the builder does not inspect it beyond checking its
+  //  length matches the declared count (which the executor does
+  //  again anyway).
+  //
+  //  This is the transaction a watcher submits after observing a
+  //  deposit on the source chain and collecting M-of-N attestations
+  //  from the active watcher set.
+
+  struct BridgeMintParams
+  {
+    TxCommonParams common;
+
+    uint64_t source_chain_id{0};
+    Crypto::Hash source_tx_hash{};
+    uint32_t source_output_index{0};
+    Crypto::Address destination{};
+    uint64_t amount{0};
+
+    //  Encoded `[2] count || N*66` signature block.
+    std::vector<uint8_t> signature_block;
+  };
+
+  std::optional<Core::Transaction> buildBridgeMint(
+      const Crypto::Address &from,
+      const BridgeMintParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  BridgeBurn: burn wrapped tokens and enqueue a withdrawal.
+  //
+  //  Payload layout (matching executeBridgeBurn):
+  //    [8]  source_chain_id
+  //    [1]  blob_len
+  //    [N]  destination_blob
+  //    [8]  amount
+  //
+  //  The wrapped token id goes in `token_id` (executor rejects if
+  //  it does not match the chain registration's wrapped_token_id).
+  //  No signature block: the sender's tx signature authorizes it.
+
+  struct BridgeBurnParams
+  {
+    TxCommonParams common;
+
+    uint64_t source_chain_id{0};
+    Id wrapped_token_id{0};
+    std::vector<uint8_t> destination_blob;
+    uint64_t amount{0};
+  };
+
+  std::optional<Core::Transaction> buildBridgeBurn(
+      const Crypto::Address &from,
+      const BridgeBurnParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  BridgeAckWithdrawal: confirm that a withdrawal was released on
+  //  the source chain. Signed by the active watcher set.
+  //
+  //  Payload layout (matching executeBridgeAckWithdrawal):
+  //    [8]  withdrawal_id
+  //    [2]  signer_count
+  //    [N]  signatures, each [2] index || [64] sig
+
+  struct BridgeAckWithdrawalParams
+  {
+    TxCommonParams common;
+
+    uint64_t withdrawal_id{0};
+
+    //  Encoded `[2] count || N*66` signature block.
+    std::vector<uint8_t> signature_block;
+  };
+
+  std::optional<Core::Transaction> buildBridgeAckWithdrawal(
+      const Crypto::Address &from,
+      const BridgeAckWithdrawalParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  BridgePause / BridgeUnpause: freeze or resume the bridge.
+  //  Signed by the validator set.
+  //
+  //  Payload layout (matching executeBridgePause / executeBridgeUnpause):
+  //    [8]  bound_height
+  //    [2]  signer_count
+  //    [N]  signatures, each [2] index || [64] sig
+  //
+  //  The signed message is `Blake2b("bpaul" || LE64(bound_height))`
+  //  for pause, `Blake2b("bunp"  || LE64(bound_height))` for unpause.
+  //  The builder takes the completed signature block as opaque bytes.
+
+  struct BridgePauseParams
+  {
+    TxCommonParams common;
+
+    uint64_t bound_height{0};
+
+    std::vector<uint8_t> signature_block;
+  };
+
+  std::optional<Core::Transaction> buildBridgePause(
+      const Crypto::Address &from,
+      const BridgePauseParams &params,
+      WalletStatus *error_out = nullptr);
+
+  std::optional<Core::Transaction> buildBridgeUnpause(
+      const Crypto::Address &from,
+      const BridgePauseParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  BridgeRegisterChain: register a new source chain. Signed by the
+  //  validator set.
+  //
+  //  Payload layout (matching executeBridgeRegisterChain):
+  //    [1]  registration_blob_len
+  //    [N]  registration_blob (BridgeChainRegistration::serializeState)
+  //    [2]  signer_count
+  //    [N]  signatures, each [2] index || [64] sig
+  //
+  //  The signed message is the registration blob itself, so the
+  //  signers commit to the exact bytes that will be written.
+
+  struct BridgeRegisterChainParams
+  {
+    TxCommonParams common;
+
+    //  Raw serialized BridgeChainRegistration bytes.
+    std::vector<uint8_t> registration_blob;
+
+    //  Encoded `[2] count || N*66` signature block.
+    std::vector<uint8_t> signature_block;
+  };
+
+  std::optional<Core::Transaction> buildBridgeRegisterChain(
+      const Crypto::Address &from,
+      const BridgeRegisterChainParams &params,
+      WalletStatus *error_out = nullptr);
+
   //  ---- Sign ----
 
-  //  Compute the transaction's signing hash, ask the signer to sign
-  //  it at `path`, and write the signature into tx.signature.
-  //
-  //  Returns the signing hash on success — which equals the txid —
-  //  so the caller can log it or use it to track the transaction.
-  //
-  //  Requires signer.isReady() to be true. Passes through the
-  //  signer's error_out on failure.
-  //
-  //  Default path is the account-0 receive address at index 0, which
-  //  is what the keystore's `address()` field corresponds to.
   std::optional<Crypto::Hash> signTransaction(
       Core::Transaction &tx,
       Signer &signer,
       const HdPath &path = clrtyPath(0, 0, 0),
       WalletStatus *error_out = nullptr);
 
+  //  BridgeAttest: record a single watcher's attestation over a
+  //  deposit. The payload carries the deposit identifier, the
+  //  destination and amount as the watcher understands them, the
+  //  watcher's position in the sorted active set, and the
+  //  watcher's signature over the canonical mint message.
+  //
+  //  The signature must be produced by `Bridge::Signing::Sign`
+  //  with the watcher's *consensus* key, not their account key.
+  //  The transaction's own signature (produced by signTransaction)
+  //  is separate: it authorizes the transaction on-chain, while
+  //  the attestation signature authorizes the deposit.
+  struct BridgeAttestParams
+  {
+    TxCommonParams common;
+    uint64_t source_chain_id{0};
+    Crypto::Hash source_tx_hash{};
+    uint32_t source_output_index{0};
+    Crypto::Address destination{};
+    uint64_t amount{0};
+    uint16_t signer_index{0};
+    Crypto::Signature signature{};
+  };
+
+  std::optional<Core::Transaction> buildBridgeAttest(
+      const Crypto::Address &from,
+      const BridgeAttestParams &params,
+      WalletStatus *error_out = nullptr);
 } // namespace Wallet

@@ -16,6 +16,7 @@
 #include "Core/Receipt.h"
 #include "Core/ValidatorTypes.h"
 #include "Core/NftTypes.h"
+#include "Core/BridgeTypes.h"
 
 namespace Rpc
 {
@@ -291,4 +292,17 @@ namespace Rpc
 
   Common::Json encodeNftCollection(const Core::NftCollection &collection,
                                    const std::string &hrp);
+
+  //  Bridge encoders. The JSON shape mirrors the C++ structs but
+  //  follows the same conventions as the rest of the RPC surface:
+  //  ids and amounts are 0x-prefixed hex strings, hashes are
+  //  0x-prefixed 64-char hex, and addresses are bech32m for the
+  //  node's network.
+  Common::Json encodeBridgeChainRegistration(
+      const Core::BridgeChainRegistration &reg,
+      const std::string &hrp);
+
+  Common::Json encodeBridgeWithdrawal(
+      const Core::BridgeWithdrawal &w,
+      const std::string &hrp);
 } // namespace Rpc

@@ -2860,6 +2860,15 @@ namespace Rpc
           "net_listening",
       });
 
+      out["bridge"] = makeArray({
+          "getBridgeChainRegistration",
+          "getBridgeConsumed",
+          "getBridgeWithdrawal",
+          "getActiveWatchers",
+          "getBridgeWatcherIdByAddress",
+          "getBridgeAttestations",
+      });
+
       return out;
     }
 
@@ -3047,7 +3056,339 @@ namespace Rpc
       out["trades"] = std::move(arr);
       return out;
     }
+
+    // =====================================================================
+    //  Bridge
+    //
+    //  Read-only accessors for bridge state. These are what the
+    //  watcher daemon calls to (a) discover whether a deposit has
+    //  already been minted, (b) read the chain registration before
+    //  submitting a mint, (c) enumerate pending withdrawals to ack,
+    //  and (d) resolve the active watcher set for the height at
+    //  which it needs to sign.
+    //
+    //  All of these are pure reads against StateAccess at the
+    //  current chain height. None of them mutate state.
+    // =====================================================================
+
+    Common::Json method_getBridgeChainRegistration(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const uint64_t source_chain_id =
+          requireU64(req.params, "source_chain_id");
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      Core::BridgeChainRegistration reg;
+      if (!state.getBridgeChainRegistration(source_chain_id, reg))
+      {
+        throw RpcMethodError(
+            ErrorCode::BridgeChainNotRegistered,
+            "no bridge registration for source_chain_id " +
+                encodeU64Hex(source_chain_id),
+            makeErrorData(ErrorCode::BridgeChainNotRegistered,
+                          {{"source_chain_id", encodeU64Hex(source_chain_id)}}));
+      }
+
+      return encodeBridgeChainRegistration(reg, hrpForNode(node));
+    }
+
+    Common::Json method_getBridgeConsumed(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const uint64_t source_chain_id =
+          requireU64(req.params, "source_chain_id");
+      const Crypto::Hash source_tx_hash =
+          requireHash(req.params, "source_tx_hash");
+      const uint64_t output_index_u64 =
+          requireU64(req.params, "source_output_index");
+      if (output_index_u64 > 0xFFFFFFFFull)
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "field 'source_output_index' exceeds uint32",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"field", "source_output_index"}}));
+      }
+      const uint32_t output_index = static_cast<uint32_t>(output_index_u64);
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      uint64_t mint_height = 0;
+      const bool consumed = state.getBridgeConsumed(
+          source_chain_id, source_tx_hash, output_index, mint_height);
+
+      Common::Json out = Common::Json::object();
+      out["consumed"] = consumed;
+      if (consumed)
+        putU64(out, "mint_height", mint_height);
+      return out;
+    }
+
+    Common::Json method_getBridgeWithdrawal(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const uint64_t withdrawal_id =
+          requireU64(req.params, "withdrawal_id");
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      Core::BridgeWithdrawal w;
+      if (!state.getBridgeWithdrawal(withdrawal_id, w))
+      {
+        throw RpcMethodError(
+            ErrorCode::BridgeWithdrawalNotFound,
+            "no bridge withdrawal with id " +
+                encodeU64Hex(withdrawal_id),
+            makeErrorData(ErrorCode::BridgeWithdrawalNotFound,
+                          {{"withdrawal_id", encodeU64Hex(withdrawal_id)}}));
+      }
+
+      return encodeBridgeWithdrawal(w, hrpForNode(node));
+    }
+
+    Common::Json method_getActiveWatchers(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const uint64_t source_chain_id =
+          requireU64(req.params, "source_chain_id");
+
+      //  height == 0 means "current chain height". Otherwise the
+      //  caller is asking for the active set as of a specific
+      //  height — same semantics the executor uses when it calls
+      //  forEachActiveBridgeWatcherForChain with ctx.current_height.
+      uint64_t height = node.chain().height();
+      if (auto v = optionalU64(req.params, "height"); v.has_value())
+      {
+        if (*v != 0)
+          height = *v;
+      }
+
+      const std::string hrp = hrpForNode(node);
+
+      State::StateAccess state(node.stateDB(), height);
+
+      Common::Json arr = Common::Json::array();
+
+      state.forEachActiveBridgeWatcherForChain(
+          source_chain_id, height,
+          [&](const Core::BridgeWatcherInfo &w)
+          {
+            Common::Json entry = Common::Json::object();
+            putU64(entry, "watcher_id", w.id);
+            putU64(entry, "validator_id", w.validator_id);
+            putU64(entry, "source_chain_id", w.source_chain_id);
+            putAddress(entry, "reward_address", w.reward_address, hrp);
+            putU64(entry, "stake", w.stake);
+            putU64(entry, "registered_at_height", w.registered_at_height);
+            entry["is_active"] = w.is_active;
+            arr.push_back(std::move(entry));
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "source_chain_id", source_chain_id);
+      putU64(out, "height", height);
+      putU64(out, "count", static_cast<uint64_t>(arr.size()));
+      out["watchers"] = std::move(arr);
+      return out;
+    }
+
+    Common::Json method_getBridgeWatcherIdByAddress(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const std::string hrp = hrpForNode(node);
+      const Crypto::Address address =
+          requireAddress(req.params, "address", hrp);
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      uint64_t watcher_id = 0;
+      if (!state.getBridgeWatcherIdByAddress(address, watcher_id))
+      {
+        throw RpcMethodError(
+            ErrorCode::BridgeWatcherNotFound,
+            "no bridge watcher registered for this address",
+            makeErrorData(ErrorCode::BridgeWatcherNotFound,
+                          {{"address", encodeAddress(address, hrp)}}));
+      }
+
+      //  Also fetch the full record so the caller can see the
+      //  validator id and source chain. If the owner-address index
+      //  exists but the record is gone (a state-consistency bug),
+      //  surface that as BridgeReadInternal rather than pretending
+      //  the watcher doesn't exist.
+      Core::BridgeWatcherInfo w;
+      if (!state.getBridgeWatcher(watcher_id, w))
+      {
+        throw RpcMethodError(
+            ErrorCode::BridgeReadInternal,
+            "watcher index references a missing record",
+            makeErrorData(ErrorCode::BridgeReadInternal,
+                          {{"watcher_id", encodeU64Hex(watcher_id)}}));
+      }
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "watcher_id", w.id);
+      putU64(out, "validator_id", w.validator_id);
+      putU64(out, "source_chain_id", w.source_chain_id);
+      putAddress(out, "reward_address", w.reward_address, hrp);
+      putU64(out, "stake", w.stake);
+      putU64(out, "registered_at_height", w.registered_at_height);
+      out["is_active"] = w.is_active;
+      return out;
+    }
+
+    Common::Json method_getBridgeAttestations(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      //  Two modes:
+      //    - Specific deposit: params contain source_chain_id,
+      //      source_tx_hash, source_output_index. Returns
+      //      attestations for that deposit.
+      //    - Full dump: params contain limit/offset (no deposit
+      //      fields). Returns a paged view of the whole table.
+      //
+      //  The single-deposit form is what the submission assembler
+      //  uses; the paged form is diagnostic.
+
+      const bool has_chain = req.params.contains("source_chain_id");
+      const bool has_tx = req.params.contains("source_tx_hash");
+      const bool has_index = req.params.contains("source_output_index");
+      const bool has_any_deposit_field = has_chain || has_tx || has_index;
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+      const std::string hrp = hrpForNode(node);
+
+      if (has_any_deposit_field)
+      {
+        if (!(has_chain && has_tx && has_index))
+        {
+          throw RpcMethodError(
+              ErrorCode::InvalidParams,
+              "either all three deposit fields must be present, or none",
+              makeErrorData(ErrorCode::InvalidParams,
+                            {{"fields", "source_chain_id, "
+                                        "source_tx_hash, "
+                                        "source_output_index"}}));
+        }
+
+        const uint64_t source_chain_id =
+            requireU64(req.params, "source_chain_id");
+        const Crypto::Hash source_tx_hash =
+            requireHash(req.params, "source_tx_hash");
+        const uint64_t output_index_u64 =
+            requireU64(req.params, "source_output_index");
+        if (output_index_u64 > 0xFFFFFFFFull)
+        {
+          throw RpcMethodError(
+              ErrorCode::InvalidParams,
+              "field 'source_output_index' exceeds uint32",
+              makeErrorData(ErrorCode::InvalidParams,
+                            {{"field", "source_output_index"}}));
+        }
+        const uint32_t output_index =
+            static_cast<uint32_t>(output_index_u64);
+
+        Common::Json arr = Common::Json::array();
+        state.forEachBridgeAttestationForDeposit(
+            source_chain_id, source_tx_hash, output_index,
+            [&](uint64_t validator_id,
+                const Core::BridgeAttestation &a) -> bool
+            {
+              Common::Json entry = Common::Json::object();
+              putU64(entry, "validator_id", validator_id);
+              putU64(entry, "signer_index", a.signer_index);
+              putAddress(entry, "destination", a.destination, hrp);
+              putU64(entry, "amount", a.amount);
+              putU64(entry, "attested_at_height", a.attested_at_height);
+              entry["signature"] = encodeBytesHex(
+                  std::vector<uint8_t>(a.signature.data.begin(),
+                                       a.signature.data.end()));
+              arr.push_back(std::move(entry));
+              return true;
+            });
+
+        Common::Json out = Common::Json::object();
+        putU64(out, "source_chain_id", source_chain_id);
+        putHash(out, "source_tx_hash", source_tx_hash);
+        putU64(out, "source_output_index", output_index);
+        putU64(out, "count", static_cast<uint64_t>(arr.size()));
+        out["attestations"] = std::move(arr);
+        return out;
+      }
+
+      //  Full dump, paged.
+      const PageParams page = parsePageParams(req.params);
+
+      Common::Json arr = Common::Json::array();
+      uint64_t seen = 0;
+      uint64_t emitted = 0;
+      uint64_t total = 0;
+
+      state.forEachBridgeAttestation(
+          [&](uint64_t source_chain_id,
+              const Crypto::Hash &source_tx_hash,
+              uint32_t output_index,
+              uint64_t validator_id,
+              const Core::BridgeAttestation &a) -> bool
+          {
+            ++total;
+            if (seen < page.offset)
+            {
+              ++seen;
+              return true;
+            }
+            if (emitted >= page.limit)
+              return true;
+
+            Common::Json entry = Common::Json::object();
+            putU64(entry, "source_chain_id", source_chain_id);
+            putHash(entry, "source_tx_hash", source_tx_hash);
+            putU64(entry, "source_output_index", output_index);
+            putU64(entry, "validator_id", validator_id);
+            putU64(entry, "signer_index", a.signer_index);
+            putAddress(entry, "destination", a.destination, hrp);
+            putU64(entry, "amount", a.amount);
+            putU64(entry, "attested_at_height", a.attested_at_height);
+            entry["signature"] = encodeBytesHex(
+                std::vector<uint8_t>(a.signature.data.begin(),
+                                     a.signature.data.end()));
+            arr.push_back(std::move(entry));
+            ++emitted;
+            return true;
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "count", emitted);
+      putU64(out, "offset", page.offset);
+      putU64(out, "limit", page.limit);
+      putU64(out, "total", total);
+      out["attestations"] = std::move(arr);
+      return out;
+    }
   } // anon namespace
+
+  void registerBridgeMethods(JsonRpcDispatcher &d)
+  {
+    d.registerMethod("getBridgeChainRegistration", method_getBridgeChainRegistration);
+    d.registerMethod("getBridgeConsumed", method_getBridgeConsumed);
+    d.registerMethod("getBridgeWithdrawal", method_getBridgeWithdrawal);
+    d.registerMethod("getActiveWatchers", method_getActiveWatchers);
+    d.registerMethod("getBridgeWatcherIdByAddress", method_getBridgeWatcherIdByAddress);
+    d.registerMethod("getBridgeAttestations", method_getBridgeAttestations);
+  }
 
   void registerAdminMethods(JsonRpcDispatcher &d)
   {

@@ -184,6 +184,78 @@ namespace Core
   static_assert(BridgeChainRegistration::STATE_SIZE == 55,
                 "BridgeChainRegistration state size mismatch");
 
+  //  A single watcher's attestation over a bridge deposit.
+  //
+  //  Produced on-chain by a BridgeAttest transaction and stored in
+  //  TBL_BRIDGE_ATTESTATIONS keyed by (source_chain_id,
+  //  source_tx_hash, source_output_index, validator_id). A BridgeMint
+  //  is valid iff a quorum of distinct active watchers has attested
+  //  to the same (destination, amount) pair for the same deposit.
+  //
+  //  The `destination` and `amount` are stored in the record because
+  //  the deposit does not exist as a first-class record until the
+  //  mint happens. Attestations are the only pre-mint record of what
+  //  watchers agreed the deposit was. The assembler validates that
+  //  all attestations for a single deposit agree on these two fields
+  //  before producing the mint's signature block; conflicting
+  //  attestations are a federation split and must not be silently
+  //  resolved.
+  struct BridgeAttestation
+  {
+    //  The watcher's position in the sorted active watcher set at
+    //  the height of the attestation. This is what goes into the
+    //  BridgeMint's signature block; it is captured here so the
+    //  block assembly is a pure function of what's in state.
+    uint16_t signer_index{0};
+
+    //  The watcher's signature over the canonical mint message
+    //  (see Bridge::Signing::EncodeBridgeMintMessage).
+    Crypto::Signature signature{};
+
+    //  The deposit's destination and amount, as the watcher
+    //  understood them.
+    Crypto::Address destination{};
+    uint64_t amount{0};
+
+    //  The height of the BridgeAttest transaction that created
+    //  this record. Used for the eventual slash path (a watcher
+    //  that attested to a nonexistent deposit is slashed) and
+    //  for the RPC response.
+    uint64_t attested_at_height{0};
+
+    bool isWellFormed() const noexcept
+    {
+      if (destination.isNull())
+        return false;
+      if (amount == 0)
+        return false;
+      if (signature.isNull())
+        return false;
+      if (attested_at_height == 0)
+        return false;
+      return true;
+    }
+
+    //  Layout (little-endian):
+    //    [2]  signer_index
+    //    [64] signature
+    //    [32] destination
+    //    [8]  amount
+    //    [8]  attested_at_height
+    //
+    //  Total: 2 + 64 + 32 + 8 + 8 = 114 bytes.
+    std::vector<uint8_t> serializeState() const;
+    static bool deserializeState(const uint8_t *data, size_t len,
+                                 BridgeAttestation &out);
+    static constexpr size_t STATE_SIZE = 2 + 64 + 32 + 8 + 8;
+
+    void serialize(Serialization::ISerializer &s);
+    void serialize(Serialization::ISerializer &s) const;
+  };
+
+  static_assert(BridgeAttestation::STATE_SIZE == 114,
+                "BridgeAttestation state size mismatch");
+
   //  ---- Outcome enums ----
   //
   //  These describe what went wrong on a specific bridge operation.
@@ -220,6 +292,23 @@ namespace Core
     DestinationTooShort = 7,
     DestinationTooLong = 8,
   };
+
+  enum class BridgeAttestStatus : uint8_t
+  {
+    Ok = 0,
+    Paused = 1,
+    ChainNotRegistered = 2,
+    ChainDisabled = 3,
+    PayloadMalformed = 4,
+    DepositAlreadyConsumed = 5,
+    SignerIndexOutOfRange = 6,
+    SignerNotActiveWatcher = 7,
+    BadSignature = 8,
+    AlreadyAttested = 9,
+    ConflictingAttestation = 10,
+  };
+
+  const char *bridgeAttestStatusName(BridgeAttestStatus s) noexcept;
 
   enum class BridgeAckStatus : uint8_t
   {

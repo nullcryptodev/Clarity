@@ -81,6 +81,14 @@ namespace Rpc
       return "NftNotFound";
     case ErrorCode::NftCollectionNotFound:
       return "NftCollectionNotFound";
+    case ErrorCode::BridgeChainNotRegistered:
+      return "BridgeChainNotRegistered";
+    case ErrorCode::BridgeWithdrawalNotFound:
+      return "BridgeWithdrawalNotFound";
+    case ErrorCode::BridgeWatcherNotFound:
+      return "BridgeWatcherNotFound";
+    case ErrorCode::BridgeReadInternal:
+      return "BridgeReadInternal";
 
     // ---- Chain ----
     case ErrorCode::BlockNotFound:
@@ -180,6 +188,14 @@ namespace Rpc
       return "NFT not found";
     case ErrorCode::NftCollectionNotFound:
       return "NFT collection not found";
+    case ErrorCode::BridgeChainNotRegistered:
+      return "No bridge registration for this source chain";
+    case ErrorCode::BridgeWithdrawalNotFound:
+      return "Bridge withdrawal not found";
+    case ErrorCode::BridgeWatcherNotFound:
+      return "No bridge watcher registered for this address";
+    case ErrorCode::BridgeReadInternal:
+      return "Bridge state read failed";
 
     case ErrorCode::BlockNotFound:
       return "Block not found";

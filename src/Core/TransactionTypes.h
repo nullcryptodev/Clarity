@@ -97,6 +97,17 @@ namespace Core
     //  set; never reuse)
     RegisterBridgeWatcher = 0x77,
     UnregisterBridgeWatcher = 0x78,
+    //  Per-watcher attestation over a bridge deposit. Each active
+    //  watcher submits one of these per deposit; the collection of
+    //  BridgeAttest transactions with a quorum of distinct
+    //  validator_ids is what makes a BridgeMint valid. See
+    //  executeBridgeAttest and Bridge::Signing for the producer
+    //  side, and Bridge::Submission's assembler for the consumer.
+    //
+    //  This is NOT a system transaction: it goes through the
+    //  standard pipeline (fee, nonce, signature), and is subject
+    //  to the same dry-run/apply invariants as everything else.
+    BridgeAttest = 0x79,
 
     //  ---- System (0xF0–0xFE) ----
     //
@@ -202,6 +213,8 @@ namespace Core
       return "register_bridge_watcher";
     case UnregisterBridgeWatcher:
       return "unregister_bridge_watcher";
+    case BridgeAttest:
+      return "bridge_attest";
     case BlockReward:
       return "block_reward";
     case OrderExpired:

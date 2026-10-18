@@ -206,6 +206,9 @@ namespace Core
     static Receipt executeBridgeRegisterChain(State::StateAccess &state,
                                               const Transaction &tx,
                                               const TxExecutionContext &ctx);
+    static Receipt executeBridgeAttest(State::StateAccess &state,
+                                       const Transaction &tx,
+                                       const TxExecutionContext &ctx);
     static Receipt executeRegisterBridgeWatcher(State::StateAccess &state,
                                                 const Transaction &tx,
                                                 const TxExecutionContext &ctx);

@@ -100,6 +100,8 @@ namespace State
       return "index_bridge_withdrawals_by_height";
     case TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER:
       return "index_bridge_watchers_by_owner";
+    case TBL_BRIDGE_ATTESTATIONS:
+      return "bridge_attestations";
     default:
       return "<unknown>";
     }

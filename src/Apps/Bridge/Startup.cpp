@@ -62,16 +62,6 @@ namespace Bridge
       return s.substr(b, e - b);
     }
 
-    std::string expandHome(const std::string &path)
-    {
-      if (path.empty() || path[0] != '~')
-        return path;
-      const char *home = std::getenv("HOME");
-      if (!home)
-        return path;
-      return std::string(home) + path.substr(1);
-    }
-
     void printRule()
     {
       std::cout << "───────────────────────────────────────────────\n";
@@ -225,7 +215,8 @@ namespace Bridge
       // session's default is 127.0.0.1:9633.
       session.clarity_endpoint.host = args.config.clarity_rpc_host;
       session.clarity_endpoint.port = args.config.clarity_rpc_port;
-
+      session.clarity_endpoint.user = args.config.clarity_rpc_user;
+      session.clarity_endpoint.password = args.config.clarity_rpc_password;
       session.clarity_rpc =
           std::make_unique<Wallet::RpcClient>(session.clarity_endpoint);
 
@@ -536,54 +527,6 @@ namespace Bridge
       std::cout << ". Use 'connect " << cfg.chain_short_name
                 << " <host:port>' later.\n";
       return false;
-    }
-  } // anonymous namespace
-
-  // ===========================================================================
-  // State directory
-  // ===========================================================================
-
-  namespace
-  {
-    bool ensureStateRoot(const std::string &path)
-    {
-      std::error_code ec;
-      if (fs::exists(path, ec))
-      {
-        if (!fs::is_directory(path, ec) || ec)
-        {
-          std::cerr << "error: state path exists but is not a directory: "
-                    << path << "\n";
-          return false;
-        }
-        return true;
-      }
-      fs::create_directories(path, ec);
-      if (ec)
-      {
-        std::cerr << "error: cannot create state dir " << path
-                  << ": " << ec.message() << "\n";
-        return false;
-      }
-      return true;
-    }
-
-    bool ensureChainStateDirs(const WatcherConfig &cfg)
-    {
-      for (const auto &c : cfg.chains)
-      {
-        const fs::path full =
-            fs::path(cfg.state_dir) / c.state_subdir;
-        std::error_code ec;
-        fs::create_directories(full, ec);
-        if (ec)
-        {
-          std::cerr << "error: cannot create chain state dir "
-                    << full.string() << ": " << ec.message() << "\n";
-          return false;
-        }
-      }
-      return true;
     }
   } // anonymous namespace
 
@@ -1116,4 +1059,54 @@ namespace Bridge
     return true;
   }
 
+  bool ensureStateRoot(const std::string &path)
+  {
+    std::error_code ec;
+    if (fs::exists(path, ec))
+    {
+      if (!fs::is_directory(path, ec) || ec)
+      {
+        std::cerr << "error: state path exists but is not a directory: "
+                  << path << "\n";
+        return false;
+      }
+      return true;
+    }
+    fs::create_directories(path, ec);
+    if (ec)
+    {
+      std::cerr << "error: cannot create state dir " << path
+                << ": " << ec.message() << "\n";
+      return false;
+    }
+    return true;
+  }
+
+  bool ensureChainStateDirs(const WatcherConfig &cfg)
+  {
+    for (const auto &c : cfg.chains)
+    {
+      const fs::path full =
+          fs::path(cfg.state_dir) / c.state_subdir;
+      std::error_code ec;
+      fs::create_directories(full, ec);
+      if (ec)
+      {
+        std::cerr << "error: cannot create chain state dir "
+                  << full.string() << ": " << ec.message() << "\n";
+        return false;
+      }
+    }
+    return true;
+  }
+
+  std::string expandHome(const std::string &path)
+  {
+    if (path.empty() || path[0] != '~')
+      return path;
+    const char *home = std::getenv("HOME");
+    if (!home)
+      return path;
+    return std::string(home) + path.substr(1);
+  }
 } // namespace Bridge

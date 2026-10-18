@@ -8,6 +8,7 @@
 #include "ChainAdapter.h"
 #include "WatcherConfig.h"
 
+#include "Common/Base.h"
 #include "Common/PasswordPrompt.h"
 #include "Common/StringTools.h"
 
@@ -24,9 +25,6 @@ namespace Bridge
 
   namespace
   {
-    // Report a WalletStatus failure on stderr. Same helper as
-    // Wallet::Session.cpp; duplicated because the Wallet namespace
-    // doesn't export it.
     void reportWalletError(const char *prefix, const Wallet::WalletStatus &st)
     {
       std::cerr << "error: " << prefix << ": ";
@@ -37,10 +35,6 @@ namespace Bridge
       std::cerr << "\n";
     }
 
-    // Parse a host:port string into the two fields. Used by
-    // ChainRuntime::reconnect (which is in the header but
-    // references this via free function), and by the wizard when
-    // the operator enters a custom endpoint.
     bool parseEndpointSpec(const std::string &spec,
                            std::string &host_out,
                            uint16_t &port_out)
@@ -64,10 +58,6 @@ namespace Bridge
       return true;
     }
   } // anonymous namespace
-
-  // ===========================================================================
-  // WatcherSession — accessors
-  // ===========================================================================
 
   ChainRuntime *WatcherSession::current() noexcept
   {
@@ -126,20 +116,17 @@ namespace Bridge
 
     const std::string short_name = adapter->short_name();
 
-    // Fill in any missing defaults. The wizard should have done
-    // this already, but enableChain is also called from the CLI
-    // path and from tests, so it's defensive.
     applyAdapterDefaults(*adapter, config);
 
     ChainRuntime rt;
     rt.adapter = std::move(adapter);
     rt.config = std::move(config);
+    rt.bridge_deposit_address = rt.config.bridge_deposit_address;
     rt.enabled = true;
-    rt.reconnect(); // creates rpc from config
+    rt.reconnect();
 
     auto [it, inserted] = chains.insert_or_assign(short_name, std::move(rt));
 
-    // If this is the first chain, select it as the current chain.
     if (current_chain.empty())
       current_chain = short_name;
 
@@ -149,7 +136,6 @@ namespace Bridge
   ChainRuntime *WatcherSession::enableChainByShortName(
       const std::string &short_name, bool replace_existing)
   {
-    // Reuse if already present and not replacing.
     if (!replace_existing)
     {
       auto existing = chains.find(short_name);
@@ -164,8 +150,6 @@ namespace Bridge
     ChainWatcherConfig cfg;
     cfg.chain_short_name = short_name;
     cfg.enabled = true;
-    // rpc_host / rpc_port / confirmation_depth are filled in by
-    // applyAdapterDefaults inside enableChain.
 
     return enableChain(std::move(adapter), std::move(cfg));
   }
@@ -198,9 +182,6 @@ namespace Bridge
 
   void WatcherSession::reset()
   {
-    // Close keystore first (locks it, nulls signer, etc.), then
-    // destroy the chain map (which drops the per-chain RPC
-    // clients), then the Clarity RPC.
     closeKeystore(*this);
 
     chains.clear();
@@ -211,11 +192,8 @@ namespace Bridge
     clarity_connected = false;
 
     running = true;
+    consensus_key.reset();
   }
-
-  // ===========================================================================
-  // Keystore open / close
-  // ===========================================================================
 
   bool openKeystore(WatcherSession &session,
                     const std::string &path,
@@ -236,7 +214,6 @@ namespace Bridge
       return false;
     }
 
-    // ---- Read the password ----
     std::string password;
     if (!password_file.empty())
     {
@@ -260,7 +237,6 @@ namespace Bridge
       password = *pw;
     }
 
-    // ---- Unlock ----
     const Wallet::WalletError err = (*ks)->unlock(password);
     if (!password.empty())
     {
@@ -276,7 +252,6 @@ namespace Bridge
       return false;
     }
 
-    // ---- Decode the address ----
     auto from_addr = Wallet::decodeAddress((*ks)->address(), (*ks)->network());
     if (!from_addr.has_value())
     {
@@ -285,7 +260,6 @@ namespace Bridge
       return false;
     }
 
-    // ---- Populate the session ----
     session.keystore_path = path;
     session.keystore = std::move(*ks);
     session.signer =
@@ -299,20 +273,10 @@ namespace Bridge
               << ") — " << Wallet::networkName(session.currentNetwork())
               << "\n";
 
-    // ---- Resolve watcher id, if possible ----
-    //
-    // The Clarity RPC may or may not expose getBridgeWatcherIdByAddress
-    // yet (see the Wallet::RpcClient header — it doesn't, as of
-    // this writing). resolveWatcherId probes for it and returns 0
-    // if it's absent. A zero result here is not an error: the
-    // operator may have supplied --watcher-id, or may be about to
-    // register the watcher, in which case the id is assigned at
-    // RegisterBridgeWatcher time and needs to be re-read from
-    // the node after that transaction is confirmed.
     if (session.watcher_id == 0 && session.clarity_rpc)
     {
       const uint64_t resolved =
-          resolveWatcherId(*session.clarity_rpc, *session.address);
+          resolveWatcherId(*session.clarity_rpc, *session.address, *session.network);
       if (resolved != 0)
       {
         session.watcher_id = resolved;
@@ -328,7 +292,6 @@ namespace Bridge
     if (!session.hasKeystore())
       return;
 
-    // Lock explicitly before releasing.
     session.keystore->lock();
 
     session.signer.reset();
@@ -342,53 +305,61 @@ namespace Bridge
     std::cout << "Keystore closed.\n";
   }
 
-  // ===========================================================================
-  // Watcher-id resolution
-  //
-  // The Clarity RPC method we want is getBridgeWatcherIdByAddress:
-  //
-  // send: { "address": <bech32m> }
-  // expect: { "watcher_id": "0x..." } on success
-  // error code 1055-ish (NotFound) on "not a watcher"
-  //
-  // Neither the method nor its error code exists in the current
-  // RpcClient surface. Rather than adding a call site against a
-  // method that would fail on every node, this function returns 0
-  // unconditionally and lets the caller fall back to --watcher-id
-  // or to the "operator runs RegisterBridgeWatcher and records
-  // the assigned id" flow.
-  //
-  // When the RPC method is added, this is a one-function change:
-  // add the method name, the parameter, the response parsing, and
-  // drop the stub.
-  // ===========================================================================
   uint64_t resolveWatcherId(Wallet::RpcClient &clarity_rpc,
-                            const Crypto::Address &address) noexcept
+                            const Crypto::Address &address,
+                            Wallet::Network network) noexcept
   {
-    (void)clarity_rpc;
-    (void)address;
+    try
+    {
+      const std::string bech32m = Wallet::encodeAddress(address, network);
+      if (bech32m.empty())
+        return 0;
 
-    // TODO: when getBridgeWatcherIdByAddress is exposed by the
-    // Clarity node, replace this body with the RPC call.
-    //
-    // try {
-    // Common::Json params = Common::Json::object();
-    // params["address"] = address_bech32m;
-    // auto res = clarity_rpc.call("getBridgeWatcherIdByAddress", params);
-    // if (!res.ok()) return 0;
-    // if (!res.result.is_object()) return 0;
-    // if (!res.result.contains("watcher_id")) return 0;
-    // // ... parse hex -> uint64
-    // } catch (...) {
-    // return 0;
-    // }
+      bool not_found = false;
+      std::string err;
+      auto res = Wallet::getBridgeWatcherIdByAddress(
+          clarity_rpc, bech32m, &not_found, &err);
 
-    return 0;
+      if (not_found)
+        return 0;
+      if (!res.has_value())
+        return 0;
+      if (!res->is_object())
+        return 0;
+      if (!res->contains("watcher_id"))
+        return 0;
+      if (!(*res)["watcher_id"].is_string())
+        return 0;
+
+      const std::string s = (*res)["watcher_id"].get<std::string>();
+      size_t i = 0;
+      if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+        i = 2;
+      if (i >= s.size())
+        return 0;
+
+      uint64_t v = 0;
+      for (; i < s.size(); ++i)
+      {
+        const char c = s[i];
+        int nib;
+        if (c >= '0' && c <= '9')
+          nib = c - '0';
+        else if (c >= 'a' && c <= 'f')
+          nib = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F')
+          nib = c - 'A' + 10;
+        else
+          return 0;
+        v = (v << 4) | static_cast<uint64_t>(nib);
+      }
+      return v;
+    }
+    catch (...)
+    {
+      return 0;
+    }
   }
-
-  // ===========================================================================
-  // Chain runtime helpers
-  // ===========================================================================
 
   bool probeChain(ChainRuntime &runtime)
   {
@@ -411,7 +382,6 @@ namespace Bridge
   void applyAdapterDefaults(ChainAdapter &adapter,
                             ChainWatcherConfig &config)
   {
-    // RPC host/port: parse the adapter's default endpoint.
     if (config.rpc_host.empty() || config.rpc_port == 0)
     {
       std::string host;
@@ -425,13 +395,9 @@ namespace Bridge
       }
     }
 
-    // Confirmation depth: use the adapter's default if zero.
     if (config.confirmation_depth == 0)
       config.confirmation_depth = adapter.default_confirmation_depth();
 
-    // State subdir: <state_dir>/<chain_short_name>/. The caller is
-    // responsible for creating it on disk (not here — this is a
-    // pure config function, no filesystem side effects).
     if (config.state_subdir.empty())
       config.state_subdir = "state/" + adapter.short_name();
   }

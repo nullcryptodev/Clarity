@@ -142,7 +142,17 @@ namespace State
       TBL_INDEX_NFTS_BY_OWNER = 39,
       TBL_INDEX_NFTS_BY_COLLECTION = 40,
 
-      TBL_COUNT = 41,
+      //  Per-watcher attestations over bridge deposits. Key =
+      //  source_chain_id (8 LE) || source_tx_hash (32) ||
+      //  source_output_index (4 LE) || validator_id (8 LE). Value =
+      //  serialized BridgeAttestation. Written by executeBridgeAttest;
+      //  read by the submission assembler to build a BridgeMint's
+      //  signature block. Not part of the state root: it is bridge
+      //  federation state, not per-account state, and it does not
+      //  affect any other transaction's validity.
+      TBL_BRIDGE_ATTESTATIONS = 41,
+
+      TBL_COUNT = 42,
     };
 
     //  Per-table diagnostic information. Reported by the metrics
