@@ -427,13 +427,14 @@ namespace Wallet
   //
   //  Two distinct trust layers:
   //
-  //    * BridgeMint, BridgeAckWithdrawal: carry a `[2] count || N*66`
-  //      signature block. The signatures are produced off-chain by
-  //      the active watcher set (their consensus keys), and the
-  //      builder takes the completed block as opaque bytes. The
-  //      builder does NOT sign, produce, or validate the block —
-  //      that is the signing service's job. The executor validates
-  //      against the active watcher set resolved from chain state.
+  //    * BridgeMint, BridgeAckWithdrawal, BridgeAckAttest: carry
+  //      watcher-produced signatures or signature blocks. The
+  //      signatures are produced off-chain by the active watcher
+  //      set (their consensus keys), and the builder takes the
+  //      completed block as opaque bytes. The builder does NOT
+  //      sign, produce, or validate the block — that is the
+  //      signing service's job. The executor validates against
+  //      the active watcher set resolved from chain state.
   //
   //    * BridgeBurn: no signature block. The burn is authorized by
   //      the sender's own transaction signature. Anyone holding the
@@ -489,10 +490,12 @@ namespace Wallet
   //  BridgeBurn: burn wrapped tokens and enqueue a withdrawal.
   //
   //  Payload layout (matching executeBridgeBurn):
-  //    [8]  source_chain_id
-  //    [1]  blob_len
-  //    [N]  destination_blob
-  //    [8]  amount
+  //   [8]  source_chain_id
+  //   [1]  blob_len
+  //   [N]  destination_blob
+  //   [1]  addr_len
+  //   [M]  destination_address
+  //   [8]  amount
   //
   //  The wrapped token id goes in `token_id` (executor rejects if
   //  it does not match the chain registration's wrapped_token_id).
@@ -505,6 +508,11 @@ namespace Wallet
     uint64_t source_chain_id{0};
     Id wrapped_token_id{0};
     std::vector<uint8_t> destination_blob;
+
+    //  Eexactly as the user typed it or received it.
+    //  Stored on-chain with the withdrawal record;
+    std::string destination_address;
+
     uint64_t amount{0};
   };
 
@@ -514,18 +522,34 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  BridgeAckWithdrawal: confirm that a withdrawal was released on
-  //  the source chain. Signed by the active watcher set.
+  //  the source chain, recording the source-chain release tx hash
+  //  and height on Clarity. Signed by the active watcher set.
   //
-  //  Payload layout (matching executeBridgeAckWithdrawal):
+  //  Payload layout:
   //    [8]  withdrawal_id
+  //    [32] release_tx_hash    — the source-chain tx hash
+  //    [8]  release_height     — the source-chain block height
   //    [2]  signer_count
   //    [N]  signatures, each [2] index || [64] sig
+  //
+  //  The watcher signatures cover only the withdrawal_id (see
+  //  executeBridgeAckWithdrawal's header comment): they authorize
+  //  "release withdrawal N". The release_tx_hash and release_height
+  //  are attestation data that anyone can independently verify
+  //  against the source chain (via the withdrawal's payment ID),
+  //  so they do not need to be under the signature.
 
   struct BridgeAckWithdrawalParams
   {
     TxCommonParams common;
 
     uint64_t withdrawal_id{0};
+
+    //  The source-chain tx that performed the release.
+    Crypto::Hash release_tx_hash{};
+
+    //  The source-chain block height the release landed at.
+    uint64_t release_height{0};
 
     //  Encoded `[2] count || N*66` signature block.
     std::vector<uint8_t> signature_block;
@@ -629,5 +653,33 @@ namespace Wallet
   std::optional<Core::Transaction> buildBridgeAttest(
       const Crypto::Address &from,
       const BridgeAttestParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  BridgeAckAttest: record a single watcher's attestation over a
+  //  withdrawal. The payload carries the withdrawal id, the
+  //  watcher's position in the sorted active set, and the watcher's
+  //  signature over `Blake2b("back" || LE64(withdrawal_id))`.
+  //
+  //  The signature must be produced by `Bridge::Signing::Sign`
+  //  with the watcher's *consensus* key, not their account key.
+  //  The transaction's own signature (produced by signTransaction)
+  //  is separate: it authorizes the transaction on-chain, while
+  //  the attestation signature authorizes the release.
+  //
+  //  Unlike BridgeAttest, this record carries no destination or
+  //  amount: those live in the BridgeWithdrawal created at burn
+  //  time. The attestation is only a vote that the federation
+  //  observed the burn.
+  struct BridgeAckAttestParams
+  {
+    TxCommonParams common;
+    uint64_t withdrawal_id{0};
+    uint16_t signer_index{0};
+    Crypto::Signature signature{};
+  };
+
+  std::optional<Core::Transaction> buildBridgeAckAttest(
+      const Crypto::Address &from,
+      const BridgeAckAttestParams &params,
       WalletStatus *error_out = nullptr);
 } // namespace Wallet

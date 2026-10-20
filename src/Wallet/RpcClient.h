@@ -344,8 +344,7 @@ namespace Wallet
   //
   //  Typed accessors for the bridge state the watcher daemon needs
   //  to drive submission. All of these call Clarity JSON-RPC
-  //  methods that the node exposes (or will expose — see the
-  //  comment on each).
+  //  methods that the node exposes.
   //
   //  None of these are used by the wallet app today; they are
   //  added here so the bridge app can share the same transport,
@@ -442,5 +441,71 @@ namespace Wallet
       uint64_t source_chain_id,
       const Crypto::Hash &source_tx_hash,
       uint32_t source_output_index,
+      std::string *error_out = nullptr);
+
+  //  Fetch all ack attestations for a specific withdrawal.
+  //
+  //  Sends: { "withdrawal_id": "0x..." }
+  //  Expects: { "withdrawal_id": ..., "count": ...,
+  //             "attestations": [ { validator_id, signer_index,
+  //                                attested_at_height, signature }, ... ] }
+  //
+  //  This is what the submission loop reads after enough attestations
+  //  have accumulated, to decide whether quorum has been reached and
+  //  to assemble the `[2] count || N*66` block for a
+  //  BridgeAckWithdrawal. The function does not attempt to build the
+  //  block — that's Bridge::Signing::AssembleBlock's job once the
+  //  caller has selected a quorum-sized subset.
+  std::optional<Common::Json> getBridgeAckAttestations(
+      RpcClient &rpc,
+      uint64_t withdrawal_id,
+      std::string *error_out = nullptr);
+
+  //  List withdrawals that have been burned but not yet released.
+  //
+  //  Sends: { "from_height": "0x...", "limit": "0x...",
+  //           "offset": "0x..." }
+  //  Expects: { "withdrawals": [ { ...withdrawal fields...,
+  //                                ack_attestation_count,
+  //                                active_watcher_count,
+  //                                ack_quorum,
+  //                                ack_quorum_reached }, ... ],
+  //             "count": ..., "height": ..., ... }
+  //
+  //  The per-entry `ack_quorum_reached` boolean lets the caller
+  //  skip a second RPC round-trip per withdrawal to compute quorum.
+  //  The quorum itself is computed against the active watcher set
+  //  at the current head height.
+  //
+  //  `from_height == 0` means "from genesis". Use a nonzero
+  //  value on incremental scans to avoid re-fetching withdrawals
+  //  the loop has already processed.
+  std::optional<Common::Json> getPendingWithdrawals(
+      RpcClient &rpc,
+      uint64_t from_height,
+      uint64_t limit,
+      uint64_t offset,
+      std::string *error_out = nullptr);
+
+  //  Fetch the aggregate BridgeStats for a source chain.
+  //
+  //  Sends: { "source_chain_id": "0x..." }
+  //  Expects: { initialized, total_minted, total_burned,
+  //             total_released, deposit_count, withdrawal_count,
+  //             released_withdrawal_count, last_mint_height,
+  //             last_burn_height, last_release_height,
+  //             registered_at_height, outstanding_liability }
+  //
+  //  A chain that has been registered but has never seen a bridge
+  //  operation returns `initialized: false` with all counters zero.
+  //  This is not an error — the call still succeeds; a monitoring
+  //  dashboard gets a clean zero rather than a 404.
+  //
+  //  `outstanding_liability` is derived (total_burned -
+  //  total_released) and included so the caller doesn't have to
+  //  recompute the invariant.
+  std::optional<Common::Json> getBridgeStats(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
       std::string *error_out = nullptr);
 } // namespace Wallet

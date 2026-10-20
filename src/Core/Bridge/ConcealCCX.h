@@ -8,11 +8,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <string_view>
 #include <vector>
 
+#include "Common/Base.h"
+#include "Common/Varint.h"
+
 #include "Crypto/Blake2b.h"
 #include "Crypto/Types.h"
+#include "Crypto/Keccak.h"
 #include "Core/BridgeTypes.h"
 #include "Core/TokenTypes.h"
 
@@ -36,7 +41,8 @@ namespace Core
   //    2. Destination codec: CCX addresses are 64 bytes (a spend
   //       public key and a view public key, each 32 bytes). The codec
   //       converts between the typed pair and the opaque blob the
-  //       bridge stores.
+  //       bridge stores, and between the blob and the base58 string
+  //       a CCX wallet RPC expects.
   //
   //    3. Fingerprint: the wrapped-CCX token's fingerprint is a
   //       commitment to (chain id, asset id). It pins the token to
@@ -182,6 +188,97 @@ namespace Core
         return false;
 
       return true;
+    }
+
+    //  Encode a (spend ‖ view) blob as a CCX base58 address.
+    //
+    //  The layout matches CryptoNote's canonical address encoding:
+    //
+    //    [varint network_prefix]
+    //    [spend key, 32 bytes]
+    //    [view key, 32 bytes]
+    //    [checksum, 4 bytes]
+    //
+    //  where the checksum is the first 4 bytes of
+    //  cn_fast_hash(prefix_bytes || spend || view) — Keccak-256
+    //  with 0x01 padding, matching Crypto::keccak256. The whole
+    //  payload is then base58-encoded with the CryptoNote base58
+    //  alphabet, which is what Common::encodeBase58 implements.
+    //
+    //  The `network_prefix` is a deployment property, not a
+    //  chain-identity property: CCX mainnet and CCX testnet share a
+    //  chain id (from the bridge's perspective) but use different
+    //  prefix bytes. The caller supplies it, typically from config
+    //  (see CcxAdapter::set_network_prefix).
+    //
+    //  Returns an empty string if:
+    //    - blob is not exactly 64 bytes,
+    //    - either 32-byte half is all-zero (no valid CCX address has
+    //      a null spend or view key),
+    //    - checksum computation fails (would indicate a library bug).
+    //
+    //  Round-trip guarantee: for any valid (spend, view) pair on the
+    //  network whose prefix is `network_prefix`,
+    //
+    //    CcxAdapter::parse_deposit_address(
+    //        encodeDestinationAsBase58(
+    //            encodeDestination(spend, view),
+    //            network_prefix)) == encodeDestination(spend, view)
+    //
+    //  as long as `parse_deposit_address` is called on the same
+    //  network. The checksum validation on the parse side guarantees
+    //  the round-trip in the presence of a corrupted prefix byte.
+    inline std::string encodeDestinationAsBase58(
+        const std::vector<uint8_t> &blob,
+        uint64_t network_prefix)
+    {
+      if (blob.size() != CCX_DESTINATION_BYTES)
+        return {};
+
+      //  Refuse null keys: a blob with a null half would produce a
+      //  syntactically valid base58 string, but the wallet RPC on
+      //  the other side would either reject it or (worse) accept it
+      //  and later fail to spend from it. The encodeDestination
+      //  helper refuses nulls too; this is the belt-and-braces check
+      //  on the raw blob, for callers that construct blobs directly.
+      Crypto::PublicKey spend_pk, view_pk;
+      std::memcpy(spend_pk.data.data(), blob.data(), 32);
+      std::memcpy(view_pk.data.data(), blob.data() + 32, 32);
+      if (spend_pk.isNull() || view_pk.isNull())
+        return {};
+
+      //  Build the payload:
+      //    [varint prefix] [spend] [view] [checksum]
+
+      std::vector<uint8_t> payload;
+      payload.reserve(1 + 64 + 4);
+
+      Common::write_varint_to_vector<uint64_t>(network_prefix, payload);
+
+      payload.insert(payload.end(), blob.begin(), blob.begin() + 32);
+      payload.insert(payload.end(), blob.begin() + 32, blob.begin() + 64);
+
+      //  CryptoNote's address checksum is the first 4 bytes of
+      //  cn_fast_hash(payload). In this codebase, cn_fast_hash is
+      //  Crypto::keccak256 (Keccak-256 with 0x01 padding, not
+      //  FIPS-202 SHA3-256). Using Blake2b here produced a
+      //  syntactically valid base58 string that walletd rejected
+      //  as an invalid address — see handover §7.8.
+      Crypto::Hash checksum;
+      Crypto::keccak256(payload.data(), payload.size(),
+                        checksum.data.data());
+
+      payload.push_back(checksum.data[0]);
+      payload.push_back(checksum.data[1]);
+      payload.push_back(checksum.data[2]);
+      payload.push_back(checksum.data[3]);
+
+      //  Base58-encode the whole payload. Common::encodeBase58
+      //  takes a string_view; the payload is bytes, so we cast
+      //  through a string_view over the same memory.
+      return Common::encodeBase58(
+          std::string_view(reinterpret_cast<const char *>(payload.data()),
+                           payload.size()));
     }
 
     //  ---------------------------------------------------------------------

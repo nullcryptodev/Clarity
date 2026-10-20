@@ -1161,4 +1161,71 @@ namespace Wallet
     }
     return res.result;
   }
+
+  //  ---- Withdrawal ack attestations ----
+
+  std::optional<Common::Json> getBridgeAckAttestations(
+      RpcClient &rpc,
+      uint64_t withdrawal_id,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["withdrawal_id"] = encodeU64Hex(withdrawal_id);
+
+    auto res = rpc.call("getBridgeAckAttestations", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+    return res.result;
+  }
+
+  //  ---- Pending withdrawals ----
+
+  std::optional<Common::Json> getPendingWithdrawals(
+      RpcClient &rpc,
+      uint64_t from_height,
+      uint64_t limit,
+      uint64_t offset,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["from_height"] = encodeU64Hex(from_height);
+    params["limit"] = encodeU64Hex(limit);
+    params["offset"] = encodeU64Hex(offset);
+
+    auto res = rpc.call("getPendingWithdrawals", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+    return res.result;
+  }
+
+  //  ---- Aggregate bridge stats ----
+
+  std::optional<Common::Json> getBridgeStats(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["source_chain_id"] = encodeU64Hex(source_chain_id);
+
+    auto res = rpc.call("getBridgeStats", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+    return res.result;
+  }
 } // namespace Wallet

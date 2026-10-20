@@ -650,8 +650,6 @@ namespace Bridge::Submission
 
     if (session.consensus_key.has_value())
     {
-      std::cerr << "[attest-bridge] signing with consensus_key "
-                << "(from --consensus-key-file)\n";
       signature = Crypto::sign(attest_hash, *session.consensus_key);
       if (!signature.has_value())
       {
@@ -662,9 +660,6 @@ namespace Bridge::Submission
     }
     else
     {
-      std::cerr << "[attest-bridge] no consensus_key; "
-                << "using keystore's clrtyPath(0,0,0)\n";
-
       Wallet::WalletStatus sig_st;
       auto sig_opt = session.signer->signAtPath(
           Wallet::clrtyPath(0, 0, 0), attest_hash, &sig_st);
@@ -680,13 +675,6 @@ namespace Bridge::Submission
       signature = sig_opt;
     }
 
-    std::cerr << "[attest-bridge] signer_index=" << signer_index
-              << " chain=0x" << std::hex << deposit.source_chain_id << std::dec
-              << " tx_hash=" << deposit.source_tx_hash.toString().substr(0, 16)
-              << " out_idx=" << deposit.source_output_index
-              << " amount=" << clarity_amount << "\n";
-    std::cerr << "[attest-bridge] hash=" << attest_hash.toString() << "\n";
-    std::cerr << "[attest-bridge] sig (first 16B): ";
     for (int i = 0; i < 16; ++i)
       std::cerr << std::hex << (int)signature->data[i];
     std::cerr << std::dec << "\n";
@@ -762,10 +750,9 @@ namespace Bridge::Submission
   //  ===========================================================================
   //  AssembleMintBlock
   //  ===========================================================================
-
   AssembleOutcome AssembleMintBlock(
       Wallet::RpcClient &clarity_rpc,
-      Wallet::Network network,
+      Wallet::Network /*network*/,
       uint64_t source_chain_id,
       const ObservedDeposit &deposit,
       size_t quorum,
@@ -783,7 +770,6 @@ namespace Bridge::Submission
     }
 
     //  ---- Step 1: read attestations from chain ----
-
     std::string err;
     auto res = Wallet::getBridgeAttestations(
         clarity_rpc,
@@ -808,21 +794,18 @@ namespace Bridge::Submission
 
     const auto &arr = (*res)["attestations"];
     if (arr.size() < quorum)
-    {
-      //  Not an error; wait for peers.
       return AssembleOutcome::NotYetQuorum;
-    }
 
     //  ---- Step 2: parse and check agreement ----
-
-    //  All attestations must agree on (destination, amount) —
-    //  same invariant executeBridgeAttest enforces when recording.
-    //  We check it again here because chain state can be
-    //  replayed, and because we want a clear "federation split"
-    //  signal rather than a downstream "invalid block" rejection
-    //  at submit time.
+    //
+    //  Compare destination as the bech32m STRING the RPC returned.
+    //  Do not decode to Crypto::Address — the destination's raw
+    //  32 bytes already live in the attestation signature's
+    //  canonical message, and re-decoding through the wallet's
+    //  address codec introduces a network/HRP dependency that has
+    //  nothing to do with whether the attestations agree.
     bool have_first = false;
-    Crypto::Address first_destination;
+    std::string first_destination;
     uint64_t first_amount = 0;
 
     std::vector<uint8_t> entries;
@@ -851,20 +834,8 @@ namespace Bridge::Submission
         return AssembleOutcome::StateError;
       }
 
-      //  Destination: the RPC returns bech32m, but we need the
-      //  raw bytes for the canonical message. Decode with the
-      //  same codec the wallet uses.
-      auto dest = Wallet::decodeAddress(
-          a["destination"].get<std::string>(), network);
-      if (!dest.has_value())
-      {
-        if (error_out)
-          *error_out = "attestation has undecodable destination: " +
-                       a["destination"].get<std::string>();
-        return AssembleOutcome::StateError;
-      }
+      const std::string dest = a["destination"].get<std::string>();
 
-      //  Signature: 64 raw bytes.
       uint8_t sig_bytes[64];
       if (!parseHexBytes(a["signature"].get<std::string>(), sig_bytes, 64))
       {
@@ -877,21 +848,17 @@ namespace Bridge::Submission
       if (!have_first)
       {
         have_first = true;
-        first_destination = *dest;
+        first_destination = dest;
         first_amount = *amt;
       }
-      else if (first_destination != *dest || first_amount != *amt)
+      else if (first_destination != dest || first_amount != *amt)
       {
-        //  Federation split. This shouldn't happen — the
-        //  executor rejects the second one when it's recorded —
-        //  but if it does, refuse to assemble.
         if (error_out)
           *error_out = "attestations disagree on (destination, amount) "
                        "for this deposit";
         return AssembleOutcome::Conflicting;
       }
 
-      //  Emit one entry: [2] signer_index LE || [64] signature.
       const uint16_t si16 = static_cast<uint16_t>(*si);
       entries.push_back(uint8_t(si16));
       entries.push_back(uint8_t(si16 >> 8));
@@ -908,7 +875,6 @@ namespace Bridge::Submission
     }
 
     //  ---- Step 3: prepend count prefix ----
-
     std::vector<uint8_t> block;
     block.reserve(2 + entries.size());
 
@@ -921,5 +887,598 @@ namespace Bridge::Submission
       *block_out = std::move(block);
 
     return AssembleOutcome::Ok;
+  }
+
+  //  ===========================================================================
+  //  SubmitAckAttestation
+  //
+  //  The withdrawal-side counterpart of SubmitAttestation. Everything
+  //  is identical except:
+  //    - the payload carries only withdrawal_id, signer_index, and
+  //      the signature (no destination/amount — those live in the
+  //      BridgeWithdrawal record);
+  //    - the signing domain is "back", over LE64(withdrawal_id);
+  //    - the replay/consumed guard is "is the withdrawal already
+  //      released?" rather than "is the deposit already minted?".
+  //  ===========================================================================
+
+  AttestOutcome SubmitAckAttestation(
+      WatcherSession &session,
+      ChainRuntime &rt,
+      uint64_t withdrawal_id,
+      Crypto::Hash *attest_tx_hash,
+      std::string *error_out)
+  {
+    if (attest_tx_hash)
+      attest_tx_hash->data.fill(0);
+
+    if (!session.hasKeystore() || !session.signer)
+    {
+      if (error_out)
+        *error_out = "no keystore open; cannot sign ack attestation";
+      return AttestOutcome::NotAWriter;
+    }
+    if (!session.clarity_rpc)
+    {
+      if (error_out)
+        *error_out = "no Clarity RPC client";
+      return AttestOutcome::Failed;
+    }
+    if (session.watcher_id == 0)
+    {
+      if (error_out)
+        *error_out = "watcher_id is unresolved; cannot determine "
+                     "active-set position";
+      return AttestOutcome::NotAWriter;
+    }
+
+    Wallet::RpcClient &clarity = *session.clarity_rpc;
+
+    //  ---- Step 1: fetch the withdrawal record ----
+    //
+    //  We need its source_chain_id (to look up the active set),
+    //  and we need to check that it hasn't already been released.
+    //  Both come from one RPC call.
+
+    bool not_found = false;
+    std::string fetch_err;
+    auto w_json = Wallet::getBridgeWithdrawal(
+        clarity, withdrawal_id, &not_found, &fetch_err);
+
+    if (not_found)
+    {
+      //  The withdrawal was deleted (post-Phase-3: released and
+      //  archived, or just never existed). Either way, there is
+      //  nothing to attest to.
+      if (error_out)
+        *error_out = "withdrawal " + std::to_string(withdrawal_id) +
+                     " does not exist";
+      return AttestOutcome::AlreadyConsumed;
+    }
+    if (!w_json.has_value())
+    {
+      if (error_out)
+        *error_out = "getBridgeWithdrawal failed: " + fetch_err;
+      return AttestOutcome::Failed;
+    }
+    if (!w_json->is_object())
+    {
+      if (error_out)
+        *error_out = "withdrawal response is not an object";
+      return AttestOutcome::Failed;
+    }
+
+    const auto &wobj = *w_json;
+
+    //  If it's already released, there is no point attesting.
+    if (wobj.contains("is_released") && wobj["is_released"].is_boolean() &&
+        wobj["is_released"].get<bool>())
+    {
+      return AttestOutcome::AlreadyConsumed;
+    }
+
+    if (!wobj.contains("source_chain_id") ||
+        !wobj["source_chain_id"].is_string())
+    {
+      if (error_out)
+        *error_out = "withdrawal record missing 'source_chain_id'";
+      return AttestOutcome::Failed;
+    }
+    auto scid_opt = parseHexU64(wobj["source_chain_id"].get<std::string>());
+    if (!scid_opt.has_value())
+    {
+      if (error_out)
+        *error_out = "'source_chain_id' is not valid hex";
+      return AttestOutcome::Failed;
+    }
+    const uint64_t source_chain_id = *scid_opt;
+
+    //  ---- Step 2: resolve own position in the active set ----
+
+    std::string set_err;
+    auto self = findSelfInActiveSet(
+        clarity, source_chain_id, session.watcher_id, &set_err);
+    if (!self.has_value())
+    {
+      if (!set_err.empty())
+      {
+        if (error_out)
+          *error_out = set_err;
+        return AttestOutcome::Failed;
+      }
+      return AttestOutcome::NotAWriter;
+    }
+    const uint16_t signer_index = self->first;
+
+    //  ---- Step 3: already attested? ----
+
+    {
+      std::string lookup_err;
+      auto res = Wallet::getBridgeAckAttestations(
+          clarity, withdrawal_id, &lookup_err);
+
+      if (res.has_value() && res->is_object() &&
+          res->contains("attestations") &&
+          (*res)["attestations"].is_array())
+      {
+        for (const auto &a : (*res)["attestations"])
+        {
+          if (!a.is_object())
+            continue;
+          if (!a.contains("signer_index"))
+            continue;
+          if (!a["signer_index"].is_string())
+            continue;
+          auto v = parseHexU64(a["signer_index"].get<std::string>());
+          if (v.has_value() && *v == signer_index)
+            return AttestOutcome::AlreadyAttested;
+        }
+      }
+    }
+
+    //  ---- Step 4: compute the canonical ack signing hash ----
+
+    const auto message = Bridge::Signing::EncodeBridgeAckMessage(withdrawal_id);
+    const Crypto::Hash attest_hash =
+        Bridge::Signing::SigningHash("back", message.data(), message.size());
+    if (attest_hash.isNull())
+    {
+      if (error_out)
+        *error_out = "SigningHash returned null";
+      return AttestOutcome::Failed;
+    }
+
+    //  ---- Step 5: sign the attestation hash ----
+
+    std::optional<Crypto::Signature> signature;
+
+    if (session.consensus_key.has_value())
+    {
+      signature = Crypto::sign(attest_hash, *session.consensus_key);
+      if (!signature.has_value())
+      {
+        if (error_out)
+          *error_out = "Crypto::sign failed with consensus_key";
+        return AttestOutcome::Failed;
+      }
+    }
+    else
+    {
+      Wallet::WalletStatus sig_st;
+      auto sig_opt = session.signer->signAtPath(
+          Wallet::clrtyPath(0, 0, 0), attest_hash, &sig_st);
+      if (!sig_opt.has_value())
+      {
+        if (error_out)
+          *error_out = "signer->signAtPath failed: " +
+                       (sig_st.detail.empty()
+                            ? Wallet::walletErrorMessage(sig_st.code)
+                            : sig_st.detail);
+        return AttestOutcome::Failed;
+      }
+      signature = sig_opt;
+    }
+
+    //  ---- Step 6: build the BridgeAckAttest transaction ----
+
+    Wallet::BridgeAckAttestParams p;
+    p.common.chain_id = session.keystore->chainId();
+    p.common.nonce = Wallet::getNonce(
+                         clarity, session.address_bech32m)
+                         .value_or(0);
+    p.common.fee = 100000;
+    p.withdrawal_id = withdrawal_id;
+    p.signer_index = signer_index;
+    p.signature = *signature;
+
+    Wallet::WalletStatus build_st;
+    auto tx = Wallet::buildBridgeAckAttest(
+        session.address.value(), p, &build_st);
+    if (!tx.has_value())
+    {
+      if (error_out)
+        *error_out = "buildBridgeAckAttest failed: " +
+                     (build_st.detail.empty()
+                          ? Wallet::walletErrorMessage(build_st.code)
+                          : build_st.detail);
+      return AttestOutcome::Failed;
+    }
+
+    //  ---- Step 7: sign the outer tx ----
+
+    Wallet::WalletStatus sign_st;
+    auto signing_hash = Wallet::signTransaction(
+        *tx, *session.signer, Wallet::clrtyPath(0, 0, 0), &sign_st);
+    if (!signing_hash.has_value())
+    {
+      if (error_out)
+        *error_out = "signTransaction failed: " +
+                     (sign_st.detail.empty()
+                          ? Wallet::walletErrorMessage(sign_st.code)
+                          : sign_st.detail);
+      return AttestOutcome::Failed;
+    }
+
+    //  ---- Step 8: submit ----
+
+    const std::string hex = transactionToHex(*tx);
+
+    std::string submit_err;
+    auto txid = Wallet::sendRawTransaction(clarity, hex, &submit_err);
+    if (!txid.has_value())
+    {
+      if (error_out)
+        *error_out = "sendRawTransaction failed: " + submit_err;
+      return AttestOutcome::Failed;
+    }
+
+    parseTxidInto(*txid, attest_tx_hash);
+
+    std::cerr << "[" << rt.chain_short_name()
+              << "] submitted BridgeAckAttest for withdrawal "
+              << withdrawal_id << " -> " << *txid << "\n";
+
+    return AttestOutcome::Submitted;
+  }
+
+  //  ===========================================================================
+  //  AssembleAckBlock
+  //
+  //  Mirror of AssembleMintBlock. Two differences:
+  //    - the attestations carry no (destination, amount) to check
+  //      agreement on; there is only the withdrawal_id, so any
+  //      quorum-sized set of distinct signer_indices is valid;
+  //    - the withdrawal may already have been released (by a peer
+  //      racing us), in which case we return AlreadyReleased rather
+  //      than pretending a block exists.
+  //  ===========================================================================
+
+  AssembleAckOutcome AssembleAckBlock(
+      Wallet::RpcClient &clarity_rpc,
+      uint64_t withdrawal_id,
+      size_t quorum,
+      std::vector<uint8_t> *block_out,
+      std::string *error_out)
+  {
+    if (block_out)
+      block_out->clear();
+
+    if (quorum == 0)
+    {
+      if (error_out)
+        *error_out = "quorum is zero";
+      return AssembleAckOutcome::StateError;
+    }
+
+    //  ---- Step 0: fetch the withdrawal (to confirm not-yet-released) ----
+
+    bool not_found = false;
+    std::string fetch_err;
+    auto w_json = Wallet::getBridgeWithdrawal(
+        clarity_rpc, withdrawal_id, &not_found, &fetch_err);
+
+    if (not_found)
+    {
+      //  Already archived. Treat as released: the caller should
+      //  advance the cursor without doing anything.
+      return AssembleAckOutcome::AlreadyReleased;
+    }
+    if (!w_json.has_value())
+    {
+      if (error_out)
+        *error_out = "getBridgeWithdrawal failed: " + fetch_err;
+      return AssembleAckOutcome::RpcError;
+    }
+    if (!w_json->is_object())
+    {
+      if (error_out)
+        *error_out = "withdrawal response is not an object";
+      return AssembleAckOutcome::StateError;
+    }
+
+    if ((*w_json).contains("is_released") &&
+        (*w_json)["is_released"].is_boolean() &&
+        (*w_json)["is_released"].get<bool>())
+    {
+      return AssembleAckOutcome::AlreadyReleased;
+    }
+
+    //  ---- Step 1: read ack attestations from chain ----
+
+    std::string err;
+    auto res = Wallet::getBridgeAckAttestations(
+        clarity_rpc, withdrawal_id, &err);
+
+    if (!res.has_value())
+    {
+      if (error_out)
+        *error_out = "getBridgeAckAttestations failed: " + err;
+      return AssembleAckOutcome::RpcError;
+    }
+    if (!res->is_object() || !res->contains("attestations") ||
+        !(*res)["attestations"].is_array())
+    {
+      if (error_out)
+        *error_out = "getBridgeAckAttestations returned an unexpected shape";
+      return AssembleAckOutcome::StateError;
+    }
+
+    const auto &arr = (*res)["attestations"];
+    if (arr.size() < quorum)
+      return AssembleAckOutcome::NotYetQuorum;
+
+    //  ---- Step 2: parse the attestations into [2] idx || [64] sig ----
+    //
+    //  We do NOT verify signatures here — the executor does that
+    //  when the block is used. What we must catch here is *structural*
+    //  malformation: wrong field types, invalid hex, out-of-range
+    //  signer_index, duplicate signer_index. A duplicate is a
+    //  specific concern because it would produce a block with two
+    //  entries pointing at the same signer, which the executor's
+    //  seen[] check rejects — so we catch it earlier with a clearer
+    //  error.
+    //
+    //  The signer_index bound check (must be < active set size) is
+    //  best-effort here; the executor's verifyBridgeSignatures
+    //  enforces it against the authoritative active set. We skip
+    //  that check in the assembler to keep this function from
+    //  needing to fetch the active set separately — the executor
+    //  will reject an out-of-range index anyway, and the caller
+    //  will get a Failed outcome, which is the right behaviour.
+    std::vector<uint8_t> entries;
+    entries.reserve(arr.size() * 66);
+
+    std::vector<uint16_t> seen_indices;
+    seen_indices.reserve(arr.size());
+
+    size_t consumed = 0;
+    for (const auto &a : arr)
+    {
+      if (!a.is_object())
+        continue;
+      if (!a.contains("signer_index") || !a["signer_index"].is_string())
+        continue;
+      if (!a.contains("signature") || !a["signature"].is_string())
+        continue;
+
+      auto si = parseHexU64(a["signer_index"].get<std::string>());
+      if (!si.has_value() || *si > 0xFFFF)
+      {
+        if (error_out)
+          *error_out = "ack attestation has malformed signer_index";
+        return AssembleAckOutcome::StateError;
+      }
+      const uint16_t si16 = static_cast<uint16_t>(*si);
+
+      if (std::find(seen_indices.begin(), seen_indices.end(), si16) !=
+          seen_indices.end())
+      {
+        if (error_out)
+          *error_out = "duplicate signer_index " +
+                       std::to_string(si16) + " in ack attestations";
+        return AssembleAckOutcome::StateError;
+      }
+      seen_indices.push_back(si16);
+
+      uint8_t sig_bytes[64];
+      if (!parseHexBytes(a["signature"].get<std::string>(), sig_bytes, 64))
+      {
+        if (error_out)
+          *error_out = "ack attestation signature has invalid length "
+                       "or non-hex characters";
+        return AssembleAckOutcome::StateError;
+      }
+
+      entries.push_back(uint8_t(si16));
+      entries.push_back(uint8_t(si16 >> 8));
+      entries.insert(entries.end(), sig_bytes, sig_bytes + 64);
+
+      ++consumed;
+    }
+
+    if (consumed < quorum)
+    {
+      if (error_out)
+        *error_out = "after parsing, fewer than quorum ack attestations "
+                     "remain";
+      return AssembleAckOutcome::StateError;
+    }
+
+    //  ---- Step 3: prepend count prefix ----
+
+    std::vector<uint8_t> block;
+    block.reserve(2 + entries.size());
+
+    const uint16_t count = static_cast<uint16_t>(consumed);
+    block.push_back(uint8_t(count));
+    block.push_back(uint8_t(count >> 8));
+    block.insert(block.end(), entries.begin(), entries.end());
+
+    if (block_out)
+      *block_out = std::move(block);
+
+    return AssembleAckOutcome::Ok;
+  }
+
+  //  ===========================================================================
+  //  SubmitAckWithdrawal
+  //
+  //  The final step. Records the CCX release on Clarity.
+  //  ===========================================================================
+
+  SubmitOutcome SubmitAckWithdrawal(
+      WatcherSession &session,
+      ChainRuntime &rt,
+      uint64_t withdrawal_id,
+      const Crypto::Hash &release_tx_hash,
+      uint64_t release_height,
+      const std::vector<uint8_t> &ack_block,
+      Crypto::Hash *clarity_tx_hash,
+      std::string *error_out)
+  {
+    if (clarity_tx_hash)
+      clarity_tx_hash->data.fill(0);
+
+    //  ---- Precondition: ack block is present and non-trivial ----
+    //
+    //  An empty block would mean we're submitting a
+    //  BridgeAckWithdrawal with no authorization. Reject. A block
+    //  with a count of zero is equally invalid (executor would
+    //  reject on threshold). Detect both here so the caller gets a
+    //  fast, clear error rather than a mempool rejection.
+    if (ack_block.size() < 2)
+    {
+      if (error_out)
+        *error_out = "ack_block is too short (needs at least a 2-byte "
+                     "count prefix)";
+      return SubmitOutcome::Failed;
+    }
+    const uint16_t ack_count =
+        uint16_t(ack_block[0]) | (uint16_t(ack_block[1]) << 8);
+    if (ack_count == 0)
+    {
+      if (error_out)
+        *error_out = "ack_block has zero signatures";
+      return SubmitOutcome::Failed;
+    }
+    if (ack_block.size() != 2 + static_cast<size_t>(ack_count) * 66)
+    {
+      if (error_out)
+        *error_out = "ack_block length does not match its declared count";
+      return SubmitOutcome::Failed;
+    }
+
+    if (release_tx_hash.isNull())
+    {
+      if (error_out)
+        *error_out = "release_tx_hash is null";
+      return SubmitOutcome::Failed;
+    }
+    if (release_height == 0)
+    {
+      if (error_out)
+        *error_out = "release_height is zero";
+      return SubmitOutcome::Failed;
+    }
+
+    if (!session.hasKeystore() || !session.signer)
+    {
+      if (error_out)
+        *error_out = "no keystore open; cannot sign submission";
+      return SubmitOutcome::Failed;
+    }
+    if (!session.clarity_rpc)
+    {
+      if (error_out)
+        *error_out = "no Clarity RPC client; cannot submit";
+      return SubmitOutcome::Failed;
+    }
+
+    Wallet::RpcClient &clarity = *session.clarity_rpc;
+
+    //  Idempotency: if the withdrawal is already released, don't
+    //  submit. If the recorded hash is different from ours, the tx
+    //  would be rejected by the executor and stall the chain. Skip.
+    bool not_found = false;
+    std::string fetch_err;
+    auto w_json = Wallet::getBridgeWithdrawal(
+        clarity, withdrawal_id, &not_found, &fetch_err);
+
+    if (w_json.has_value() && w_json->is_object() &&
+        (*w_json).contains("is_released") &&
+        (*w_json)["is_released"].is_boolean() &&
+        (*w_json)["is_released"].get<bool>())
+    {
+      //  Already released. Our submission is either idempotent (same
+      //  hash) or conflicting (different hash). Either way, don't
+      //  submit — the record is already final.
+      return SubmitOutcome::AlreadyConsumed;
+    }
+
+    //  ---- Step 1: build the transaction ----
+
+    Wallet::BridgeAckWithdrawalParams p;
+    p.common.chain_id = session.keystore->chainId();
+    p.common.nonce = Wallet::getNonce(
+                         clarity, session.address_bech32m)
+                         .value_or(0);
+    p.common.fee = 100000;
+
+    p.withdrawal_id = withdrawal_id;
+    p.release_tx_hash = release_tx_hash;
+    p.release_height = release_height;
+    p.signature_block = ack_block;
+
+    Wallet::WalletStatus build_st;
+    auto tx = Wallet::buildBridgeAckWithdrawal(
+        session.address.value(), p, &build_st);
+    if (!tx.has_value())
+    {
+      if (error_out)
+        *error_out = "buildBridgeAckWithdrawal failed: " +
+                     (build_st.detail.empty()
+                          ? Wallet::walletErrorMessage(build_st.code)
+                          : build_st.detail);
+      return SubmitOutcome::Failed;
+    }
+
+    //  ---- Step 2: sign the transaction ----
+
+    Wallet::WalletStatus sign_st;
+    auto signing_hash = Wallet::signTransaction(
+        *tx, *session.signer, Wallet::clrtyPath(0, 0, 0), &sign_st);
+    if (!signing_hash.has_value())
+    {
+      if (error_out)
+        *error_out = "signTransaction failed: " +
+                     (sign_st.detail.empty()
+                          ? Wallet::walletErrorMessage(sign_st.code)
+                          : sign_st.detail);
+      return SubmitOutcome::Failed;
+    }
+
+    //  ---- Step 3: submit ----
+
+    const std::string hex = transactionToHex(*tx);
+
+    std::string submit_err;
+    auto txid = Wallet::sendRawTransaction(clarity, hex, &submit_err);
+    if (!txid.has_value())
+    {
+      if (error_out)
+        *error_out = "sendRawTransaction failed: " + submit_err;
+      return SubmitOutcome::Failed;
+    }
+
+    //  ---- Success ----
+
+    parseTxidInto(*txid, clarity_tx_hash);
+
+    std::cerr << "[" << rt.chain_short_name()
+              << "] submitted BridgeAckWithdrawal for withdrawal "
+              << withdrawal_id << " (release=" << release_tx_hash.toString().substr(0, 16)
+              << "... @ height " << release_height << ") -> " << *txid << "\n";
+
+    return SubmitOutcome::Submitted;
   }
 } // namespace Bridge::Submission

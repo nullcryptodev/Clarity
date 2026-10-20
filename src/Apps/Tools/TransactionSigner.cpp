@@ -145,6 +145,7 @@ namespace
     // BridgeBurn
     uint64_t wrapped_token_id{0};
     std::string destination_blob_hex;
+    std::string destination_address;
 
     // BridgeAck
     uint64_t withdrawal_id{0};
@@ -426,6 +427,11 @@ namespace
         args.destination_blob_hex = next();
         continue;
       }
+      if (arg == "--destination-address")
+      {
+        args.destination_address = next();
+        continue;
+      }
 
       //  ---- BridgeAck ----
       if (arg == "--withdrawal-id")
@@ -504,6 +510,8 @@ namespace
         throw std::runtime_error("bridge-burn requires --source-chain-id");
       if (args.wrapped_token_id == 0)
         throw std::runtime_error("bridge-burn requires --wrapped-token-id");
+      if (args.destination_blob_hex.empty())
+        throw std::runtime_error("bridge-burn requires --destination-blob");
       if (args.destination_blob_hex.empty())
         throw std::runtime_error("bridge-burn requires --destination-blob");
       if (args.amount == 0)
@@ -712,6 +720,9 @@ namespace
       return 1;
     }
 
+    std::cerr << "DEBUG source_chain_id = " << args.source_chain_id
+              << " (0x" << std::hex << args.source_chain_id << std::dec << ")\n";
+
     // ---- Unlock ----
     const std::string password = resolvePassword(args);
     const Wallet::WalletError err = (*ks)->unlock(password);
@@ -840,6 +851,7 @@ namespace
           static_cast<Id>(args.wrapped_token_id);
       p.destination_blob = parseHexBytesOrDie(args.destination_blob_hex,
                                               "--destination-blob");
+      p.destination_address = args.destination_address;
       p.amount = args.amount;
       tx = Wallet::buildBridgeBurn(*from_addr, p, &st);
       break;
@@ -972,7 +984,9 @@ namespace
         << "                         --output-index <n> --destination <addr>\n"
         << "                         --amount <clrty> --signature-block <hex>\n"
         << "  bridge-burn:           --source-chain-id <n> --wrapped-token-id <n>\n"
-        << "                         --destination-blob <hex> --amount <clrty>\n"
+        << "                         --destination-blob <hex>\n"
+        << "                         --destination-address <base58>\n"
+        << "                         --amount <clrty>\n"
         << "  bridge-ack:            --withdrawal-id <n> --signature-block <hex>\n"
         << "  bridge-pause:          --bound-height <n> --signature-block <hex>\n"
         << "  bridge-unpause:        --bound-height <n> --signature-block <hex>\n"

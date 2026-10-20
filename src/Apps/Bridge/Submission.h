@@ -215,4 +215,109 @@ namespace Bridge::Submission
       size_t quorum,
       std::vector<uint8_t> *block_out,
       std::string *error_out);
+
+  //  =========================================================================
+  //  Withdrawal submission
+  //
+  //  The withdrawal-side pipeline is symmetric to the deposit side,
+  //  with one structural difference: after the per-watcher ack
+  //  attestations reach quorum, there is a release step on the
+  //  source chain (CCX) *before* the quorum block is recorded on
+  //  Clarity. The shape is:
+  //
+  //    1. Each watcher submits a BridgeAckAttest for the
+  //       withdrawal (SubmitAckAttestation).
+  //    2. Acks accumulate on-chain.
+  //    3. Once quorum is reached, a watcher assembles the
+  //       [2] count || N*66 block (AssembleAckBlock).
+  //    4. A watcher (any watcher) uses the assembled block to
+  //       authorize a CCX release from the custody address
+  //       (CcxAdapter::submit_release — implemented elsewhere).
+  //    5. The release tx hash and height are recorded on Clarity
+  //       in a BridgeAckWithdrawal transaction, carrying the same
+  //       ack block (SubmitAckWithdrawal).
+  //
+  //  Steps 4 and 5 are separate because the release has to be
+  //  *confirmed* on CCX before we record it — a reorged-out release
+  //  must not be finalized on Clarity. This module handles steps 1,
+  //  3, and 5; step 4 lives in CcxAdapter.
+  //  =========================================================================
+
+  //  Submit a BridgeAckAttest for one withdrawal. Mirrors
+  //  SubmitAttestation in every respect except the payload and
+  //  the domain tag ("back" vs "bmin").
+  //
+  //  Preconditions: as SubmitAttestation.
+  AttestOutcome SubmitAckAttestation(
+      WatcherSession &session,
+      ChainRuntime &rt,
+      uint64_t withdrawal_id,
+      Crypto::Hash *attest_tx_hash,
+      std::string *error_out);
+
+  //  Assemble the BridgeAckWithdrawal signature block for one
+  //  withdrawal. Mirrors AssembleMintBlock. The resulting block
+  //  is used twice: once by CcxAdapter::submit_release (as
+  //  authorization, though the CCX chain does not verify it — it's
+  //  an audit artifact), and once as the payload of the
+  //  BridgeAckWithdrawal tx that SubmitAckWithdrawal sends.
+  //
+  //  `quorum` is required. If the current active set can't be
+  //  fetched (to determine whether the caller's count meets
+  //  quorum), returns NoActiveSet — distinct from RpcError because
+  //  the caller may want to retry only the set fetch, not the
+  //  attestation fetch.
+  enum class AssembleAckOutcome
+  {
+    Ok,
+    NotYetQuorum,
+    //  The withdrawal is already released (release_tx_hash != 0).
+    //  The scan loop should have filtered it out; reaching here
+    //  with this outcome means the RPC state changed between scan
+    //  and assembly. Not an error; advance the cursor.
+    AlreadyReleased,
+    //  Could not fetch the active watcher set (needed to confirm
+    //  quorum and to validate signer_index ordering). Retry.
+    NoActiveSet,
+    //  Attestations couldn't be parsed, or a signer_index is out
+    //  of range for the active set. Retry.
+    StateError,
+    RpcError,
+  };
+
+  AssembleAckOutcome AssembleAckBlock(
+      Wallet::RpcClient &clarity_rpc,
+      uint64_t withdrawal_id,
+      size_t quorum,
+      std::vector<uint8_t> *block_out,
+      std::string *error_out);
+
+  //  Submit a BridgeAckWithdrawal recording the CCX release on
+  //  Clarity. This is the final step of the withdrawal pipeline.
+  //
+  //  The release_tx_hash and release_height must come from the
+  //  CCX chain — they are the proof that the release landed. The
+  //  scan loop obtains them from the wallet RPC transfer result
+  //  (see CcxAdapter::submit_release).
+  //
+  //  Preconditions: as SubmitAttestation. Additionally, the caller
+  //  should have verified that:
+  //    - the release_tx_hash is a real CCX tx that carries the
+  //      expected payment ID (`Blake2b("back" || LE64(withdrawal_id))`),
+  //    - release_height > 0,
+  //    - the ack_block represents at least quorum acks.
+  //
+  //  The executor re-verifies the block (executeBridgeAckWithdrawal),
+  //  so this function does not need to — but it does need to build
+  //  a well-formed block, and any malformed block will be rejected.
+  //  See AssembleAckBlock.
+  SubmitOutcome SubmitAckWithdrawal(
+      WatcherSession &session,
+      ChainRuntime &rt,
+      uint64_t withdrawal_id,
+      const Crypto::Hash &release_tx_hash,
+      uint64_t release_height,
+      const std::vector<uint8_t> &ack_block,
+      Crypto::Hash *clarity_tx_hash,
+      std::string *error_out);
 } // namespace Bridge::Submission

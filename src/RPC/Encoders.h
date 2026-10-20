@@ -302,7 +302,84 @@ namespace Rpc
       const Core::BridgeChainRegistration &reg,
       const std::string &hrp);
 
+  //  BridgeWithdrawal -> JSON
+  //
+  //  Fields:
+  //    withdrawal_id          (hex)
+  //    source_chain_id        (hex)
+  //    wrapped_token_id       (hex)
+  //    burner                 (Bech32m)
+  //    amount                 (hex)
+  //    destination_blob       (0x-prefixed hex)
+  //    created_at_height      (hex)
+  //    well_formed            (bool; derived)
+  //
+  //  release audit fields:
+  //    is_released            (bool; derived)
+  //    release_tx_hash        (0x-prefixed hex; all-zero if unreleased)
+  //    release_height         (hex; 0 if unreleased)
+  //    released_at_height     (hex; 0 if unreleased)
+  //    released_by_watcher_id (hex; 0 if unreleased)
   Common::Json encodeBridgeWithdrawal(
       const Core::BridgeWithdrawal &w,
       const std::string &hrp);
+
+  //  BridgeAckAttestation -> JSON
+  //
+  //  Fields:
+  //    signer_index        (number)
+  //    signature           (0x-prefixed hex)
+  //    attested_at_height  (hex)
+  //
+  //  The validator_id / withdrawal_id that key the record are NOT
+  //  part of the encoded object: they are supplied by the caller
+  //  (whoever enumerated the table) so the same encoder can be used
+  //  whether the record is being returned from a per-withdrawal scan
+  //  or a full-table dump.
+  Common::Json encodeBridgeAckAttestation(
+      const Core::BridgeAckAttestation &a);
+
+  //  BridgeStats -> JSON
+  //
+  //  Fields:
+  //    source_chain_id           (hex)
+  //    total_minted              (hex)
+  //    total_burned              (hex)
+  //    total_released            (hex)
+  //    deposit_count             (hex)
+  //    withdrawal_count          (hex)
+  //    released_withdrawal_count (hex)
+  //    last_mint_height          (hex)
+  //    last_burn_height          (hex)
+  //    last_release_height       (hex)
+  //    registered_at_height      (hex)
+  //
+  //  Derived:
+  //    outstanding_liability     (hex; total_burned - total_released)
+  //
+  //  `outstanding_liability` is the amount of source-chain value the
+  //  federation still owes to holders of the wrapped token. It is a
+  //  pure function of the stored stats (total_burned minus
+  //  total_released) and is included here so callers don't have to
+  //  recompute the invariant themselves.
+  Common::Json encodeBridgeStats(const Core::BridgeStats &stats);
+
+  //  BridgeEvent -> JSON.
+  //
+  //  Fields:
+  //    kind                  (string: "mint" | "burn" | "ack_attest" |
+  //                           "ack_withdrawal")
+  //    kind_code             (number)
+  //    source_chain_id       (hex)
+  //    block_height          (hex)
+  //    tx_index_in_block     (number)
+  //    tx_hash               (0x-prefixed hex)
+  //    source_tx_hash        (0x-prefixed hex or null)
+  //    source_output_index   (hex; 0 if has_source_hash is false)
+  //    withdrawal_id         (hex)
+  //    actor                 (Bech32m)
+  //    amount                (hex)
+  //    counterparty          (hex)
+  Common::Json encodeBridgeEvent(const Core::BridgeEvent &evt,
+                                 const std::string &hrp);
 } // namespace Rpc

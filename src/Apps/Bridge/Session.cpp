@@ -5,66 +5,24 @@
 
 #include "Session.h"
 
-#include "ChainAdapter.h"
-#include "WatcherConfig.h"
-
-#include "Common/Base.h"
 #include "Common/PasswordPrompt.h"
-#include "Common/StringTools.h"
-
 #include "Wallet/AddressCodec.h"
 #include "Wallet/RpcClient.h"
 #include "Wallet/WalletError.h"
 
-#include <chrono>
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <iostream>
-#include <string>
 
 namespace Bridge
 {
-
-  namespace
-  {
-    void reportWalletError(const char *prefix, const Wallet::WalletStatus &st)
-    {
-      std::cerr << "error: " << prefix << ": ";
-      if (!st.detail.empty())
-        std::cerr << st.detail;
-      else
-        std::cerr << Wallet::walletErrorMessage(st.code);
-      std::cerr << "\n";
-    }
-
-    bool parseEndpointSpec(const std::string &spec,
-                           std::string &host_out,
-                           uint16_t &port_out)
-    {
-      const size_t colon = spec.find(':');
-      if (colon == std::string::npos || colon == 0 ||
-          colon + 1 >= spec.size())
-        return false;
-
-      const std::string host = spec.substr(0, colon);
-      const std::string port_str = spec.substr(colon + 1);
-
-      char *end = nullptr;
-      const unsigned long port = std::strtoul(port_str.c_str(), &end, 10);
-      if (end == port_str.c_str() || *end != '\0' ||
-          port == 0 || port > 65535)
-        return false;
-
-      host_out = host;
-      port_out = static_cast<uint16_t>(port);
-      return true;
-    }
-  } // anonymous namespace
-
   ChainRuntime *WatcherSession::current() noexcept
   {
     if (current_chain.empty())
       return nullptr;
     auto it = chains.find(current_chain);
-    if (it == chains.end())
+    if (it == chains.end() || !it->second.enabled)
       return nullptr;
     return &it->second;
   }
@@ -74,15 +32,16 @@ namespace Bridge
     if (current_chain.empty())
       return nullptr;
     auto it = chains.find(current_chain);
-    if (it == chains.end())
+    if (it == chains.end() || !it->second.enabled)
       return nullptr;
     return &it->second;
   }
 
-  ChainRuntime *WatcherSession::findChain(const std::string &short_name) noexcept
+  ChainRuntime *WatcherSession::findChain(
+      const std::string &short_name) noexcept
   {
     auto it = chains.find(short_name);
-    if (it == chains.end())
+    if (it == chains.end() || !it->second.enabled)
       return nullptr;
     return &it->second;
   }
@@ -91,17 +50,14 @@ namespace Bridge
       const std::string &short_name) const noexcept
   {
     auto it = chains.find(short_name);
-    if (it == chains.end())
+    if (it == chains.end() || !it->second.enabled)
       return nullptr;
     return &it->second;
   }
 
   bool WatcherSession::selectChain(const std::string &short_name)
   {
-    auto it = chains.find(short_name);
-    if (it == chains.end())
-      return false;
-    if (!it->second.enabled)
+    if (!findChain(short_name))
       return false;
     current_chain = short_name;
     return true;
@@ -114,44 +70,57 @@ namespace Bridge
     if (!adapter)
       return nullptr;
 
-    const std::string short_name = adapter->short_name();
+    const std::string name = adapter->short_name();
 
-    applyAdapterDefaults(*adapter, config);
+    auto it = chains.find(name);
+    if (it != chains.end() && it->second.enabled)
+      return &it->second;
 
     ChainRuntime rt;
     rt.adapter = std::move(adapter);
     rt.config = std::move(config);
-    rt.bridge_deposit_address = rt.config.bridge_deposit_address;
     rt.enabled = true;
     rt.reconnect();
 
-    auto [it, inserted] = chains.insert_or_assign(short_name, std::move(rt));
+    auto [inserted, ok] = chains.emplace(name, std::move(rt));
+    if (!ok)
+      return nullptr;
+    return &inserted->second;
+  }
 
-    if (current_chain.empty())
-      current_chain = short_name;
-
-    return &it->second;
+  size_t WatcherSession::enabledChainCount() const noexcept
+  {
+    size_t n = 0;
+    for (const auto &[name, rt] : chains)
+    {
+      (void)name;
+      if (rt.enabled)
+        ++n;
+    }
+    return n;
   }
 
   ChainRuntime *WatcherSession::enableChainByShortName(
-      const std::string &short_name, bool replace_existing)
+      const std::string &short_name,
+      bool replace_existing)
   {
-    if (!replace_existing)
-    {
-      auto existing = chains.find(short_name);
-      if (existing != chains.end() && existing->second.enabled)
-        return &existing->second;
-    }
-
     auto adapter = ChainAdapterRegistry::find(short_name);
     if (!adapter)
       return nullptr;
 
+    if (!replace_existing)
+    {
+      auto it = chains.find(short_name);
+      if (it != chains.end() && it->second.enabled)
+        return &it->second;
+    }
+
     ChainWatcherConfig cfg;
     cfg.chain_short_name = short_name;
     cfg.enabled = true;
+    applyAdapterDefaults(*adapter, cfg);
 
-    return enableChain(std::move(adapter), std::move(cfg));
+    return enableChain(adapter, cfg);
   }
 
   std::optional<ChainWatcherConfig> WatcherSession::defaultConfigFor(
@@ -168,49 +137,48 @@ namespace Bridge
     return cfg;
   }
 
-  size_t WatcherSession::enabledChainCount() const noexcept
-  {
-    size_t n = 0;
-    for (const auto &[name, rt] : chains)
-    {
-      (void)name;
-      if (rt.enabled)
-        ++n;
-    }
-    return n;
-  }
-
   void WatcherSession::reset()
   {
-    closeKeystore(*this);
+    for (auto &[name, rt] : chains)
+    {
+      (void)name;
+      if (rt.running)
+        rt.running = false;
+    }
 
     chains.clear();
     current_chain.clear();
 
-    clarity_rpc.reset();
-    clarity_endpoint = Wallet::RpcEndpoint{};
+    if (signer)
+      signer.reset();
+    if (keystore)
+    {
+      keystore->lock();
+      keystore.reset();
+    }
+    address.reset();
+    address_bech32m.clear();
+    keystore_path.clear();
+    network.reset();
+    watcher_id = 0;
+    consensus_key.reset();
+    custody_view_key.reset();
+    mint_destination.reset();
+
+    if (clarity_rpc)
+      clarity_rpc.reset();
     clarity_connected = false;
 
     running = true;
-    consensus_key.reset();
   }
 
   bool openKeystore(WatcherSession &session,
                     const std::string &path,
                     const std::string &password_file)
   {
-    if (session.hasKeystore())
+    if (session.keystore)
     {
-      std::cerr << "error: a keystore is already open ("
-                << session.keystore_path << "). Use 'close' first.\n";
-      return false;
-    }
-
-    Wallet::WalletStatus st;
-    auto ks = Wallet::EncryptedKeyStore::open(path, &st);
-    if (!ks.has_value())
-    {
-      reportWalletError("cannot open keystore", st);
+      std::cerr << "error: a keystore is already open; close it first\n";
       return false;
     }
 
@@ -220,87 +188,104 @@ namespace Bridge
       auto pw = Apps::readPasswordFile(password_file);
       if (!pw.has_value())
       {
-        std::cerr << "error: cannot read password file: "
-                  << password_file << "\n";
+        std::cerr << "error: cannot read password file '"
+                  << password_file << "'\n";
         return false;
       }
-      password = *pw;
+      password = std::move(*pw);
     }
     else
     {
       auto pw = Apps::promptForPassword("Keystore password: ");
       if (!pw.has_value())
       {
-        std::cerr << "error: could not read password\n";
+        std::cerr << "error: password entry aborted\n";
         return false;
       }
-      password = *pw;
+      password = std::move(*pw);
     }
 
-    const Wallet::WalletError err = (*ks)->unlock(password);
-    if (!password.empty())
+    if (password.empty())
     {
-      for (auto &c : password)
-        c = '\0';
-    }
-
-    if (err != Wallet::WalletError::Ok)
-    {
-      Wallet::WalletStatus unlock_err =
-          Wallet::WalletStatus::fail(err, "");
-      reportWalletError("cannot unlock keystore", unlock_err);
+      std::cerr << "error: empty password\n";
       return false;
     }
 
-    auto from_addr = Wallet::decodeAddress((*ks)->address(), (*ks)->network());
-    if (!from_addr.has_value())
+    Wallet::WalletStatus open_st;
+    auto ks = Wallet::openEncryptedKeyStore(path, &open_st);
+    if (!ks.has_value())
     {
-      std::cerr << "error: keystore address is not decodable: "
-                << (*ks)->address() << "\n";
+      std::cerr << "error: failed to open keystore: "
+                << (open_st.detail.empty()
+                        ? Wallet::walletErrorMessage(open_st.code)
+                        : open_st.detail)
+                << "\n";
       return false;
     }
 
+    const Wallet::WalletError unlock_err = (*ks)->unlock(password);
+    if (unlock_err != Wallet::WalletError::Ok)
+    {
+      std::cerr << "error: failed to unlock keystore: "
+                << Wallet::walletErrorMessage(unlock_err) << "\n";
+      return false;
+    }
+
+    const std::string bech = (*ks)->address();
+    if (bech.empty())
+    {
+      std::cerr << "error: keystore has no address\n";
+      (*ks)->lock();
+      return false;
+    }
+
+    session.network = (*ks)->network();
+
+    auto decoded = Wallet::decodeAddress(bech, session.currentNetwork());
+    if (!decoded.has_value())
+    {
+      std::cerr << "error: keystore address is invalid bech32m: "
+                << bech << "\n";
+      (*ks)->lock();
+      return false;
+    }
+
+    session.address = *decoded;
+    session.address_bech32m = bech;
     session.keystore_path = path;
     session.keystore = std::move(*ks);
-    session.signer =
-        std::make_unique<Wallet::LocalSigner>(*session.keystore);
-    session.address = *from_addr;
-    session.address_bech32m = session.keystore->address();
-    session.network = session.keystore->network();
+    session.signer = std::make_unique<Wallet::LocalSigner>(*session.keystore);
 
-    std::cout << "Unlocked " << path
-              << " (" << session.address_bech32m
-              << ") — " << Wallet::networkName(session.currentNetwork())
-              << "\n";
-
-    if (session.watcher_id == 0 && session.clarity_rpc)
+    if (session.clarity_rpc)
     {
-      const uint64_t resolved =
-          resolveWatcherId(*session.clarity_rpc, *session.address, *session.network);
-      if (resolved != 0)
-      {
-        session.watcher_id = resolved;
-        std::cout << "Watcher id: " << resolved << "\n";
-      }
+      session.watcher_id = resolveWatcherId(
+          *session.clarity_rpc, *session.address, session.currentNetwork());
     }
 
+    std::cout << "Keystore opened: " << session.address_bech32m << "\n";
+    if (session.watcher_id != 0)
+      std::cout << "Watcher id: " << session.watcher_id << "\n";
     return true;
   }
 
   void closeKeystore(WatcherSession &session)
   {
-    if (!session.hasKeystore())
-      return;
+    if (session.signer)
+      session.signer.reset();
 
-    session.keystore->lock();
+    if (session.keystore)
+    {
+      session.keystore->lock();
+      session.keystore.reset();
+    }
 
-    session.signer.reset();
-    session.keystore.reset();
-    session.keystore_path.clear();
     session.address.reset();
     session.address_bech32m.clear();
-    session.network.reset();
+    session.keystore_path.clear();
     session.watcher_id = 0;
+    session.consensus_key.reset();
+    session.custody_view_key.reset();
+    session.mint_destination.reset();
 
     std::cout << "Keystore closed.\n";
   }
@@ -311,45 +296,37 @@ namespace Bridge
   {
     try
     {
-      const std::string bech32m = Wallet::encodeAddress(address, network);
-      if (bech32m.empty())
-        return 0;
-
       bool not_found = false;
       std::string err;
-      auto res = Wallet::getBridgeWatcherIdByAddress(
-          clarity_rpc, bech32m, &not_found, &err);
+      const std::string bech = Wallet::encodeAddress(address, network);
 
-      if (not_found)
+      auto res = Wallet::getBridgeWatcherIdByAddress(
+          clarity_rpc, bech, &not_found, &err);
+      if (not_found || !res.has_value())
         return 0;
-      if (!res.has_value())
-        return 0;
-      if (!res->is_object())
-        return 0;
-      if (!res->contains("watcher_id"))
+
+      if (!res->is_object() || !res->contains("watcher_id"))
         return 0;
       if (!(*res)["watcher_id"].is_string())
         return 0;
 
-      const std::string s = (*res)["watcher_id"].get<std::string>();
+      const std::string hex = (*res)["watcher_id"].get<std::string>();
       size_t i = 0;
-      if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+      if (hex.size() >= 2 && hex[0] == '0' &&
+          (hex[1] == 'x' || hex[1] == 'X'))
         i = 2;
-      if (i >= s.size())
-        return 0;
-
       uint64_t v = 0;
-      for (; i < s.size(); ++i)
+      for (; i < hex.size(); ++i)
       {
-        const char c = s[i];
-        int nib;
+        const char c = hex[i];
+        int nib = -1;
         if (c >= '0' && c <= '9')
           nib = c - '0';
         else if (c >= 'a' && c <= 'f')
           nib = c - 'a' + 10;
         else if (c >= 'A' && c <= 'F')
           nib = c - 'A' + 10;
-        else
+        if (nib < 0)
           return 0;
         v = (v << 4) | static_cast<uint64_t>(nib);
       }
@@ -364,34 +341,36 @@ namespace Bridge
   bool probeChain(ChainRuntime &runtime)
   {
     if (!runtime.adapter || !runtime.rpc)
+      return false;
+
+    try
     {
+      const ChainStatus status =
+          runtime.adapter->fetch_status(*runtime.rpc);
+      runtime.connected = status.reachable;
+      return status.reachable;
+    }
+    catch (const std::exception &e)
+    {
+      std::cerr << "[" << runtime.chain_short_name() << "] probe: "
+                << e.what() << "\n";
       runtime.connected = false;
       return false;
     }
-
-    std::string error;
-    const bool ok = runtime.adapter->probe_rpc(*runtime.rpc, &error);
-    runtime.connected = ok;
-    if (!ok && !error.empty())
-    {
-      std::cerr << " probe failed: " << error << "\n";
-    }
-    return ok;
   }
 
   void applyAdapterDefaults(ChainAdapter &adapter,
                             ChainWatcherConfig &config)
   {
-    if (config.rpc_host.empty() || config.rpc_port == 0)
+    if (config.rpc_host.empty())
     {
-      std::string host;
-      uint16_t port = 0;
-      if (parseEndpointSpec(adapter.default_rpc_endpoint(), host, port))
+      const std::string ep = adapter.default_rpc_endpoint();
+      const size_t colon = ep.find(':');
+      if (colon != std::string::npos)
       {
-        if (config.rpc_host.empty())
-          config.rpc_host = host;
-        if (config.rpc_port == 0)
-          config.rpc_port = port;
+        config.rpc_host = ep.substr(0, colon);
+        config.rpc_port = static_cast<uint16_t>(
+            std::strtoul(ep.c_str() + colon + 1, nullptr, 10));
       }
     }
 
@@ -399,7 +378,7 @@ namespace Bridge
       config.confirmation_depth = adapter.default_confirmation_depth();
 
     if (config.state_subdir.empty())
-      config.state_subdir = "state/" + adapter.short_name();
+      config.state_subdir = adapter.short_name();
   }
 
 } // namespace Bridge

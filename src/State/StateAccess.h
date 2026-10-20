@@ -485,6 +485,23 @@ namespace State
         size_t max_results,
         const std::function<bool(const Core::BridgeWithdrawal &)> &fn) const;
 
+    //  ---- bridge event log (non-SMT, chronological) ----
+    //
+    //  Written once per successful bridge operation, unconditionally
+    //  (including on the dry-run path, where the surrounding write
+    //  transaction aborts). Read by getBridgeEvents.
+
+    void putBridgeEvent(const Core::BridgeEvent &evt);
+
+    void forEachBridgeEvent(
+        uint64_t source_chain_id,
+        uint64_t from_height,
+        const std::function<bool(const Core::BridgeEvent &)> &fn) const;
+
+    void forEachBridgeEventForWithdrawal(
+        uint64_t withdrawal_id,
+        const std::function<bool(const Core::BridgeEvent &)> &fn) const;
+
     //  ---- Chain registry ----
 
     bool getBridgeChainRegistration(uint64_t source_chain_id,
@@ -599,6 +616,74 @@ namespace State
         const Crypto::Hash &source_tx_hash,
         uint32_t source_output_index,
         uint64_t validator_id);
+
+    //  ---- Withdrawal attestations ----
+    //
+    //  A BridgeAckAttestation is keyed by (withdrawal_id,
+    //  validator_id). The composite key is simpler than the deposit
+    //  attestation key because a withdrawal is identified by one
+    //  integer, not (chain_id, tx_hash, output_index).
+    //
+    //  Key layout (16 bytes):
+    //    [8]  withdrawal_id (LE)
+    //    [8]  validator_id (LE)
+    //
+    //  Like the deposit attestations, these records do NOT live in
+    //  the SMT: they are federation state and do not affect any
+    //  other transaction's validity.
+
+    void putBridgeAckAttestation(
+        uint64_t withdrawal_id,
+        uint64_t validator_id,
+        const Core::BridgeAckAttestation &attestation);
+
+    bool getBridgeAckAttestation(
+        uint64_t withdrawal_id,
+        uint64_t validator_id,
+        Core::BridgeAckAttestation &out) const;
+
+    void forEachBridgeAckAttestationForWithdrawal(
+        uint64_t withdrawal_id,
+        const std::function<bool(uint64_t validator_id,
+                                 const Core::BridgeAckAttestation &)> &fn) const;
+
+    size_t countBridgeAckAttestationsForWithdrawal(
+        uint64_t withdrawal_id) const;
+
+    void forEachBridgeAckAttestation(
+        const std::function<bool(uint64_t withdrawal_id,
+                                 uint64_t validator_id,
+                                 const Core::BridgeAckAttestation &)> &fn) const;
+
+    static std::array<uint8_t, 16> bridgeAckAttestationKey(
+        uint64_t withdrawal_id,
+        uint64_t validator_id);
+
+    //  ---- Withdrawals awaiting release ----
+    //
+    //  Like forEachPendingBridgeWithdrawal, but filtered to
+    //  unreleased withdrawals. Used by the getPendingWithdrawals
+    //  RPC and by the submission assembler's poll loop.
+    //
+    //  A withdrawal is "pending" in this sense if it has been
+    //  burned but not yet released. That is: it exists in
+    //  TBL_BRIDGE_WITHDRAWALS (created at burn time) and its
+    //  release_tx_hash is null.
+    //
+    //  Iteration order is creation order (same (height, id) index
+    //  as forEachPendingBridgeWithdrawal). `from_height == 0` means
+    //  "from genesis".
+    void forEachUnreleasedBridgeWithdrawal(
+        uint64_t from_height,
+        size_t max_results,
+        const std::function<bool(const Core::BridgeWithdrawal &)> &fn) const;
+
+    //  ---- Bridge stats ----
+
+    bool getBridgeStats(uint64_t source_chain_id,
+                        Core::BridgeStats &out) const;
+
+    void putBridgeStats(const Core::BridgeStats &stats);
 
     //  =====================================================================
     //  Global state
@@ -768,6 +853,9 @@ namespace State
 
     void indexOrderPoolRows(const Core::Order &order);
     void unindexOrderPoolRows(const Core::Order &order);
+
+    void indexBridgeWithdrawalRow(const Core::BridgeWithdrawal &w);
+    void unindexBridgeWithdrawalRow(const Core::BridgeWithdrawal &w);
 
     //  Low-level row writers.
     void putSentinel(uint32_t table_id, const void *key, size_t key_len);

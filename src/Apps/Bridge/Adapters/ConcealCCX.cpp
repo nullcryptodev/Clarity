@@ -12,6 +12,7 @@
 #include "Common/StringTools.h"
 #include "Common/Varint.h"
 
+#include "Crypto/Helpers.h"
 #include "Crypto/Ed25519.h"
 
 #include <boost/asio/connect.hpp>
@@ -55,9 +56,21 @@ namespace Bridge
     constexpr uint32_t CCX_BLOCK_CHUNK_SIZE = 1000;
     constexpr int CCX_HTTP_TIMEOUT_SECONDS = 30;
 
+    //  The wallet RPC's sendTransaction and getTransaction are both
+    //  fast index lookups; a 30-minute timeout is not needed for
+    //  walletd (unlike conceal-wallet-rpc, where `transfer` blocks
+    //  until confirmation). walletd returns as soon as the tx is
+    //  relayed to the daemon, so a short timeout is correct.
+    //
+    //  We still use the longer timeout for the daemon's
+    //  /gettransactions path since a slow daemon under load can
+    //  take a while, and we don't want to spuriously fail a
+    //  confirmed tx just because a node was briefly slow.
+    constexpr int CCX_WALLET_HTTP_TIMEOUT_SECONDS = 60;
+
     void dbg(const std::string &msg)
     {
-      std::cerr << "[ccx] " << msg << "\n";
+      // std::cerr << "[ccx] " << msg << "\n";
     }
 
     std::string hexPreview(const std::vector<uint8_t> &bytes,
@@ -158,6 +171,7 @@ namespace Bridge
     Common::Json doHttpPost(const Wallet::RpcEndpoint &ep,
                             const std::string &path,
                             const std::string &body,
+                            int timeout_seconds,
                             std::string *error_out)
     {
       try
@@ -167,7 +181,7 @@ namespace Bridge
         beast::tcp_stream stream(ioc);
 
         const auto timeout =
-            std::chrono::seconds(CCX_HTTP_TIMEOUT_SECONDS);
+            std::chrono::seconds(timeout_seconds);
 
         const auto results = resolver.resolve(
             ep.host, std::to_string(ep.port));
@@ -235,7 +249,8 @@ namespace Bridge
 
       std::string transport_error;
       Common::Json resp =
-          doHttpPost(ep, "/", envelope.dump(), &transport_error);
+          doHttpPost(ep, "/", envelope.dump(),
+                     CCX_HTTP_TIMEOUT_SECONDS, &transport_error);
 
       if (!transport_error.empty())
       {
@@ -286,7 +301,8 @@ namespace Bridge
     {
       std::string transport_error;
       Common::Json resp =
-          doHttpPost(ep, path, params.dump(), &transport_error);
+          doHttpPost(ep, path, params.dump(),
+                     CCX_HTTP_TIMEOUT_SECONDS, &transport_error);
 
       if (!transport_error.empty())
       {
@@ -303,6 +319,86 @@ namespace Bridge
       }
 
       return resp;
+    }
+
+    //  Call the Conceal PaymentService (walletd) JSON-RPC endpoint.
+    //
+    //  The walletd protocol is:
+    //
+    //    POST /json_rpc
+    //    {
+    //      "jsonrpc": "2.0",
+    //      "id": <any>,
+    //      "method": "<name>",
+    //      "params": { ... }
+    //    }
+    //
+    //  Unlike the daemon's JSON-RPC 2.0 endpoint, walletd
+    //  *requires* the params to be nested under a "params" key.
+    //  Unlike `transfer` on conceal-wallet-rpc, walletd's
+    //  `sendTransaction` returns as soon as the tx is relayed to the
+    //  daemon — it does not block until confirmation.
+    //
+    //  The timeout is short because nothing walletd does blocks for
+    //  long: `sendTransaction` relays immediately, and the
+    //  `getTransaction`/`getStatus` calls it also serves are index
+    //  lookups.
+    std::optional<Common::Json> call_wallet_rpc(
+        const Wallet::RpcEndpoint &ep,
+        const std::string &method,
+        const Common::Json &params,
+        std::string *error_out)
+    {
+      Common::Json envelope = Common::Json::object();
+      envelope["jsonrpc"] = "2.0";
+      envelope["id"] = 1;
+      envelope["method"] = method;
+      envelope["params"] = params;
+
+      std::string transport_error;
+      Common::Json resp =
+          doHttpPost(ep, "/json_rpc", envelope.dump(),
+                     CCX_WALLET_HTTP_TIMEOUT_SECONDS, &transport_error);
+
+      if (!transport_error.empty())
+      {
+        if (error_out)
+          *error_out = transport_error;
+        return std::nullopt;
+      }
+
+      if (!resp.is_object())
+      {
+        if (error_out)
+          *error_out = "wallet response is not an object";
+        return std::nullopt;
+      }
+
+      if (resp.contains("error") && !resp["error"].is_null())
+      {
+        const auto &err = resp["error"];
+        if (err.is_object() && err.contains("message") &&
+            err["message"].is_string())
+        {
+          if (error_out)
+            *error_out = err["message"].get<std::string>();
+        }
+        else
+        {
+          if (error_out)
+            *error_out = err.dump();
+        }
+        return std::nullopt;
+      }
+
+      if (!resp.contains("result"))
+      {
+        if (error_out)
+          *error_out = "wallet response has no 'result' field";
+        return std::nullopt;
+      }
+
+      return resp["result"];
     }
 
     bool extractPaymentId(const std::vector<uint8_t> &extra,
@@ -1099,19 +1195,371 @@ namespace Bridge
     }
   }
 
+  //  =========================================================================
+  //  submit_release
+  //
+  //  Asks walletd to build, sign, and relay a release transaction from
+  //  the custody address to the withdrawal's destination.
+  //
+  //  The walletd protocol:
+  //
+  //    sendTransaction:
+  //      params: {
+  //        "transfers": [
+  //          { "address": "<base58>", "amount": <atomic> }
+  //        ],
+  //        "paymentId": "<32-byte hex, no 0x>",
+  //        "changeAddress": "<base58>"   // where change goes
+  //      }
+  //      result: {
+  //        "transactionHash": "<hex>",
+  //        "transactionSecretKey": "<hex>"
+  //      }
+  //
+  //  Notes:
+  //
+  //    - sendTransaction returns as soon as the daemon accepts the
+  //      tx into the mempool. It does NOT block until confirmation.
+  //      The caller is expected to poll the daemon (via
+  //      fetch_release_height, or its own tracking) for confirmation.
+  //
+  //    - "changeAddress" is the address the walletd puts any change
+  //      on. For our release, we want change back to the custody
+  //      address (so subsequent releases can draw on it). We compute
+  //      this from the destination_blob's spend key — but the
+  //      custody address and the destination address share a spend
+  //      key in general (they're different addresses with different
+  //      spend keys). We need the custody address as a separate
+  //      parameter.
+  //
+  //    - We do NOT pass the payment ID via the destination
+  //      integrated-address mechanism. walletd's sendTransaction
+  //      has a dedicated paymentId field, and we use that. The
+  //      32-byte payment ID is our Blake2b("back" || LE64(id))
+  //      value, which is what the recovery scan looks for.
+  //
+  //  The signature_block parameter is ignored: it's the quorum-of-acks
+  //  audit record that lands on Clarity in the subsequent
+  //  BridgeAckWithdrawal. walletd's authority is the custody spend
+  //  key it holds.
+  //  =========================================================================
   ReleaseSubmission CcxAdapter::submit_release(
-      Wallet::RpcClient &rpc,
-      const ReleaseRequest & /*request*/,
-      uint64_t /*amount_source_atomic*/,
+      Wallet::RpcClient & /*rpc*/,
+      const ReleaseRequest &request,
+      uint64_t amount_source_atomic,
       const std::vector<uint8_t> & /*signature_block*/) const
   {
     ReleaseSubmission out;
     out.ok = false;
-    out.reason =
-        "submit_release not implemented in v1 — signing service "
-        "integration is out of scope";
-    (void)rpc;
+
+    if (wallet_rpc_endpoint_.host.empty() || wallet_rpc_endpoint_.port == 0)
+    {
+      out.reason =
+          "no CCX wallet RPC configured; cannot release. "
+          "Set wallet_rpc_host / wallet_rpc_port in the bridge "
+          "config (or --ccx-wallet-rpc).";
+      return out;
+    }
+
+    if (!validate_destination(request.destination_blob))
+    {
+      out.reason = "destination_blob is not a valid 64-byte "
+                   "(spend ‖ view) pubkey pair";
+      return out;
+    }
+
+    if (amount_source_atomic == 0)
+    {
+      out.reason = "amount_source_atomic is zero; refusing to release";
+      return out;
+    }
+
+    //  ---- Address strings ----
+    //
+    //  Both addresses come from string sources already present in
+    //  the system:
+    //
+    //    - destination: the withdrawal's destination_address,
+    //      which the user supplied in the burn payload. Carried
+    //      verbatim from the burn. No base58 encoding needed.
+    //
+    //    - custody: the operator's --bridge-address string, which
+    //      is stored on the adapter at startup. Used for both
+    //      sourceAddresses and changeAddress.
+    //
+    //  The destination_blob is still checked above as a sanity
+    //  signal — a malformed blob (wrong length, null keys) means
+    //  the withdrawal record is corrupt, and we refuse to release
+    //  rather than risk sending to an unexpected address.
+
+    const std::string destination_addr = request.destination_address;
+    const std::string change_addr = custody_address_string_;
+
+    if (destination_addr.empty())
+    {
+      out.reason = "withdrawal has no destination_address; cannot "
+                   "build a transfer";
+      return out;
+    }
+
+    if (change_addr.empty())
+    {
+      out.reason = "no custody address string configured on the "
+                   "adapter; cannot build a transfer. Call "
+                   "set_custody_address_string at startup.";
+      return out;
+    }
+
+    //  ---- Compute the payment ID ----
+
+    Crypto::Hash payment_id;
+    {
+      uint8_t preimage[8];
+      for (int i = 0; i < 8; ++i)
+        preimage[i] = uint8_t(request.withdrawal_id >> (i * 8));
+
+      payment_id = Crypto::hashDomain("back", preimage, sizeof(preimage));
+    }
+
+    auto to_hex_32 = [](const Crypto::Hash &h) -> std::string
+    {
+      static const char HEX[] = "0123456789abcdef";
+      std::string s;
+      s.reserve(64);
+      for (uint8_t b : h.data)
+      {
+        s.push_back(HEX[b >> 4]);
+        s.push_back(HEX[b & 0xF]);
+      }
+      return s;
+    };
+    const std::string payment_id_hex = to_hex_32(payment_id);
+
+    //  ---- Build the sendTransaction params ----
+
+    Common::Json params = Common::Json::object();
+
+    Common::Json source_addrs = Common::Json::array();
+    source_addrs.push_back(change_addr);
+    params["sourceAddresses"] = std::move(source_addrs);
+
+    Common::Json transfers = Common::Json::array();
+    Common::Json t = Common::Json::object();
+    t["address"] = destination_addr;
+    t["amount"] = amount_source_atomic;
+    t["message"] = "";
+    transfers.push_back(std::move(t));
+    params["transfers"] = std::move(transfers);
+
+    params["changeAddress"] = change_addr;
+    params["paymentId"] = payment_id_hex;
+    params["fee"] = static_cast<uint64_t>(1000);
+    params["anonymity"] = static_cast<uint64_t>(0);
+    params["unlockTime"] = static_cast<uint64_t>(0);
+
+    //  ---- Submit ----
+
+    std::string wallet_err;
+    auto result = call_wallet_rpc(
+        wallet_rpc_endpoint_, "sendTransaction", params, &wallet_err);
+
+    if (!result.has_value())
+    {
+      out.reason = "wallet transfer failed: " +
+                   (wallet_err.empty() ? std::string("(unknown error)")
+                                       : wallet_err);
+      return out;
+    }
+
+    if (!result->is_object() ||
+        !result->contains("transactionHash") ||
+        !(*result)["transactionHash"].is_string())
+    {
+      out.reason = "wallet transfer returned no transactionHash";
+      return out;
+    }
+
+    const std::string tx_hash_hex =
+        (*result)["transactionHash"].get<std::string>();
+
+    if (!parseHexBytes(tx_hash_hex,
+                       out.source_tx_hash.data.data(),
+                       out.source_tx_hash.data.size()))
+    {
+      out.reason = "wallet transfer returned a malformed transactionHash \"" +
+                   tx_hash_hex + "\"";
+      return out;
+    }
+
+    out.ok = true;
     return out;
+  }
+
+  void CcxAdapter::set_wallet_rpc_endpoint(const std::string &host,
+                                           uint16_t port,
+                                           const std::string &user,
+                                           const std::string &password)
+  {
+    wallet_rpc_endpoint_.host = host;
+    wallet_rpc_endpoint_.port = port;
+    wallet_rpc_endpoint_.user = user;
+    wallet_rpc_endpoint_.password = password;
+
+    if (host.empty() || port == 0)
+    {
+      dbg("set_wallet_rpc_endpoint: wallet RPC disabled");
+    }
+    else
+    {
+      dbg("set_wallet_rpc_endpoint: configured "
+          "host=" +
+          host + " port=" + std::to_string(port));
+    }
+  }
+
+  void CcxAdapter::set_network_prefix(uint64_t prefix)
+  {
+    ccx_network_prefix_ = prefix;
+    dbg("set_ccx_network_prefix: set to 0x" +
+        std::to_string(prefix));
+  }
+
+  std::optional<Crypto::Hash> CcxAdapter::find_existing_release(
+      const Crypto::Hash &payment_id) const
+  {
+    if (wallet_rpc_endpoint_.host.empty() || wallet_rpc_endpoint_.port == 0)
+      return std::nullopt;
+
+    //  Hex-encode payment ID
+    static const char HEX[] = "0123456789abcdef";
+    std::string pid_hex;
+    pid_hex.reserve(64);
+    for (uint8_t b : payment_id.data)
+    {
+      pid_hex.push_back(HEX[b >> 4]);
+      pid_hex.push_back(HEX[b & 0xF]);
+    }
+
+    Common::Json params = Common::Json::object();
+    params["addresses"] = Common::Json::array();
+    params["addresses"].push_back(custody_address_string_);
+    params["blockCount"] = static_cast<uint64_t>(200); // last ~200 blocks
+    params["paymentId"] = pid_hex;
+
+    std::string err;
+    auto result = call_wallet_rpc(
+        wallet_rpc_endpoint_, "getTransactionHashes", params, &err);
+
+    if (!result.has_value() || !result->is_object())
+      return std::nullopt;
+
+    if (!result->contains("items") || !(*result)["items"].is_array())
+      return std::nullopt;
+
+    for (const auto &item : (*result)["items"])
+    {
+      if (!item.is_object())
+        continue;
+      if (!item.contains("transactionHashes") ||
+          !item["transactionHashes"].is_array())
+        continue;
+      for (const auto &hash_val : item["transactionHashes"])
+      {
+        if (!hash_val.is_string())
+          continue;
+        Crypto::Hash out;
+        if (parseHexBytes(hash_val.get<std::string>(),
+                          out.data.data(), out.data.size()))
+        {
+          return out;
+        }
+      }
+    }
+
+    return std::nullopt;
+  }
+
+  //  =========================================================================
+  //  fetch_release_height
+  //
+  //  Ask walletd for the block height of a specific tx, using the
+  //  getTransaction method. Returns nullopt if the tx isn't in a
+  //  block yet (still in the mempool, or walletd hasn't seen it).
+  //
+  //  Response shape:
+  //    {
+  //      "transaction": {
+  //        "transactionHash": "...",
+  //        "blockIndex": N,          // present iff confirmed
+  //        "timestamp": N,
+  //        "amount": N,
+  //        "fee": N,
+  //        "transfers": [...],
+  //        ...
+  //      }
+  //    }
+  //
+  //  If the tx is in the mempool, walletd still returns a
+  //  transaction object but blockIndex is 0 or absent. We treat
+  //  that as "not yet confirmed".
+  //  =========================================================================
+  std::optional<uint64_t> CcxAdapter::fetch_release_height(
+      Wallet::RpcClient & /*rpc*/,
+      const Crypto::Hash &tx_hash) const
+  {
+    if (wallet_rpc_endpoint_.host.empty() || wallet_rpc_endpoint_.port == 0)
+    {
+      dbg("fetch_release_height: no wallet RPC configured");
+      return std::nullopt;
+    }
+
+    //  Hex-encode the hash. walletd's getTransaction takes the
+    //  bare hex form (no 0x).
+    static const char HEX[] = "0123456789abcdef";
+    std::string hash_hex;
+    hash_hex.reserve(64);
+    for (uint8_t b : tx_hash.data)
+    {
+      hash_hex.push_back(HEX[b >> 4]);
+      hash_hex.push_back(HEX[b & 0xF]);
+    }
+
+    Common::Json params = Common::Json::object();
+    params["transactionHash"] = hash_hex;
+
+    std::string err;
+    auto resp = call_wallet_rpc(
+        wallet_rpc_endpoint_, "getTransaction", params, &err);
+
+    if (!resp.has_value() || !resp->is_object())
+    {
+      dbg("fetch_release_height: getTransaction failed: " +
+          (err.empty() ? std::string("(malformed response)") : err));
+      return std::nullopt;
+    }
+
+    const Common::Json &j = *resp;
+
+    if (!j.contains("transaction") || !j["transaction"].is_object())
+    {
+      return std::nullopt;
+    }
+
+    const Common::Json &tx = j["transaction"];
+
+    if (!tx.contains("blockIndex") || !tx["blockIndex"].is_number_unsigned())
+    {
+      return std::nullopt;
+    }
+
+    const uint64_t height = tx["blockIndex"].get<uint64_t>();
+    if (height == 0 || height == 0xFFFFFFFFull)
+    {
+      //  Mempool only.
+      return std::nullopt;
+    }
+
+    return height;
   }
 
   uint64_t CcxAdapter::to_clarity_atomic(uint64_t amount_source_atomic,

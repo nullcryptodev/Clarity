@@ -186,6 +186,7 @@ namespace Core
     static Receipt executeRefillCollectionReward(State::StateAccess &state,
                                                  const Transaction &tx,
                                                  const TxExecutionContext &ctx);
+
     //  ---- Bridge ----
 
     static Receipt executeBridgeMint(State::StateAccess &state,
@@ -209,6 +210,13 @@ namespace Core
     static Receipt executeBridgeAttest(State::StateAccess &state,
                                        const Transaction &tx,
                                        const TxExecutionContext &ctx);
+    //  per-watcher attestation over a withdrawal. Mirrors
+    //  executeBridgeAttest but carries only (withdrawal_id,
+    //  signer_index, signature): the destination and amount live
+    //  in the BridgeWithdrawal record created at burn time.
+    static Receipt executeBridgeAckAttest(State::StateAccess &state,
+                                          const Transaction &tx,
+                                          const TxExecutionContext &ctx);
     static Receipt executeRegisterBridgeWatcher(State::StateAccess &state,
                                                 const Transaction &tx,
                                                 const TxExecutionContext &ctx);

@@ -31,7 +31,7 @@ namespace State
   //  =========================================================================
   //  StateDB
   //
-  //  An MDBX-backed key-value store with 39 tables. The tables fall into
+  //  An MDBX-backed key-value store with 44 tables. The tables fall into
   //  four groups:
   //
   //    - Live SMT: TBL_SMT_NODES, TBL_SMT_LEAVES. Written by every tree
@@ -152,7 +152,30 @@ namespace State
       //  affect any other transaction's validity.
       TBL_BRIDGE_ATTESTATIONS = 41,
 
-      TBL_COUNT = 42,
+      //  Per-watcher attestations over bridge withdrawals. Key =
+      //  withdrawal_id (8 LE) || validator_id (8 LE). Value =
+      //  serialized BridgeAckAttestation. Written by
+      //  executeBridgeAckAttest; read by the submission assembler
+      //  to build a BridgeAckWithdrawal's signature block. Same
+      //  rationale as TBL_BRIDGE_ATTESTATIONS: federation state,
+      //  not per-account state, not part of the state root.
+      TBL_BRIDGE_ACK_ATTESTATIONS = 42,
+
+      //  Aggregate bridge counters, one row per source chain. Key =
+      //  source_chain_id (8 LE). Value = serialized BridgeStats.
+      //  Written by executeBridgeMint, executeBridgeBurn, and
+      //  executeBridgeAckWithdrawal. Read by the getBridgeStats RPC.
+      TBL_BRIDGE_STATS = 43,
+
+      //  Chronological log of successful bridge operations. Written
+      //  by the executor after the operation's state changes have
+      //  committed, and read by getBridgeEvents. NOT in the SMT:
+      //  this is audit history, not consensus input. A node that
+      //  never wrote a row would still produce the same state root
+      //  as one that did.
+      TBL_BRIDGE_EVENTS = 44,
+
+      TBL_COUNT = 45,
     };
 
     //  Per-table diagnostic information. Reported by the metrics

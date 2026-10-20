@@ -43,7 +43,11 @@ namespace Bridge
 
     int64_t started_at{0};
 
-    std::vector<uint8_t> bridge_deposit_address;
+    //  Human-readable form of the deposit address, as passed to
+    //  --bridge-address on the start command. Authoritative 64-byte
+    //  blob lives on the adapter. This string exists so cmd_status
+    //  can display it. Empty until configured.
+    std::string bridge_deposit_address;
 
     std::string chain_short_name() const
     {
@@ -71,7 +75,6 @@ namespace Bridge
   {
     Wallet::RpcEndpoint clarity_endpoint;
     std::unique_ptr<Wallet::RpcClient> clarity_rpc;
-
     bool clarity_connected{false};
 
     std::string keystore_path;
@@ -83,14 +86,19 @@ namespace Bridge
 
     uint64_t watcher_id{0};
 
-    std::optional<Crypto::SecretKey> consensus_key;
-
-    std::optional<Crypto::SecretKey> custody_view_key;
-
-    std::optional<Crypto::Address> mint_destination;
-
     std::unordered_map<std::string, ChainRuntime> chains;
     std::string current_chain;
+
+    //  Consensus secret key for signing deposit attestations.
+    //  Loaded by cmd_start or main.cpp.
+    std::optional<Crypto::SecretKey> consensus_key;
+
+    //  Custody wallet's private view key. Loaded by main.cpp from
+    //  --view-key-file, handed to the adapter in cmd_start.
+    std::optional<Crypto::SecretKey> custody_view_key;
+
+    //  Destination for minted wrapped tokens. Set by cmd_start.
+    std::optional<Crypto::Address> mint_destination;
 
     bool running{true};
 
@@ -113,6 +121,7 @@ namespace Bridge
                               ChainWatcherConfig config);
 
     size_t enabledChainCount() const noexcept;
+
     size_t chainCount() const noexcept { return enabledChainCount(); }
 
     ChainRuntime *enableChainByShortName(const std::string &short_name,
@@ -130,12 +139,19 @@ namespace Bridge
 
   void closeKeystore(WatcherSession &session);
 
+  //  Takes the session's network so the bech32m encoding it does
+  //  internally matches what the RPC handler compares against.
+  //  Hard-coding Mainnet (as the previous version did) meant the
+  //  RPC was being asked about a clrty1... address on a regtest
+  //  chain whose watchers use rclrty1... addresses — a lookup that
+  //  could never succeed.
   uint64_t resolveWatcherId(Wallet::RpcClient &clarity_rpc,
                             const Crypto::Address &address,
                             Wallet::Network network) noexcept;
 
   bool probeChain(ChainRuntime &runtime);
 
-  void applyAdapterDefaults(ChainAdapter &adapter, ChainWatcherConfig &config);
+  void applyAdapterDefaults(ChainAdapter &adapter,
+                            ChainWatcherConfig &config);
 
 } // namespace Bridge

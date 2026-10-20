@@ -75,9 +75,14 @@ namespace Bridge::Signing
       const Crypto::Address &destination,
       uint64_t amount);
 
-  //  Encode the canonical message for a BridgeAckWithdrawal. The
-  //  message is just the withdrawal id as LE64; the domain tag
-  //  "back" is prepended at hash time.
+  //  Encode the canonical message for a BridgeAckWithdrawal and
+  //  for a BridgeAckAttest. The message is just the withdrawal id
+  //  as LE64; the domain tag "back" is prepended at hash time.
+  //
+  //  Both the per-watcher attestation (BridgeAckAttest) and the
+  //  quorum block (BridgeAckWithdrawal) sign the SAME message: the
+  //  withdrawal id. This is what makes the attestation's signature
+  //  re-usable inside the assembled block without re-signing.
   std::vector<uint8_t> EncodeBridgeAckMessage(uint64_t withdrawal_id);
 
   //  Encode the canonical message for a BridgePause / Unpause.
@@ -87,7 +92,7 @@ namespace Bridge::Signing
 
   //  Domain-separated signing hash. `domain` is a 4-byte tag:
   //    "bmin"  — BridgeMint attestation
-  //    "back"  — BridgeAckWithdrawal attestation
+  //    "back"  — BridgeAckWithdrawal / BridgeAckAttest
   //    "bpaul" — BridgePause governance
   //    "bunp"  — BridgeUnpause governance
   //    "brgr"  — BridgeRegisterChain governance
@@ -168,4 +173,25 @@ namespace Bridge::Signing
       uint32_t source_output_index,
       const Crypto::Address &destination,
       uint64_t amount);
+
+  //  Sign the canonical ack message with one watcher's consensus
+  //  key. Returns the signature alone, ready to be wrapped in a
+  //  BridgeAckAttest transaction by Wallet::buildBridgeAckAttest.
+  //
+  //  This is the withdrawal-side counterpart of
+  //  SignSingleBridgeMint. The domain tag is "back"; the message
+  //  is LE64(withdrawal_id); the signing key is the watcher's
+  //  consensus key (the same key that signs mints, not their
+  //  account key).
+  //
+  //  A BridgeAckAttest carries one of these; a BridgeAckWithdrawal
+  //  carries a quorum of them, assembled into the
+  //  [2] count || N*66 block. Because both sign the SAME message,
+  //  a signature produced here can be assembled directly into a
+  //  BridgeAckWithdrawal block without re-signing — the attestation
+  //  record and the block entry are byte-identical apart from the
+  //  surrounding payload framing.
+  std::optional<Crypto::Signature> SignSingleBridgeAck(
+      const Crypto::SecretKey &watcher_consensus_key,
+      uint64_t withdrawal_id);
 } // namespace Bridge::Signing

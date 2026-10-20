@@ -752,6 +752,10 @@ namespace Rpc
     return out;
   }
 
+  // ===========================================================================
+  //  Bridge
+  // ===========================================================================
+
   Common::Json encodeBridgeChainRegistration(
       const Core::BridgeChainRegistration &reg,
       const std::string & /*hrp*/)
@@ -785,6 +789,110 @@ namespace Rpc
     j["destination_blob"] = encodeBytesHex(w.destination_blob);
     putU64(j, "created_at_height", w.created_at_height);
     j["well_formed"] = w.isWellFormed();
+    j["destination_address"] = w.destination_address;
+
+    //  ---- release audit fields ----
+    //
+    //  An unreleased withdrawal carries the release fields as all
+    //  zeros / null. A released one carries the source-chain tx
+    //  hash and height, plus when and by which watcher the release
+    //  was recorded on Clarity. The `is_released` boolean lets a
+    //  client branch without inspecting the hash.
+    j["is_released"] = w.isReleased();
+
+    if (w.isReleased())
+    {
+      putHash(j, "release_tx_hash", w.release_tx_hash);
+    }
+    else
+    {
+      //  A null release_tx_hash reads more clearly than 0x00...00
+      //  in a JSON payload, and matches how `to` is encoded in
+      //  encodeTransaction.
+      j["release_tx_hash"] = Common::Json(nullptr);
+    }
+
+    putU64(j, "release_height", w.release_height);
+    putU64(j, "released_at_height", w.released_at_height);
+    putU64(j, "released_by_watcher_id", w.released_by_watcher_id);
+
     return j;
   }
+
+  Common::Json encodeBridgeAckAttestation(
+      const Core::BridgeAckAttestation &a)
+  {
+    Common::Json j = Common::Json::object();
+    JsonWriter w(j);
+
+    w.setNumber("signer_index", a.signer_index);
+    w.setSignature("signature", a.signature);
+    w.setHexU64("attested_at_height", a.attested_at_height);
+
+    return j;
+  }
+
+  Common::Json encodeBridgeStats(const Core::BridgeStats &stats)
+  {
+    Common::Json j = Common::Json::object();
+    JsonWriter w(j);
+
+    w.setHexU64("source_chain_id", stats.source_chain_id);
+
+    w.setHexU64("total_minted", stats.total_minted);
+    w.setHexU64("total_burned", stats.total_burned);
+    w.setHexU64("total_released", stats.total_released);
+
+    w.setHexU64("deposit_count", stats.deposit_count);
+    w.setHexU64("withdrawal_count", stats.withdrawal_count);
+    w.setHexU64("released_withdrawal_count",
+                stats.released_withdrawal_count);
+
+    w.setHexU64("last_mint_height", stats.last_mint_height);
+    w.setHexU64("last_burn_height", stats.last_burn_height);
+    w.setHexU64("last_release_height", stats.last_release_height);
+
+    w.setHexU64("registered_at_height", stats.registered_at_height);
+
+    //  Derived: the amount of source-chain value the federation
+    //  still owes holders of the wrapped token. Equal to
+    //  total_burned - total_released. Saturates at zero so a
+    //  corrupted stats row cannot report a negative liability.
+    const uint64_t outstanding =
+        stats.total_burned > stats.total_released
+            ? stats.total_burned - stats.total_released
+            : 0;
+    w.setHexU64("outstanding_liability", outstanding);
+
+    return j;
+  }
+
+  Common::Json encodeBridgeEvent(const Core::BridgeEvent &evt,
+                                 const std::string &hrp)
+  {
+    Common::Json j = Common::Json::object();
+    JsonWriter w(j);
+
+    w.setString("kind", Core::bridgeEventKindName(evt.kind));
+    w.setNumber("kind_code", static_cast<uint64_t>(evt.kind));
+    w.setHexU64("source_chain_id", evt.source_chain_id);
+    w.setHexU64("block_height", evt.block_height);
+    w.setNumber("tx_index_in_block",
+                static_cast<uint64_t>(evt.tx_index_in_block));
+    w.setHash("tx_hash", evt.tx_hash);
+
+    if (evt.has_source_hash)
+      w.setHash("source_tx_hash", evt.source_tx_hash);
+    else
+      j["source_tx_hash"] = Common::Json(nullptr);
+
+    w.setHexU64("source_output_index", evt.source_output_index);
+    w.setHexU64("withdrawal_id", evt.withdrawal_id);
+    w.setAddress("actor", evt.actor, hrp);
+    w.setHexU64("amount", evt.amount);
+    w.setHexU64("counterparty", evt.counterparty);
+
+    return j;
+  }
+  
 } // namespace Rpc

@@ -736,6 +736,38 @@ namespace Core
       }
     }
 
+    //  ---- Bridge: BridgeAckWithdrawal ----
+    //
+    //  A BridgeAckWithdrawal records the source-chain release tx for
+    //  a withdrawal. Once the withdrawal has been released (with ANY
+    //  release_tx_hash), a second BridgeAckWithdrawal for the same
+    //  withdrawal will be rejected by the executor (the conflicting-
+    //  hash check). The mempool should not admit it.
+    //
+    //  Note: this is a state read, so it must run after the cheap
+    //  structural checks. It runs before the balance check (which
+    //  for this type is a no-op anyway).
+    if (tx.tx_type == TxType::BridgeAckWithdrawal)
+    {
+      if (tx.payload.size() < 50)
+        return MempoolAddResult::Rejected_Malformed;
+
+      uint64_t withdrawal_id = 0;
+      for (int i = 0; i < 8; ++i)
+        withdrawal_id |= uint64_t(tx.payload[i]) << (i * 8);
+
+      Core::BridgeWithdrawal w;
+      if (!state.getBridgeWithdrawal(withdrawal_id, w))
+      {
+        return MempoolAddResult::Rejected_TokenPrecondition;
+      }
+
+      if (w.isReleased())
+      {
+        return MempoolAddResult::Rejected_TokenPrecondition;
+      }
+    }
+
     return MempoolAddResult::Accepted;
   }
 

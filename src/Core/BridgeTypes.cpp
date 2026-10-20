@@ -19,7 +19,8 @@ namespace Core
       return {};
 
     std::vector<uint8_t> out;
-    out.reserve(PREFIX_SIZE + destination_blob.size());
+    out.reserve(PREFIX_SIZE + destination_blob.size() +
+                1 + destination_address.size() + RELEASE_TRAILER_SIZE);
 
     Common::Writer w(out);
     w.writeU64(id);
@@ -30,6 +31,14 @@ namespace Core
     w.writeU64(created_at_height);
     w.writeU8(static_cast<uint8_t>(destination_blob.size()));
     w.writeBytes(destination_blob.data(), destination_blob.size());
+    w.writeU8(static_cast<uint8_t>(destination_address.size()));
+    w.writeString(destination_address);
+
+    //  Release fields are always written, zeroed when unreleased.
+    w.writeBytes(release_tx_hash.data.data(), release_tx_hash.data.size());
+    w.writeU64(release_height);
+    w.writeU64(released_at_height);
+    w.writeU64(released_by_watcher_id);
 
     return out;
   }
@@ -37,7 +46,7 @@ namespace Core
   bool BridgeWithdrawal::deserializeState(const uint8_t *data, size_t len,
                                           BridgeWithdrawal &out)
   {
-    if (len < PREFIX_SIZE)
+    if (len < PREFIX_SIZE + 1 + RELEASE_TRAILER_SIZE)
       return false;
 
     Common::Reader r(data, len);
@@ -53,16 +62,28 @@ namespace Core
     const uint8_t blob_len = r.readU8();
     if (!r.ok())
       return false;
-
-    if (r.remaining() != blob_len)
+    if (r.remaining() < blob_len + 1 + RELEASE_TRAILER_SIZE)
       return false;
 
     w.destination_blob.resize(blob_len);
     if (blob_len > 0)
       r.readBytes(w.destination_blob.data(), blob_len);
+
+    const uint8_t addr_len = r.readU8();
     if (!r.ok())
       return false;
+    if (r.remaining() != addr_len + RELEASE_TRAILER_SIZE)
+      return false;
 
+    w.destination_address = r.readString(addr_len);
+
+    r.readBytes(w.release_tx_hash.data.data(), w.release_tx_hash.data.size());
+    w.release_height = r.readU64();
+    w.released_at_height = r.readU64();
+    w.released_by_watcher_id = r.readU64();
+
+    if (!r.ok())
+      return false;
     if (!w.isWellFormed())
       return false;
 
@@ -78,6 +99,11 @@ namespace Core
     s(burner, "burner");
     s(amount, "amount");
     s(created_at_height, "created_at_height");
+    s(destination_address, "destination_address");
+    s(release_tx_hash, "release_tx_hash");
+    s(release_height, "release_height");
+    s(released_at_height, "released_at_height");
+    s(released_by_watcher_id, "released_by_watcher_id");
   }
 
   void BridgeWithdrawal::serialize(Serialization::ISerializer &s) const
@@ -88,6 +114,11 @@ namespace Core
     s(burner, "burner");
     s(amount, "amount");
     s(created_at_height, "created_at_height");
+    s(destination_address, "destination_address");
+    s(release_tx_hash, "release_tx_hash");
+    s(release_height, "release_height");
+    s(released_at_height, "released_at_height");
+    s(released_by_watcher_id, "released_by_watcher_id");
   }
 
   //  =========================================================================
@@ -255,6 +286,10 @@ namespace Core
     return "unknown";
   }
 
+  //  =========================================================================
+  //  BridgeAttestation
+  //  =========================================================================
+
   std::vector<uint8_t> BridgeAttestation::serializeState() const
   {
     std::vector<uint8_t> out;
@@ -346,5 +381,267 @@ namespace Core
       return "ConflictingAttestation";
     }
     return "Unknown";
+  }
+
+  //  =========================================================================
+  //  BridgeAckAttestation
+  //  =========================================================================
+
+  std::vector<uint8_t> BridgeAckAttestation::serializeState() const
+  {
+    std::vector<uint8_t> out;
+    out.reserve(STATE_SIZE);
+
+    out.push_back(uint8_t(signer_index));
+    out.push_back(uint8_t(signer_index >> 8));
+    out.insert(out.end(), signature.data.begin(), signature.data.end());
+    for (int i = 0; i < 8; ++i)
+      out.push_back(uint8_t(attested_at_height >> (i * 8)));
+
+    return out;
+  }
+
+  bool BridgeAckAttestation::deserializeState(const uint8_t *data, size_t len,
+                                              BridgeAckAttestation &out)
+  {
+    if (len != STATE_SIZE)
+      return false;
+
+    size_t off = 0;
+    out.signer_index = uint16_t(data[off]) | (uint16_t(data[off + 1]) << 8);
+    off += 2;
+
+    std::memcpy(out.signature.data.data(), data + off, 64);
+    off += 64;
+
+    out.attested_at_height = 0;
+    for (int i = 0; i < 8; ++i)
+      out.attested_at_height |= uint64_t(data[off + i]) << (i * 8);
+
+    return true;
+  }
+
+  void BridgeAckAttestation::serialize(Serialization::ISerializer &s)
+  {
+    s(signer_index, "signer_index");
+    s(signature, "signature");
+    s(attested_at_height, "attested_at_height");
+  }
+
+  void BridgeAckAttestation::serialize(Serialization::ISerializer &s) const
+  {
+    s(signer_index, "signer_index");
+    s(signature, "signature");
+    s(attested_at_height, "attested_at_height");
+  }
+
+  const char *bridgeAckAttestStatusName(BridgeAckAttestStatus s) noexcept
+  {
+    switch (s)
+    {
+    case BridgeAckAttestStatus::Ok:
+      return "Ok";
+    case BridgeAckAttestStatus::Paused:
+      return "Paused";
+    case BridgeAckAttestStatus::ChainNotRegistered:
+      return "ChainNotRegistered";
+    case BridgeAckAttestStatus::ChainDisabled:
+      return "ChainDisabled";
+    case BridgeAckAttestStatus::PayloadMalformed:
+      return "PayloadMalformed";
+    case BridgeAckAttestStatus::WithdrawalNotFound:
+      return "WithdrawalNotFound";
+    case BridgeAckAttestStatus::WithdrawalAlreadyReleased:
+      return "WithdrawalAlreadyReleased";
+    case BridgeAckAttestStatus::SignerIndexOutOfRange:
+      return "SignerIndexOutOfRange";
+    case BridgeAckAttestStatus::SignerNotActiveWatcher:
+      return "SignerNotActiveWatcher";
+    case BridgeAckAttestStatus::BadSignature:
+      return "BadSignature";
+    case BridgeAckAttestStatus::AlreadyAttested:
+      return "AlreadyAttested";
+    }
+    return "Unknown";
+  }
+
+  //  =========================================================================
+  //  BridgeStats
+  //  =========================================================================
+
+  std::vector<uint8_t> BridgeStats::serializeState() const
+  {
+    if (!isWellFormed())
+      return {};
+
+    std::vector<uint8_t> out;
+    out.reserve(STATE_SIZE);
+
+    Common::Writer w(out);
+    w.writeU64(source_chain_id);
+    w.writeU64(total_minted);
+    w.writeU64(total_burned);
+    w.writeU64(total_released);
+    w.writeU64(deposit_count);
+    w.writeU64(withdrawal_count);
+    w.writeU64(released_withdrawal_count);
+    w.writeU64(last_mint_height);
+    w.writeU64(last_burn_height);
+    w.writeU64(last_release_height);
+    w.writeU64(registered_at_height);
+
+    return out;
+  }
+
+  bool BridgeStats::deserializeState(const uint8_t *data, size_t len,
+                                     BridgeStats &out)
+  {
+    if (len != STATE_SIZE)
+      return false;
+
+    Common::Reader r(data, len);
+
+    BridgeStats s;
+    s.source_chain_id = r.readU64();
+    s.total_minted = r.readU64();
+    s.total_burned = r.readU64();
+    s.total_released = r.readU64();
+    s.deposit_count = r.readU64();
+    s.withdrawal_count = r.readU64();
+    s.released_withdrawal_count = r.readU64();
+    s.last_mint_height = r.readU64();
+    s.last_burn_height = r.readU64();
+    s.last_release_height = r.readU64();
+    s.registered_at_height = r.readU64();
+
+    if (!r.ok())
+      return false;
+    if (!s.isWellFormed())
+      return false;
+
+    out = std::move(s);
+    return true;
+  }
+
+  void BridgeStats::serialize(Serialization::ISerializer &s)
+  {
+    s(source_chain_id, "source_chain_id");
+    s(total_minted, "total_minted");
+    s(total_burned, "total_burned");
+    s(total_released, "total_released");
+    s(deposit_count, "deposit_count");
+    s(withdrawal_count, "withdrawal_count");
+    s(released_withdrawal_count, "released_withdrawal_count");
+    s(last_mint_height, "last_mint_height");
+    s(last_burn_height, "last_burn_height");
+    s(last_release_height, "last_release_height");
+    s(registered_at_height, "registered_at_height");
+  }
+
+  void BridgeStats::serialize(Serialization::ISerializer &s) const
+  {
+    s(source_chain_id, "source_chain_id");
+    s(total_minted, "total_minted");
+    s(total_burned, "total_burned");
+    s(total_released, "total_released");
+    s(deposit_count, "deposit_count");
+    s(withdrawal_count, "withdrawal_count");
+    s(released_withdrawal_count, "released_withdrawal_count");
+    s(last_mint_height, "last_mint_height");
+    s(last_burn_height, "last_burn_height");
+    s(last_release_height, "last_release_height");
+    s(registered_at_height, "registered_at_height");
+  }
+
+  const char *bridgeEventKindName(BridgeEventKind k) noexcept
+  {
+    switch (k)
+    {
+    case BridgeEventKind::Mint:
+      return "mint";
+    case BridgeEventKind::Burn:
+      return "burn";
+    case BridgeEventKind::AckAttest:
+      return "ack_attest";
+    case BridgeEventKind::AckWithdrawal:
+      return "ack_withdrawal";
+    }
+    return "unknown";
+  }
+
+  std::array<uint8_t, BridgeEvent::KEY_SIZE> BridgeEvent::makeKey(
+      BridgeChainId source_chain_id, uint64_t block_height,
+      uint32_t tx_index_in_block, BridgeEventKind kind)
+  {
+    std::array<uint8_t, KEY_SIZE> key{};
+    for (int i = 0; i < 8; ++i)
+      key[i] = uint8_t(source_chain_id >> ((7 - i) * 8));
+    for (int i = 0; i < 8; ++i)
+      key[8 + i] = uint8_t(block_height >> ((7 - i) * 8));
+    for (int i = 0; i < 4; ++i)
+      key[16 + i] = uint8_t(tx_index_in_block >> ((7 - i) * 8));
+    key[20] = static_cast<uint8_t>(kind);
+    return key;
+  }
+
+  std::array<uint8_t, 8> BridgeEvent::chainPrefix(BridgeChainId source_chain_id)
+  {
+    std::array<uint8_t, 8> prefix{};
+    for (int i = 0; i < 8; ++i)
+      prefix[i] = uint8_t(source_chain_id >> ((7 - i) * 8));
+    return prefix;
+  }
+
+  std::vector<uint8_t> BridgeEvent::serializeState() const
+  {
+    std::vector<uint8_t> out;
+    out.reserve(STATE_SIZE);
+    Common::Writer w(out);
+
+    w.writeU8(static_cast<uint8_t>(kind));
+    w.writeU64(source_chain_id);
+    w.writeU64(block_height);
+    w.writeU32(tx_index_in_block);
+    w.writeU8(has_tx_hash ? 1 : 0);
+    w.writeBytes(tx_hash.data.data(), 32);
+    w.writeU8(has_source_hash ? 1 : 0);
+    w.writeBytes(source_tx_hash.data.data(), 32);
+    w.writeU32(source_output_index);
+    w.writeU64(withdrawal_id);
+    w.writeBytes(actor.data.data(), 32);
+    w.writeU64(amount);
+    w.writeU64(counterparty);
+
+    return out;
+  }
+
+  bool BridgeEvent::deserializeState(const uint8_t *data, size_t len,
+                                     BridgeEvent &out)
+  {
+    if (len != STATE_SIZE)
+      return false;
+
+    Common::Reader r(data, len);
+
+    BridgeEvent e;
+    e.kind = static_cast<BridgeEventKind>(r.readU8());
+    e.source_chain_id = r.readU64();
+    e.block_height = r.readU64();
+    e.tx_index_in_block = r.readU32();
+    e.has_tx_hash = (r.readU8() != 0);
+    r.readBytes(e.tx_hash.data.data(), 32);
+    e.has_source_hash = (r.readU8() != 0);
+    r.readBytes(e.source_tx_hash.data.data(), 32);
+    e.source_output_index = r.readU32();
+    e.withdrawal_id = r.readU64();
+    r.readBytes(e.actor.data.data(), 32);
+    e.amount = r.readU64();
+    e.counterparty = r.readU64();
+
+    if (!r.ok())
+      return false;
+
+    out = std::move(e);
+    return true;
   }
 }

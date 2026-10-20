@@ -10,6 +10,7 @@
 #include "Account.h"
 #include "ValidatorTypes.h"
 #include "TokenTypes.h"
+#include "BridgeTypes.h"
 #include "Crypto/Types.h"
 
 namespace Core
@@ -57,6 +58,27 @@ namespace Core
     virtual uint64_t chainId() const = 0;
 
     virtual bool getValidator(Id validator_id, ValidatorInfo &out) const = 0;
+
+    //  Fetch a bridge withdrawal by id. Returns false if the
+    //  withdrawal does not exist. Used by the mempool to reject
+    //  BridgeAckWithdrawal transactions for withdrawals that
+    //  have already been released — those will always be
+    //  rejected by the executor (conflicting-hash check), and
+    //  admitting them would allow a stalled-mempool loop:
+    //  the executor rejects, the proposer evicts, a peer
+    //  rebroadcasts, the mempool re-admits, repeat.
+    //
+    //  Default implementation returns false. A StateView that
+    //  doesn't track bridge state (a test mock) doesn't need to
+    //  implement it; the mempool's bridge precondition check
+    //  becomes a no-op for those views.
+    virtual bool getBridgeWithdrawal(uint64_t withdrawal_id,
+                                     BridgeWithdrawal &out) const
+    {
+      (void)withdrawal_id;
+      (void)out;
+      return false;
+    }
 
     //  Release any read txn the underlying access is holding, so that
     //  a caller can immediately perform a write without MDBX refusing

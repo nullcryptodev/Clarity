@@ -1212,6 +1212,31 @@ namespace Node
       return;
     }
 
+    //  Bridge-specific pre-check: a BridgeAckWithdrawal for an
+    //  already-released withdrawal will never apply. The mempool
+    //  validation catches it below, but this pre-check gives a
+    //  cleaner log line and avoids even building a StateView.
+    if (tx.tx_type == Core::TxType::BridgeAckWithdrawal &&
+        tx.payload.size() >= 8)
+    {
+      uint64_t withdrawal_id = 0;
+      for (int i = 0; i < 8; ++i)
+        withdrawal_id |= uint64_t(tx.payload[i]) << (i * 8);
+
+      auto view = makeStateView();
+      if (view)
+      {
+        Core::BridgeWithdrawal w;
+        if (view->getBridgeWithdrawal(withdrawal_id, w) && w.isReleased())
+        {
+          (*log_)(Logging::DEBUGGING)
+              << "Dropping BridgeAckWithdrawal for already-released "
+              << "withdrawal " << withdrawal_id;
+          return;
+        }
+      }
+    }
+
     const Crypto::Hash txid = tx.txid();
     if (mempool_->contains(txid))
       return;

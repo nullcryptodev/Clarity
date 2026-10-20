@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <iomanip>
 
 namespace Core
 {
@@ -177,6 +178,73 @@ namespace Core
       return out;
     }
 
+    //  Encode the canonical message that a withdrawal-ack
+    //  attestation covers:
+    //
+    //    LE64(withdrawal_id)
+    //
+    //  The domain tag is "back", applied by bridgeSigningHash.
+    //  Kept in lockstep with Bridge::Signing::EncodeBridgeAckMessage
+    //  on the client side.
+    std::vector<uint8_t> encodeBridgeAckMessage(uint64_t withdrawal_id)
+    {
+      std::vector<uint8_t> out;
+      out.reserve(8);
+      for (int i = 0; i < 8; ++i)
+        out.push_back(uint8_t(withdrawal_id >> (i * 8)));
+      return out;
+    }
+
+    //  Read or initialize the bridge stats row for a chain and
+    //  apply a delta. Centralized so every handler updates the
+    //  same fields the same way, and so a missing row is
+    //  initialized on first touch.
+    //
+    //  The caller passes the incremental change; this function
+    //  reads-modifies-writes in one step. Not reentrant: the
+    //  handlers never call this twice for the same chain in one
+    //  transaction, because each transaction touches exactly one
+    //  chain.
+    void bumpBridgeStats(State::StateAccess &state,
+                         uint64_t source_chain_id,
+                         uint64_t current_height,
+                         uint64_t minted_delta,
+                         uint64_t burned_delta,
+                         uint64_t released_delta,
+                         bool count_deposit,
+                         bool count_withdrawal,
+                         bool count_release)
+    {
+      Core::BridgeStats stats;
+      if (!state.getBridgeStats(source_chain_id, stats))
+      {
+        stats.source_chain_id = source_chain_id;
+        stats.registered_at_height = current_height;
+      }
+
+      stats.total_minted += minted_delta;
+      stats.total_burned += burned_delta;
+      stats.total_released += released_delta;
+
+      if (count_deposit)
+      {
+        stats.deposit_count += 1;
+        stats.last_mint_height = current_height;
+      }
+      if (count_withdrawal)
+      {
+        stats.withdrawal_count += 1;
+        stats.last_burn_height = current_height;
+      }
+      if (count_release)
+      {
+        stats.released_withdrawal_count += 1;
+        stats.last_release_height = current_height;
+      }
+
+      state.putBridgeStats(stats);
+    }
+
     //  Read a 2-byte LE count from a payload at `off`, and advance
     //  `off` past it. Returns 0 and does NOT advance on truncation
     //  (caller must check `off <= payload.size()` afterwards).
@@ -246,6 +314,41 @@ namespace Core
       for (int i = 0; i < 8; ++i)
         v |= uint64_t(p[off + i]) << (i * 8);
       return v;
+    }
+
+    //  Record a bridge event. Called once per successful operation,
+    //  after the operation's state changes are in place. The table
+    //  is non-SMT, so this is safe on both the dry-run and apply
+    //  paths; the dry-run path aborts and discards it.
+    void recordBridgeEvent(State::StateAccess &state,
+                           Core::BridgeEventKind kind,
+                           uint64_t source_chain_id,
+                           uint64_t current_height,
+                           uint64_t tx_index,
+                           const Crypto::Hash &tx_hash,
+                           const Crypto::Address &actor,
+                           const Crypto::Hash &source_tx_hash,
+                           bool has_source,
+                           uint32_t source_output_index,
+                           uint64_t withdrawal_id,
+                           uint64_t amount,
+                           uint64_t counterparty)
+    {
+      Core::BridgeEvent evt;
+      evt.kind = kind;
+      evt.source_chain_id = source_chain_id;
+      evt.block_height = current_height;
+      evt.tx_index_in_block = static_cast<uint32_t>(tx_index);
+      evt.tx_hash = tx_hash;
+      evt.has_source_hash = has_source;
+      evt.source_tx_hash = source_tx_hash;
+      evt.source_output_index = source_output_index;
+      evt.withdrawal_id = withdrawal_id;
+      evt.actor = actor;
+      evt.amount = amount;
+      evt.counterparty = counterparty;
+      evt.has_tx_hash = true;
+      state.putBridgeEvent(evt);
     }
   } // anonymous namespace
 
@@ -433,6 +536,10 @@ namespace Core
 
     case TxType::BridgeAttest:
       receipt = executeBridgeAttest(state, tx, ctx);
+      break;
+
+    case TxType::BridgeAckAttest:
+      receipt = executeBridgeAckAttest(state, tx, ctx);
       break;
 
     case TxType::RegisterBridgeWatcher:
@@ -3057,6 +3164,24 @@ namespace Core
     GlobalStateWriter writer(state);
     writer.setBridgeConsumedCount(reader.bridgeConsumedCount() + 1);
 
+    //  Aggregate stats.
+    bumpBridgeStats(state, source_chain_id, ctx.current_height,
+                    /*minted*/ amount, /*burned*/ 0, /*released*/ 0,
+                    /*count_deposit*/ true,
+                    /*count_withdrawal*/ false,
+                    /*count_release*/ false);
+
+    recordBridgeEvent(state, Core::BridgeEventKind::Mint,
+                      source_chain_id, ctx.current_height,
+                      ctx.tx_index_in_block, tx.txid(),
+                      /*actor=*/tx.from,
+                      /*source_tx_hash=*/source_tx_hash,
+                      /*has_source=*/true,
+                      /*source_output_index=*/source_output_index,
+                      /*withdrawal_id=*/0,
+                      /*amount=*/amount,
+                      /*counterparty=*/0);
+
     return {ReceiptStatus::Success, tx.fee};
   }
 
@@ -3100,7 +3225,10 @@ namespace Core
     const uint8_t blob_len = tx.payload[off];
     off += 1;
 
-    if (tx.payload.size() != 8 + 1 + static_cast<size_t>(blob_len) + 8)
+    //  Minimum payload: source_chain_id(8) + blob_len(1) +
+    //  destination_blob(blob_len) + addr_len(1) +
+    //  destination_address(addr_len) + amount(8).
+    if (tx.payload.size() < off + blob_len + 1 + 8)
       return failure;
 
     std::vector<uint8_t> destination_blob(blob_len);
@@ -3110,9 +3238,25 @@ namespace Core
       off += blob_len;
     }
 
+    const uint8_t addr_len = tx.payload[off];
+    off += 1;
+
+    if (tx.payload.size() != off + addr_len + 8)
+      return failure;
+
+    std::string destination_address;
+    if (addr_len > 0)
+    {
+      destination_address.assign(
+          reinterpret_cast<const char *>(tx.payload.data() + off), addr_len);
+      off += addr_len;
+    }
+
     const uint64_t amount = readU64At(tx.payload, off);
 
     if (amount == 0)
+      return failure;
+    if (destination_address.empty())
       return failure;
 
     GlobalStateReader reader(state);
@@ -3125,21 +3269,18 @@ namespace Core
     if (!reg.isWellFormed() || !reg.enabled)
       return failure;
 
-    //  The burned token must be the wrapped token for this chain.
     if (tx.token_id != reg.wrapped_token_id)
       return failure;
 
-    //  Destination blob bounds.
     if (blob_len < reg.destination_blob_min_len ||
         blob_len > reg.destination_blob_max_len)
       return failure;
 
-    //  Balance check.
     const uint64_t balance = state.getTokenBalance(tx.from, tx.token_id);
     if (balance < amount)
       return failure;
 
-    //  All checks passed. Apply state changes.
+    //  ---- Apply ----
 
     state.putTokenBalance(tx.from, tx.token_id, balance - amount);
 
@@ -3158,6 +3299,7 @@ namespace Core
     w.burner = tx.from;
     w.amount = amount;
     w.destination_blob = std::move(destination_blob);
+    w.destination_address = std::move(destination_address);
     w.created_at_height = ctx.current_height;
 
     if (!w.isWellFormed())
@@ -3168,6 +3310,23 @@ namespace Core
     GlobalStateWriter writer(state);
     writer.setBridgeNextWithdrawalId(next_id + 1);
     writer.setBridgeWithdrawalsPending(reader.bridgeWithdrawalsPending() + 1);
+
+    bumpBridgeStats(state, source_chain_id, ctx.current_height,
+                    /*minted*/ 0, /*burned*/ amount, /*released*/ 0,
+                    /*count_deposit*/ false,
+                    /*count_withdrawal*/ true,
+                    /*count_release*/ false);
+
+    recordBridgeEvent(state, Core::BridgeEventKind::Burn,
+                      source_chain_id, ctx.current_height,
+                      ctx.tx_index_in_block, tx.txid(),
+                      /*actor=*/tx.from,
+                      /*source_tx_hash=*/Crypto::Hash{},
+                      /*has_source=*/false,
+                      /*source_output_index=*/0,
+                      /*withdrawal_id=*/w.id,
+                      /*amount=*/amount,
+                      /*counterparty=*/0);
 
     return {ReceiptStatus::Success, tx.fee};
   }
@@ -3300,19 +3459,35 @@ namespace Core
   //  =========================================================================
   //
   //  Payload layout:
-  //    [8]  withdrawal_id         — the withdrawal being acked
-  //    [2]  signer_count          — LE
-  //    [N]  signatures            — operational watcher signatures
+  //    [8]  withdrawal_id
+  //    [32] release_tx_hash        — the source-chain (CCX) tx hash
+  //    [8]  release_height         — the source-chain block height
+  //    [2]  signer_count           — LE
+  //    [N]  signatures             — operational watcher signatures
   //
   //  Message:
   //    Blake2b("back" || LE64(withdrawal_id))
+  //
+  //  The message is deliberately UNCHANGED from the pre-Phase-3
+  //  form. The release_tx_hash and release_height are not covered
+  //  by the watcher signatures — they are attestation data that
+  //  the submitting watcher provides, cross-checked against
+  //  CCX on-chain (payment ID), not against the signatures. The
+  //  signatures authorize "release withdrawal N"; the hash and
+  //  height record "the release was tx H at height X". Anyone can
+  //  verify the latter independently.
   //
   //  The ack is watcher-signed against the operational set for the
   //  withdrawal's chain — the same set that signs mints. The chain
   //  is resolved from the withdrawal record, not from the payload.
   //
-  //  On success: delete the withdrawal record and its height index
-  //  row; decrement the pending counter.
+  //  On success:
+  //    - the withdrawal record's release_* fields are populated;
+  //    - the record is NOT deleted (it is the permanent audit trail);
+  //    - the height index row is updated (the record drops out of
+  //      the unreleased scan by virtue of isReleased());
+  //    - the pending counter is decremented;
+  //    - BridgeStats.total_released += w.amount, release counters ++.
 
   Receipt TransactionExecutor::executeBridgeAckWithdrawal(
       State::StateAccess &state,
@@ -3321,7 +3496,8 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    if (tx.payload.size() < 8 + 2)
+    //  Minimum: id(8) + release_hash(32) + release_height(8) + count(2)
+    if (tx.payload.size() < 8 + 32 + 8 + 2)
       return failure;
 
     size_t off = 0;
@@ -3331,9 +3507,15 @@ namespace Core
       withdrawal_id |= uint64_t(tx.payload[off + i]) << (i * 8);
     off += 8;
 
+    Crypto::Hash release_tx_hash;
+    std::memcpy(release_tx_hash.data.data(), tx.payload.data() + off, 32);
+    off += 32;
+
+    const uint64_t release_height = readU64At(tx.payload, off);
+    off += 8;
+
     //  The signature block, including its 2-byte count, is the
-    //  remainder of the payload. parseBridgeSignatureBlock expects
-    //  the count at data[0], so do NOT advance `off` past it here.
+    //  remainder of the payload.
     const size_t sig_block_off = off;
     const size_t sig_block_len = tx.payload.size() - sig_block_off;
 
@@ -3349,6 +3531,11 @@ namespace Core
     const uint8_t *sigs_ptr = tx.payload.data() + sig_block_off;
     const size_t sigs_len = sig_block_len;
 
+    if (release_tx_hash.isNull())
+      return failure;
+    if (release_height == 0)
+      return failure;
+
     GlobalStateReader reader(state);
     if (reader.bridgePaused())
       return failure;
@@ -3359,15 +3546,25 @@ namespace Core
     if (!w.isWellFormed())
       return failure;
 
+    //  Idempotency / conflict:
+    //    - already released with the SAME hash  → no-op success
+    //    - already released with a DIFFERENT hash → reject
+    if (w.isReleased())
+    {
+      if (w.release_tx_hash == release_tx_hash &&
+          w.release_height == release_height)
+      {
+        return {ReceiptStatus::Success, tx.fee};
+      }
+      return failure;
+    }
+
     Core::BridgeChainRegistration reg;
     if (!state.getBridgeChainRegistration(w.source_chain_id, reg))
       return failure;
 
     //  Message: the withdrawal id.
-    std::vector<uint8_t> message;
-    message.reserve(8);
-    for (int i = 0; i < 8; ++i)
-      message.push_back(uint8_t(withdrawal_id >> (i * 8)));
+    const std::vector<uint8_t> message = encodeBridgeAckMessage(withdrawal_id);
 
     if (!verifyBridgeSignatures(
             state, w.source_chain_id, "back",
@@ -3375,13 +3572,58 @@ namespace Core
             sigs_ptr, sigs_len, ctx))
       return failure;
 
-    //  Apply: delete the record (which also deletes its height-index
-    //  row), decrement the pending counter.
-    state.deleteBridgeWithdrawal(withdrawal_id);
+    //  Apply: populate the release audit fields in place. The
+    //  record stays in state — it is the permanent audit trail.
+    w.release_tx_hash = release_tx_hash;
+    w.release_height = release_height;
+    w.released_at_height = ctx.current_height;
+    state.putBridgeWithdrawal(w);
+
+    //  Attribute the release to the submitting watcher, if the
+    //  sender is a registered watcher for this chain. It usually
+    //  is; if not (someone relaying a peer's release), leave 0.
+    {
+      uint64_t watcher_id = 0;
+      if (state.getBridgeWatcherIdByAddress(tx.from, watcher_id))
+      {
+        Core::BridgeWatcherInfo wi;
+        if (state.getBridgeWatcher(watcher_id, wi) &&
+            wi.source_chain_id == w.source_chain_id)
+        {
+          w.released_by_watcher_id = watcher_id;
+        }
+      }
+    }
+
+    if (!w.isWellFormed())
+      return failure;
+
+    //  Rewrite the record in place. putBridgeWithdrawal reindexes
+    //  the height row; the record is now isReleased() and so drops
+    //  out of forEachUnreleasedBridgeWithdrawal.
+    state.putBridgeWithdrawal(w);
 
     GlobalStateWriter writer(state);
     const uint64_t pending = reader.bridgeWithdrawalsPending();
     writer.setBridgeWithdrawalsPending(pending > 0 ? pending - 1 : 0);
+
+    //  Aggregate stats.
+    bumpBridgeStats(state, w.source_chain_id, ctx.current_height,
+                    /*minted*/ 0, /*burned*/ 0, /*released*/ w.amount,
+                    /*count_deposit*/ false,
+                    /*count_withdrawal*/ false,
+                    /*count_release*/ true);
+
+    recordBridgeEvent(state, Core::BridgeEventKind::AckWithdrawal,
+                      w.source_chain_id, ctx.current_height,
+                      ctx.tx_index_in_block, tx.txid(),
+                      /*actor=*/tx.from,
+                      /*source_tx_hash=*/Crypto::Hash{},
+                      /*has_source=*/false,
+                      /*source_output_index=*/0,
+                      /*withdrawal_id=*/withdrawal_id,
+                      /*amount=*/w.amount,
+                      /*counterparty=*/release_height);
 
     return {ReceiptStatus::Success, tx.fee};
   }
@@ -3747,6 +3989,142 @@ namespace Core
                                attestation);
 
     std::cerr << "[attest] SUCCESS: recorded attestation\n";
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  //  =========================================================================
+  //  Bridge — BridgeAckAttest
+  //  =========================================================================
+  //
+  //  Payload layout:
+  //    [8]  withdrawal_id
+  //    [2]  signer_index (LE, position in sorted active watcher set)
+  //    [64] signature (ed25519 over Blake2b("back" || LE64(withdrawal_id)))
+  //
+  //  Total: 8 + 2 + 64 = 74 bytes, exact.
+  //
+  //  Each active watcher submits one BridgeAckAttest per withdrawal.
+  //  The submission assembler later reads the attestations back,
+  //  verifies that they form a quorum, and assembles the
+  //  [2] count || N*66 block that a BridgeAckWithdrawal carries.
+  //
+  //  The executor's job is to validate *one* attestation in
+  //  isolation:
+  //    - the bridge is not paused;
+  //    - the withdrawal exists and is not already released;
+  //    - the signer_index is within the active watcher set;
+  //    - the resolved consensus key at ctx.current_height signs
+  //      the canonical message;
+  //    - no other attestation exists for (withdrawal, validator) —
+  //      resubmission is rejected.
+  //
+  //  There is no conflict check: the record carries no
+  //  destination/amount, so all watchers either attest to the same
+  //  withdrawal_id or not at all.
+
+  Receipt TransactionExecutor::executeBridgeAckAttest(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    if (tx.payload.size() != 8 + 2 + 64)
+      return failure;
+
+    size_t off = 0;
+
+    uint64_t withdrawal_id = 0;
+    for (int i = 0; i < 8; ++i)
+      withdrawal_id |= uint64_t(tx.payload[off + i]) << (i * 8);
+    off += 8;
+
+    const uint16_t signer_index =
+        uint16_t(tx.payload[off]) | (uint16_t(tx.payload[off + 1]) << 8);
+    off += 2;
+
+    Crypto::Signature signature;
+    std::memcpy(signature.data.data(), tx.payload.data() + off, 64);
+    off += 64;
+
+    GlobalStateReader reader(state);
+    if (reader.bridgePaused())
+      return failure;
+
+    Core::BridgeWithdrawal w;
+    if (!state.getBridgeWithdrawal(withdrawal_id, w))
+      return failure;
+    if (!w.isWellFormed())
+      return failure;
+    if (w.isReleased())
+      return failure; // pointless to attest to an already-released withdrawal
+
+    Core::BridgeChainRegistration reg;
+    if (!state.getBridgeChainRegistration(w.source_chain_id, reg))
+      return failure;
+    if (!reg.isWellFormed() || !reg.enabled)
+      return failure;
+
+    //  Resolve the active watcher set at this height, sorted by id
+    //  (same ordering as verifyBridgeSignatures).
+    std::vector<Core::BridgeWatcherInfo> active;
+    state.forEachActiveBridgeWatcherForChain(
+        w.source_chain_id, ctx.current_height,
+        [&](const Core::BridgeWatcherInfo &wi)
+        { active.push_back(wi); });
+
+    std::sort(active.begin(), active.end(),
+              [](const Core::BridgeWatcherInfo &a,
+                 const Core::BridgeWatcherInfo &b)
+              { return a.id < b.id; });
+
+    if (active.size() < reg.active_watcher_min)
+      return failure;
+
+    if (signer_index >= active.size())
+      return failure;
+
+    const Id validator_id = active[signer_index].validator_id;
+
+    auto pk = state.validatorKeyAtHeight(validator_id, ctx.current_height);
+    if (!pk.has_value())
+      return failure;
+
+    const std::vector<uint8_t> message = encodeBridgeAckMessage(withdrawal_id);
+    const Crypto::Hash hash =
+        bridgeSigningHash("back", message.data(), message.size());
+
+    if (!Crypto::verify(hash, *pk, signature))
+      return failure;
+
+    //  Duplicate check.
+    {
+      Core::BridgeAckAttestation existing;
+      if (state.getBridgeAckAttestation(withdrawal_id, validator_id, existing))
+        return failure;
+    }
+
+    Core::BridgeAckAttestation attestation;
+    attestation.signer_index = signer_index;
+    attestation.signature = signature;
+    attestation.attested_at_height = ctx.current_height;
+
+    if (!attestation.isWellFormed())
+      return failure;
+
+    state.putBridgeAckAttestation(withdrawal_id, validator_id, attestation);
+
+    recordBridgeEvent(state, Core::BridgeEventKind::AckAttest,
+                      w.source_chain_id, ctx.current_height,
+                      ctx.tx_index_in_block, tx.txid(),
+                      /*actor=*/tx.from,
+                      /*source_tx_hash=*/Crypto::Hash{},
+                      /*has_source=*/false,
+                      /*source_output_index=*/0,
+                      /*withdrawal_id=*/withdrawal_id,
+                      /*amount=*/0,
+                      /*counterparty=*/validator_id);
+
     return {ReceiptStatus::Success, tx.fee};
   }
 

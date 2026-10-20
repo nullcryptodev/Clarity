@@ -102,6 +102,12 @@ namespace State
       return "index_bridge_watchers_by_owner";
     case TBL_BRIDGE_ATTESTATIONS:
       return "bridge_attestations";
+    case TBL_BRIDGE_ACK_ATTESTATIONS:
+      return "bridge_ack_attestations";
+    case TBL_BRIDGE_STATS:
+      return "bridge_stats";
+    case TBL_BRIDGE_EVENTS:
+      return "bridge_events";
     default:
       return "<unknown>";
     }

@@ -189,13 +189,6 @@ namespace State
         out[8 + i] = uint8_t(withdrawal_id >> ((7 - i) * 8));
     }
 
-    void encodeBridgeWithdrawalHeightPrefix(uint64_t from_height,
-                                            uint8_t out[8])
-    {
-      for (int i = 0; i < 8; ++i)
-        out[i] = uint8_t(from_height >> ((7 - i) * 8));
-    }
-
     //  Bridge-attestation key composition. The full 52-byte key is
     //
     //    [8]  source_chain_id (LE)
@@ -234,6 +227,35 @@ namespace State
       std::memcpy(prefix.data() + 8, source_tx_hash.data.data(), 32);
       for (int i = 0; i < 4; ++i)
         prefix[40 + i] = uint8_t(source_output_index >> (i * 8));
+      return prefix;
+    }
+
+    //  Bridge ack-attestation key composition. The full 16-byte key is
+    //
+    //    [8]  withdrawal_id (LE)
+    //    [8]  validator_id (LE)
+    //
+    //  and the 8-byte prefix (withdrawal_id) is what the
+    //  per-withdrawal range scan seeks.
+
+    std::array<uint8_t, 16> bridgeAckAttestationKeyImpl(
+        uint64_t withdrawal_id,
+        uint64_t validator_id)
+    {
+      std::array<uint8_t, 16> key{};
+      for (int i = 0; i < 8; ++i)
+        key[i] = uint8_t(withdrawal_id >> (i * 8));
+      for (int i = 0; i < 8; ++i)
+        key[8 + i] = uint8_t(validator_id >> (i * 8));
+      return key;
+    }
+
+    std::array<uint8_t, 8> bridgeAckAttestationPrefixImpl(
+        uint64_t withdrawal_id)
+    {
+      std::array<uint8_t, 8> prefix{};
+      for (int i = 0; i < 8; ++i)
+        prefix[i] = uint8_t(withdrawal_id >> (i * 8));
       return prefix;
     }
   } // anonymous namespace
@@ -2333,10 +2355,7 @@ namespace State
     auto value = w.serializeState();
     smt_.update(key, value, version_);
 
-    uint8_t height_key[16];
-    encodeBridgeWithdrawalHeightKey(w.created_at_height, w.id, height_key);
-    putSentinel(StateDB::TBL_INDEX_BRIDGE_WITHDRAWALS_BY_HEIGHT,
-                height_key, sizeof(height_key));
+    indexBridgeWithdrawalRow(w);
   }
 
   void StateAccess::deleteBridgeWithdrawal(uint64_t withdrawal_id)
@@ -2352,11 +2371,82 @@ namespace State
     if (!have)
       return;
 
-    uint8_t height_key[16];
-    encodeBridgeWithdrawalHeightKey(w.created_at_height, withdrawal_id,
-                                    height_key);
-    deleteRow(StateDB::TBL_INDEX_BRIDGE_WITHDRAWALS_BY_HEIGHT,
-              height_key, sizeof(height_key));
+    unindexBridgeWithdrawalRow(w);
+  }
+
+  void StateAccess::putBridgeEvent(const Core::BridgeEvent &evt)
+  {
+    const auto key = Core::BridgeEvent::makeKey(
+        evt.source_chain_id, evt.block_height,
+        evt.tx_index_in_block, evt.kind);
+    const auto value = evt.serializeState();
+    putBlobRow(StateDB::TBL_BRIDGE_EVENTS,
+               key.data(), key.size(),
+               value.data(), value.size());
+  }
+
+  void StateAccess::forEachBridgeEvent(
+      uint64_t source_chain_id,
+      uint64_t from_height,
+      const std::function<bool(const Core::BridgeEvent &)> &fn) const
+  {
+    const auto prefix = Core::BridgeEvent::chainPrefix(source_chain_id);
+    std::vector<uint8_t> prefix_vec(prefix.begin(), prefix.end());
+
+    //  Seek to the first event at or after (source_chain_id, from_height).
+    //  The prefix alone would scan the entire chain; the from_height
+    //  bound is a starting point for the (8-byte prefix + 8-byte
+    //  height) seek key.
+    uint8_t seek_bytes[16];
+    std::memcpy(seek_bytes, prefix.data(), 8);
+    for (int i = 0; i < 8; ++i)
+      seek_bytes[8 + i] = uint8_t(from_height >> ((7 - i) * 8));
+    std::vector<uint8_t> seek_key(seek_bytes, seek_bytes + sizeof(seek_bytes));
+
+    auto visitor = [&fn](const std::vector<uint8_t> &key,
+                         const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != Core::BridgeEvent::KEY_SIZE)
+        return true;
+
+      Core::BridgeEvent evt;
+      if (!Core::BridgeEvent::deserializeState(
+              value.data(), value.size(), evt))
+        return true;
+
+      return fn(evt);
+    };
+
+    readForEachFromKey(StateDB::TBL_BRIDGE_EVENTS, seek_key, visitor);
+  }
+
+  void StateAccess::forEachBridgeEventForWithdrawal(
+      uint64_t withdrawal_id,
+      const std::function<bool(const Core::BridgeEvent &)> &fn) const
+  {
+    //  No index for this — walk the whole table and filter. The
+    //  bridge's event volume is low (one per operation), and a
+    //  withdrawal touches at most three events (burn, ack-attests,
+    //  ack-withdrawal). A future index can be added if a caller
+    //  needs O(1) per-withdrawal iteration.
+    auto visitor = [&](const std::vector<uint8_t> &key,
+                       const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != Core::BridgeEvent::KEY_SIZE)
+        return true;
+
+      Core::BridgeEvent evt;
+      if (!Core::BridgeEvent::deserializeState(
+              value.data(), value.size(), evt))
+        return true;
+
+      if (evt.withdrawal_id != withdrawal_id)
+        return true;
+
+      return fn(evt);
+    };
+
+    readForEach(StateDB::TBL_BRIDGE_EVENTS, visitor);
   }
 
   void StateAccess::forEachPendingBridgeWithdrawal(
@@ -2644,6 +2734,202 @@ namespace State
 
     readForEachWithPrefix(StateDB::TBL_BRIDGE_ATTESTATIONS,
                           prefix_vec, visitor);
+  }
+
+  //  =========================================================================
+  //  Bridge — withdrawal ack attestations
+  //  =========================================================================
+
+  std::array<uint8_t, 16> StateAccess::bridgeAckAttestationKey(
+      uint64_t withdrawal_id,
+      uint64_t validator_id)
+  {
+    return bridgeAckAttestationKeyImpl(withdrawal_id, validator_id);
+  }
+
+  void StateAccess::putBridgeAckAttestation(
+      uint64_t withdrawal_id,
+      uint64_t validator_id,
+      const Core::BridgeAckAttestation &attestation)
+  {
+    if (!attestation.isWellFormed())
+      throw StateDBError("putBridgeAckAttestation: malformed attestation");
+
+    const auto key = bridgeAckAttestationKeyImpl(withdrawal_id, validator_id);
+    const auto value = attestation.serializeState();
+    putBlobRow(StateDB::TBL_BRIDGE_ACK_ATTESTATIONS,
+               key.data(), key.size(),
+               value.data(), value.size());
+  }
+
+  bool StateAccess::getBridgeAckAttestation(
+      uint64_t withdrawal_id,
+      uint64_t validator_id,
+      Core::BridgeAckAttestation &out) const
+  {
+    const auto key = bridgeAckAttestationKeyImpl(withdrawal_id, validator_id);
+
+    std::vector<uint8_t> value;
+    if (!readRow(StateDB::TBL_BRIDGE_ACK_ATTESTATIONS,
+                 key.data(), key.size(), value))
+      return false;
+
+    return Core::BridgeAckAttestation::deserializeState(
+        value.data(), value.size(), out);
+  }
+
+  void StateAccess::forEachBridgeAckAttestationForWithdrawal(
+      uint64_t withdrawal_id,
+      const std::function<bool(uint64_t, const Core::BridgeAckAttestation &)> &fn) const
+  {
+    const auto prefix = bridgeAckAttestationPrefixImpl(withdrawal_id);
+    const std::vector<uint8_t> prefix_vec(prefix.begin(), prefix.end());
+
+    auto visitor = [&fn](const std::vector<uint8_t> &key,
+                         const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != 16)
+        return true;
+
+      uint64_t validator_id = 0;
+      for (int i = 0; i < 8; ++i)
+        validator_id |= uint64_t(key[8 + i]) << (i * 8);
+
+      Core::BridgeAckAttestation a;
+      if (!Core::BridgeAckAttestation::deserializeState(
+              value.data(), value.size(), a))
+        return true;
+
+      return fn(validator_id, a);
+    };
+
+    readForEachWithPrefix(StateDB::TBL_BRIDGE_ACK_ATTESTATIONS,
+                          prefix_vec, visitor);
+  }
+
+  size_t StateAccess::countBridgeAckAttestationsForWithdrawal(
+      uint64_t withdrawal_id) const
+  {
+    size_t count = 0;
+    forEachBridgeAckAttestationForWithdrawal(
+        withdrawal_id,
+        [&](uint64_t, const Core::BridgeAckAttestation &) -> bool
+        {
+          ++count;
+          return true;
+        });
+    return count;
+  }
+
+  void StateAccess::forEachBridgeAckAttestation(
+      const std::function<bool(uint64_t, uint64_t,
+                               const Core::BridgeAckAttestation &)> &fn) const
+  {
+    auto visitor = [&fn](const std::vector<uint8_t> &key,
+                         const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != 16)
+        return true;
+
+      uint64_t withdrawal_id = 0;
+      for (int i = 0; i < 8; ++i)
+        withdrawal_id |= uint64_t(key[i]) << (i * 8);
+
+      uint64_t validator_id = 0;
+      for (int i = 0; i < 8; ++i)
+        validator_id |= uint64_t(key[8 + i]) << (i * 8);
+
+      Core::BridgeAckAttestation a;
+      if (!Core::BridgeAckAttestation::deserializeState(
+              value.data(), value.size(), a))
+        return true;
+
+      return fn(withdrawal_id, validator_id, a);
+    };
+
+    readForEach(StateDB::TBL_BRIDGE_ACK_ATTESTATIONS, visitor);
+  }
+
+  //  =========================================================================
+  //  Bridge — unreleased withdrawals
+  //  =========================================================================
+
+  void StateAccess::forEachUnreleasedBridgeWithdrawal(
+      uint64_t from_height,
+      size_t max_results,
+      const std::function<bool(const Core::BridgeWithdrawal &)> &fn) const
+  {
+    //  Same scan as forEachPendingBridgeWithdrawal, but filtered
+    //  to records whose release_tx_hash is still null. The filter
+    //  is applied inside the visitor, so the underlying index
+    //  scan is identical.
+    uint8_t seek_bytes[16];
+    encodeBridgeWithdrawalHeightKey(from_height, 0, seek_bytes);
+    std::vector<uint8_t> seek_key(seek_bytes, seek_bytes + sizeof(seek_bytes));
+
+    size_t yielded = 0;
+
+    auto visitor = [&](const std::vector<uint8_t> &key,
+                       const std::vector<uint8_t> &) -> bool
+    {
+      if (key.size() != 16)
+        return true;
+
+      uint64_t withdrawal_id = 0;
+      for (int i = 0; i < 8; ++i)
+        withdrawal_id = (withdrawal_id << 8) | key[8 + i];
+
+      Core::BridgeWithdrawal w;
+      if (!getBridgeWithdrawal(withdrawal_id, w))
+        return true; // stale index row; skip and continue
+
+      if (w.isReleased())
+        return true; // already released; skip and continue
+
+      if (!fn(w))
+        return false;
+
+      ++yielded;
+      if (max_results != 0 && yielded >= max_results)
+        return false;
+
+      return true;
+    };
+
+    readForEachFromKey(StateDB::TBL_INDEX_BRIDGE_WITHDRAWALS_BY_HEIGHT,
+                       seek_key, visitor);
+  }
+
+  //  =========================================================================
+  //  Bridge — stats
+  //  =========================================================================
+
+  bool StateAccess::getBridgeStats(uint64_t source_chain_id,
+                                   Core::BridgeStats &out) const
+  {
+    uint8_t key[8];
+    Common::writeU64(key, source_chain_id);
+
+    std::vector<uint8_t> value;
+    if (!readRow(StateDB::TBL_BRIDGE_STATS, key, sizeof(key), value))
+      return false;
+
+    return Core::BridgeStats::deserializeState(
+        value.data(), value.size(), out);
+  }
+
+  void StateAccess::putBridgeStats(const Core::BridgeStats &stats)
+  {
+    if (!stats.isWellFormed())
+      throw StateDBError("putBridgeStats: malformed stats");
+
+    uint8_t key[8];
+    Common::writeU64(key, stats.source_chain_id);
+
+    const auto value = stats.serializeState();
+    putBlobRow(StateDB::TBL_BRIDGE_STATS,
+               key, sizeof(key),
+               value.data(), value.size());
   }
 
   size_t StateAccess::countBridgeAttestationsForDeposit(
@@ -3106,6 +3392,24 @@ namespace State
     result.status = ProofResultStatus::Ok;
     result.proof = std::move(proof);
     return result;
+  }
+
+  void StateAccess::indexBridgeWithdrawalRow(
+      const Core::BridgeWithdrawal &w)
+  {
+    uint8_t height_key[16];
+    encodeBridgeWithdrawalHeightKey(w.created_at_height, w.id, height_key);
+    putSentinel(StateDB::TBL_INDEX_BRIDGE_WITHDRAWALS_BY_HEIGHT,
+                height_key, sizeof(height_key));
+  }
+
+  void StateAccess::unindexBridgeWithdrawalRow(
+      const Core::BridgeWithdrawal &w)
+  {
+    uint8_t height_key[16];
+    encodeBridgeWithdrawalHeightKey(w.created_at_height, w.id, height_key);
+    deleteRow(StateDB::TBL_INDEX_BRIDGE_WITHDRAWALS_BY_HEIGHT,
+              height_key, sizeof(height_key));
   }
 
   //  =========================================================================

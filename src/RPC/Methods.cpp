@@ -46,8 +46,7 @@ namespace Rpc
       {
         throw RpcMethodError(
             ErrorCode::MethodNotFound,
-            "admin methods are disabled (no admin token configured)"
-        );
+            "admin methods are disabled (no admin token configured)");
       }
 
       const std::string prefix = "Bearer ";
@@ -56,8 +55,7 @@ namespace Rpc
       {
         throw RpcMethodError(
             ErrorCode::Unauthorized,
-            "missing or malformed Authorization header"
-        );
+            "missing or malformed Authorization header");
       }
 
       const std::string presented = authorization_header.substr(prefix.size());
@@ -65,8 +63,7 @@ namespace Rpc
       {
         throw RpcMethodError(
             ErrorCode::Unauthorized,
-            "invalid admin token"
-        );
+            "invalid admin token");
       }
     }
 
@@ -74,9 +71,7 @@ namespace Rpc
     {
       std::vector<Core::ValidatorInfo> out;
       state.forEachValidator([&out](const Core::ValidatorInfo &v)
-      {
-        out.push_back(v);
-      });
+                             { out.push_back(v); });
       return out;
     }
 
@@ -121,18 +116,14 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'tx' must be 0x-prefixed even-length hex",
             makeErrorData(ErrorCode::InvalidParams,
-            {
-              {"field", "tx"}
-            })
-        );
+                          {{"field", "tx"}}));
       }
 
       if (bytes.empty())
       {
         throw RpcMethodError(
             ErrorCode::TxMalformed,
-            "transaction bytes are empty"
-        );
+            "transaction bytes are empty");
       }
 
       Core::Transaction tx;
@@ -140,8 +131,7 @@ namespace Rpc
       {
         throw RpcMethodError(
             ErrorCode::TxMalformed,
-            "transaction failed to deserialize"
-        );
+            "transaction failed to deserialize");
       }
 
       return tx;
@@ -176,11 +166,8 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'limit' must be 1.." + std::to_string(max_limit),
             makeErrorData(ErrorCode::InvalidParams,
-            {
-              {"field", "limit"},
-              {"value", encodeU64Hex(p.limit)}
-            })
-        );
+                          {{"field", "limit"},
+                           {"value", encodeU64Hex(p.limit)}}));
       }
       return p;
     }
@@ -282,16 +269,12 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "level must be one of: debug, info, warn, error",
             makeErrorData(ErrorCode::InvalidParams,
-            {
-              {"level", level}
-            })
-        );
+                          {{"level", level}}));
       }
 
       throw RpcMethodError(
           ErrorCode::InternalError,
-          "runtime log level changes are not yet supported"
-      );
+          "runtime log level changes are not yet supported");
     }
 
     Common::Json method_getPool(Node::Node &node,
@@ -310,10 +293,7 @@ namespace Rpc
             ErrorCode::PoolNotFound,
             "no pool with id " + encodeU64Hex(pool_id),
             makeErrorData(ErrorCode::PoolNotFound,
-            {
-              {"pool_id", encodeU64Hex(pool_id)}
-            })
-        );
+                          {{"pool_id", encodeU64Hex(pool_id)}}));
       }
 
       return encodeAmmPool(pool, hrp);
@@ -335,10 +315,7 @@ namespace Rpc
             ErrorCode::PoolNotFound,
             "no position with id " + encodeU64Hex(pos_id),
             makeErrorData(ErrorCode::PoolNotFound,
-            {
-              {"position_id", encodeU64Hex(pos_id)}
-            })
-        );
+                          {{"position_id", encodeU64Hex(pos_id)}}));
       }
 
       Core::AmmPool pool;
@@ -365,11 +342,8 @@ namespace Rpc
             ErrorCode::PoolNotFound,
             "no position for this address in this pool",
             makeErrorData(ErrorCode::PoolNotFound,
-            {
-              {"address", encodeAddress(owner, hrp)},
-              {"pool_id", encodeU64Hex(pool_id)}
-            })
-        );
+                          {{"address", encodeAddress(owner, hrp)},
+                           {"pool_id", encodeU64Hex(pool_id)}}));
       }
 
       Core::AmmPosition pos;
@@ -379,10 +353,7 @@ namespace Rpc
             ErrorCode::StateReadInternal,
             "position index references a missing position",
             makeErrorData(ErrorCode::StateReadInternal,
-            {
-              {"position_id", encodeU64Hex(pos_id)}
-            })
-        );
+                          {{"position_id", encodeU64Hex(pos_id)}}));
       }
 
       Core::AmmPool pool;
@@ -406,7 +377,7 @@ namespace Rpc
       uint64_t emitted = 0;
 
       state.forEachAmmPool([&](const Core::AmmPool &pool)
-      {
+                           {
         if (seen < page.offset)
         {
           ++seen;
@@ -415,8 +386,7 @@ namespace Rpc
         if (emitted >= page.limit)
           return;
         arr.push_back(encodeAmmPool(pool, hrp));
-        ++emitted;
-      });
+        ++emitted; });
 
       Common::Json out = Common::Json::object();
       putU64(out, "count", emitted);
@@ -439,9 +409,7 @@ namespace Rpc
       Common::Json arr = Common::Json::array();
 
       state.forEachPoolForToken(token_id, [&](const Core::AmmPool &pool)
-      {
-        arr.push_back(encodeAmmPool(pool, hrp));
-      });
+                                { arr.push_back(encodeAmmPool(pool, hrp)); });
 
       Common::Json out = Common::Json::object();
       putU64(out, "count", static_cast<uint64_t>(arr.size()));
@@ -463,17 +431,15 @@ namespace Rpc
       std::vector<Core::AmmPosition> matches;
 
       state.forEachAmmPosition([&](const Core::AmmPosition &pos)
-      {
+                               {
         if (pos.pool_id == pool_id)
-          matches.push_back(pos);
-      });
+          matches.push_back(pos); });
 
       std::sort(matches.begin(), matches.end(), [](const Core::AmmPosition &a, const Core::AmmPosition &b)
-      {
+                {
         if (a.liquidity != b.liquidity)
           return a.liquidity > b.liquidity;
-        return a.id < b.id;
-      });
+        return a.id < b.id; });
 
       Common::Json arr = Common::Json::array();
       uint64_t emitted = 0;
@@ -530,10 +496,7 @@ namespace Rpc
             ErrorCode::BlockNotFound,
             "no block at height " + encodeU64Hex(height),
             makeErrorData(ErrorCode::BlockNotFound,
-            {
-              {"height", encodeU64Hex(height)}
-            })
-        );
+                          {{"height", encodeU64Hex(height)}}));
       }
 
       return encodeBlock(*block, full, hrpForNode(node));
@@ -553,10 +516,7 @@ namespace Rpc
             ErrorCode::BlockNotFound,
             "no block with hash " + encodeHash(hash),
             makeErrorData(ErrorCode::BlockNotFound,
-            {
-              {"hash", encodeHash(hash)}
-            })
-        );
+                          {{"hash", encodeHash(hash)}}));
       }
 
       return encodeBlock(*block, full, hrpForNode(node));
@@ -575,10 +535,7 @@ namespace Rpc
             ErrorCode::BlockNotFound,
             "no header at height " + encodeU64Hex(height),
             makeErrorData(ErrorCode::BlockNotFound,
-            {
-              {"height", encodeU64Hex(height)}
-            })
-        );
+                          {{"height", encodeU64Hex(height)}}));
       }
 
       return encodeBlockHeader(*header, hrpForNode(node));
@@ -598,11 +555,8 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'limit' must be 1..100",
             makeErrorData(ErrorCode::InvalidParams,
-            {
-              {"field", "limit"},
-              {"value", encodeU64Hex(limit)}
-            })
-        );
+                          {{"field", "limit"},
+                           {"value", encodeU64Hex(limit)}}));
       }
 
       const uint64_t tip = node.chain().height();
@@ -652,10 +606,7 @@ namespace Rpc
             ErrorCode::BlockNotFound,
             "no committed state root at height " + encodeU64Hex(height),
             makeErrorData(ErrorCode::BlockNotFound,
-            {
-              {"height", encodeU64Hex(height)}
-            })
-        );
+                          {{"height", encodeU64Hex(height)}}));
       }
 
       putHash(j, "state_root", *root);
@@ -678,11 +629,8 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'count' must be 1..100",
             makeErrorData(ErrorCode::InvalidParams,
-            {
-              {"field", "count"},
-              {"value", encodeU64Hex(count)}
-            })
-        );
+                          {{"field", "count"},
+                           {"value", encodeU64Hex(count)}}));
       }
 
       std::string order = "desc";
@@ -694,11 +642,8 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'order' must be 'asc' or 'desc'",
             makeErrorData(ErrorCode::InvalidParams,
-            {
-              {"field", "order"},
-              {"value", order}
-            })
-        );
+                          {{"field", "order"},
+                           {"value", order}}));
       }
 
       const uint64_t tip = node.chain().height();
@@ -760,11 +705,8 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "field 'limit' must be 1..100",
             makeErrorData(ErrorCode::InvalidParams,
-            {
-              {"field", "limit"},
-              {"value", encodeU64Hex(limit)}
-            })
-        );
+                          {{"field", "limit"},
+                           {"value", encodeU64Hex(limit)}}));
       }
 
       State::StateAccess state(node.stateDB(), node.chain().height());
@@ -812,10 +754,7 @@ namespace Rpc
             ErrorCode::InvalidParams,
             "block range exceeds 10,000 blocks",
             makeErrorData(ErrorCode::InvalidParams,
-            {
-              {"range", encodeU64Hex(to - from + 1)}
-            })
-        );
+                          {{"range", encodeU64Hex(to - from + 1)}}));
       }
 
       uint64_t total_txs = 0;
@@ -970,10 +909,7 @@ namespace Rpc
             ErrorCode::ValidatorNotFound,
             "no validator with id " + encodeU64Hex(id),
             makeErrorData(ErrorCode::ValidatorNotFound,
-            {
-              {"id", encodeU64Hex(id)}
-            })
-        );
+                          {{"id", encodeU64Hex(id)}}));
       }
 
       return encodeValidator(v, height, hrp);
@@ -1031,10 +967,7 @@ namespace Rpc
             ErrorCode::ValidatorNotFound,
             "no validator registered for this address",
             makeErrorData(ErrorCode::ValidatorNotFound,
-            {
-              {"address", encodeAddress(address, hrp)}
-            })
-        );
+                          {{"address", encodeAddress(address, hrp)}}));
       }
 
       Core::ValidatorInfo v;
@@ -1044,10 +977,7 @@ namespace Rpc
             ErrorCode::ConsensusReadInternal,
             "validator index references a missing record",
             makeErrorData(ErrorCode::ConsensusReadInternal,
-            {
-              {"validator_id", encodeU64Hex(validator_id)}
-            })
-        );
+                          {{"validator_id", encodeU64Hex(validator_id)}}));
       }
 
       return encodeValidator(v, height, hrp);
@@ -1086,10 +1016,7 @@ namespace Rpc
             ErrorCode::ValidatorNotFound,
             "no validator with id " + encodeU64Hex(id),
             makeErrorData(ErrorCode::ValidatorNotFound,
-            {
-              {"id", encodeU64Hex(id)}
-            })
-        );
+                          {{"id", encodeU64Hex(id)}}));
       }
 
       constexpr size_t RECENT_BLOCKS = 20;
@@ -2867,6 +2794,10 @@ namespace Rpc
           "getActiveWatchers",
           "getBridgeWatcherIdByAddress",
           "getBridgeAttestations",
+          "getBridgeAckAttestations",
+          "getPendingWithdrawals",
+          "getBridgeStats",
+          "getBridgeEvents",
       });
 
       return out;
@@ -3378,6 +3309,400 @@ namespace Rpc
       out["attestations"] = std::move(arr);
       return out;
     }
+
+    //  ---- Withdrawal ack attestations ----
+
+    Common::Json method_getBridgeAckAttestations(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      //  Two modes, mirroring getBridgeAttestations:
+      //    - Specific withdrawal: params contain withdrawal_id.
+      //      Returns attestations for that withdrawal.
+      //    - Full dump: params contain limit/offset only. Paged.
+      //
+      //  Unlike the deposit attestations, the key is a single
+      //  integer, so the "all-or-none" field-group check is just
+      //  "withdrawal_id present or absent".
+
+      const bool has_withdrawal = req.params.contains("withdrawal_id");
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+      const std::string hrp = hrpForNode(node);
+
+      if (has_withdrawal)
+      {
+        const uint64_t withdrawal_id =
+            requireU64(req.params, "withdrawal_id");
+
+        Common::Json arr = Common::Json::array();
+        state.forEachBridgeAckAttestationForWithdrawal(
+            withdrawal_id,
+            [&](uint64_t validator_id,
+                const Core::BridgeAckAttestation &a) -> bool
+            {
+              Common::Json entry = Common::Json::object();
+              putU64(entry, "validator_id", validator_id);
+              putU64(entry, "signer_index", a.signer_index);
+              putU64(entry, "attested_at_height", a.attested_at_height);
+              entry["signature"] = encodeBytesHex(
+                  std::vector<uint8_t>(a.signature.data.begin(),
+                                       a.signature.data.end()));
+              arr.push_back(std::move(entry));
+              return true;
+            });
+
+        Common::Json out = Common::Json::object();
+        putU64(out, "withdrawal_id", withdrawal_id);
+        putU64(out, "count", static_cast<uint64_t>(arr.size()));
+        out["attestations"] = std::move(arr);
+        return out;
+      }
+
+      //  Full dump, paged.
+      const PageParams page = parsePageParams(req.params);
+
+      Common::Json arr = Common::Json::array();
+      uint64_t seen = 0;
+      uint64_t emitted = 0;
+      uint64_t total = 0;
+
+      state.forEachBridgeAckAttestation(
+          [&](uint64_t withdrawal_id,
+              uint64_t validator_id,
+              const Core::BridgeAckAttestation &a) -> bool
+          {
+            ++total;
+            if (seen < page.offset)
+            {
+              ++seen;
+              return true;
+            }
+            if (emitted >= page.limit)
+              return true;
+
+            Common::Json entry = Common::Json::object();
+            putU64(entry, "withdrawal_id", withdrawal_id);
+            putU64(entry, "validator_id", validator_id);
+            putU64(entry, "signer_index", a.signer_index);
+            putU64(entry, "attested_at_height", a.attested_at_height);
+            entry["signature"] = encodeBytesHex(
+                std::vector<uint8_t>(a.signature.data.begin(),
+                                     a.signature.data.end()));
+            arr.push_back(std::move(entry));
+            ++emitted;
+            return true;
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "count", emitted);
+      putU64(out, "offset", page.offset);
+      putU64(out, "limit", page.limit);
+      putU64(out, "total", total);
+      out["attestations"] = std::move(arr);
+      return out;
+    }
+
+    //  ---- Pending withdrawals ----
+
+    Common::Json method_getPendingWithdrawals(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      //  Returns withdrawals that have been burned but not yet
+      //  released. Optional:
+      //    - from_height: only withdrawals created at or after
+      //      this Clarity height. 0 (default) = from genesis.
+      //    - limit/offset: standard pagination.
+      //
+      //  The watcher daemon uses this to discover withdrawals it
+      //  needs to attest to or release. The state is fully
+      //  derived: a withdrawal is pending iff it exists in
+      //  TBL_BRIDGE_WITHDRAWALS and its release_tx_hash is null.
+      //
+      //  We expose the per-withdrawal ack count and the ack
+      //  quorum so the caller can decide whether quorum is
+      //  already reached without a second RPC per withdrawal.
+      //  The quorum is computed against the active watcher set
+      //  at the current chain height, since that's the height the
+      //  BridgeAckWithdrawal would be evaluated at.
+
+      uint64_t from_height = 0;
+      if (auto v = optionalU64(req.params, "from_height"); v.has_value())
+        from_height = *v;
+
+      const PageParams page = parsePageParams(req.params);
+
+      const uint64_t height = node.chain().height();
+      State::StateAccess state(node.stateDB(), height);
+      const std::string hrp = hrpForNode(node);
+
+      Common::Json arr = Common::Json::array();
+      uint64_t seen = 0;
+      uint64_t emitted = 0;
+
+      state.forEachUnreleasedBridgeWithdrawal(
+          from_height, /*max_results=*/0,
+          [&](const Core::BridgeWithdrawal &w) -> bool
+          {
+            if (seen < page.offset)
+            {
+              ++seen;
+              return true;
+            }
+            if (emitted >= page.limit)
+              return false;
+
+            //  Ack count for this withdrawal. Cheap: one range
+            //  scan over the ack table.
+            const size_t ack_count =
+                state.countBridgeAckAttestationsForWithdrawal(w.id);
+
+            //  Active watcher set size at the current height.
+            //  The executor checks active_watcher_min and
+            //  bftQuorum(active) at execution time, so the
+            //  pending view reports the same numbers.
+            size_t active_count = 0;
+            state.forEachActiveBridgeWatcherForChain(
+                w.source_chain_id, height,
+                [&](const Core::BridgeWatcherInfo &)
+                { ++active_count; });
+
+            const size_t quorum = Core::bftQuorum(active_count);
+
+            Common::Json entry =
+                encodeBridgeWithdrawal(w, hrp);
+
+            putU64(entry, "ack_attestation_count", ack_count);
+            putU64(entry, "active_watcher_count",
+                   static_cast<uint64_t>(active_count));
+            putU64(entry, "ack_quorum", static_cast<uint64_t>(quorum));
+
+            const bool quorum_reached =
+                active_count > 0 && ack_count >= quorum;
+            entry["ack_quorum_reached"] = quorum_reached;
+
+            arr.push_back(std::move(entry));
+            ++emitted;
+            return true;
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "height", height);
+      putU64(out, "from_height", from_height);
+      putU64(out, "count", emitted);
+      putU64(out, "offset", page.offset);
+      putU64(out, "limit", page.limit);
+      out["withdrawals"] = std::move(arr);
+      return out;
+    }
+
+    //  ---- Aggregate bridge stats ----
+
+    Common::Json method_getBridgeStats(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const uint64_t source_chain_id =
+          requireU64(req.params, "source_chain_id");
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      Core::BridgeStats stats;
+      const bool found =
+          state.getBridgeStats(source_chain_id, stats);
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "source_chain_id", source_chain_id);
+      out["initialized"] = found;
+
+      if (!found)
+      {
+        //  A chain that has been registered but has never seen a
+        //  bridge operation has no stats row. Return zeros rather
+        //  than an error: the caller asked a well-formed question
+        //  with the answer "no activity yet". This is friendlier
+        //  to monitoring dashboards than a 404 for a legitimately
+        //  quiet bridge.
+        putU64(out, "total_minted", 0);
+        putU64(out, "total_burned", 0);
+        putU64(out, "total_released", 0);
+        putU64(out, "deposit_count", 0);
+        putU64(out, "withdrawal_count", 0);
+        putU64(out, "released_withdrawal_count", 0);
+        putU64(out, "last_mint_height", 0);
+        putU64(out, "last_burn_height", 0);
+        putU64(out, "last_release_height", 0);
+        putU64(out, "registered_at_height", 0);
+        putU64(out, "outstanding_liability", 0);
+        return out;
+      }
+
+      putU64(out, "total_minted", stats.total_minted);
+      putU64(out, "total_burned", stats.total_burned);
+      putU64(out, "total_released", stats.total_released);
+      putU64(out, "deposit_count", stats.deposit_count);
+      putU64(out, "withdrawal_count", stats.withdrawal_count);
+      putU64(out, "released_withdrawal_count",
+             stats.released_withdrawal_count);
+      putU64(out, "last_mint_height", stats.last_mint_height);
+      putU64(out, "last_burn_height", stats.last_burn_height);
+      putU64(out, "last_release_height", stats.last_release_height);
+      putU64(out, "registered_at_height", stats.registered_at_height);
+
+      //  Derived: the amount of CCX the federation owes to current
+      //  wCCX holders. Equal to total_burned - total_released.
+      const uint64_t outstanding =
+          stats.total_burned > stats.total_released
+              ? stats.total_burned - stats.total_released
+              : 0;
+      putU64(out, "outstanding_liability", outstanding);
+
+      //  Supply invariant: total_minted - total_burned must equal
+      //  the current wrapped-token supply. This is the invariant
+      //  the auditor RPC (handover §13.5) will check, but it is
+      //  cheap enough to compute inline and useful for monitoring
+      //  dashboards that already call getBridgeStats. Expose it as
+      //  a pair of fields so an operator can see both sides of the
+      //  equation, not just the pass/fail.
+      //
+      //  A `false` here means the bridge has drifted: either a
+      //  mint/burn was executed without a stats bump (a code bug),
+      //  or the wrapped-token supply was changed outside the
+      //  bridge (a governance or admin path that shouldn't exist).
+      //  Either way, it should alert loudly.
+      uint64_t wrapped_supply = 0;
+      Core::TokenInfo wrapped_token;
+      if (state.getToken(stats.source_chain_id, wrapped_token))
+        wrapped_supply = state.getTokenSupply(stats.source_chain_id);
+
+      putU64(out, "wrapped_supply", wrapped_supply);
+
+      const bool supply_consistent =
+          stats.total_minted >= stats.total_burned &&
+          (stats.total_minted - stats.total_burned) == wrapped_supply;
+      out["supply_consistent"] = supply_consistent;
+
+      return out;
+    }
+
+    Common::Json method_getBridgeEvents(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const uint64_t source_chain_id =
+          requireU64(req.params, "source_chain_id");
+
+      uint64_t from_height = 0;
+      if (auto v = optionalU64(req.params, "from_height"); v.has_value())
+        from_height = *v;
+
+      //  Optional kind filter. Parse as either number or hex string
+      //  so a client can pass "mint" → 0x0 or "0x0" or 0.
+      std::optional<Core::BridgeEventKind> kind_filter;
+      if (req.params.contains("kind") && !req.params["kind"].is_null())
+      {
+        const auto &k = req.params["kind"];
+        uint64_t kc = 0;
+        if (k.is_number_unsigned())
+        {
+          kc = k.get<uint64_t>();
+        }
+        else if (k.is_string())
+        {
+          const std::string s = k.get<std::string>();
+          if (s == "mint" || s == "burn" ||
+              s == "ack_attest" || s == "ack_withdrawal")
+          {
+            //  Handled below by name.
+            kind_filter = s == "mint"         ? Core::BridgeEventKind::Mint
+                          : s == "burn"       ? Core::BridgeEventKind::Burn
+                          : s == "ack_attest" ? Core::BridgeEventKind::AckAttest
+                                              : Core::BridgeEventKind::AckWithdrawal;
+          }
+          else
+          {
+            uint64_t parsed = 0;
+            if (!parseHexU64(s, parsed))
+            {
+              throw RpcMethodError(
+                  ErrorCode::InvalidParams,
+                  "field 'kind' must be a kind name or hex code",
+                  makeErrorData(ErrorCode::InvalidParams,
+                                {{"field", "kind"}}));
+            }
+            kc = parsed;
+          }
+        }
+        else
+        {
+          throw RpcMethodError(
+              ErrorCode::InvalidParams,
+              "field 'kind' must be a string or number",
+              makeErrorData(ErrorCode::InvalidParams,
+                            {{"field", "kind"}}));
+        }
+
+        if (!kind_filter.has_value())
+        {
+          if (kc > 3)
+          {
+            throw RpcMethodError(
+                ErrorCode::InvalidParams,
+                "field 'kind' code must be 0..3",
+                makeErrorData(ErrorCode::InvalidParams,
+                              {{"field", "kind"},
+                               {"value", encodeU64Hex(kc)}}));
+          }
+          kind_filter = static_cast<Core::BridgeEventKind>(kc);
+        }
+      }
+
+      const PageParams page = parsePageParams(req.params);
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+      const std::string hrp = hrpForNode(node);
+
+      Common::Json arr = Common::Json::array();
+      uint64_t seen = 0;
+      uint64_t emitted = 0;
+      uint64_t total = 0;
+
+      state.forEachBridgeEvent(
+          source_chain_id, from_height,
+          [&](const Core::BridgeEvent &evt) -> bool
+          {
+            if (kind_filter.has_value() && evt.kind != *kind_filter)
+              return true;
+
+            ++total;
+            if (seen < page.offset)
+            {
+              ++seen;
+              return true;
+            }
+            if (emitted >= page.limit)
+              return true;
+
+            arr.push_back(encodeBridgeEvent(evt, hrp));
+            ++emitted;
+            return true;
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "source_chain_id", source_chain_id);
+      putU64(out, "from_height", from_height);
+      putU64(out, "count", emitted);
+      putU64(out, "offset", page.offset);
+      putU64(out, "limit", page.limit);
+      putU64(out, "total", total);
+      out["events"] = std::move(arr);
+      return out;
+    }
   } // anon namespace
 
   void registerBridgeMethods(JsonRpcDispatcher &d)
@@ -3388,6 +3713,10 @@ namespace Rpc
     d.registerMethod("getActiveWatchers", method_getActiveWatchers);
     d.registerMethod("getBridgeWatcherIdByAddress", method_getBridgeWatcherIdByAddress);
     d.registerMethod("getBridgeAttestations", method_getBridgeAttestations);
+    d.registerMethod("getBridgeAckAttestations", method_getBridgeAckAttestations);
+    d.registerMethod("getPendingWithdrawals", method_getPendingWithdrawals);
+    d.registerMethod("getBridgeStats", method_getBridgeStats);
+    d.registerMethod("getBridgeEvents", method_getBridgeEvents);
   }
 
   void registerAdminMethods(JsonRpcDispatcher &d)

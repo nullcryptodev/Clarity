@@ -39,6 +39,13 @@ namespace Bridge
     //  in which case neither is required.
     bool no_wizard{false};
 
+    //  Path to a JSON config file. When set, its values are
+    //  loaded into this Args before CLI flags are applied, so
+    //  CLI flags override config-file values. A config file is
+    //  the canonical way to provision a watcher with 15+ settings
+    //  the CLI flags remain for scripting and one-off testing.
+    std::string config_file;
+
     //  One-shot command to run instead of dropping into the REPL.
     //  Empty means "REPL" (the default). A non-empty value is
     //  validated at parse time against the command table, and

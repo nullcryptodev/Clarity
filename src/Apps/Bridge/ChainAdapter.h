@@ -39,8 +39,15 @@ namespace Bridge
   {
     uint64_t withdrawal_id{0};
     uint64_t source_chain_id{0};
-    uint64_t amount_clarity_atomic{0};
+
+    //  The 64-byte (spend ‖ view) destination blob, as stored in
+    //  the BridgeWithdrawal record.
     std::vector<uint8_t> destination_blob;
+
+    //  The base58 destination address, as stored in the record.
+    //  This is what the CCX wallet RPC uses; the blob is only used
+    //  for validation.
+    std::string destination_address;
   };
 
   struct ReleaseSubmission
@@ -127,6 +134,13 @@ namespace Bridge
       return false;
     }
 
+    //  Human-readable form of the deposit address, for display in
+    //  cmd_status. Returns an empty string if the adapter has no
+    //  deposit address configured. Concrete adapters override this
+    //  to return whatever textual form makes sense for their chain
+    //  (base58 for CCX, bech32m for anything EVM-adjacent, etc.).
+    virtual std::string deposit_address_display() const { return {}; }
+
     //  Deliver a parsed deposit-address blob to the adapter. Called
     //  by cmd_start after parse_deposit_address succeeds, or after
     //  a blob is loaded from config. Default: no-op.
@@ -142,6 +156,70 @@ namespace Bridge
         const Crypto::SecretKey & /*secret*/)
     {
     }
+
+    //  =========================================================================
+    //  Withdrawal release configuration and helpers
+    //  =========================================================================
+    //
+    //  The Commands.cpp scan loop drives the release pipeline
+    //  generically; it does not know which chain adapter it is
+    //  talking to. These three methods let a chain adapter
+    //  participate in the release pipeline (by overriding them),
+    //  or opt out cleanly (by leaving the defaults, which disable
+    //  the release path for that chain).
+    //
+    //  A deposit-only chain leaves all three at their defaults:
+    //    - set_wallet_rpc_endpoint: no-op
+    //    - set_network_prefix:  no-op
+    //    - fetch_release_height:    returns nullopt
+    //
+    //  The scan loop then logs "cannot determine release height;
+    //  marking Done without the Clarity-side record" for each
+    //  withdrawal it can't complete, which is the correct
+    //  behavior for a chain that has no on-chain release record.
+
+    //  Configure the wallet RPC endpoint used by submit_release.
+    //  For CCX this is conceal-wallet-rpc; for a chain whose
+    //  daemon can build and sign transactions itself, it might be
+    //  the daemon RPC or unused entirely.
+    //
+    //  Default: no-op. submit_release's default implementation
+    //  returns ok=false with "release not supported", so a watcher
+    //  configured for a deposit-only chain simply skips releases.
+    virtual void set_wallet_rpc_endpoint(
+        const std::string & /*host*/,
+        uint16_t /*port*/,
+        const std::string & /*user*/ = {},
+        const std::string & /*password*/ = {})
+    {
+    }
+
+    //  Configure the chain's address network prefix. For CCX this
+    //  is the varint version byte written at the start of a
+    //  decoded base58 address. Other chains use it differently or
+    //  ignore it.
+    //
+    //  Default: no-op.
+    virtual void set_network_prefix(uint64_t /*prefix*/)
+    {
+    }
+
+    //  Look up the block height of a source-chain transaction that
+    //  is already in a block. Returns std::nullopt if the tx is
+    //  not in a block (mempool, unknown, or the adapter has no
+    //  height-lookup capability).
+    //
+    //  Used by the scan loop's Released phase to populate the
+    //  release_height that BridgeAckWithdrawal requires.
+    //
+    //  Default: return nullopt.
+    virtual std::optional<uint64_t> fetch_release_height(
+        Wallet::RpcClient & /*rpc*/,
+        const Crypto::Hash & /*tx_hash*/) const
+    {
+      return std::nullopt;
+    }
+
   };
 
   class ChainAdapterRegistry

@@ -100,14 +100,19 @@ namespace Core
     //  Per-watcher attestation over a bridge deposit. Each active
     //  watcher submits one of these per deposit; the collection of
     //  BridgeAttest transactions with a quorum of distinct
-    //  validator_ids is what makes a BridgeMint valid. See
-    //  executeBridgeAttest and Bridge::Signing for the producer
-    //  side, and Bridge::Submission's assembler for the consumer.
-    //
-    //  This is NOT a system transaction: it goes through the
-    //  standard pipeline (fee, nonce, signature), and is subject
-    //  to the same dry-run/apply invariants as everything else.
+    //  validator_ids is what makes a BridgeMint valid.
     BridgeAttest = 0x79,
+    //  Per-watcher attestation over a bridge withdrawal. Each
+    //  active watcher submits one of these per withdrawal; the
+    //  collection of BridgeAckAttest transactions with a quorum of
+    //  distinct validator_ids is what makes a BridgeAckWithdrawal
+    //  valid — and what authorizes the corresponding CCX release.
+    //
+    //  The BridgeAckAttest record is smaller than BridgeAttest
+    //  because a withdrawal is identified by one integer, not
+    //  (chain_id, tx_hash, output_index), and destination/amount
+    //  live in the BridgeWithdrawal record created at burn time.
+    BridgeAckAttest = 0x7A,
 
     //  ---- System (0xF0–0xFE) ----
     //
@@ -215,6 +220,8 @@ namespace Core
       return "unregister_bridge_watcher";
     case BridgeAttest:
       return "bridge_attest";
+    case BridgeAckAttest:
+      return "bridge_ack_attest";
     case BlockReward:
       return "block_reward";
     case OrderExpired:

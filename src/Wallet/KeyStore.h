@@ -36,8 +36,7 @@ namespace Wallet
   //
   //    PlainKeyStore      — in-memory only, no encryption. For tests
   //                         and for transient wallets that never touch
-  //                         disk. Will be added if a concrete need
-  //                         arises; not part of Phase 1.
+  //                         disk.
   //
   //  The interface is deliberately small. Everything a caller needs
   //  to sign transactions comes from three methods: unlock, derive,

@@ -238,4 +238,16 @@ namespace Bridge::Signing
       return std::nullopt;
     return Crypto::sign(hash, watcher_consensus_key);
   }
+
+  std::optional<Crypto::Signature> SignSingleBridgeAck(
+      const Crypto::SecretKey &watcher_consensus_key,
+      uint64_t withdrawal_id)
+  {
+    const auto message = EncodeBridgeAckMessage(withdrawal_id);
+    const Crypto::Hash hash =
+        SigningHash("back", message.data(), message.size());
+    if (hash.isNull())
+      return std::nullopt;
+    return Crypto::sign(hash, watcher_consensus_key);
+  }
 } // namespace Bridge::Signing

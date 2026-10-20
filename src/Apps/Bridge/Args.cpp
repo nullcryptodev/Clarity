@@ -5,6 +5,7 @@
 
 #include "Args.h"
 
+#include "Config.h"
 #include "ChainAdapter.h"
 #include "Commands.h"
 #include "GlobalConfig.h"
@@ -47,12 +48,6 @@ namespace Bridge
         throw std::runtime_error(std::string(flag) + ": missing value");
     }
 
-    //  Read a password file and trim a single trailing newline.
-    //  Password files are almost always written by `echo` or an
-    //  editor, both of which add one; operators always trip on
-    //  it if we don't strip it. Only one trailing newline (or
-    //  CRLF) is stripped — embedded newlines stay, so a
-    //  multi-line passphrase still works.
     std::string readPasswordFile(const std::string &path, const char *flag)
     {
       std::FILE *f = std::fopen(path.c_str(), "rb");
@@ -78,6 +73,50 @@ namespace Bridge
   Args parseArgs(int argc, char **argv)
   {
     Args args;
+
+    //  ---- Pass 1: find --config-file (if any) ----
+    //
+    //  We scan the argv for --config-file first, because the
+    //  config file has to be loaded before CLI flags are applied
+    //  (so CLI flags can override config values). We only look
+    //  for --config-file in this pass; all other flags are
+    //  ignored until pass 2.
+    std::string config_file;
+    for (int i = 1; i < argc; ++i)
+    {
+      const std::string a = argv[i];
+      if (a == "--config-file")
+      {
+        if (i + 1 >= argc)
+          throw std::runtime_error("--config-file: missing value");
+        config_file = argv[i + 1];
+        ++i;
+        continue;
+      }
+      //  Also catch the "--config-file=path" form.
+      if (a.rfind("--config-file=", 0) == 0)
+      {
+        config_file = a.substr(std::strlen("--config-file="));
+      }
+    }
+
+    if (!config_file.empty())
+    {
+      args.config_file = config_file;
+      BridgeConfig::load(config_file, args);
+    }
+
+    //  ---- Pass 2: apply CLI flags on top ----
+    //
+    //  The config file has already populated args (if one was
+    //  given). CLI flags override. The convention for each string
+    //  field is "CLI flag if present, else config value, else
+    //  default" — which means we must be careful with fields that
+    //  legitimately have an empty-string meaning, but none of
+    //  those are string fields except for password fields, and
+    //  those are loaded from files whose empty-string form is
+    //  already "no password". So the "empty means unset" convention
+    //  works cleanly.
 
     for (int i = 1; i < argc; ++i)
     {
@@ -109,6 +148,18 @@ namespace Bridge
         continue;
       }
 
+      //  --config-file was already processed in pass 1; skip it
+      //  (and its value) here so we don't double-load.
+      if (a == "--config-file")
+      {
+        ++i;
+        continue;
+      }
+      if (a.rfind("--config-file=", 0) == 0)
+      {
+        continue;
+      }
+
       if (a == "--app")
       {
         requireValue(i, argc, "--app");
@@ -118,10 +169,6 @@ namespace Bridge
 
       if (a == "--chain")
       {
-        //  --chain <name> enables one chain and pre-populates its
-        //  config with the adapter's defaults. If the operator
-        //  passes --chain more than once, multiple chains are
-        //  enabled and each gets its own ChainWatcherConfig.
         requireValue(i, argc, "--chain");
         const std::string name = argv[++i];
 
@@ -131,7 +178,6 @@ namespace Bridge
                                    "' (use --list-chains to see the "
                                    "available adapters)");
 
-        //  Reject duplicates.
         for (const auto &c : args.cli_chain_configs)
         {
           if (c.chain_short_name == name)
@@ -144,8 +190,6 @@ namespace Bridge
         cc.enabled = true;
         cc.confirmation_depth = adapter->default_confirmation_depth();
 
-        //  Parse the adapter's default RPC endpoint, which is
-        //  "host:port" (the same shape the CLI accepts).
         std::string host;
         uint16_t port = 0;
         parseEndpoint(adapter->default_rpc_endpoint(), "--chain",
@@ -157,7 +201,6 @@ namespace Bridge
         continue;
       }
 
-      // todo remove
       if (a == "--mint-destination")
       {
         requireValue(i, argc, "--mint-destination");
@@ -191,8 +234,6 @@ namespace Bridge
 
       if (a == "--rpc")
       {
-        //  Per-chain RPC override. Requires a preceding --chain
-        //  so the override has a target.
         requireValue(i, argc, "--rpc");
         if (args.cli_chain_configs.empty())
           throw std::runtime_error(
@@ -228,7 +269,6 @@ namespace Bridge
 
       if (a == "--confirmation-depth")
       {
-        //  Per-chain override.
         requireValue(i, argc, "--confirmation-depth");
         if (args.cli_chain_configs.empty())
           throw std::runtime_error(
@@ -238,6 +278,81 @@ namespace Bridge
         if (end == argv[i] || *end != '\0' || v == 0 || v > 65535)
           throw std::runtime_error("--confirmation-depth: invalid value");
         args.cli_chain_configs.back().confirmation_depth =
+            static_cast<uint16_t>(v);
+        continue;
+      }
+
+      //  ---- per-chain wallet RPC and prefix ----
+      //
+      //  These must follow a --chain, same as --rpc. The wallet
+      //  RPC is a separate endpoint from the daemon RPC; it holds
+      //  the custody spend key that signs releases. Without it,
+      //  submit_release returns ok=false and the withdrawal scan
+      //  loop logs an error per pending withdrawal.
+
+      if (a == "--ccx-wallet-rpc")
+      {
+        requireValue(i, argc, "--ccx-wallet-rpc");
+        if (args.cli_chain_configs.empty())
+          throw std::runtime_error(
+              "--ccx-wallet-rpc: must follow a --chain");
+        parseEndpoint(argv[++i], "--ccx-wallet-rpc",
+                      args.cli_chain_configs.back().wallet_rpc_host,
+                      args.cli_chain_configs.back().wallet_rpc_port);
+        continue;
+      }
+
+      if (a == "--ccx-wallet-rpc-user")
+      {
+        requireValue(i, argc, "--ccx-wallet-rpc-user");
+        if (args.cli_chain_configs.empty())
+          throw std::runtime_error(
+              "--ccx-wallet-rpc-user: must follow a --chain");
+        args.cli_chain_configs.back().wallet_rpc_user = argv[++i];
+        continue;
+      }
+
+      if (a == "--ccx-wallet-rpc-password-file")
+      {
+        requireValue(i, argc, "--ccx-wallet-rpc-password-file");
+        if (args.cli_chain_configs.empty())
+          throw std::runtime_error(
+              "--ccx-wallet-rpc-password-file: must follow a --chain");
+        args.cli_chain_configs.back().wallet_rpc_password =
+            readPasswordFile(argv[++i],
+                             "--ccx-wallet-rpc-password-file");
+        continue;
+      }
+
+      if (a == "--ccx-network-prefix")
+      {
+        requireValue(i, argc, "--ccx-network-prefix");
+        if (args.cli_chain_configs.empty())
+          throw std::runtime_error(
+              "--ccx-network-prefix: must follow a --chain");
+        char *end = nullptr;
+        const unsigned long long v =
+            std::strtoull(argv[++i], &end, 0);
+        if (end == argv[i] || *end != '\0' || v > 0xFFFFFFFFull)
+          throw std::runtime_error(
+              "--ccx-network-prefix: invalid value");
+        args.cli_chain_configs.back().ccx_network_prefix =
+            static_cast<uint64_t>(v);
+        continue;
+      }
+
+      if (a == "--burn-finality-depth")
+      {
+        requireValue(i, argc, "--burn-finality-depth");
+        if (args.cli_chain_configs.empty())
+          throw std::runtime_error(
+              "--burn-finality-depth: must follow a --chain");
+        char *end = nullptr;
+        const unsigned long v = std::strtoul(argv[++i], &end, 10);
+        if (end == argv[i] || *end != '\0' || v == 0 || v > 65535)
+          throw std::runtime_error(
+              "--burn-finality-depth: invalid value");
+        args.cli_chain_configs.back().burn_finality_depth =
             static_cast<uint16_t>(v);
         continue;
       }
@@ -256,19 +371,6 @@ namespace Bridge
         continue;
       }
 
-      //  ---- --consensus-key-file ----
-      //
-      //  Loads the validator's consensus signing key from a
-      //  file. The file contains a single 32-byte secret key as
-      //  64 hex characters (optionally 0x-prefixed, whitespace-
-      //  trimmed). Used by SubmitAttestation to sign BridgeAttest
-      //  transactions.
-      //
-      //  Required when the validator's registered consensus key
-      //  differs from the keystore's default-path (0/0/0) key.
-      //  When absent, the bridge falls back to the keystore's
-      //  default-path key — which only produces a valid
-      //  attestation signature if that is the same key.
       if (a == "--consensus-key-file")
       {
         requireValue(i, argc, "--consensus-key-file");
@@ -276,21 +378,6 @@ namespace Bridge
         continue;
       }
 
-      //  ---- --view-key-file ----
-      //
-      //  Loads the custody wallet's private view key from a file.
-      //  Same format as --consensus-key-file: 64 hex chars,
-      //  optional 0x prefix, optional trailing newline.
-      //
-      //  Used by CcxAdapter to compute the per-tx shared secret
-      //  (Crypto::generateKeyDerivation) and thereby identify
-      //  which vout of a scanned deposit pays to the custody
-      //  address. Without it, scan_deposits falls back to
-      //  sum-of-outputs and mints the wrong amount.
-      //
-      //  The corresponding spend pubkey is not a flag: it's the
-      //  first 32 bytes of the decoded --bridge-address, so the
-      //  adapter derives it from the address it already has.
       if (a == "--view-key-file")
       {
         requireValue(i, argc, "--view-key-file");
@@ -341,10 +428,6 @@ namespace Bridge
         requireValue(i, argc, "--command");
         const std::string name = argv[++i];
 
-        //  Validate against the command table now so a typo
-        //  fails fast, before any RPC probe or keystore prompt.
-        //  A service manager should not see the daemon "start"
-        //  and then discover the command was garbage.
         if (!findCommand(name))
           throw std::runtime_error(
               "--command: unknown command '" + name +
@@ -354,10 +437,6 @@ namespace Bridge
         continue;
       }
 
-      //  Positional token, only meaningful when --command has
-      //  been seen. Collected as command_args in order. Anything
-      //  that doesn't start with "--" and arrives after
-      //  "--command <name>" ends up here.
       if (a.rfind("--", 0) != 0 && !args.command.empty())
       {
         args.command_args.push_back(a);
@@ -367,17 +446,10 @@ namespace Bridge
       throw std::runtime_error("unknown argument '" + a + "'");
     }
 
-    //  Validate mode combinations at the end, after every flag
-    //  has been seen. This lets --command appear before or after
-    //  --no-wizard without ordering mattering.
+    //  ---- Validation ----
 
     if (args.no_wizard)
     {
-      //  Read-only one-shot commands (status, chains, deposits,
-      //  withdrawals, pending, help, version) don't need a
-      //  keystore or a chain — they just report what's already in
-      //  the session, which may be empty. `start` and the default
-      //  REPL case do need both.
       const bool read_only_command =
           !args.command.empty() && args.command != "start";
 
@@ -411,6 +483,15 @@ namespace Bridge
         "Starts the Clarity bridge app. With no --chain flags, the\n"
         "startup wizard lists every compiled-in chain adapter and\n"
         "prompts you to enable one or more.\n"
+        "\n"
+        "Config file:\n"
+        "  --config-file <path>        Load a JSON config file. CLI\n"
+        "                              flags override config-file\n"
+        "                              values. The file is the canonical\n"
+        "                              way to provision a watcher with\n"
+        "                              15+ settings; see the comment at\n"
+        "                              the top of BridgeConfig.h for the\n"
+        "                              format.\n"
         "\n"
         "Global options:\n"
         "  --app <name>                App name (default: clarity-bridge)\n"
@@ -472,6 +553,35 @@ namespace Bridge
         "  --rpc-password-file <path>  Read the preceding --chain's RPC\n"
         "                              password from a file\n"
         "\n"
+        "Per-chain withdrawal-release options:\n"
+        "  --ccx-wallet-rpc <host:port>\n"
+        "                              CCX wallet RPC endpoint. Used\n"
+        "                              by submit_release to build,\n"
+        "                              sign, and submit the CCX\n"
+        "                              release transaction. Distinct\n"
+        "                              from the daemon RPC, which can\n"
+        "                              only relay raw transactions.\n"
+        "                              If not set, withdrawals are not\n"
+        "                              released by this watcher.\n"
+        "  --ccx-wallet-rpc-user <user>\n"
+        "                              Optional Basic auth user for\n"
+        "                              the CCX wallet RPC\n"
+        "  --ccx-wallet-rpc-password-file <path>\n"
+        "                              Read the CCX wallet RPC\n"
+        "                              password from a file\n"
+        "  --ccx-network-prefix <n>    CCX address network prefix byte\n"
+        "                              (default: 0x13 for mainnet,\n"
+        "                              0x53 for testnet). Must match\n"
+        "                              what the wallet RPC is watching,\n"
+        "                              or releases fail with a network\n"
+        "                              mismatch error.\n"
+        "  --burn-finality-depth <n>   Number of Clarity blocks a\n"
+        "                              BridgeBurn must be buried under\n"
+        "                              before the federation releases\n"
+        "                              the corresponding CCX (default:\n"
+        "                              3). Protects against reorg-\n"
+        "                              driven double-release.\n"
+        "\n"
         "Discovery:\n"
         "  --list-chains               List every chain adapter compiled\n"
         "                              into this binary and exit\n"
@@ -502,6 +612,8 @@ namespace Bridge
   void printConfig(const Args &a)
   {
     std::printf("Bridge configuration:\n");
+    if (!a.config_file.empty())
+      std::printf("  config file:         %s\n", a.config_file.c_str());
     std::printf("  app:                 %s\n", a.config.app_name.c_str());
     std::printf("  clarity rpc:         %s:%u\n",
                 a.config.clarity_rpc_host.c_str(),
@@ -557,6 +669,23 @@ namespace Bridge
                       c.rpc_user.c_str());
         std::printf("      confirmation:      %u\n",
                     static_cast<unsigned>(c.confirmation_depth));
+        if (!c.wallet_rpc_host.empty() && c.wallet_rpc_port != 0)
+        {
+          std::printf("      wallet rpc:        %s:%u\n",
+                      c.wallet_rpc_host.c_str(), c.wallet_rpc_port);
+          if (!c.wallet_rpc_user.empty())
+            std::printf("      wallet rpc user:   %s\n",
+                        c.wallet_rpc_user.c_str());
+        }
+        else
+        {
+          std::printf("      wallet rpc:        (not configured — "
+                      "releases disabled)\n");
+        }
+        std::printf("      ccx network prefix: 0x%llx\n",
+                    static_cast<unsigned long long>(c.ccx_network_prefix));
+        std::printf("      burn finality depth: %u\n",
+                    static_cast<unsigned>(c.burn_finality_depth));
       }
     }
   }

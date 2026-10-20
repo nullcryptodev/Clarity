@@ -1363,16 +1363,29 @@ namespace Wallet
       return std::nullopt;
     }
 
-    //  The destination blob is length-prefixed with a single byte,
-    //  so its size must fit in 255. The executor enforces the chain
-    //  registration's min/max, but the byte prefix is a hard
-    //  physical limit.
     if (params.destination_blob.size() > 255)
     {
       if (error_out)
         *error_out = WalletStatus::fail(
             WalletError::InvalidParameter,
             "destination_blob exceeds 255 bytes");
+      return std::nullopt;
+    }
+
+    if (params.destination_address.empty())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "destination_address is empty");
+      return std::nullopt;
+    }
+
+    if (params.destination_address.size() > 255)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "destination_address exceeds 255 bytes");
       return std::nullopt;
     }
 
@@ -1388,7 +1401,7 @@ namespace Wallet
         makeBase(Core::TxType::BridgeBurn, from, params.common);
     tx.to = from;
     tx.token_id = params.wrapped_token_id;
-    tx.amount = 0; // amount lives in the payload
+    tx.amount = 0;
 
     std::vector<uint8_t> &p = tx.payload;
     appendU64(p, params.source_chain_id);
@@ -1396,6 +1409,10 @@ namespace Wallet
     p.insert(p.end(),
              params.destination_blob.begin(),
              params.destination_blob.end());
+    appendU8(p, static_cast<uint8_t>(params.destination_address.size()));
+    p.insert(p.end(),
+             params.destination_address.begin(),
+             params.destination_address.end());
     appendU64(p, params.amount);
 
     return tx;
@@ -1419,6 +1436,22 @@ namespace Wallet
       return std::nullopt;
     }
 
+    if (params.release_tx_hash.isNull())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "release_tx_hash is null");
+      return std::nullopt;
+    }
+
+    if (params.release_height == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "release_height is zero");
+      return std::nullopt;
+    }
+
     if (!validateSignatureBlock(params.signature_block, error_out))
       return std::nullopt;
 
@@ -1427,8 +1460,15 @@ namespace Wallet
     tx.to = from;
     tx.amount = 0;
 
+    //  Payload layout (matching executeBridgeAckWithdrawal):
+    //    [8]  withdrawal_id
+    //    [32] release_tx_hash
+    //    [8]  release_height
+    //    [2]  count || N*66 signature block
     std::vector<uint8_t> &p = tx.payload;
     appendU64(p, params.withdrawal_id);
+    appendHash(p, params.release_tx_hash);
+    appendU64(p, params.release_height);
     p.insert(p.end(),
              params.signature_block.begin(),
              params.signature_block.end());
@@ -1559,6 +1599,8 @@ namespace Wallet
     return hash;
   }
 
+  //  ---- BridgeAttest ----
+
   std::optional<Core::Transaction> buildBridgeAttest(
       const Crypto::Address &from,
       const BridgeAttestParams &params,
@@ -1620,6 +1662,52 @@ namespace Wallet
              params.destination.data.begin(),
              params.destination.data.end());
     appendU64(p, params.amount);
+    appendU16(p, params.signer_index);
+    p.insert(p.end(),
+             params.signature.data.begin(),
+             params.signature.data.end());
+
+    return tx;
+  }
+
+  //  ---- BridgeAckAttest ----
+
+  std::optional<Core::Transaction> buildBridgeAckAttest(
+      const Crypto::Address &from,
+      const BridgeAckAttestParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.withdrawal_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "withdrawal_id is zero");
+      return std::nullopt;
+    }
+
+    if (params.signature.isNull())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "signature is null");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::BridgeAckAttest, from, params.common);
+    tx.to = from;
+    tx.amount = 0;
+
+    //  Payload layout (matching executeBridgeAckAttest):
+    //    [8]  withdrawal_id
+    //    [2]  signer_index
+    //    [64] signature
+    //  Total: 74 bytes.
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.withdrawal_id);
     appendU16(p, params.signer_index);
     p.insert(p.end(),
              params.signature.data.begin(),
