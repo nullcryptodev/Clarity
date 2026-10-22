@@ -181,6 +181,11 @@ namespace Wallet
   //  On ValidatorNotFound, `is_not_found` is set to true and the
   //  function returns nullopt. On other errors, `is_not_found` is
   //  false and error_out carries the message.
+  //
+  //  This is the identity lookup the bridge daemon uses to resolve
+  //  its own validator id at startup: under the validator-is-watcher
+  //  model there is no separate per-chain watcher id, so an address
+  //  either maps to a validator or it does not.
   std::optional<Common::Json> getValidatorByAddress(
       RpcClient &rpc,
       const std::string &address_bech32m,
@@ -342,14 +347,24 @@ namespace Wallet
   //  =========================================================================
   //  Bridge RPC wrappers
   //
-  //  Typed accessors for the bridge state the watcher daemon needs
-  //  to drive submission. All of these call Clarity JSON-RPC
-  //  methods that the node exposes.
+  //  Typed accessors for the bridge state the bridge daemon needs to
+  //  drive submission. All of these call Clarity JSON-RPC methods
+  //  that the node exposes.
   //
   //  None of these are used by the wallet app today; they are
   //  added here so the bridge app can share the same transport,
   //  timeout, and auth configuration as the rest of the wallet's
   //  RPC surface.
+  //
+  //  Under the validator-is-watcher model there is no per-chain
+  //  watcher record, no per-chain watcher id, and no per-chain
+  //  watcher set. The bridge's operational signer set is the active
+  //  validator set at the height of the operation; see getActiveSet
+  //  below for the read that resolves it. The two per-chain watcher
+  //  wrappers (getActiveWatchers, getBridgeWatcherIdByAddress) were
+  //  removed together with their RPC methods; identity resolution is
+  //  getValidatorByAddress above, and the signer set is getActiveSet
+  //  below.
   //  =========================================================================
 
   //  Fetch the BridgeChainRegistration for a given source chain
@@ -378,39 +393,6 @@ namespace Wallet
   std::optional<Common::Json> getBridgeWithdrawal(
       RpcClient &rpc,
       uint64_t withdrawal_id,
-      bool *is_not_found,
-      std::string *error_out = nullptr);
-
-  //  List the active watchers for a source chain. Used to
-  //  resolve the signer set when building a mint attestation.
-  //
-  //  Sends: { "source_chain_id": "0x...", "height": "0x..." }
-  //  Expects: { "watchers": [ { "id": ..., "validator_id": ...,
-  //                            "reward_address": ... }, ... ] }
-  //
-  //  The height parameter selects the active set as of that
-  //  height, matching the executor's resolution at
-  //  ctx.current_height. Pass 0 for "current head".
-  std::optional<Common::Json> getActiveWatchers(
-      RpcClient &rpc,
-      uint64_t source_chain_id,
-      uint64_t height,
-      std::string *error_out = nullptr);
-
-  //  Resolve a reward address to its bridge watcher id, if
-  //  registered. Used by the startup path to fill in
-  //  WatcherSession::watcher_id without operator intervention.
-  //
-  //  Sends: { "address": <bech32m> }
-  //  Expects: { "watcher_id": "0x..." }
-  //
-  //  On BridgeWatcherNotFound, `is_not_found` is set to true and
-  //  the function returns nullopt. A null watcher_id (0) is
-  //  treated the same as not-found: the caller should fall back
-  //  to prompting.
-  std::optional<Common::Json> getBridgeWatcherIdByAddress(
-      RpcClient &rpc,
-      const std::string &address_bech32m,
       bool *is_not_found,
       std::string *error_out = nullptr);
 
@@ -467,15 +449,18 @@ namespace Wallet
   //           "offset": "0x..." }
   //  Expects: { "withdrawals": [ { ...withdrawal fields...,
   //                                ack_attestation_count,
-  //                                active_watcher_count,
+  //                                active_validator_count,
   //                                ack_quorum,
   //                                ack_quorum_reached }, ... ],
   //             "count": ..., "height": ..., ... }
   //
   //  The per-entry `ack_quorum_reached` boolean lets the caller
   //  skip a second RPC round-trip per withdrawal to compute quorum.
-  //  The quorum itself is computed against the active watcher set
-  //  at the current head height.
+  //  The quorum itself is computed against the active validator set
+  //  at the current head height. That set is the same for every
+  //  source chain: there is one active validator set, and every
+  //  active validator is eligible to attest to every registered
+  //  chain.
   //
   //  `from_height == 0` means "from genesis". Use a nonzero
   //  value on incremental scans to avoid re-fetching withdrawals
@@ -507,5 +492,27 @@ namespace Wallet
   std::optional<Common::Json> getBridgeStats(
       RpcClient &rpc,
       uint64_t source_chain_id,
+      std::string *error_out = nullptr);
+
+  //  Fetch the current active validator set.
+  //
+  //  Sends: {}
+  //  Expects: { "ids": ["0x...", ...], "size": "0x...", "quorum": "0x..." }
+  //
+  //  `ids` is the sorted active-set array — the order the executor's
+  //  verifyGovernanceSignatures and verifyAttestationSignatures
+  //  resolve `signer_index` against. A `signer_index` of N means
+  //  `ids[N]`, not "the validator whose id is N".
+  //
+  //  Under the validator-is-watcher model this is also the bridge's
+  //  operational signer set. The bridge daemon reads it to compute
+  //  its own signer_index for a deposit or withdrawal attestation,
+  //  and to decide whether a quorum of acks has been reached.
+  //
+  //  This is the read the transaction_signer's sign-governance-blob
+  //  subcommand uses to print "index:0x<sig>" lines for the
+  //  webwallet's multi-seed registration dialog.
+  std::optional<Common::Json> getActiveSet(
+      RpcClient &rpc,
       std::string *error_out = nullptr);
 } // namespace Wallet

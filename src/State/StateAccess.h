@@ -21,7 +21,6 @@
 #include "Core/ValidatorTypes.h"
 #include "Core/KeyRotation.h"
 #include "Core/NftTypes.h"
-#include "Core/BridgeWatcherTypes.h"
 #include "Crypto/Types.h"
 #include "SparseMerkleTree.h"
 #include "StateDB.h"
@@ -86,6 +85,16 @@ namespace State
   //  retention window. A version outside the window returns
   //  std::nullopt without touching the DB, and a proof request
   //  returns VersionUnavailable.
+  //
+  //  Bridge watcher model
+  //  --------------------
+  //
+  //  There is no `BridgeWatcherInfo` record. Every active validator
+  //  is a bridge watcher: their stake is the validator's stake, their
+  //  signing key is the validator's consensus key, and their attestation
+  //  quorum is `bftQuorum(active_validators)`. This module provides
+  //  `forEachActiveValidator` and `countActiveValidators` for the
+  //  bridge executor's attestation and verification paths.
   //  =========================================================================
 
   class StateAccess
@@ -183,6 +192,26 @@ namespace State
     void forEachValidator(
         const std::function<void(const Core::ValidatorInfo &)> &fn) const;
 
+    //  Iterate the validators that are currently active at `height`.
+    //  Under the "validator is watcher" model, this is also the
+    //  bridge's operational signer set for every registered source
+    //  chain. The bridge executor calls this from
+    //  executeBridgeAttest, executeBridgeMint, executeBridgeAckAttest,
+    //  and executeBridgeAckWithdrawal.
+    //
+    //  "Active at `height`" means the validator is in the `active_set`
+    //  global AND, if the set is height-dependent via rotation, the
+    //  caller has resolved the rotation at `height` first (the
+    //  executor does this via resolveActiveSet before reading the
+    //  set). The iterator here is the plain "read the current
+    //  active_set global" view; it does not re-run rotation.
+    void forEachActiveValidator(
+        const std::function<void(const Core::ValidatorInfo &)> &fn) const;
+
+    //  Count of active validators. Cheaper than materializing the
+    //  full records when the caller only needs the threshold check.
+    size_t countActiveValidators() const;
+
     //  =====================================================================
     //  Validator lookup by reward address
     //  =====================================================================
@@ -195,17 +224,6 @@ namespace State
 
     //  =====================================================================
     //  Validator consensus-key history
-    //
-    //  A companion to the validator record that describes which
-    //  signing key was authoritative at each height the validator
-    //  was registered. Not part of ValidatorInfo's wire format;
-    //  stored under Keys::validatorKeyHistory.
-    //
-    //  Invariants:
-    //    - The list is ordered by valid_from_height ascending.
-    //    - The last entry's valid_until_height is 0 (current).
-    //    - Every other entry's valid_until_height equals the next
-    //      entry's valid_from_height (gapless, non-overlapping).
     //  =====================================================================
 
     bool getValidatorKeyHistory(uint64_t validator_id,
@@ -266,16 +284,7 @@ namespace State
         const std::function<void(const Core::Order &)> &fn) const;
 
     //  =====================================================================
-    //  Order book (placement index)
-    //
-    //  The book index is pair-symmetric and price-sorted. Write
-    //  discipline:
-    //
-    //    addToOrderBook      once, when an order first rests
-    //    removeFromOrderBook once, when an order leaves the book
-    //
-    //  A partial fill does not call either. Both methods are
-    //  idempotent against the txn.
+    //  Order book
     //  =====================================================================
 
     void addToOrderBook(const Core::Order &order, uint64_t sequence);
@@ -436,14 +445,15 @@ namespace State
     //  =====================================================================
     //
     //  Consumed-deposit records, withdrawal records, per-chain
-    //  registrations, registered-watcher records, and per-watcher
-    //  deposit attestations. The operational signer set for a
-    //  source chain is the active watcher set for that chain,
-    //  resolved from the watcher records on each verification;
-    //  there is no separately-stored signer set.
+    //  registrations, and per-validator deposit attestations.
+    //
+    //  The operational signer set for a source chain is the active
+    //  validator set (see forEachActiveValidator above). There is no
+    //  watcher role, no watcher record, and no per-chain registration
+    //  of a watcher.
     //
     //  Attestations are recorded on-chain by BridgeAttest
-    //  transactions. Each active watcher submits exactly one per
+    //  transactions. Each active validator submits exactly one per
     //  deposit; the submission assembler reads them back and
     //  assembles a BridgeMint signature block once a quorum has
     //  agreed on the same (destination, amount) pair.
@@ -469,27 +479,12 @@ namespace State
 
     void deleteBridgeWithdrawal(uint64_t withdrawal_id);
 
-    //  Iterate pending withdrawals in creation order, starting from
-    //  `from_height` (inclusive), yielding at most `max_results`.
-    //
-    //  The callback returns true to continue, false to stop. The
-    //  iteration uses the (height, id) index so a caller can persist
-    //  the last-seen height and resume without scanning the whole
-    //  set.
-    //
-    //  `from_height == 0` means "from genesis", which is what a
-    //  fresh watcher uses on its first run. After that, the watcher
-    //  passes its last-processed height to avoid re-processing.
     void forEachPendingBridgeWithdrawal(
         uint64_t from_height,
         size_t max_results,
         const std::function<bool(const Core::BridgeWithdrawal &)> &fn) const;
 
     //  ---- bridge event log (non-SMT, chronological) ----
-    //
-    //  Written once per successful bridge operation, unconditionally
-    //  (including on the dry-run path, where the surrounding write
-    //  transaction aborts). Read by getBridgeEvents.
 
     void putBridgeEvent(const Core::BridgeEvent &evt);
 
@@ -512,37 +507,6 @@ namespace State
 
     void deleteBridgeChainRegistration(uint64_t source_chain_id);
 
-    //  ---- Watchers ----
-
-    bool getBridgeWatcher(uint64_t watcher_id,
-                          Core::BridgeWatcherInfo &out) const;
-
-    void putBridgeWatcher(const Core::BridgeWatcherInfo &w);
-
-    void deleteBridgeWatcher(uint64_t watcher_id);
-
-    bool getBridgeWatcherIdByAddress(const Crypto::Address &addr,
-                                     uint64_t &watcher_id_out) const;
-
-    void forEachBridgeWatcher(
-        const std::function<void(const Core::BridgeWatcherInfo &)> &fn) const;
-
-    //  Iterate the active watchers for a specific source chain at
-    //  the given height. Uses isInActiveSet to filter. Used by the
-    //  executor and the RPC.
-    void forEachActiveBridgeWatcherForChain(
-        uint64_t source_chain_id,
-        uint64_t current_height,
-        const std::function<void(const Core::BridgeWatcherInfo &)> &fn) const;
-
-    //  Count the active watchers for a source chain at a height.
-    //  Cheap when the caller only needs the threshold; the executor
-    //  uses it to decide whether the active set is large enough to
-    //  verify a watcher attestation.
-    size_t countActiveBridgeWatchersForChain(
-        uint64_t source_chain_id,
-        uint64_t current_height) const;
-
     //  ---- Attestations ----
     //
     //  A BridgeAttestation is keyed by
@@ -550,7 +514,7 @@ namespace State
     //   validator_id). The composite key is used because:
     //
     //    - A deposit is identified by (chain, tx_hash, output_index);
-    //    - Each active watcher submits exactly one attestation per
+    //    - Each active validator submits exactly one attestation per
     //      deposit (enforced by the executor's AlreadyAttested
     //      check);
     //    - A future fetch for "all attestations on a deposit" wants
@@ -562,10 +526,6 @@ namespace State
     //    [4]  source_output_index (LE)
     //    [8]  validator_id (LE)
 
-    //  Write one attestation. Throws StateDBError if the
-    //  attestation is not well-formed (the executor validates
-    //  before calling; this is a belt-and-braces check for direct
-    //  callers).
     void putBridgeAttestation(
         uint64_t source_chain_id,
         const Crypto::Hash &source_tx_hash,
@@ -573,8 +533,6 @@ namespace State
         uint64_t validator_id,
         const Core::BridgeAttestation &attestation);
 
-    //  Read one attestation for (deposit, validator_id). Returns
-    //  false if no such attestation exists.
     bool getBridgeAttestation(
         uint64_t source_chain_id,
         const Crypto::Hash &source_tx_hash,
@@ -582,8 +540,6 @@ namespace State
         uint64_t validator_id,
         Core::BridgeAttestation &out) const;
 
-    //  Iterate every attestation for a single deposit, in
-    //  validator_id order. The visitor returns false to stop.
     void forEachBridgeAttestationForDeposit(
         uint64_t source_chain_id,
         const Crypto::Hash &source_tx_hash,
@@ -591,15 +547,11 @@ namespace State
         const std::function<bool(uint64_t validator_id,
                                  const Core::BridgeAttestation &)> &fn) const;
 
-    //  Count attestations for a deposit without materializing them.
-    //  Cheap enough to call on every scan iteration.
     size_t countBridgeAttestationsForDeposit(
         uint64_t source_chain_id,
         const Crypto::Hash &source_tx_hash,
         uint32_t source_output_index) const;
 
-    //  Iterate every attestation in the table, in key order. Used
-    //  by the getBridgeAttestations RPC method's full-dump form.
     void forEachBridgeAttestation(
         const std::function<bool(uint64_t source_chain_id,
                                  const Crypto::Hash &source_tx_hash,
@@ -607,10 +559,6 @@ namespace State
                                  uint64_t validator_id,
                                  const Core::BridgeAttestation &)> &fn) const;
 
-    //  Compose the composite key used by the attestation table.
-    //  Exposed so the executor (and tests) can reason about the
-    //  layout without duplicating it. The returned array is exactly
-    //  the 52 bytes the table stores.
     static std::array<uint8_t, 52> bridgeAttestationKey(
         uint64_t source_chain_id,
         const Crypto::Hash &source_tx_hash,
@@ -619,18 +567,9 @@ namespace State
 
     //  ---- Withdrawal attestations ----
     //
-    //  A BridgeAckAttestation is keyed by (withdrawal_id,
-    //  validator_id). The composite key is simpler than the deposit
-    //  attestation key because a withdrawal is identified by one
-    //  integer, not (chain_id, tx_hash, output_index).
-    //
     //  Key layout (16 bytes):
     //    [8]  withdrawal_id (LE)
     //    [8]  validator_id (LE)
-    //
-    //  Like the deposit attestations, these records do NOT live in
-    //  the SMT: they are federation state and do not affect any
-    //  other transaction's validity.
 
     void putBridgeAckAttestation(
         uint64_t withdrawal_id,
@@ -660,19 +599,7 @@ namespace State
         uint64_t validator_id);
 
     //  ---- Withdrawals awaiting release ----
-    //
-    //  Like forEachPendingBridgeWithdrawal, but filtered to
-    //  unreleased withdrawals. Used by the getPendingWithdrawals
-    //  RPC and by the submission assembler's poll loop.
-    //
-    //  A withdrawal is "pending" in this sense if it has been
-    //  burned but not yet released. That is: it exists in
-    //  TBL_BRIDGE_WITHDRAWALS (created at burn time) and its
-    //  release_tx_hash is null.
-    //
-    //  Iteration order is creation order (same (height, id) index
-    //  as forEachPendingBridgeWithdrawal). `from_height == 0` means
-    //  "from genesis".
+
     void forEachUnreleasedBridgeWithdrawal(
         uint64_t from_height,
         size_t max_results,
@@ -724,20 +651,6 @@ namespace State
 
     //  =====================================================================
     //  Versioned reads
-    //
-    //  Each of these returns std::nullopt if the requested version
-    //  is outside the retention window, without touching the DB.
-    //  The window is the range of versions for which the historical
-    //  SMT tables retain rows. It is set at startup from
-    //  NodeConfig::smt_history_blocks and is a property of the DB,
-    //  not of the StateAccess.
-    //
-    //  A caller that wants to distinguish "outside the window" from
-    //  "key not present in this version" should call
-    //  smtRootAtVersion first: if that returns nullopt, the version
-    //  is unavailable; if it returns a root, the version is
-    //  available and a subsequent key lookup that returns nullopt
-    //  means the key wasn't in the tree at that version.
     //  =====================================================================
 
     std::optional<Crypto::Hash> smtRootAtVersion(uint64_t version) const;
@@ -758,9 +671,6 @@ namespace State
 
     //  =====================================================================
     //  Proofs
-    //
-    //  proveAtVersion returns a ProofResult. The status distinguishes
-    //  the four outcomes; only Ok carries a proof.
     //  =====================================================================
 
     ProofResult proveAtVersion(const Crypto::Hash &key,
@@ -768,15 +678,6 @@ namespace State
 
     //  =====================================================================
     //  Retention window
-    //
-    //  The window is (current_height - smt_history_blocks, current_height].
-    //  A version in this range has its historical rows present; a
-    //  version outside it has been pruned (or never existed).
-    //
-    //  setHistoryWindow is called once at startup by Node after it
-    //  reads NodeConfig. The default window (before setHistoryWindow
-    //  is called) is UINT64_MAX, which means "everything is in the
-    //  window" — the safe default for tests and genesis.
     //  =====================================================================
 
     void setHistoryWindow(uint64_t window_blocks) noexcept
@@ -786,23 +687,16 @@ namespace State
 
     uint64_t historyWindow() const noexcept { return history_window_; }
 
-    //  Compute the oldest version that is still available, given the
-    //  current height and the configured window. Returns 0 if the
-    //  window is larger than the current height, meaning every
-    //  version from genesis is available.
     uint64_t oldestAvailableVersion() const noexcept;
 
     //  =====================================================================
     //  Stats
     //  =====================================================================
 
-    //  Number of entries in a table. O(1) via MDBX's dbi stat.
     size_t tableEntryCount(uint32_t table_id) const;
 
-    //  Per-table stats including a byte estimate.
     StateDB::TableStats tableStats(uint32_t table_id) const;
 
-    //  Snapshot of the SMT's cumulative counters.
     const SparseMerkleTree::Stats &smtStats() const noexcept
     {
       return smt_.stats();
@@ -810,16 +704,19 @@ namespace State
 
     //  =====================================================================
     //  Read txn release
-    //
-    //  Destroy the autocommit read txn (if any). Called at the top
-    //  of every write method. MDBX refuses to open a write txn on a
-    //  thread that already has a read txn open; the next read after
-    //  this method returns will transparently acquire a fresh one.
     //  =====================================================================
 
     void releaseReadTxnIfHeld();
 
-  private:
+    //  The version (chain height) this StateAccess was constructed
+    //  with. For an autocommit access, this is the height passed to
+    //  the constructor; for a txn-bound access, the height of the
+    //  block being applied. The mempool's bridge verifiers use it
+    //  so their key-history lookups happen at the same height the
+    //  executor will use, rather than a sentinel.
+    uint64_t version() const noexcept { return version_; }
+
+private:
     //  Txn-aware storage helpers.
     void putMetaImpl(const std::string &key,
                      const std::vector<uint8_t> &value);
@@ -886,27 +783,17 @@ namespace State
                                       const std::vector<uint8_t> &prefix,
                                       const EntryVisitor &visitor) const;
 
-    //  Iterate every row whose key is >= seek_key, in ascending key
-    //  order. Same three-layer dispatch as the other readForEach
-    //  helpers: bound txn wins, then held read txn, then DB
-    //  autocommit.
     void readForEachFromKey(uint32_t table_id,
                             const std::vector<uint8_t> &seek_key,
                             const StateDB::EntryVisitor &visitor) const;
 
     size_t readTableCount(uint32_t table_id) const;
 
-    //  Guard: enforce the retention window on a historical read.
-    //  Returns true if the version is available (either within the
-    //  window or the window is unbounded), false otherwise.
     bool versionIsAvailable(uint64_t version) const noexcept;
 
     StateDB &db_;
     StateDB::Txn *txn_{nullptr};
 
-    //  Autocommit-mode read transaction. Owns a single MDBX read
-    //  txn for the lifetime of this StateAccess. Null when the
-    //  StateAccess is bound to a write txn.
     std::unique_ptr<StateDB::ReadTxn> read_txn_;
 
     uint64_t version_;

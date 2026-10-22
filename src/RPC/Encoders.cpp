@@ -772,7 +772,11 @@ namespace Rpc
     j["destination_blob_max_len"] =
         static_cast<uint64_t>(reg.destination_blob_max_len);
     j["enabled"] = reg.enabled;
-    putU64(j, "active_watcher_min", reg.active_watcher_min);
+    //  The minimum active validator set size for this chain to
+    //  operate. Under the validator-is-watcher model every active
+    //  validator is a bridge watcher, so the floor is on the
+    //  active validator set, not on a per-chain watcher set.
+    putU64(j, "active_validator_min", reg.active_validator_min);
     return j;
   }
 
@@ -795,8 +799,10 @@ namespace Rpc
     //
     //  An unreleased withdrawal carries the release fields as all
     //  zeros / null. A released one carries the source-chain tx
-    //  hash and height, plus when and by which watcher the release
-    //  was recorded on Clarity. The `is_released` boolean lets a
+    //  hash and height, plus when and by which validator the
+    //  release was recorded on Clarity. Under the validator-is-
+    //  watcher model the releasing party is a validator; there is
+    //  no separate watcher role. The `is_released` boolean lets a
     //  client branch without inspecting the hash.
     j["is_released"] = w.isReleased();
 
@@ -814,7 +820,7 @@ namespace Rpc
 
     putU64(j, "release_height", w.release_height);
     putU64(j, "released_at_height", w.released_at_height);
-    putU64(j, "released_by_watcher_id", w.released_by_watcher_id);
+    putU64(j, "released_by_validator_id", w.released_by_validator_id);
 
     return j;
   }

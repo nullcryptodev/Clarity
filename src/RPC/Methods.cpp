@@ -17,6 +17,8 @@
 #include "Core/TransactionExecutor.h"
 #include "Core/RewardCalculator.h"
 
+#include "Crypto/Blake2b.h"
+
 #include "Node/Node.h"
 
 #include "State/ProofKeys.h"
@@ -933,20 +935,88 @@ namespace Rpc
         return out;
       }
 
-      Common::Json arr = Common::Json::array();
+      std::vector<uint64_t> ids;
       size_t count = set_bytes.size() / 8;
+      ids.reserve(count);
       for (size_t i = 0; i < count; ++i)
       {
         uint64_t id = 0;
         for (int j = 0; j < 8; ++j)
           id |= uint64_t(set_bytes[i * 8 + j]) << (j * 8);
-        arr.push_back(encodeU64Hex(id));
+        ids.push_back(id);
       }
+
+      //  Sorted ascending, matching the executor's
+      //  verifyGovernanceSignatures and verifyBridgeSignatures.
+      //  A signer_index in a signature block is a position in THIS
+      //  ordering, so the RPC must return the same order the
+      //  verifier uses. Returning SMT insertion order would produce
+      //  a block whose signatures verify against the wrong
+      //  validators.
+      std::sort(ids.begin(), ids.end());
+
+      Common::Json arr = Common::Json::array();
+      for (auto id : ids)
+        arr.push_back(encodeU64Hex(id));
 
       Common::Json out = Common::Json::object();
       out["ids"] = std::move(arr);
-      putU64(out, "size", static_cast<uint64_t>(count));
-      putU64(out, "quorum", Core::bftQuorum(count));
+      putU64(out, "size", static_cast<uint64_t>(ids.size()));
+      putU64(out, "quorum", Core::bftQuorum(ids.size()));
+      return out;
+    }
+
+    Common::Json method_removeMempoolTx(Node::Node &node,
+                                        const RpcConfig &config,
+                                        const JsonRpcRequest &req)
+    {
+      requireAdmin(config, getCurrentAuthorization());
+
+      const Crypto::Hash txid = requireHash(req.params, "hash");
+
+      const bool removed = node.mempool().remove(txid);
+
+      Common::Json out = Common::Json::object();
+      putHash(out, "tx_hash", txid);
+      out["removed"] = removed;
+      return out;
+    }
+
+    Common::Json method_signGovernanceBlob(
+        Node::Node &node, const RpcConfig &config,
+        const JsonRpcRequest &req)
+    {
+      requireAdmin(config, getCurrentAuthorization());
+
+      const std::string blob_hex = requireString(req.params, "blob");
+      std::vector<uint8_t> blob;
+      if (!parseBytesHex(blob_hex, blob) || blob.size() != 55)
+        throw RpcMethodError(ErrorCode::InvalidParams,
+                             "blob must be 55-byte hex");
+
+      //  Hash: Blake2b("brgr" || blob).
+      std::vector<uint8_t> input = {'b', 'r', 'g', 'r'};
+      input.insert(input.end(), blob.begin(), blob.end());
+      Crypto::Hash hash;
+      Crypto::blake2b(input.data(), input.size(), hash.data.data(), 32);
+
+      //  Sign with the node's consensus key.
+      Crypto::Signature sig = node.signWithConsensusKey(hash);
+
+      //  Resolve the signer's index against the sorted active set.
+      std::vector<Id> active = node.getActiveSet();
+      std::sort(active.begin(), active.end());
+      const Id my_id = node.config().validator_id;
+      const auto it = std::find(active.begin(), active.end(), my_id);
+      const uint16_t signer_index =
+          it == active.end()
+              ? 0xffff
+              : static_cast<uint16_t>(it - active.begin());
+
+      Common::Json out = Common::Json::object();
+      out["signer_index"] = signer_index;
+      out["signature"] = encodeBytesHex(
+          std::vector<uint8_t>(sig.data.begin(), sig.data.end()));
       return out;
     }
 
@@ -3084,101 +3154,6 @@ namespace Rpc
       return encodeBridgeWithdrawal(w, hrpForNode(node));
     }
 
-    Common::Json method_getActiveWatchers(
-        Node::Node &node,
-        const RpcConfig & /*config*/,
-        const JsonRpcRequest &req)
-    {
-      const uint64_t source_chain_id =
-          requireU64(req.params, "source_chain_id");
-
-      //  height == 0 means "current chain height". Otherwise the
-      //  caller is asking for the active set as of a specific
-      //  height — same semantics the executor uses when it calls
-      //  forEachActiveBridgeWatcherForChain with ctx.current_height.
-      uint64_t height = node.chain().height();
-      if (auto v = optionalU64(req.params, "height"); v.has_value())
-      {
-        if (*v != 0)
-          height = *v;
-      }
-
-      const std::string hrp = hrpForNode(node);
-
-      State::StateAccess state(node.stateDB(), height);
-
-      Common::Json arr = Common::Json::array();
-
-      state.forEachActiveBridgeWatcherForChain(
-          source_chain_id, height,
-          [&](const Core::BridgeWatcherInfo &w)
-          {
-            Common::Json entry = Common::Json::object();
-            putU64(entry, "watcher_id", w.id);
-            putU64(entry, "validator_id", w.validator_id);
-            putU64(entry, "source_chain_id", w.source_chain_id);
-            putAddress(entry, "reward_address", w.reward_address, hrp);
-            putU64(entry, "stake", w.stake);
-            putU64(entry, "registered_at_height", w.registered_at_height);
-            entry["is_active"] = w.is_active;
-            arr.push_back(std::move(entry));
-          });
-
-      Common::Json out = Common::Json::object();
-      putU64(out, "source_chain_id", source_chain_id);
-      putU64(out, "height", height);
-      putU64(out, "count", static_cast<uint64_t>(arr.size()));
-      out["watchers"] = std::move(arr);
-      return out;
-    }
-
-    Common::Json method_getBridgeWatcherIdByAddress(
-        Node::Node &node,
-        const RpcConfig & /*config*/,
-        const JsonRpcRequest &req)
-    {
-      const std::string hrp = hrpForNode(node);
-      const Crypto::Address address =
-          requireAddress(req.params, "address", hrp);
-
-      State::StateAccess state(node.stateDB(), node.chain().height());
-
-      uint64_t watcher_id = 0;
-      if (!state.getBridgeWatcherIdByAddress(address, watcher_id))
-      {
-        throw RpcMethodError(
-            ErrorCode::BridgeWatcherNotFound,
-            "no bridge watcher registered for this address",
-            makeErrorData(ErrorCode::BridgeWatcherNotFound,
-                          {{"address", encodeAddress(address, hrp)}}));
-      }
-
-      //  Also fetch the full record so the caller can see the
-      //  validator id and source chain. If the owner-address index
-      //  exists but the record is gone (a state-consistency bug),
-      //  surface that as BridgeReadInternal rather than pretending
-      //  the watcher doesn't exist.
-      Core::BridgeWatcherInfo w;
-      if (!state.getBridgeWatcher(watcher_id, w))
-      {
-        throw RpcMethodError(
-            ErrorCode::BridgeReadInternal,
-            "watcher index references a missing record",
-            makeErrorData(ErrorCode::BridgeReadInternal,
-                          {{"watcher_id", encodeU64Hex(watcher_id)}}));
-      }
-
-      Common::Json out = Common::Json::object();
-      putU64(out, "watcher_id", w.id);
-      putU64(out, "validator_id", w.validator_id);
-      putU64(out, "source_chain_id", w.source_chain_id);
-      putAddress(out, "reward_address", w.reward_address, hrp);
-      putU64(out, "stake", w.stake);
-      putU64(out, "registered_at_height", w.registered_at_height);
-      out["is_active"] = w.is_active;
-      return out;
-    }
-
     Common::Json method_getBridgeAttestations(
         Node::Node &node,
         const RpcConfig & /*config*/,
@@ -3417,7 +3392,7 @@ namespace Rpc
       //      this Clarity height. 0 (default) = from genesis.
       //    - limit/offset: standard pagination.
       //
-      //  The watcher daemon uses this to discover withdrawals it
+      //  The bridge daemon uses this to discover withdrawals it
       //  needs to attest to or release. The state is fully
       //  derived: a withdrawal is pending iff it exists in
       //  TBL_BRIDGE_WITHDRAWALS and its release_tx_hash is null.
@@ -3425,9 +3400,13 @@ namespace Rpc
       //  We expose the per-withdrawal ack count and the ack
       //  quorum so the caller can decide whether quorum is
       //  already reached without a second RPC per withdrawal.
-      //  The quorum is computed against the active watcher set
+      //  The quorum is computed against the active validator set
       //  at the current chain height, since that's the height the
-      //  BridgeAckWithdrawal would be evaluated at.
+      //  BridgeAckWithdrawal would be evaluated at. Under the
+      //  validator-is-watcher model there is no per-chain watcher
+      //  set: every active validator is eligible to attest to
+      //  every registered source chain, so the count is the same
+      //  for every chain at a given height.
 
       uint64_t from_height = 0;
       if (auto v = optionalU64(req.params, "from_height"); v.has_value())
@@ -3438,6 +3417,15 @@ namespace Rpc
       const uint64_t height = node.chain().height();
       State::StateAccess state(node.stateDB(), height);
       const std::string hrp = hrpForNode(node);
+
+      //  Active validator set size at the current height. The
+      //  executor checks active_validator_min and
+      //  bftQuorum(active) at execution time, so the pending view
+      //  reports the same numbers. Hoisted out of the loop: it
+      //  does not depend on the withdrawal, and each call walks
+      //  the active_set global.
+      const size_t active_count = state.countActiveValidators();
+      const size_t quorum = Core::bftQuorum(active_count);
 
       Common::Json arr = Common::Json::array();
       uint64_t seen = 0;
@@ -3460,23 +3448,11 @@ namespace Rpc
             const size_t ack_count =
                 state.countBridgeAckAttestationsForWithdrawal(w.id);
 
-            //  Active watcher set size at the current height.
-            //  The executor checks active_watcher_min and
-            //  bftQuorum(active) at execution time, so the
-            //  pending view reports the same numbers.
-            size_t active_count = 0;
-            state.forEachActiveBridgeWatcherForChain(
-                w.source_chain_id, height,
-                [&](const Core::BridgeWatcherInfo &)
-                { ++active_count; });
-
-            const size_t quorum = Core::bftQuorum(active_count);
-
             Common::Json entry =
                 encodeBridgeWithdrawal(w, hrp);
 
             putU64(entry, "ack_attestation_count", ack_count);
-            putU64(entry, "active_watcher_count",
+            putU64(entry, "active_validator_count",
                    static_cast<uint64_t>(active_count));
             putU64(entry, "ack_quorum", static_cast<uint64_t>(quorum));
 
@@ -3561,23 +3537,16 @@ namespace Rpc
               : 0;
       putU64(out, "outstanding_liability", outstanding);
 
-      //  Supply invariant: total_minted - total_burned must equal
-      //  the current wrapped-token supply. This is the invariant
-      //  the auditor RPC (handover §13.5) will check, but it is
-      //  cheap enough to compute inline and useful for monitoring
-      //  dashboards that already call getBridgeStats. Expose it as
-      //  a pair of fields so an operator can see both sides of the
-      //  equation, not just the pass/fail.
-      //
-      //  A `false` here means the bridge has drifted: either a
-      //  mint/burn was executed without a stats bump (a code bug),
-      //  or the wrapped-token supply was changed outside the
-      //  bridge (a governance or admin path that shouldn't exist).
-      //  Either way, it should alert loudly.
+      //  Resolve the wrapped token id from the chain registration,
+      //  not from the stats row. `BridgeStats` does not carry a
+      //  token id; `BridgeChainRegistration` does. Reading the
+      //  registration also means the supply check is scoped to the
+      //  same token the bridge actually mints and burns, which is
+      //  the one the invariant is about.
       uint64_t wrapped_supply = 0;
-      Core::TokenInfo wrapped_token;
-      if (state.getToken(stats.source_chain_id, wrapped_token))
-        wrapped_supply = state.getTokenSupply(stats.source_chain_id);
+      Core::BridgeChainRegistration reg;
+      if (state.getBridgeChainRegistration(source_chain_id, reg))
+        wrapped_supply = state.getTokenSupply(reg.wrapped_token_id);
 
       putU64(out, "wrapped_supply", wrapped_supply);
 
@@ -3710,8 +3679,6 @@ namespace Rpc
     d.registerMethod("getBridgeChainRegistration", method_getBridgeChainRegistration);
     d.registerMethod("getBridgeConsumed", method_getBridgeConsumed);
     d.registerMethod("getBridgeWithdrawal", method_getBridgeWithdrawal);
-    d.registerMethod("getActiveWatchers", method_getActiveWatchers);
-    d.registerMethod("getBridgeWatcherIdByAddress", method_getBridgeWatcherIdByAddress);
     d.registerMethod("getBridgeAttestations", method_getBridgeAttestations);
     d.registerMethod("getBridgeAckAttestations", method_getBridgeAckAttestations);
     d.registerMethod("getPendingWithdrawals", method_getPendingWithdrawals);
@@ -3723,6 +3690,8 @@ namespace Rpc
   {
     d.registerMethod("shutdown", method_shutdown);
     d.registerMethod("setLogLevel", method_setLogLevel);
+    d.registerMethod("removeMempoolTx", method_removeMempoolTx);
+    d.registerMethod("signGovernanceBlob", method_signGovernanceBlob);
   }
 
   void registerAmmMethods(JsonRpcDispatcher &d)

@@ -81,7 +81,6 @@ namespace Node
       uint64_t chain_id{0};
       bool running{false};
 
-      // ---- P2P counters ----
       size_t peers_total{0};
       size_t peers_inbound{0};
       size_t peers_outbound{0};
@@ -89,12 +88,10 @@ namespace Node
       size_t peers_banned{0};
       size_t addresses_known{0};
 
-      // ---- Aggregate rate limiter (config) ----
       uint32_t aggregate_rate_limit_burst{0};
       uint32_t aggregate_rate_limit_per_second{0};
       bool aggregate_rate_limit_enabled{false};
 
-      // ---- Consensus detail ----
       size_t consensus_prevotes{0};
       size_t consensus_precommits{0};
       uint32_t consensus_consecutive_timeouts{0};
@@ -104,62 +101,47 @@ namespace Node
 
     Status status() const;
 
-    // Submit a transaction to the mempool. Returns the raw result code
-    // so callers can distinguish rejection reasons. `error` is populated
-    // with a human-readable name on non-accepted results; on Accepted it
-    // is cleared.
     Core::MempoolAddResult submitTransaction(const Core::Transaction &tx,
                                              std::string &error);
 
     Crypto::Hash stateRoot() const;
 
-    //  Snapshot of the SMT's cumulative counters. Read by the metrics
-    //  handler. Returns a value copy, so the caller doesn't need to
-    //  hold any lock or worry about the tree mutating underneath.
-    //
-    //  The counters are for the tree attached to the most recent
-    //  StateAccess constructed by this node. Because the node opens a
-    //  fresh StateAccess for every block application and every RPC
-    //  call, the counters reflect the sum of writes since the DB was
-    //  opened, not since the tree object was constructed. Under the
-    //  compressed tree each block's writes are O(K log N) where K is
-    //  the number of state-changing transactions in the block.
     State::SparseMerkleTree::Stats smtStats() const;
 
-    // Test-only crash injection.
     enum class FailPoint
     {
       None,
-      InsideTxn, // after beginWrite, before txn.commit()
+      InsideTxn,
     };
 
     void setFailPointForTest(FailPoint fp) { fail_point_for_test_ = fp; }
 
     const Core::Chain &chain() const { return *chain_; }
     const Core::Mempool &mempool() const { return *mempool_; }
+    Core::Mempool &mempool() { return *mempool_; }
     State::StateDB &stateDB() const { return *state_db_; }
     Core::ChainDB &chainDB() const { return *chain_db_; }
 
-    // Data directory path. Read by the metrics handler to compute
-    // the on-disk size of the state and chain databases.
     const std::string &dataDir() const noexcept { return config_.data_dir; }
 
-    // Forwarding method for RPC. Returns an empty vector if P2P is
-    // disabled or not initialized.
     std::vector<P2P::P2PManager::PeerInfo> p2pPeerList() const;
 
-    // Given a peer's public key, return the validator ID whose reward
-    // address matches it, or 0 if no active validator claims it.
     uint64_t validatorIdForAddress(const Crypto::PublicKey &pk) const;
 
-    //  The retention window the node is using, in blocks. Read by the
-    //  metrics handler and by the RPC getSmtHistoryWindow method.
-    //  Resolved at construction from NodeConfig (which validateConfig
-    //  has already filled from the network default).
     uint64_t smtHistoryBlocks() const noexcept
     {
       return config_.smt_history_blocks;
     }
+
+    Crypto::Signature signWithConsensusKey(const Crypto::Hash &hash) const
+    {
+      if (config_.consensus_secret_key.isNull())
+        return Crypto::Signature{};
+      return Crypto::sign(hash, config_.consensus_secret_key);
+    }
+
+    NodeConfig config() const { return config_; }
+    std::vector<Id> getActiveSet() const;
 
   private:
     friend class Tests::NodeTestAccess;
@@ -195,7 +177,6 @@ namespace Node
     Id getMyValidatorId() const;
     Crypto::Signature signHash(const Crypto::Hash &hash);
     Height getCurrentHeight() const;
-    std::vector<Id> getActiveSet() const;
     std::optional<Crypto::PublicKey> getSignerPublicKey(Index idx) const;
 
     void onConsensusProposal(const Consensus::Proposal &p);
@@ -212,6 +193,32 @@ namespace Node
     void maybeStartConsensus();
 
     bool applyCommittedBlock(const Core::Block &block, std::string &error);
+
+    //  Bridge verifiers passed to the mempool. Each mirrors the
+    //  corresponding executor check (see TransactionExecutor.cpp's
+    //  verifyGovernanceSignatures / verifyAttestationSignatures),
+    //  but reads state via the supplied StateAccess rather than
+    //  through the executor's own StateAccess. Returning true
+    //  means "the tx's bridge signature block verifies at the
+    //  current tip and the tx is admissible"; false means it will
+    //  be rejected by the executor, so it should not enter the
+    //  mempool.
+    //
+    //  Non-static: they log through log_. Called only from the
+    //  mempool, on a StateAccess the mempool obtained from the
+    //  factory Node::initMempool installs.
+    //
+    //  Under the validator-is-watcher model both verifiers resolve
+    //  the active validator set via Core::loadSortedActiveValidators
+    //  and index it by the signature block's signer_index. There
+    //  is no per-chain watcher set to resolve.
+    bool verifyGovernanceTxAtAdmission(
+        State::StateAccess &access,
+        const Core::Transaction &tx);
+
+    bool verifyBridgeAttestationTxAtAdmission(
+        State::StateAccess &access,
+        const Core::Transaction &tx);
 
     P2P::AuthMessage buildAuthMessageForPeer(P2P::Peer &peer);
     bool verifyPeerAuth(P2P::Peer &peer,
@@ -236,8 +243,6 @@ namespace Node
 
     void armSyncTickTimer();
     void onSyncTickTimer(const boost::system::error_code &ec);
-
-    // ---- Write-ahead log helpers ----
 
     static std::vector<uint8_t> walVoteKey(Height height,
                                            Round round,
@@ -270,11 +275,6 @@ namespace Node
     std::atomic<bool> consensus_started_{false};
     uint64_t active_set_height_{0};
 
-    //  The height at which the most recent history prune ran. The
-    //  prune itself is throttled: applyCommittedBlock() runs it only
-    //  when the block height has advanced since the last successful
-    //  prune, which prevents re-pruning on a re-applied block. On a
-    //  healthy chain the throttle never fires: heights are monotonic.
     uint64_t last_prune_height_{0};
 
     FailPoint fail_point_for_test_{FailPoint::None};

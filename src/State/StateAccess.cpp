@@ -1219,6 +1219,82 @@ namespace State
   }
 
   //  =========================================================================
+  //  Active validator set (bridge operational signer set)
+  //
+  //  Under the validator-is-watcher model, the bridge's operational
+  //  signer set for every registered source chain is the active
+  //  validator set. There is no separate watcher record, no per-chain
+  //  scope, no separate stake.
+  //
+  //  The `active_set` global is written by the genesis writer (seed
+  //  validators) and by the rotation logic in BlockProcessor. It is
+  //  a packed list of little-endian uint64 validator ids, 8 bytes
+  //  each.
+  //
+  //  forEachActiveValidator yields the ValidatorInfo record for
+  //  each id in the set that is present in state and marked
+  //  is_active. The two filters (present, is_active) are defensive:
+  //  a record can be absent if it was deleted while still in the
+  //  set (shouldn't happen on a healthy chain, but the alternative
+  //  is a crash), and a record can be is_active=false if it's in
+  //  the set but pending unbond (a transient state the rotation
+  //  logic will correct at the next epoch).
+  //
+  //  countActiveValidators yields the same count, computed with the
+  //  same filters, so callers can check "is the set big enough for
+  //  this chain's active_validator_min" without materializing the
+  //  records.
+  //  =========================================================================
+
+  void StateAccess::forEachActiveValidator(
+      const std::function<void(const Core::ValidatorInfo &)> &fn) const
+  {
+    std::vector<uint8_t> set_bytes;
+    if (!getGlobal("active_set", set_bytes))
+      return;
+
+    const size_t count = set_bytes.size() / 8;
+    for (size_t i = 0; i < count; ++i)
+    {
+      uint64_t vid = 0;
+      for (int j = 0; j < 8; ++j)
+        vid |= uint64_t(set_bytes[i * 8 + j]) << (j * 8);
+
+      Core::ValidatorInfo v;
+      if (!getValidator(vid, v))
+        continue;
+      if (!v.is_active)
+        continue;
+
+      fn(v);
+    }
+  }
+
+  size_t StateAccess::countActiveValidators() const
+  {
+    std::vector<uint8_t> set_bytes;
+    if (!getGlobal("active_set", set_bytes))
+      return 0;
+
+    const size_t count = set_bytes.size() / 8;
+    size_t active = 0;
+    for (size_t i = 0; i < count; ++i)
+    {
+      uint64_t vid = 0;
+      for (int j = 0; j < 8; ++j)
+        vid |= uint64_t(set_bytes[i * 8 + j]) << (j * 8);
+
+      Core::ValidatorInfo v;
+      if (!getValidator(vid, v))
+        continue;
+      if (!v.is_active)
+        continue;
+      ++active;
+    }
+    return active;
+  }
+
+  //  =========================================================================
   //  Validator by address
   //  =========================================================================
 
@@ -2302,6 +2378,19 @@ namespace State
   //  =========================================================================
   //  Bridge
   //  =========================================================================
+  //
+  //  Under the validator-is-watcher model there is no watcher record
+  //  and no watcher index. The per-deposit and per-withdrawal
+  //  attestation records, the chain registry, the withdrawal records,
+  //  the event log, and the aggregate stats are all unchanged. The
+  //  bridge executor resolves the active validator set with
+  //  forEachActiveValidator / countActiveValidators, not with a
+  //  per-chain watcher iterator.
+  //
+  //  TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER is declared in StateDB.h as
+  //  a reserved table. Nothing reads from it, nothing writes to it.
+  //  Files from earlier builds open cleanly because the table exists;
+  //  the rows are simply ignored.
 
   //  ---- Consumed deposits ----
 
@@ -2393,10 +2482,6 @@ namespace State
     const auto prefix = Core::BridgeEvent::chainPrefix(source_chain_id);
     std::vector<uint8_t> prefix_vec(prefix.begin(), prefix.end());
 
-    //  Seek to the first event at or after (source_chain_id, from_height).
-    //  The prefix alone would scan the entire chain; the from_height
-    //  bound is a starting point for the (8-byte prefix + 8-byte
-    //  height) seek key.
     uint8_t seek_bytes[16];
     std::memcpy(seek_bytes, prefix.data(), 8);
     for (int i = 0; i < 8; ++i)
@@ -2424,11 +2509,6 @@ namespace State
       uint64_t withdrawal_id,
       const std::function<bool(const Core::BridgeEvent &)> &fn) const
   {
-    //  No index for this — walk the whole table and filter. The
-    //  bridge's event volume is low (one per operation), and a
-    //  withdrawal touches at most three events (burn, ack-attests,
-    //  ack-withdrawal). A future index can be added if a caller
-    //  needs O(1) per-withdrawal iteration.
     auto visitor = [&](const std::vector<uint8_t> &key,
                        const std::vector<uint8_t> &value) -> bool
     {
@@ -2454,12 +2534,6 @@ namespace State
       size_t max_results,
       const std::function<bool(const Core::BridgeWithdrawal &)> &fn) const
   {
-    //  Seek to the first row at or after (from_height, 0). The
-    //  index key is (height BE, id BE); the smallest key with
-    //  height >= from_height is (from_height, 0). MDBX_SET_RANGE
-    //  positions at the first existing key >= that point, so
-    //  "no withdrawal at from_height" naturally advances to the
-    //  next height.
     uint8_t seek_bytes[16];
     encodeBridgeWithdrawalHeightKey(from_height, 0, seek_bytes);
     std::vector<uint8_t> seek_key(seek_bytes, seek_bytes + sizeof(seek_bytes));
@@ -2478,7 +2552,7 @@ namespace State
 
       Core::BridgeWithdrawal w;
       if (!getBridgeWithdrawal(withdrawal_id, w))
-        return true; // stale index row; skip and continue
+        return true;
 
       if (!fn(w))
         return false;
@@ -2526,118 +2600,6 @@ namespace State
     smt_.remove(key, version_);
   }
 
-  //  ---- Watchers ----
-
-  bool StateAccess::getBridgeWatcher(uint64_t watcher_id,
-                                     Core::BridgeWatcherInfo &out) const
-  {
-    Crypto::Hash key = Keys::bridgeWatcher(watcher_id);
-    auto value = smt_.get(key);
-    if (!value.has_value())
-      return false;
-    return Core::BridgeWatcherInfo::deserializeState(
-        value->data(), value->size(), out);
-  }
-
-  void StateAccess::putBridgeWatcher(const Core::BridgeWatcherInfo &w)
-  {
-    releaseReadTxnIfHeld();
-
-    Crypto::Hash key = Keys::bridgeWatcher(w.id);
-    auto value = w.serializeState();
-    smt_.update(key, value, version_);
-
-    //  The owner-address index row. Keyed by reward_address; value
-    //  is the watcher_id (8 LE). Used to look up by address and to
-    //  enforce "one active watcher per (validator, chain)" at
-    //  registration time.
-    putU64Row(StateDB::TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER,
-              w.reward_address.data.data(), w.reward_address.data.size(),
-              w.id);
-  }
-
-  void StateAccess::deleteBridgeWatcher(uint64_t watcher_id)
-  {
-    Core::BridgeWatcherInfo w;
-    const bool have = getBridgeWatcher(watcher_id, w);
-
-    releaseReadTxnIfHeld();
-
-    Crypto::Hash key = Keys::bridgeWatcher(watcher_id);
-    smt_.remove(key, version_);
-
-    if (!have)
-      return;
-
-    deleteRow(StateDB::TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER,
-              w.reward_address.data.data(), w.reward_address.data.size());
-  }
-
-  bool StateAccess::getBridgeWatcherIdByAddress(const Crypto::Address &addr,
-                                                uint64_t &watcher_id_out) const
-  {
-    std::vector<uint8_t> value;
-    if (!readRow(StateDB::TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER,
-                 addr.data.data(), addr.data.size(), value))
-      return false;
-    if (value.size() != 8)
-      return false;
-
-    watcher_id_out = Common::readU64(value.data());
-    return true;
-  }
-
-  void StateAccess::forEachBridgeWatcher(
-      const std::function<void(const Core::BridgeWatcherInfo &)> &fn) const
-  {
-    //  Walk the owner-address index, look up each watcher by id.
-    //  The index is keyed by address (32 bytes) and the value is
-    //  the watcher id (8 LE).
-    auto visitor = [&](const std::vector<uint8_t> &key,
-                       const std::vector<uint8_t> &value) -> bool
-    {
-      if (key.size() != 32 || value.size() != 8)
-        return true;
-
-      const uint64_t watcher_id = Common::readU64(value.data());
-
-      Core::BridgeWatcherInfo w;
-      if (!getBridgeWatcher(watcher_id, w))
-        return true;
-
-      fn(w);
-      return true;
-    };
-
-    readForEach(StateDB::TBL_INDEX_BRIDGE_WATCHERS_BY_OWNER, visitor);
-  }
-
-  void StateAccess::forEachActiveBridgeWatcherForChain(
-      uint64_t source_chain_id,
-      uint64_t current_height,
-      const std::function<void(const Core::BridgeWatcherInfo &)> &fn) const
-  {
-    forEachBridgeWatcher([&](const Core::BridgeWatcherInfo &w)
-                         {
-      if (w.source_chain_id != source_chain_id)
-        return;
-      if (!w.isInActiveSet(current_height))
-        return;
-      fn(w); });
-  }
-
-  size_t StateAccess::countActiveBridgeWatchersForChain(
-      uint64_t source_chain_id,
-      uint64_t current_height) const
-  {
-    size_t count = 0;
-    forEachActiveBridgeWatcherForChain(
-        source_chain_id, current_height,
-        [&](const Core::BridgeWatcherInfo &)
-        { ++count; });
-    return count;
-  }
-
   //  ---- Attestations ----
   //
   //  Key layout (52 bytes):
@@ -2651,11 +2613,7 @@ namespace State
   //
   //  Attestation records are NOT written into the SMT. They are
   //  federation state — a per-deposit vote tally — and do not
-  //  affect any other transaction's validity. Storing them in the
-  //  key-value table (rather than the SMT) also means the state
-  //  root does not change when a watcher attests, which is what
-  //  makes attestations cheap to record and trivially prunable
-  //  once the deposit is minted.
+  //  affect any other transaction's validity.
 
   std::array<uint8_t, 52> StateAccess::bridgeAttestationKey(
       uint64_t source_chain_id,
@@ -2859,10 +2817,6 @@ namespace State
       size_t max_results,
       const std::function<bool(const Core::BridgeWithdrawal &)> &fn) const
   {
-    //  Same scan as forEachPendingBridgeWithdrawal, but filtered
-    //  to records whose release_tx_hash is still null. The filter
-    //  is applied inside the visitor, so the underlying index
-    //  scan is identical.
     uint8_t seek_bytes[16];
     encodeBridgeWithdrawalHeightKey(from_height, 0, seek_bytes);
     std::vector<uint8_t> seek_key(seek_bytes, seek_bytes + sizeof(seek_bytes));
@@ -2881,10 +2835,10 @@ namespace State
 
       Core::BridgeWithdrawal w;
       if (!getBridgeWithdrawal(withdrawal_id, w))
-        return true; // stale index row; skip and continue
+        return true;
 
       if (w.isReleased())
-        return true; // already released; skip and continue
+        return true;
 
       if (!fn(w))
         return false;

@@ -5,8 +5,11 @@
 
 #include "Mempool.h"
 
+#include "BridgeSigning.h"
+
 #include "Crypto/Ed25519.h"
 #include "RewardTypes.h"
+#include "State/StateAccess.h"
 #include "State/StateDB.h"
 
 #include "Order.h"
@@ -57,6 +60,10 @@ namespace Core
       return "order-price-overflow";
     case MempoolAddResult::Rejected_TokenPrecondition:
       return "token-precondition";
+    case MempoolAddResult::Rejected_BridgePayloadMalformed:
+      return "bridge-payload-malformed";
+    case MempoolAddResult::Rejected_BridgeSignature:
+      return "bridge-signature";
     }
     return "unknown";
   }
@@ -72,6 +79,134 @@ namespace Core
                  system_clock::now().time_since_epoch())
           .count();
     }
+
+    //  Structural payload check for the bridge tx types. Catches
+    //  "wrong payload for this tx type" — no crypto, pure layout.
+    //
+    //  Returns Accepted if the payload matches the type's layout, or
+    //  Rejected_BridgePayloadMalformed otherwise. Callers run this
+    //  before any state reads, so a malformed payload is rejected
+    //  even when no verifier is installed.
+    MempoolAddResult validateBridgePayloadShape(const Transaction &tx)
+    {
+      switch (tx.tx_type)
+      {
+      case TxType::BridgePause:
+      case TxType::BridgeUnpause:
+      {
+        //  [8] bound_height || [2] count || count * 66
+        if (tx.payload.size() < 8 + 2)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        const uint16_t count =
+            uint16_t(tx.payload[8]) | (uint16_t(tx.payload[9]) << 8);
+
+        if (count > BRIDGE_MAX_WATCHERS)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        const size_t expected = 8 + 2 + static_cast<size_t>(count) * 66;
+        if (tx.payload.size() != expected)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        return MempoolAddResult::Accepted;
+      }
+
+      case TxType::BridgeRegisterChain:
+      {
+        //  [1] reg_len || [N] reg_blob || [2] count || count * 66
+        if (tx.payload.size() < 1 + 2)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        const uint8_t reg_len = tx.payload[0];
+        const size_t after_blob = 1 + static_cast<size_t>(reg_len);
+        if (tx.payload.size() < after_blob + 2)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        const uint16_t count =
+            uint16_t(tx.payload[after_blob]) |
+            (uint16_t(tx.payload[after_blob + 1]) << 8);
+
+        if (count > BRIDGE_MAX_WATCHERS)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        const size_t expected =
+            after_blob + 2 + static_cast<size_t>(count) * 66;
+        if (tx.payload.size() != expected)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        return MempoolAddResult::Accepted;
+      }
+
+      case TxType::BridgeMint:
+      {
+        //  [8+32+4+32+8] = 84-byte prefix, then [2] count ||
+        //  count*66.
+        constexpr size_t fixed = 8 + 32 + 4 + 32 + 8;
+        if (tx.payload.size() < fixed + 2)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        const uint16_t count =
+            uint16_t(tx.payload[fixed]) |
+            (uint16_t(tx.payload[fixed + 1]) << 8);
+
+        if (count > BRIDGE_MAX_WATCHERS)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        const size_t expected =
+            fixed + 2 + static_cast<size_t>(count) * 66;
+        if (tx.payload.size() != expected)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        return MempoolAddResult::Accepted;
+      }
+
+      case TxType::BridgeAckWithdrawal:
+      {
+        //  [8] withdrawal_id || [32] release_tx_hash ||
+        //  [8] release_height, then [2] count || count*66.
+        constexpr size_t fixed = 8 + 32 + 8;
+        if (tx.payload.size() < fixed + 2)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        const uint16_t count =
+            uint16_t(tx.payload[fixed]) |
+            (uint16_t(tx.payload[fixed + 1]) << 8);
+
+        if (count > BRIDGE_MAX_WATCHERS)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        const size_t expected =
+            fixed + 2 + static_cast<size_t>(count) * 66;
+        if (tx.payload.size() != expected)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+
+        return MempoolAddResult::Accepted;
+      }
+
+      case TxType::BridgeAttest:
+      {
+        //  [8] source_chain_id || [32] source_tx_hash ||
+        //  [4] output_index || [32] destination || [8] amount ||
+        //  [2] signer_index || [64] signature.
+        //  Total: 8 + 32 + 4 + 32 + 8 + 2 + 64 = 150 bytes.
+        if (tx.payload.size() != 8 + 32 + 4 + 32 + 8 + 2 + 64)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+        return MempoolAddResult::Accepted;
+      }
+
+      case TxType::BridgeAckAttest:
+      {
+        //  [8] withdrawal_id || [2] signer_index || [64] signature.
+        //  Total: 74 bytes.
+        if (tx.payload.size() != 8 + 2 + 64)
+          return MempoolAddResult::Rejected_BridgePayloadMalformed;
+        return MempoolAddResult::Accepted;
+      }
+
+      default:
+        return MempoolAddResult::Accepted;
+      }
+    }
   } // anonymous namespace
 
   //  Construction
@@ -82,6 +217,27 @@ namespace Core
   {
     std::lock_guard<std::mutex> lock(mutex_);
     db_ = &db;
+  }
+
+  //  Bridge verifier installation. Called once at startup by
+  //  Node::initMempool, before the first add(). No lock, because
+  //  the ordering guarantee makes it unnecessary and validate()
+  //  reads the members without one. See the header comment on
+  //  setGovernanceVerifier for the full reasoning.
+
+  void Mempool::setGovernanceVerifier(GovernanceVerifier v)
+  {
+    governance_verifier_ = std::move(v);
+  }
+
+  void Mempool::setBridgeAttestationVerifier(BridgeAttestationVerifier v)
+  {
+    bridge_attestation_verifier_ = std::move(v);
+  }
+
+  void Mempool::setStateAccessFactory(StateAccessFactory f)
+  {
+    state_access_factory_ = std::move(f);
   }
 
   std::string Mempool::nonceKey(const Crypto::Address &from, uint64_t nonce)
@@ -480,9 +636,10 @@ namespace Core
     }
 
     // Re-add through the normal validation path. Entries that fail
-    // (nonce too low, insufficient funds, expired, already on chain)
-    // are dropped from memory and their txids are stashed for the
-    // caller to prune from disk later.
+    // (nonce too low, insufficient funds, expired, already on chain,
+    // or now rejected by the bridge pre-checks) are dropped from
+    // memory and their txids are stashed for the caller to prune
+    // from disk later.
     //
     // `loading_` is set for the duration of the re-add loop so that
     // `add` does not persist. Persisting an entry that is already on
@@ -516,8 +673,6 @@ namespace Core
     std::lock_guard<std::mutex> lock(mutex_);
     return std::exchange(stale_after_load_, {});
   }
-
-  //  Validation
 
   //  Validation
 
@@ -588,11 +743,39 @@ namespace Core
         return payload_result;
     }
 
+    // ---- CreatePool payload structure ----
+    //
+    //  Disabled in the current tree. See the commented call below
+    //  for context: the call was active before the payload layout
+    //  was changed, and re-enabling it needs the same fix applied
+    //  here as in TransactionExecutor.cpp. Until then, the executor
+    //  rejects malformed CreatePool payloads at apply time and the
+    //  proposer's drop-and-retry loop cleans them up.
     if (tx.tx_type == TxType::CreatePool)
     {
-      //MempoolAddResult payload_result = validateCreatePoolPayload(tx);
-      //if (payload_result != MempoolAddResult::Accepted)
-      //  return payload_result;
+      // MempoolAddResult payload_result = validateCreatePoolPayload(tx);
+      // if (payload_result != MempoolAddResult::Accepted)
+      //   return payload_result;
+    }
+
+    // ---- Bridge structural pre-check ----
+    //
+    //  Catches malformed bridge payloads before any state reads or
+    //  crypto. This is the "wrong shape for this type" check that
+    //  rejects a BridgeUnpause carrying a BridgeRegisterChain
+    //  payload at admission. Runs even when no verifier is
+    //  installed.
+    if (tx.tx_type == TxType::BridgePause ||
+        tx.tx_type == TxType::BridgeUnpause ||
+        tx.tx_type == TxType::BridgeRegisterChain ||
+        tx.tx_type == TxType::BridgeMint ||
+        tx.tx_type == TxType::BridgeAckWithdrawal ||
+        tx.tx_type == TxType::BridgeAttest ||
+        tx.tx_type == TxType::BridgeAckAttest)
+    {
+      const MempoolAddResult shape = validateBridgePayloadShape(tx);
+      if (shape != MempoolAddResult::Accepted)
+        return shape;
     }
 
     // ---- Nonce ----
@@ -765,6 +948,50 @@ namespace Core
       if (w.isReleased())
       {
         return MempoolAddResult::Rejected_TokenPrecondition;
+      }
+    }
+
+    // ---- Bridge signature pre-check ----
+    //
+    //  Runs the same governance / attestation checks the executor
+    //  will run at apply time. A tx that fails here would be
+    //  rejected by the executor on every proposal attempt, which is
+    //  the stall failure mode: executor rejects, proposer drops,
+    //  peer rebroadcasts, mempool re-admits, repeat.
+    //
+    //  The verifiers and the StateAccess factory are supplied by
+    //  Node after the StateDB is open. When no verifier is
+    //  installed (a unit test constructing a bare Mempool, or a
+    //  node that does not participate in consensus), the check is
+    //  a no-op and only the structural shape check above applies.
+    //
+    //  The verifier members are read without a lock. They are set
+    //  exactly once at startup, before the first add() call, by
+    //  Node::initMempool. A concurrent add() cannot observe a
+    //  half-installed verifier because installation completes
+    //  before the node accepts RPC or P2P traffic.
+    if (tx.tx_type == TxType::BridgePause ||
+        tx.tx_type == TxType::BridgeUnpause ||
+        tx.tx_type == TxType::BridgeRegisterChain)
+    {
+      if (governance_verifier_ && state_access_factory_)
+      {
+        auto access = state_access_factory_();
+        if (!access || !governance_verifier_(*access, tx))
+          return MempoolAddResult::Rejected_BridgeSignature;
+      }
+    }
+
+    if (tx.tx_type == TxType::BridgeMint ||
+        tx.tx_type == TxType::BridgeAckWithdrawal ||
+        tx.tx_type == TxType::BridgeAttest ||
+        tx.tx_type == TxType::BridgeAckAttest)
+    {
+      if (bridge_attestation_verifier_ && state_access_factory_)
+      {
+        auto access = state_access_factory_();
+        if (!access || !bridge_attestation_verifier_(*access, tx))
+          return MempoolAddResult::Rejected_BridgeSignature;
       }
     }
 

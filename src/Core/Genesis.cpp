@@ -7,7 +7,6 @@
 
 #include "Account.h"
 #include "BridgeTypes.h"
-#include "BridgeWatcherTypes.h"
 #include "Bridge/ConcealCCX.h"
 #include "GlobalState.h"
 #include "KeyRotation.h"
@@ -223,34 +222,16 @@ namespace Core
 
   void applyGenesis(State::StateAccess &state, const GenesisConfig &config)
   {
-    //  =====================================================================
     //  Idempotency contract
     //
     //  This function must be safe to call more than once on the same
-    //  state and produce the same resulting root each time. That is
-    //  *not* the same as "every write is an assignment":
-    //
-    //    - putAccount() maintains the globals `total_staked` and
-    //      `staker_count` by an *incremental* update:
-    //          total += copy.staked - old.staked
-    //      On a fresh DB old.staked == 0 so this adds the full
-    //      amount; on a second call old.staked already equals the
-    //      new staked amount, so it adds zero. If we simply wrote
-    //      `0` to those globals at the top and relied on putAccount
-    //      to rebuild them, the second call would leave them at 0
-    //      while the first left them at sum-of-genesis-stakes —
-    //      different roots, broken idempotency.
-    //
-    //    - The bridge block needs a deterministic wrapped-token id
-    //      regardless of whatever `next_token_id` happens to be in
-    //      the DB. At genesis, that id is always 1 (nothing else
-    //      has been minted yet), so we hard-code it as a local
-    //      constant rather than reading the global back.
-    //
-    //  So: every write here is either a plain assignment derived
-    //  from `config`, or an incremental update whose final value
-    //  we then overwrite with the correct config-derived total.
-    //  =====================================================================
+    //  state and produce the same resulting root each time. The
+    //  non-obvious part is putAccount's incremental maintenance of
+    //  total_staked and staker_count: it adds the delta between the
+    //  incoming record and the existing one, so on a fresh DB it
+    //  adds the full amount and on a second call it adds zero. To
+    //  make the function idempotent, the totals are recomputed from
+    //  config.accounts and overwritten after the loop.
 
     // ---- Global state ----
 
@@ -294,13 +275,6 @@ namespace Core
     }
 
     // ---- Initial accounts ----
-    //
-    //  putAccount maintains `total_staked` and `staker_count` as a
-    //  side-effect. On a fresh DB that side-effect produces the
-    //  correct totals; on a second call it produces zero. To make
-    //  the function idempotent we recompute the totals directly
-    //  from `config.accounts` and overwrite the globals once the
-    //  loop has finished.
 
     uint64_t genesis_total_staked = 0;
     uint64_t genesis_staker_count = 0;
@@ -370,6 +344,13 @@ namespace Core
     }
 
     // ---- Bridge ----
+    //
+    //  Under the validator-is-watcher model there is no watcher
+    //  record to write at genesis. Every active validator is a
+    //  bridge watcher; the operational signer set is derived from
+    //  the active_set global, which was just written. Genesis only
+    //  creates the chain registration and the wrapped token for the
+    //  CCX chain; the bridge's signer set is implicit.
 
     if (config.bridge.enabled)
     {
@@ -408,7 +389,7 @@ namespace Core
         reg.destination_blob_max_len =
             static_cast<uint8_t>(CcxBridge::CCX_DESTINATION_MAX_BYTES);
         reg.enabled = true;
-        reg.active_watcher_min = BRIDGE_CCX_ACTIVE_WATCHER_MIN;
+        reg.active_validator_min = GlobalConfig::ACTIVE_SET_MIN;
 
         if (!reg.isWellFormed())
           throw std::runtime_error(
@@ -417,33 +398,10 @@ namespace Core
         state.putBridgeChainRegistration(reg);
       }
 
-      uint64_t next_watcher_id = 1;
-      for (const auto &v : config.validators)
-      {
-        BridgeWatcherInfo w;
-        w.id = next_watcher_id++;
-        w.validator_id = v.id;
-        w.source_chain_id = config.bridge.ccx_chain_id;
-        w.reward_address = v.reward_address;
-        w.registered_at_height = 0;
-        w.stake = BRIDGE_WATCHER_MIN_STAKE;
-        w.last_seen_height = 0;
-        w.is_active = true;
-        w.became_active_at = 0;
-        w.last_active_at = 0;
-
-        if (!w.isWellFormed())
-          throw std::runtime_error(
-              "genesis: bridge watcher record for seed is ill-formed");
-
-        state.putBridgeWatcher(w);
-      }
-
       state.putGlobal("bridge_paused", u64Bytes(0));
       state.putGlobal("bridge_next_withdrawal_id", u64Bytes(1));
       state.putGlobal("bridge_withdrawals_pending", u64Bytes(0));
       state.putGlobal("bridge_consumed_count", u64Bytes(0));
-      state.putGlobal("bridge_next_watcher_id", u64Bytes(next_watcher_id));
     }
 
     // ---- Active set ----

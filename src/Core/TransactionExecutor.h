@@ -44,6 +44,16 @@ namespace Core
   //
   //  The caller (BlockProcessor) can rely on this: a failed tx leaves
   //  state unchanged except for the fee deduction on `from`.
+  //
+  //  Bridge signer set
+  //  -----------------
+  //
+  //  The bridge's operational signer set is the active validator set.
+  //  A validator IS a bridge watcher: there is no separate watcher
+  //  record, no separate stake, no per-chain registration. Attestation
+  //  quorums are computed with bftQuorum(active_validators) at the
+  //  height of the operation. See Core/BridgeTypes.h for the full
+  //  rationale.
 
   struct TxExecutionContext
   {
@@ -73,6 +83,10 @@ namespace Core
                                       uint64_t validator_id,
                                       uint64_t slash_height,
                                       const TxExecutionContext &ctx);
+
+    // Load the active set from global state. Returns an empty vector if
+    // unset.
+    static std::vector<Id> loadActiveSet(State::StateAccess &state);
 
   private:
     // Per-type handlers. Each returns Success on success, and reports
@@ -188,6 +202,14 @@ namespace Core
                                                  const TxExecutionContext &ctx);
 
     //  ---- Bridge ----
+    //
+    //  There is no executeRegisterBridgeWatcher or
+    //  executeUnregisterBridgeWatcher. A validator is a watcher by
+    //  virtue of being in the active set; there is no separate
+    //  registration or unbonding. If those tx types ever arrive in
+    //  a block (a peer on an older protocol version, or a malicious
+    //  block producer), the dispatch default in execute() rejects
+    //  them.
 
     static Receipt executeBridgeMint(State::StateAccess &state,
                                      const Transaction &tx,
@@ -210,36 +232,27 @@ namespace Core
     static Receipt executeBridgeAttest(State::StateAccess &state,
                                        const Transaction &tx,
                                        const TxExecutionContext &ctx);
-    //  per-watcher attestation over a withdrawal. Mirrors
+    //  per-validator attestation over a withdrawal. Mirrors
     //  executeBridgeAttest but carries only (withdrawal_id,
     //  signer_index, signature): the destination and amount live
     //  in the BridgeWithdrawal record created at burn time.
     static Receipt executeBridgeAckAttest(State::StateAccess &state,
                                           const Transaction &tx,
                                           const TxExecutionContext &ctx);
-    static Receipt executeRegisterBridgeWatcher(State::StateAccess &state,
-                                                const Transaction &tx,
-                                                const TxExecutionContext &ctx);
-    static Receipt executeUnregisterBridgeWatcher(State::StateAccess &state,
-                                                  const Transaction &tx,
-                                                  const TxExecutionContext &ctx);
 
-    //  Verify M-of-N watcher attestations for a source chain.
-    //
-    //  The signer set is the active watcher set for `source_chain_id`
-    //  at `ctx.current_height`, resolved from state. The threshold is
-    //  bftQuorum(active_count), same as consensus.
+    //  Verify M-of-N attestations for a bridge operation. The signer
+    //  set is the active validator set at `ctx.current_height`; the
+    //  threshold is bftQuorum(active_count).
     //
     //  `signatures` is the same `[2] count || N*66` block used before;
     //  the `signer_index` in each entry is a position in the sorted
-    //  active watcher id list, not a position in a config-declared
-    //  set.
+    //  active validator id list.
     //
-    //  The signature is verified against the validator's consensus
-    //  key at `ctx.current_height` (the height-scoped key, not the
-    //  current key — a validator that rotated its consensus key
-    //  after signing must still verify).
-    static bool verifyBridgeSignatures(
+    //  `source_chain_id` is used only for logging/attribution; the
+    //  set itself is chain-agnostic. `domain` selects the signed-
+    //  message construction: "bmin" for a mint attestation, "back"
+    //  for a withdrawal-ack attestation.
+    static bool verifyAttestationSignatures(
         State::StateAccess &state,
         uint64_t source_chain_id,
         std::string_view domain,
@@ -248,12 +261,11 @@ namespace Core
         const TxExecutionContext &ctx);
 
     //  Verify M-of-N validator-set attestations for a governance
-    //  operation (pause, unpause, register-chain). The signer set
-    //  is the active validator set at `ctx.current_height`; the
-    //  threshold is bftQuorum(active_count).
-    //
-    //  Reuses the same `[2] count || N*66` signature block; the
-    //  `signer_index` is a position in the active validator set.
+    //  operation (pause, unpause, register-chain). Same set, same
+    //  threshold, same signature-block shape as
+    //  verifyAttestationSignatures; the two names are kept for
+    //  call-site readability and because governance operations
+    //  don't carry a `source_chain_id`.
     static bool verifyGovernanceSignatures(
         State::StateAccess &state,
         std::string_view domain,
@@ -282,24 +294,17 @@ namespace Core
     // Increment the nonce of `tx.from` after a successful execution.
     static void bumpNonce(State::StateAccess &state, const Transaction &tx);
 
-    // Load the active set from global state. Returns an empty vector if
-    // unset. Shared by RegisterValidator, UnregisterValidator, and
-    // UpdateRewardAddress.
-    static std::vector<Id> loadActiveSet(State::StateAccess &state);
-
     // Persist the active set to global state.
     static void saveActiveSet(State::StateAccess &state, const std::vector<Id> &active_set);
 
-    //  Pre-lock validation for a CreateOrder transaction. Called by
-    //  the mempool admission path and, redundantly, at the top of
-    //  executeCreateOrder. Returns true iff the tx passes every
-    //  structural check that does not require the sender's balance
-    //  to be known.
-    //
-    //  The point of splitting this out is to let the mempool reject
-    //  malformed order txs before they take a block slot. Same
-    //  checks, same reject reasons.
+    //  Pre-lock validation for a CreateOrder transaction.
     static bool validateCreateOrderStructure(const Transaction &tx);
+
+    //  Adopt-or-create the wrapped token for a bridge chain
+    //  registration.
+    static bool adoptOrCreateWrappedToken(
+        State::StateAccess &state,
+        Core::BridgeChainRegistration &reg);
   }; // class TransactionExecutor
 
 } // namespace Core

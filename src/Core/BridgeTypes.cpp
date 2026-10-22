@@ -38,7 +38,7 @@ namespace Core
     w.writeBytes(release_tx_hash.data.data(), release_tx_hash.data.size());
     w.writeU64(release_height);
     w.writeU64(released_at_height);
-    w.writeU64(released_by_watcher_id);
+    w.writeU64(released_by_validator_id);
 
     return out;
   }
@@ -80,7 +80,7 @@ namespace Core
     r.readBytes(w.release_tx_hash.data.data(), w.release_tx_hash.data.size());
     w.release_height = r.readU64();
     w.released_at_height = r.readU64();
-    w.released_by_watcher_id = r.readU64();
+    w.released_by_validator_id = r.readU64();
 
     if (!r.ok())
       return false;
@@ -103,7 +103,7 @@ namespace Core
     s(release_tx_hash, "release_tx_hash");
     s(release_height, "release_height");
     s(released_at_height, "released_at_height");
-    s(released_by_watcher_id, "released_by_watcher_id");
+    s(released_by_validator_id, "released_by_validator_id");
   }
 
   void BridgeWithdrawal::serialize(Serialization::ISerializer &s) const
@@ -118,7 +118,7 @@ namespace Core
     s(release_tx_hash, "release_tx_hash");
     s(release_height, "release_height");
     s(released_at_height, "released_at_height");
-    s(released_by_watcher_id, "released_by_watcher_id");
+    s(released_by_validator_id, "released_by_validator_id");
   }
 
   //  =========================================================================
@@ -143,7 +143,7 @@ namespace Core
     w.writeU8(destination_blob_min_len);
     w.writeU8(destination_blob_max_len);
     w.writeU8(enabled ? 1 : 0);
-    w.writeU32(active_watcher_min);
+    w.writeU32(active_validator_min);
 
     return out;
   }
@@ -167,7 +167,7 @@ namespace Core
     reg.destination_blob_min_len = r.readU8();
     reg.destination_blob_max_len = r.readU8();
     reg.enabled = (r.readU8() != 0);
-    reg.active_watcher_min = r.readU32();
+    reg.active_validator_min = r.readU32();
 
     if (!r.ok())
       return false;
@@ -189,7 +189,7 @@ namespace Core
     s(destination_blob_min_len, "destination_blob_min_len");
     s(destination_blob_max_len, "destination_blob_max_len");
     s(enabled, "enabled");
-    s(active_watcher_min, "active_watcher_min");
+    s(active_validator_min, "active_validator_min");
   }
 
   void BridgeChainRegistration::serialize(Serialization::ISerializer &s) const
@@ -203,7 +203,7 @@ namespace Core
     s(destination_blob_min_len, "destination_blob_min_len");
     s(destination_blob_max_len, "destination_blob_max_len");
     s(enabled, "enabled");
-    s(active_watcher_min, "active_watcher_min");
+    s(active_validator_min, "active_validator_min");
   }
 
   //  =========================================================================
@@ -226,12 +226,12 @@ namespace Core
       return "token_not_found";
     case BridgeMintStatus::TokenFingerprintMismatch:
       return "token_fingerprint_mismatch";
-    case BridgeMintStatus::WatcherSetTooSmall:
-      return "watcher_set_too_small";
-    case BridgeMintStatus::BelowWatcherThreshold:
-      return "below_watcher_threshold";
-    case BridgeMintStatus::BadWatcherSignature:
-      return "bad_watcher_signature";
+    case BridgeMintStatus::ValidatorSetTooSmall:
+      return "validator_set_too_small";
+    case BridgeMintStatus::BelowValidatorThreshold:
+      return "below_validator_threshold";
+    case BridgeMintStatus::BadValidatorSignature:
+      return "bad_validator_signature";
     case BridgeMintStatus::Replay:
       return "replay";
     }
@@ -274,12 +274,12 @@ namespace Core
       return "paused";
     case BridgeAckStatus::ChainNotRegistered:
       return "chain_not_registered";
-    case BridgeAckStatus::WatcherSetTooSmall:
-      return "watcher_set_too_small";
-    case BridgeAckStatus::BelowWatcherThreshold:
-      return "below_watcher_threshold";
-    case BridgeAckStatus::BadWatcherSignature:
-      return "bad_watcher_signature";
+    case BridgeAckStatus::ValidatorSetTooSmall:
+      return "validator_set_too_small";
+    case BridgeAckStatus::BelowValidatorThreshold:
+      return "below_validator_threshold";
+    case BridgeAckStatus::BadValidatorSignature:
+      return "bad_validator_signature";
     case BridgeAckStatus::WithdrawalNotFound:
       return "withdrawal_not_found";
     }
@@ -371,8 +371,8 @@ namespace Core
       return "DepositAlreadyConsumed";
     case BridgeAttestStatus::SignerIndexOutOfRange:
       return "SignerIndexOutOfRange";
-    case BridgeAttestStatus::SignerNotActiveWatcher:
-      return "SignerNotActiveWatcher";
+    case BridgeAttestStatus::SignerNotActiveValidator:
+      return "SignerNotActiveValidator";
     case BridgeAttestStatus::BadSignature:
       return "BadSignature";
     case BridgeAttestStatus::AlreadyAttested:
@@ -455,8 +455,8 @@ namespace Core
       return "WithdrawalAlreadyReleased";
     case BridgeAckAttestStatus::SignerIndexOutOfRange:
       return "SignerIndexOutOfRange";
-    case BridgeAckAttestStatus::SignerNotActiveWatcher:
-      return "SignerNotActiveWatcher";
+    case BridgeAckAttestStatus::SignerNotActiveValidator:
+      return "SignerNotActiveValidator";
     case BridgeAckAttestStatus::BadSignature:
       return "BadSignature";
     case BridgeAckAttestStatus::AlreadyAttested:

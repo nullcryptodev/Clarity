@@ -27,14 +27,17 @@ namespace Rpc
   //      1000..1049      Transaction submission
   //      1050..1099      State lookup
   //      1100..1149      Chain lookup
-  //      1050..1099      State lookup
   //      1050..1060      Account, token, validator, pool, order,
   //                      receipt, proof, NFT
   //      1061..1070      Bridge
   //      1071..1099      Reserved
   //
   //  Codes are stable forever. If a method gains a new failure mode,
-  //  it gets a new code. Never reuse.
+  //  it gets a new code. Never reuse. A code that is retired — for
+  //  example because the model that produced it was replaced — keeps
+  //  its slot reserved and stops being emitted. The name and message
+  //  strings stay so an old log parser or an old client that switches
+  //  on the numeric code still gets something meaningful back.
   //
   //  The `message` field of a JSON-RPC error is a short, human-readable
   //  string suitable for display in a client's log. It is NOT parsed by
@@ -78,9 +81,11 @@ namespace Rpc
     //  type-specific preconditions cannot be satisfied at the current
     //  chain tip: minting a token that does not exist, minting or
     //  updating a token the sender did not create, exceeding the
-    //  supply cap, or burning a token that does not exist. Distinct
-    //  from TxMalformed (the bytes are fine) and from TxInsufficientFunds
-    //  (the fee and amount are covered).
+    //  supply cap, burning a token that does not exist, or a bridge
+    //  transaction whose signature block does not verify against the
+    //  current active validator set. Distinct from TxMalformed (the
+    //  bytes are fine) and from TxInsufficientFunds (the fee and
+    //  amount are covered).
     TxPrecondition = 1012,
 
     // ---- Application: state lookup (1050..1099) ----
@@ -102,11 +107,30 @@ namespace Rpc
     //  Grouped with state lookup because they all read bridge state
     //  that lives in the StateAccess. A future bridge-write error
     //  block (submission rejection, etc.) would go after these.
+    //
+    //  Under the validator-is-watcher model there is no per-chain
+    //  watcher record. Every active validator is a bridge watcher,
+    //  and the operational signer set is the active validator set
+    //  at the height of the operation. As a consequence:
+    //
+    //    - There is no "watcher not found" condition (an address
+    //      either maps to a validator or it does not; that is
+    //      ValidatorNotFound, and it lives in the state block).
+    //    - There is no per-watcher read that could fail
+    //      independently of a general bridge read.
+    //
+    //  BridgeWatcherNotFound (1063) and BridgeReadInternal (1064)
+    //  are therefore reserved. They are kept in the enum so that
+    //  an older client or log parser that switches on the numeric
+    //  code does not misinterpret a future error that happens to
+    //  land on 1063/1064, and so that a future, unrelated error
+    //  cannot reuse the slot. Nothing in the current tree emits
+    //  either code.
 
     BridgeChainNotRegistered = 1061,
     BridgeWithdrawalNotFound = 1062,
-    BridgeWatcherNotFound = 1063,
-    BridgeReadInternal = 1064,
+    BridgeWatcherNotFound = 1063, // reserved; not emitted
+    BridgeReadInternal = 1064,    // reserved; not emitted
 
     // ---- Application: chain lookup (1100..1149) ----
 
@@ -134,7 +158,8 @@ namespace Rpc
   //
   //  Short stable identifier used in logs and in the `data.name` field
   //  of an error response. Clients should switch on `code`, not on
-  //  this string, but logging benefits from having one.
+  //  this string, but logging benefits from having one. A reserved
+  //  code returns its historical name; no handler emits it.
   const char *errorCodeName(ErrorCode code) noexcept;
 
   //  errorCodeMessage
@@ -149,6 +174,23 @@ namespace Rpc
   //  Map a Core::MempoolAddResult to an RPC error code. The Accepted
   //  value has no error mapping and must never be passed here; doing
   //  so returns InternalError as a defensive fallback.
+  //
+  //  The bridge rejections map onto the existing tx codes:
+  //
+  //    Rejected_BridgePayloadMalformed -> TxMalformed
+  //    Rejected_BridgeSignature        -> TxPrecondition
+  //
+  //  A malformed bridge payload is structurally wrong at the byte
+  //  level (a declared count that overruns the buffer, a field
+  //  missing from the fixed prefix), which is what TxMalformed
+  //  means everywhere else. A signature block that does not verify
+  //  against the current active validator set is well-formed and
+  //  correctly signed but cannot apply at the tip, which is what
+  //  TxPrecondition means. Neither is given a dedicated code: from
+  //  the client's perspective the remedy in both cases is "fix the
+  //  bridge transaction and resubmit", and the distinction is
+  //  already available to a caller that wants it via the receipt
+  //  or the mempool rejection reason.
   ErrorCode mempoolResultToErrorCode(Core::MempoolAddResult result) noexcept;
 
   //  makeError

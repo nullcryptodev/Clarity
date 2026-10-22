@@ -23,6 +23,7 @@
 namespace State
 {
   class StateDB;
+  class StateAccess;
 }
 
 namespace Core
@@ -67,6 +68,20 @@ namespace Core
   //    - Persistence stores the full Entry (tx + tier + fee rate +
   //      sequence + add time), not just the tx, so eviction ordering
   //      and priority status survive a restart.
+  //
+  //  Bridge pre-checks:
+  //    - The mempool rejects transactions the executor would reject
+  //      at apply time. For bridge operations this is the difference
+  //      between "the chain stalls on every proposal attempt" and
+  //      "the transaction never enters a block."
+  //    - The checks are supplied by Node as callables
+  //      (GovernanceVerifier, BridgeAttestationVerifier) plus a
+  //      StateAccess factory. The mempool does not know how to read
+  //      validator sets or bridge registrations; Node does, and the
+  //      factory hands it a live StateAccess.
+  //    - When no verifier is installed (unit tests, a node that does
+  //      not participate in consensus), only the structural
+  //      payload-shape check runs.
 
   // ---- Fee policy constants ----
 
@@ -121,12 +136,35 @@ namespace Core
     //  in the pool forever and every block proposal that tries to
     //  include it fails simulation.
     Rejected_TokenPrecondition,
+
+    //  The transaction is well-formed, correctly signed, has a valid
+    //  nonce, and enough balance, but its payload does not match the
+    //  shape the executor expects for its type. For a bridge
+    //  transaction this is the "wrong payload for the wrong type"
+    //  class — e.g. a `BridgeUnpause` carrying a
+    //  `BridgeRegisterChain` payload. The executor would reject it on
+    //  its payload length check; the mempool rejects it here so it
+    //  never occupies a block slot.
+    Rejected_BridgePayloadMalformed,
+
+    //  The transaction is a bridge operation whose signature block
+    //  does not verify against the active set at the current height.
+    //  The mempool cannot fix this and the executor will reject it;
+    //  admitting it would stall the chain on every proposal attempt.
+    //
+    //  This covers both governance operations (BridgePause,
+    //  BridgeUnpause, BridgeRegisterChain) and operational
+    //  attestations (BridgeMint, BridgeAckWithdrawal, BridgeAttest,
+    //  BridgeAckAttest), because both classes have the same stall
+    //  failure mode: executor rejects, proposer drops, peer
+    //  rebroadcasts, mempool re-admits, repeat.
+    Rejected_BridgeSignature,
   };
 
   //  Pin the counter array size to the enum. Update both if a
   //  variant is added.
   static_assert(
-      static_cast<size_t>(MempoolAddResult::Rejected_TokenPrecondition) + 1 == 15,
+      static_cast<size_t>(MempoolAddResult::Rejected_BridgeSignature) + 1 == 17,
       "MempoolAddResult grew; update Mempool::ADD_RESULT_COUNT");
 
   const char *mempoolAddResultName(MempoolAddResult r) noexcept;
@@ -188,6 +226,38 @@ namespace Core
   class Mempool
   {
   public:
+    //  The governance verifier callback. Node supplies this at startup
+    //  so the mempool can run the same signature check the executor
+    //  will run at apply time. It is intentionally a std::function so
+    //  tests can leave it null and the check becomes a no-op — the
+    //  mempool's structural checks still apply, but signature checks
+    //  are skipped.
+    //
+    //  The callback returns true if the tx's governance signature
+    //  block verifies against the active validator set at the current
+    //  height, false otherwise. `access` is a live StateAccess (the
+    //  caller owns it); the callback must not outlive it.
+    using GovernanceVerifier = std::function<bool(
+        State::StateAccess &access,
+        const Transaction &tx)>;
+
+    //  A verifier for operational bridge attestations
+    //  (BridgeMint, BridgeAckWithdrawal, BridgeAttest,
+    //  BridgeAckAttest). Same shape as GovernanceVerifier, but the
+    //  checks differ: these depend on watcher-set state,
+    //  consumed-deposit state, and (for mint) the registration. Node
+    //  supplies the verifier; the mempool just dispatches.
+    using BridgeAttestationVerifier = std::function<bool(
+        State::StateAccess &access,
+        const Transaction &tx)>;
+
+    //  The factory that makes a StateAccess at the current chain
+    //  height. The mempool calls this from validate() when a verifier
+    //  needs to read state. Node supplies a factory bound to its own
+    //  state_db_ and the chain height at call time.
+    using StateAccessFactory =
+        std::function<std::unique_ptr<State::StateAccess>()>;
+
     Mempool() = default;
     ~Mempool() = default;
 
@@ -207,6 +277,21 @@ namespace Core
     // are NOT retroactively persisted. attach() only affects future
     // mutations. Typical usage is to attach once at construction.
     void attach(State::StateDB &db);
+
+    //  ---- Bridge verifier installation ----
+    //
+    //  Called once at startup by Node::initMempool, before the node
+    //  accepts RPC or P2P traffic. The verifier members are read from
+    //  validate() without a lock; the ordering guarantee is "install
+    //  completes before the first add()". A concurrent add() cannot
+    //  observe a half-installed verifier because installation
+    //  completes before the node starts accepting traffic.
+    //
+    //  Until a verifier is installed, the corresponding check is a
+    //  no-op and only the structural payload-shape check applies.
+    void setGovernanceVerifier(GovernanceVerifier v);
+    void setBridgeAttestationVerifier(BridgeAttestationVerifier v);
+    void setStateAccessFactory(StateAccessFactory f);
 
     // Rebuild the pool from persisted rows. Reads TBL_MEMPOOL, and for
     // each stored Entry, re-adds it through the normal `add` path with
@@ -275,7 +360,7 @@ namespace Core
     //
     // The array has one slot per MempoolAddResult variant. The size
     // is pinned to the enum by a static_assert above.
-    static constexpr size_t ADD_RESULT_COUNT = 15;
+    static constexpr size_t ADD_RESULT_COUNT = 17;
     std::array<uint64_t, ADD_RESULT_COUNT> addResultCounts() const;
 
     // Remove a single transaction by txid. Returns true if it was present.
@@ -523,6 +608,14 @@ namespace Core
     //  outside of the window between a load() and the next
     //  takeStaleAfterLoad().
     std::vector<Crypto::Hash> stale_after_load_;
+
+    //  Bridge verifiers and the factory that makes a StateAccess for
+    //  them. Installed once at startup by Node::initMempool; read
+    //  without a lock from validate(). See the header comment on
+    //  setGovernanceVerifier for the ordering guarantee.
+    GovernanceVerifier governance_verifier_;
+    BridgeAttestationVerifier bridge_attestation_verifier_;
+    StateAccessFactory state_access_factory_;
   };
 
 } // namespace Core

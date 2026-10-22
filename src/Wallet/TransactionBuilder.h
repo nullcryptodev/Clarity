@@ -568,7 +568,7 @@ namespace Wallet
   //    [2]  signer_count
   //    [N]  signatures, each [2] index || [64] sig
   //
-  //  The signed message is `Blake2b("bpaul" || LE64(bound_height))`
+  //  The signed message is `Blake2b("bpau" || LE64(bound_height))`
   //  for pause, `Blake2b("bunp"  || LE64(bound_height))` for unpause.
   //  The builder takes the completed signature block as opaque bytes.
 

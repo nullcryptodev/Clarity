@@ -95,19 +95,17 @@ namespace Core
     //  CCX crypto config). Clarity's atomic unit has 5
     //  (`ATOMIC_UNITS_PER_COIN = 100,000`).
     //
-    //  The bridge converts by the ratio 10^6 / 10^5 = 10. A CCX
-    //  amount of `A` atomic units becomes `A / 10` Clarity atomic
-    //  units (flooring the remainder to the bridge's remainder
-    //  pool), and a Clarity amount of `C` atomic units becomes
-    //  `C * 10` CCX atomic units (exact, no rounding).
+    //  The wrapped-CCX token on Clarity has 6 decimals, matching
+    //  CCX's own. This means a CCX amount and the wCCX amount are
+    //  the same atomic number: a deposit of `A` CCX atomic units
+    //  mints `A` wCCX atomic units. There is no scaling factor and
+    //  no rounding. The value is preserved exactly.
     //
-    //  These constants are exposed so the watcher and the RPC can
-    //  display the conversion without hardcoding the numbers.
+    //  (An earlier design used 5 clarity decimals and divided by
+    //  ten, which produced a display bug — a 1.0 CCX deposit
+    //  showed as 10 wCCX. Matching the source decimals is the fix.)
     inline constexpr uint8_t CCX_SOURCE_DECIMALS = 6;
-    inline constexpr uint8_t CCX_CLARITY_DECIMALS = 5;
-
-    //  The source → clarity scale factor: 10^(6-5) = 10.
-    inline constexpr uint64_t CCX_TO_CLARITY_DIVISOR = 10;
+    inline constexpr uint8_t CCX_CLARITY_DECIMALS = 6;
 
     //  ---------------------------------------------------------------------
     //  Confirmation depth
@@ -337,11 +335,10 @@ namespace Core
     //  RPC display don't hardcode string literals.
     //
     //  The symbol is "wCCX" rather than "CCX" to distinguish the
-    //  wrapped asset from the source asset in any display. CCX
-    //  decimals are 6, but the wrapped token on Clarity uses the
-    //  Clarity decimals (5) because it's denominated in Clarity
-    //  atomic units. A user holding 1.00000 wCCX is owed 1.000000
-    //  CCX on release (the 10:1 conversion in the other direction).
+    //  wrapped asset from the source asset in any display. The
+    //  wrapped token has 6 decimals, matching CCX's own; a user
+    //  holding 1.000000 wCCX is owed 1.000000 CCX on release. The
+    //  amount is preserved exactly, with no scaling factor.
     inline constexpr std::string_view CCX_WRAPPED_NAME = "Wrapped CCX";
     inline constexpr std::string_view CCX_WRAPPED_SYMBOL = "wCCX";
     inline constexpr uint8_t CCX_WRAPPED_DECIMALS = CCX_CLARITY_DECIMALS;
@@ -355,15 +352,13 @@ namespace Core
     //  they make the "which number changed?" question answerable
     //  from the compiler output.
 
-    static_assert(CCX_SOURCE_DECIMALS >= CCX_CLARITY_DECIMALS,
-                  "CCX has more decimals than Clarity; the conversion "
-                  "divides and floors. A future chain with fewer decimals "
-                  "would need a separate adapter and a different "
-                  "conversion direction.");
-    static_assert(CCX_TO_CLARITY_DIVISOR == 10,
-                  "The divisor must match 10^(source-clarity). If either "
-                  "decimals constant changes, this assert fires and the "
-                  "watcher's conversion logic must be updated.");
+    static_assert(CCX_SOURCE_DECIMALS == CCX_CLARITY_DECIMALS,
+                  "CCX and Clarity decimals must match under the "
+                  "value-preserving design: a CCX amount and its wCCX "
+                  "amount are the same atomic number. If a future chain "
+                  "needs scaling, that is a different adapter with a "
+                  "different conversion direction and its own static "
+                  "asserts.");
     static_assert(CCX_DESTINATION_MIN_BYTES == CCX_DESTINATION_BYTES &&
                       CCX_DESTINATION_MAX_BYTES == CCX_DESTINATION_BYTES,
                   "CCX destinations are a fixed 64 bytes (spend || view). "

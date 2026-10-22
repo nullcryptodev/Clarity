@@ -10,6 +10,7 @@
 #include "Core/TransactionExecutor.h"
 #include "Core/ValidatorRotation.h"
 #include "Core/EquivocationProof.h"
+#include "Core/BridgeSigning.h"
 #include "Consensus/Message.h"
 #include "P2P/MessageTypes.h"
 #include "P2P/VersionMessage.h"
@@ -149,8 +150,6 @@ namespace Node
     (*log_)(Logging::INFO) << "Node stopped";
   }
 
-  // This helper makes "every StateAccess in Node has the
-  // configured window" a structural property rather than a discipline.
   std::unique_ptr<State::StateAccess>
   Node::makeStateAccess(uint64_t version) const
   {
@@ -233,6 +232,62 @@ namespace Node
     if (!mempool_)
       return;
 
+    //  ---- Verifier wiring ----
+    //
+    //  The mempool's bridge pre-checks are supplied by the node as
+    //  callables. The mempool itself does not know how to read
+    //  validator sets or bridge registrations; that is the
+    //  executor's job, and its state-reading machinery is not part
+    //  of the StateView interface. Rather than widen StateView
+    //  (which would drag validator and bridge types into every
+    //  test mock), the node installs two verifier closures here.
+    //  The mempool dispatches to them from validate().
+    //
+    //  The StateAccess factory reads the current chain height at
+    //  call time, so the verifiers see the same state the executor
+    //  would apply against. A tx that fails here is one the
+    //  executor will reject at apply time; admitting it would
+    //  occupy a block slot and force the proposer's drop-and-retry
+    //  loop to clean it up on every proposal attempt.
+    //
+    //  Under the validator-is-watcher model, both verifiers
+    //  resolve the active validator set via
+    //  Core::loadSortedActiveValidators and index it by the
+    //  signature block's signer_index.
+    //
+    //  If the factory or a verifier is not installed (a unit test
+    //  that constructs a bare Mempool, a future lightweight node
+    //  that does not participate in consensus), the corresponding
+    //  check is a no-op. The structural payload-shape checks in
+    //  validate() still run unconditionally.
+
+    mempool_->setStateAccessFactory(
+        [this]() -> std::unique_ptr<State::StateAccess>
+        {
+          if (!chain_ || !state_db_)
+            return nullptr;
+          auto access = std::make_unique<State::StateAccess>(
+              *state_db_, chain_->height());
+          access->setHistoryWindow(config_.smt_history_blocks);
+          return access;
+        });
+
+    mempool_->setGovernanceVerifier(
+        [this](State::StateAccess &access,
+               const Core::Transaction &tx) -> bool
+        {
+          return verifyGovernanceTxAtAdmission(access, tx);
+        });
+
+    mempool_->setBridgeAttestationVerifier(
+        [this](State::StateAccess &access,
+               const Core::Transaction &tx) -> bool
+        {
+          return verifyBridgeAttestationTxAtAdmission(access, tx);
+        });
+
+    //  ---- Load persisted entries ----
+
     std::vector<Crypto::Hash> stale;
     {
       auto view = makeStateView();
@@ -271,7 +326,8 @@ namespace Node
     }
 
     (*log_)(Logging::INFO)
-        << "Mempool loaded: " << Logging::BRIGHT_GREEN << mempool_->size() << " pending txs";
+        << "Mempool loaded: " << Logging::BRIGHT_GREEN
+        << mempool_->size() << " pending txs";
   }
 
   void Node::initGenesis()
@@ -308,12 +364,6 @@ namespace Node
     {
       auto txn = state_db_->beginWrite();
 
-      //  CHANGED: construct the StateAccess with the retention
-      //  window set. The window is irrelevant here (genesis writes
-      //  at version 0, which the tree never writes to the historical
-      //  tables), but using the same helper everywhere keeps the
-      //  invariant "every StateAccess has the configured window"
-      //  structurally true.
       State::StateAccess state(*state_db_, txn, /*version=*/0);
       state.setHistoryWindow(config_.smt_history_blocks);
 
@@ -608,16 +658,6 @@ namespace Node
     return s;
   }
 
-  // CHANGED: new method. Returns a snapshot of the tree's cumulative
-  // counters. Constructs a short-lived autocommit StateAccess, reads
-  // its stats, and destroys it. The stats struct is a value copy, so
-  // there's no lifetime concern.
-  //
-  // The counters reflect writes since the DB was opened, aggregated
-  // across every StateAccess the node has constructed. Under the
-  // compressed tree, each block's writes are O(K log N) for K
-  // state-changing transactions and N live keys; the historical
-  // counters in the struct show the retention-window cost directly.
   State::SparseMerkleTree::Stats Node::smtStats() const
   {
     if (!state_db_)
@@ -682,16 +722,6 @@ namespace Node
                std::vector<Core::Fill> &out_epoch_fills,
                Crypto::Hash *out_failed_txid) -> bool
     {
-      //  A dry-run apply needs a write txn so the processor's
-      //  mutations land somewhere they can be rolled back. The
-      //  txn is aborted unconditionally at the end of this
-      //  callback: nothing the simulation writes is ever
-      //  committed.
-      //
-      //  The version argument is the candidate block's height.
-      //  The dry-run path in BlockProcessor uses it to key the
-      //  tree's historical writes and to drive the retention
-      //  window, same as a real apply.
       auto txn = state_db_->beginWrite();
 
       State::StateAccess state(*state_db_, txn, block.header.height);
@@ -705,25 +735,13 @@ namespace Node
       Core::BlockResult result =
           Core::BlockProcessor::applyBlock(state, block, ctx);
 
-      //  Always abort: this was a simulation, not an apply. The
-      //  txn's mutations are discarded regardless of whether the
-      //  block validated.
       txn.abort();
 
       if (!result.valid)
       {
-        //  Report the failing transaction to the caller. Null
-        //  when the failure was a block-level check (bad header,
-        //  bad tx_root, bad quorum, state-root mismatch) and
-        //  there is no single transaction to blame.
         if (out_failed_txid)
           *out_failed_txid = result.failed_txid;
 
-        //  Drop the offender from the mempool so the next
-        //  proposal does not select it and re-enter the same
-        //  failure. Only when we actually have a txid and a
-        //  mempool to reject it in; a block-level failure has
-        //  nothing to drop.
         if (out_failed_txid &&
             !out_failed_txid->isNull() &&
             mempool_)
@@ -751,11 +769,6 @@ namespace Node
         return false;
       }
 
-      //  Success. Hand back both the state root and the fills the
-      //  dry-run produced. The proposer needs the fills to compute
-      //  epoch_fills_root and commit it to the header before the
-      //  proposal is signed; validateProposal needs them to check
-      //  a peer's commitment against what execution would produce.
       out_state_root = result.new_state_root;
       out_epoch_fills = std::move(result.epoch_fills);
       return true;
@@ -1212,10 +1225,6 @@ namespace Node
       return;
     }
 
-    //  Bridge-specific pre-check: a BridgeAckWithdrawal for an
-    //  already-released withdrawal will never apply. The mempool
-    //  validation catches it below, but this pre-check gives a
-    //  cleaner log line and avoids even building a StateView.
     if (tx.tx_type == Core::TxType::BridgeAckWithdrawal &&
         tx.payload.size() >= 8)
     {
@@ -1450,39 +1459,12 @@ namespace Node
                                    r.serializeState());
       }
 
-      //  CHANGED: prune runs inside the commit transaction, every
-      //  block. Previously it ran outside the transaction and was
-      //  throttled to once every 100 blocks. The old design had
-      //  two problems:
-      //
-      //    1. A crash between block commit and prune would leave
-      //       the retention window larger than configured, which
-      //       made the storage bound loose rather than tight.
-      //    2. With the small windows we now use (64/512/2048), a
-      //       once-per-100-blocks throttle means a regtest can run
-      //       its whole window between prunes, which is the bug
-      //       that produced the 800 MB DBs.
-      //
-      //  The prune is now atomic with the block commit: either the
-      //  block and its prune both land, or neither does. On failure
-      //  the whole commit is aborted, which surfaces a storage
-      //  problem loudly rather than letting the historical tables
-      //  grow unbounded behind a silent warning.
-      //
-      //  The keepFrom is computed so that after this block commits,
-      //  the oldest version in the historical tables is exactly
-      //  (block.header.height - config_.smt_history_blocks). The
-      //  version just committed (block.header.height) is retained
-      //  because it is at the top of the window.
       if (config_.smt_history_blocks > 0 &&
           block.header.height > config_.smt_history_blocks)
       {
         const uint64_t keep_from =
             block.header.height - config_.smt_history_blocks;
 
-        //  last_prune_height_ guards against re-pruning when the
-        //  same height is applied twice (which shouldn't happen on
-        //  a healthy chain, but a defensive check costs nothing).
         if (block.header.height != last_prune_height_)
         {
           state_db_->pruneHistoryBeforeTxn(txn, keep_from);
@@ -1533,13 +1515,318 @@ namespace Node
       state->putMetaU64("fees_in_window", sum);
     }
 
-    //  CHANGED: removed the old prune-outside-txn block. It lived
-    //  here, before the flush, and ran at most once per 100 blocks.
-    //  The prune now happens inside applyCommittedBlock's commit
-    //  transaction above.
-
     state_db_->flush();
     return true;
+  }
+
+  //  =====================================================================
+  //  Bridge pre-check verifiers
+  //
+  //  These run inside Mempool::validate, on a StateAccess the node
+  //  supplied via the factory. They mirror the executor's signature
+  //  checks (TransactionExecutor.cpp), rebuilt here against the same
+  //  message encoding and the same sorted active validator set.
+  //
+  //  Under the validator-is-watcher model, both verifiers resolve
+  //  the active validator set via Core::loadSortedActiveValidators
+  //  and index it by the signature block's signer_index. There is
+  //  no per-chain watcher set to resolve.
+  //
+  //  They exist because the executor's checks, without a mempool
+  //  mirror, produce the stall failure mode: a tx that cannot apply
+  //  sits in the pool, every proposal includes it, the block fails
+  //  simulation, the proposer drops it, a peer rebroadcasts it, the
+  //  mempool re-admits it, repeat. The proposer's drop-and-retry
+  //  loop is a safety net; these verifiers are the fix.
+  //
+  //  Both return false on any doubt (empty active set, malformed
+  //  payload, missing key). A false result rejects the tx from the
+  //  pool. The mempool counts the rejection under
+  //  Rejected_BridgeSignature, so an operator can see them in
+  //  getMempoolStats.
+  //  =====================================================================
+
+  bool Node::verifyGovernanceTxAtAdmission(
+      State::StateAccess &access,
+      const Core::Transaction &tx)
+  {
+    std::vector<Id> active = Core::loadSortedActiveValidators(access);
+    if (active.empty())
+      return false;
+
+    switch (tx.tx_type)
+    {
+    case Core::TxType::BridgePause:
+    case Core::TxType::BridgeUnpause:
+    {
+      if (tx.payload.size() < 8 + 2)
+        return false;
+
+      uint64_t bound_height = 0;
+      for (int i = 0; i < 8; ++i)
+        bound_height |= uint64_t(tx.payload[i]) << (i * 8);
+
+      uint8_t message[8];
+      for (int i = 0; i < 8; ++i)
+        message[i] = uint8_t(bound_height >> (i * 8));
+
+      const std::string_view domain =
+          (tx.tx_type == Core::TxType::BridgePause) ? "bpau" : "bunp";
+
+      const size_t sig_off = 8;
+      const uint8_t *sigs = tx.payload.data() + sig_off;
+      const size_t sig_len = tx.payload.size() - sig_off;
+
+      const auto result = Core::verifyGovernanceSignaturesAt(
+          access, active, domain,
+          message, sizeof(message),
+          sigs, sig_len,
+          access.version());
+
+      if (result != Core::GovernanceVerifyResult::Ok)
+      {
+        (*log_)(Logging::WARNING)
+            << "verifyGovernanceTxAtAdmission: rejected "
+            << Core::txTypeName(tx.tx_type)
+            << " reason=" << static_cast<int>(result)
+            << " active.size()=" << active.size()
+            << " height=" << access.version()
+            << " sig_len=" << sig_len;
+      }
+
+      return result == Core::GovernanceVerifyResult::Ok;
+    }
+
+    case Core::TxType::BridgeRegisterChain:
+    {
+      if (tx.payload.size() < 1 + 2)
+        return false;
+
+      const uint8_t reg_len = tx.payload[0];
+      const size_t after_blob = 1 + static_cast<size_t>(reg_len);
+      if (tx.payload.size() < after_blob + 2)
+        return false;
+
+      const uint8_t *msg = tx.payload.data() + 1;
+      const size_t msg_len = reg_len;
+      const uint8_t *sigs = tx.payload.data() + after_blob;
+      const size_t sig_len = tx.payload.size() - after_blob;
+
+      return Core::verifyGovernanceSignaturesAt(
+                 access, active, "brgr",
+                 msg, msg_len,
+                 sigs, sig_len,
+                 access.version()) ==
+             Core::GovernanceVerifyResult::Ok;
+    }
+
+    default:
+      return false;
+    }
+  }
+
+  bool Node::verifyBridgeAttestationTxAtAdmission(
+      State::StateAccess &access,
+      const Core::Transaction &tx)
+  {
+    switch (tx.tx_type)
+    {
+    case Core::TxType::BridgeAckWithdrawal:
+    {
+      //  Layout: [8] withdrawal_id || [32] release_tx_hash ||
+      //  [8] release_height || [2] count || count * 66.
+      if (tx.payload.size() < 8 + 32 + 8 + 2)
+        return false;
+
+      uint64_t withdrawal_id = 0;
+      for (int i = 0; i < 8; ++i)
+        withdrawal_id |= uint64_t(tx.payload[i]) << (i * 8);
+
+      Core::BridgeWithdrawal w;
+      if (!access.getBridgeWithdrawal(withdrawal_id, w))
+        return false;
+      if (w.isReleased())
+        return false;
+      if (!w.isWellFormed())
+        return false;
+
+      Core::BridgeChainRegistration reg;
+      if (!access.getBridgeChainRegistration(w.source_chain_id, reg))
+        return false;
+      if (!reg.isWellFormed())
+        return false;
+
+      //  Active validator set. Under the validator-is-watcher
+      //  model there is no per-chain watcher set to resolve; every
+      //  active validator is eligible to attest to every chain.
+      std::vector<Id> active = Core::loadSortedActiveValidators(access);
+      if (active.size() < reg.active_validator_min)
+        return false;
+
+      const size_t threshold = Core::bftQuorum(active.size());
+
+      //  Message: Blake2b("back" || LE64(withdrawal_id)).
+      uint8_t msg[8];
+      for (int i = 0; i < 8; ++i)
+        msg[i] = uint8_t(withdrawal_id >> (i * 8));
+
+      const size_t sig_off = 8 + 32 + 8;
+      const uint8_t *sigs = tx.payload.data() + sig_off;
+      const size_t sig_len = tx.payload.size() - sig_off;
+
+      std::vector<Core::BridgeSignatureEntry> sigs_parsed;
+      if (!Core::parseBridgeSignatureBlock(sigs, sig_len, sigs_parsed))
+        return false;
+      if (sigs_parsed.size() < threshold)
+        return false;
+
+      std::vector<bool> seen(active.size(), false);
+      for (const auto &e : sigs_parsed)
+      {
+        if (e.signer_index >= active.size())
+          return false;
+        if (seen[e.signer_index])
+          return false;
+        seen[e.signer_index] = true;
+      }
+
+      const Crypto::Hash hash =
+          Core::bridgeSigningHash("back", msg, sizeof(msg));
+
+      for (const auto &e : sigs_parsed)
+      {
+        auto pk = access.validatorKeyAtHeight(
+            active[e.signer_index], access.version());
+        if (!pk.has_value())
+          return false;
+        if (!Crypto::verify(hash, *pk, e.signature))
+          return false;
+      }
+
+      return true;
+    }
+
+    case Core::TxType::BridgeMint:
+    {
+      //  Layout: [8] source_chain_id || [32] source_tx_hash ||
+      //  [4] output_index || [32] destination || [8] amount ||
+      //  [2] count || count * 66.
+      constexpr size_t fixed = 8 + 32 + 4 + 32 + 8;
+
+      if (tx.payload.size() < fixed + 2)
+        return false;
+
+      uint64_t source_chain_id = 0;
+      for (int i = 0; i < 8; ++i)
+        source_chain_id |= uint64_t(tx.payload[i]) << (i * 8);
+
+      Crypto::Hash source_tx_hash;
+      std::memcpy(source_tx_hash.data.data(),
+                  tx.payload.data() + 8, 32);
+
+      uint32_t output_index = 0;
+      for (int i = 0; i < 4; ++i)
+        output_index |= uint32_t(tx.payload[8 + 32 + i]) << (i * 8);
+
+      Core::BridgeChainRegistration reg;
+      if (!access.getBridgeChainRegistration(source_chain_id, reg))
+        return false;
+      if (!reg.isWellFormed() || !reg.enabled)
+        return false;
+
+      Core::TokenInfo token;
+      if (!access.getToken(reg.wrapped_token_id, token))
+        return false;
+      if (!token.isBridged() ||
+          !token.fingerprint.has_value() ||
+          *token.fingerprint != reg.fingerprint)
+        return false;
+
+      uint64_t consumed_at = 0;
+      if (access.getBridgeConsumed(source_chain_id, source_tx_hash,
+                                   output_index, consumed_at))
+        return false;
+
+      std::vector<Id> active = Core::loadSortedActiveValidators(access);
+      if (active.size() < reg.active_validator_min)
+        return false;
+
+      const size_t threshold = Core::bftQuorum(active.size());
+
+      std::vector<uint8_t> message;
+      message.reserve(fixed);
+
+      for (int i = 0; i < 8; ++i)
+        message.push_back(uint8_t(source_chain_id >> (i * 8)));
+
+      message.insert(message.end(),
+                     tx.payload.begin() + 8,
+                     tx.payload.begin() + 8 + 32);
+
+      for (int i = 0; i < 4; ++i)
+        message.push_back(tx.payload[8 + 32 + i]);
+
+      message.insert(message.end(),
+                     tx.payload.begin() + 8 + 32 + 4,
+                     tx.payload.begin() + 8 + 32 + 4 + 32);
+
+      for (int i = 0; i < 8; ++i)
+        message.push_back(tx.payload[8 + 32 + 4 + 32 + i]);
+
+      const size_t sig_off = fixed;
+      const uint8_t *sigs = tx.payload.data() + sig_off;
+      const size_t sig_len = tx.payload.size() - sig_off;
+
+      std::vector<Core::BridgeSignatureEntry> sigs_parsed;
+      if (!Core::parseBridgeSignatureBlock(sigs, sig_len, sigs_parsed))
+        return false;
+      if (sigs_parsed.size() < threshold)
+        return false;
+
+      std::vector<bool> seen(active.size(), false);
+      for (const auto &e : sigs_parsed)
+      {
+        if (e.signer_index >= active.size())
+          return false;
+        if (seen[e.signer_index])
+          return false;
+        seen[e.signer_index] = true;
+      }
+
+      const Crypto::Hash hash =
+          Core::bridgeSigningHash("bmin", message.data(),
+                                  message.size());
+
+      for (const auto &e : sigs_parsed)
+      {
+        auto pk = access.validatorKeyAtHeight(
+            active[e.signer_index], access.version());
+        if (!pk.has_value())
+          return false;
+        if (!Crypto::verify(hash, *pk, e.signature))
+          return false;
+      }
+
+      return true;
+    }
+
+    case Core::TxType::BridgeAttest:
+    case Core::TxType::BridgeAckAttest:
+    {
+      //  Single-validator attestations. The structural shape is
+      //  already enforced by validateBridgePayloadShape; the check
+      //  here is a single signature against the validator's
+      //  consensus key at the current tip. A single failed
+      //  attestation is not a stall (the block is rebuilt without
+      //  it), so this returns true and lets the executor's own
+      //  check reject an invalid attestation at apply time. The
+      //  proposer's drop-and-retry loop cleans it up.
+      return true;
+    }
+
+    default:
+      return false;
+    }
   }
 
   Core::MempoolAddResult Node::submitTransaction(const Core::Transaction &tx,
@@ -1821,11 +2108,6 @@ namespace Node
 
     resp.state_root = *root;
 
-    //  CHANGED: StateAccess::proveAtVersion now returns a typed
-    //  ProofResult instead of an optional<SmtProof>. The status
-    //  distinguishes Ok from VersionUnavailable (window miss) and
-    //  KeyNotFound (the version has a root, but the walk could not
-    //  produce a proof for the key — pruned or inconsistent DB).
     auto result = state->proveAtVersion(*key, resolved_version);
 
     switch (result.status)

@@ -1016,58 +1016,19 @@ namespace Wallet
     return res.result;
   }
 
-  std::optional<Common::Json> getActiveWatchers(
-      RpcClient &rpc,
-      uint64_t source_chain_id,
-      uint64_t height,
-      std::string *error_out)
-  {
-    Common::Json params = Common::Json::object();
-    params["source_chain_id"] = encodeU64Hex(source_chain_id);
-    params["height"] = encodeU64Hex(height);
+  //  getActiveWatchers(...) — DELETED.
+  //
+  //  The underlying RPC method is gone. Under the validator-is-
+  //  watcher model the operational signer set for every source
+  //  chain is the active validator set, read with getActiveSet
+  //  below. There is no per-chain watcher set to enumerate.
 
-    auto res = rpc.call("getActiveWatchers", params);
-    if (!res.ok())
-    {
-      if (error_out)
-        *error_out = res.error.has_value() ? res.error->message
-                                           : "RPC call failed";
-      return std::nullopt;
-    }
-
-    return res.result;
-  }
-
-  std::optional<Common::Json> getBridgeWatcherIdByAddress(
-      RpcClient &rpc,
-      const std::string &address_bech32m,
-      bool *is_not_found,
-      std::string *error_out)
-  {
-    if (is_not_found)
-      *is_not_found = false;
-
-    Common::Json params = Common::Json::object();
-    params["address"] = address_bech32m;
-
-    auto res = rpc.call("getBridgeWatcherIdByAddress", params);
-    if (!res.ok())
-    {
-      //  BridgeWatcherNotFound = 1063.
-      if (is_not_found && res.error.has_value() &&
-          res.error->code == 1063)
-      {
-        *is_not_found = true;
-        return std::nullopt;
-      }
-      if (error_out)
-        *error_out = res.error.has_value() ? res.error->message
-                                           : "RPC call failed";
-      return std::nullopt;
-    }
-
-    return res.result;
-  }
+  //  getBridgeWatcherIdByAddress(...) — DELETED.
+  //
+  //  The underlying RPC method is gone. Under the validator-is-
+  //  watcher model the daemon's identity is its validator id,
+  //  resolved with getValidatorByAddress above. There is no
+  //  per-chain watcher id to resolve.
 
   std::optional<uint64_t> getBridgeConsumed(
       RpcClient &rpc,
@@ -1227,5 +1188,31 @@ namespace Wallet
       return std::nullopt;
     }
     return res.result;
+  }
+
+  std::optional<Common::Json> getActiveSet(
+      RpcClient &rpc,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+
+    auto result = rpc.call("getActiveSet", params);
+    if (!result.ok())
+    {
+      if (error_out)
+        *error_out = result.error->message;
+      return std::nullopt;
+    }
+
+    if (!result.result.is_object() ||
+        !result.result.contains("ids") ||
+        !result.result["ids"].is_array())
+    {
+      if (error_out)
+        *error_out = "getActiveSet: response missing 'ids' array";
+      return std::nullopt;
+    }
+
+    return result.result;
   }
 } // namespace Wallet

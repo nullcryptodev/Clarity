@@ -15,7 +15,7 @@
 #include "GlobalState.h"
 #include "RewardTypes.h"
 #include "KeyRotation.h"
-#include "BridgeWatcherTypes.h"
+#include "Bridge/Bitcoin.h"
 
 #include "State/Keys.h"
 #include "State/StateAccess.h"
@@ -32,23 +32,13 @@ namespace Core
 
   namespace
   {
-    //  Integer square root. Returns floor(sqrt(n)).
-    //
-    //  Binary search over [0, 2^64). The result of sqrt(n) for
-    //  n < 2^128 always fits in 64 bits, so the search is bounded.
-    //
-    //  Used to compute a pool's initial LP supply from the initial
-    //  reserves: for a first deposit of amount_a and amount_b, the
-    //  minted liquidity is floor(sqrt(amount_a * amount_b)). This is
-    //  the Uniswap V2 convention and gives the first LP a share
-    //  proportional to the geometric mean of the two deposits.
     uint64_t isqrt128(__uint128_t n)
     {
       if (n == 0)
         return 0;
 
       __uint128_t lo = 0;
-      __uint128_t hi = (__uint128_t(1) << 64); // exclusive upper bound
+      __uint128_t hi = (__uint128_t(1) << 64);
 
       while (hi - lo > 1)
       {
@@ -62,10 +52,6 @@ namespace Core
       return static_cast<uint64_t>(lo);
     }
 
-    //  Read a uint64 from a global state entry via the SMT.
-    //  Duplicated from BlockProcessor's anonymous namespace —
-    //  small enough that sharing it via a header would be more
-    //  code than the copy.
     uint64_t readU64GlobalInternal(State::StateAccess &state,
                                    const char *name)
     {
@@ -87,17 +73,6 @@ namespace Core
       state.putGlobal(name, bytes);
     }
 
-    //  ---- Bridge helpers ----
-    //
-    //  Read a 2-byte LE count followed by `count` 66-byte entries
-    //  ([2] signer_index LE || [64] signature). The whole block must
-    //  be exactly 2 + count * 66 bytes. On any malformation, return
-    //  false and leave `out` empty.
-    //
-    //  The parser is separate from the verifier so that a caller
-    //  that wants only structural validation (e.g. mempool admission
-    //  for a BridgeMint before checking signatures) can call it
-    //  without doing any crypto.
     struct BridgeSignatureEntry
     {
       uint16_t signer_index{0};
@@ -114,9 +89,6 @@ namespace Core
       const uint16_t count =
           uint16_t(data[0]) | (uint16_t(data[1]) << 8);
 
-      //  Bound the allocation before computing size * 66.
-      //  BRIDGE_MAX_WATCHERS is 100, so a count above that is
-      //  rejected without allocation.
       if (count > BRIDGE_MAX_WATCHERS)
         return false;
 
@@ -137,31 +109,82 @@ namespace Core
       return true;
     }
 
-    //  Build the domain-separated signing message:
-    //
-    //    Blake2b(domain4 || message)
-    //
-    //  The 4-byte domain tag separates bridge operations from each
-    //  other (and from the rest of the chain's hashing), which is
-    //  what prevents a signature harvested from one operation from
-    //  being replayed in another.
+    bool adoptOrCreateWrappedTokenImpl(
+        State::StateAccess &state,
+        Core::BridgeChainRegistration &reg)
+    {
+      Core::TokenInfo existing;
+      const bool have_existing = state.getToken(reg.wrapped_token_id, existing);
+
+      if (have_existing)
+      {
+        if (!existing.isBridged())
+          return false;
+        if (!existing.fingerprint.has_value() ||
+            *existing.fingerprint != reg.fingerprint)
+          return false;
+        if (existing.backing != Core::BackingModel::Backed)
+          return false;
+        if (!existing.creator.isNull())
+          return false;
+        if (existing.decimals != reg.clarity_decimals)
+        {
+          //  Decimals mismatch: an existing token has the right
+          //  fingerprint but the wrong decimal count. This happens
+          //  when a chain's clarity_decimals constant is changed
+          //  after the token has already been created. Refusing to
+          //  adopt it is the safe behaviour: the operator must
+          //  either accept the old token's decimals or wipe and
+          //  re-register.
+          return false;
+        }
+
+        return true;
+      }
+
+      if (reg.source_chain_id != Core::BitcoinBridge::BTC_CHAIN_ID)
+        return false;
+
+      const uint64_t alloc_id = reg.wrapped_token_id;
+
+      Core::TokenInfo token;
+      token.id = static_cast<Id>(alloc_id);
+      token.name = std::string(Core::BitcoinBridge::BTC_WRAPPED_NAME);
+      token.symbol = std::string(Core::BitcoinBridge::BTC_WRAPPED_SYMBOL);
+      token.decimals = Core::BitcoinBridge::BTC_WRAPPED_DECIMALS;
+      token.creator = Crypto::Address{};
+      token.backing = Core::BackingModel::Backed;
+      token.maxSupply = 0;
+      token.royaltyBps = 0;
+      token.fingerprint = reg.fingerprint;
+
+      if (!token.isValid())
+        return false;
+
+      state.putToken(token);
+      state.putTokenSupply(token.id, 0);
+
+      uint64_t current_next = readU64GlobalInternal(state, "next_token_id");
+      if (current_next == 0)
+        current_next = 1;
+      const uint64_t new_next = std::max(current_next, alloc_id + 1);
+      writeU64GlobalInternal(state, "next_token_id", new_next);
+
+      return true;
+    }
+
     Crypto::Hash bridgeSigningHash(std::string_view domain,
                                    const uint8_t *message, size_t message_len)
     {
       return Crypto::hashDomain(domain.data(), message, message_len);
     }
 
-    //  Encode the canonical message that a mint attestation covers.
-    //
-    //    LE64(source_chain_id) || source_tx_hash(32) ||
-    //    LE32(source_output_index) || destination(32) ||
-    //    LE64(amount)
     std::vector<uint8_t> encodeBridgeMintMessage(
-        uint64_t source_chain_id,           // 8 bytes LE
-        const Crypto::Hash &source_tx_hash, // 32 bytes
-        uint32_t source_output_index,       // 4 bytes LE
-        const Crypto::Address &destination, // 32 bytes
-        uint64_t amount)                    // 8 bytes LE
+        uint64_t source_chain_id,
+        const Crypto::Hash &source_tx_hash,
+        uint32_t source_output_index,
+        const Crypto::Address &destination,
+        uint64_t amount)
     {
       std::vector<uint8_t> out;
       out.reserve(8 + 32 + 4 + 32 + 8);
@@ -178,14 +201,6 @@ namespace Core
       return out;
     }
 
-    //  Encode the canonical message that a withdrawal-ack
-    //  attestation covers:
-    //
-    //    LE64(withdrawal_id)
-    //
-    //  The domain tag is "back", applied by bridgeSigningHash.
-    //  Kept in lockstep with Bridge::Signing::EncodeBridgeAckMessage
-    //  on the client side.
     std::vector<uint8_t> encodeBridgeAckMessage(uint64_t withdrawal_id)
     {
       std::vector<uint8_t> out;
@@ -195,16 +210,6 @@ namespace Core
       return out;
     }
 
-    //  Read or initialize the bridge stats row for a chain and
-    //  apply a delta. Centralized so every handler updates the
-    //  same fields the same way, and so a missing row is
-    //  initialized on first touch.
-    //
-    //  The caller passes the incremental change; this function
-    //  reads-modifies-writes in one step. Not reentrant: the
-    //  handlers never call this twice for the same chain in one
-    //  transaction, because each transaction touches exactly one
-    //  chain.
     void bumpBridgeStats(State::StateAccess &state,
                          uint64_t source_chain_id,
                          uint64_t current_height,
@@ -245,9 +250,6 @@ namespace Core
       state.putBridgeStats(stats);
     }
 
-    //  Read a 2-byte LE count from a payload at `off`, and advance
-    //  `off` past it. Returns 0 and does NOT advance on truncation
-    //  (caller must check `off <= payload.size()` afterwards).
     uint16_t readU16At(const std::vector<uint8_t> &p, size_t &off)
     {
       if (off + 2 > p.size())
@@ -257,8 +259,6 @@ namespace Core
       return v;
     }
 
-    //  Debit an account's balance of a token (native or custom).
-    //  Returns false if the balance is insufficient.
     bool debitToken(State::StateAccess &state,
                     const Crypto::Address &addr,
                     Id token_id, uint64_t amount)
@@ -280,7 +280,6 @@ namespace Core
       return true;
     }
 
-    //  Credit an account's balance of a token (native or custom).
     void creditToken(State::StateAccess &state,
                      const Crypto::Address &addr,
                      Id token_id, uint64_t amount)
@@ -300,8 +299,6 @@ namespace Core
       state.putTokenBalance(addr, token_id, bal + amount);
     }
 
-    //  Read an id from a payload at a byte offset, LE. No bounds
-    //  check — callers are expected to have validated size first.
     uint32_t readU32At(const std::vector<uint8_t> &p, size_t off)
     {
       return uint32_t(p[off]) | (uint32_t(p[off + 1]) << 8) |
@@ -316,10 +313,6 @@ namespace Core
       return v;
     }
 
-    //  Record a bridge event. Called once per successful operation,
-    //  after the operation's state changes are in place. The table
-    //  is non-SMT, so this is safe on both the dry-run and apply
-    //  paths; the dry-run path aborts and discards it.
     void recordBridgeEvent(State::StateAccess &state,
                            Core::BridgeEventKind kind,
                            uint64_t source_chain_id,
@@ -350,6 +343,67 @@ namespace Core
       evt.has_tx_hash = true;
       state.putBridgeEvent(evt);
     }
+
+    //  Shared body of verifyAttestationSignatures and
+    //  verifyGovernanceSignatures. Resolves the active validator
+    //  set, parses the signature block, and verifies every entry
+    //  against the corresponding validator's consensus key at
+    //  ctx.current_height.
+    //
+    //  Returns false on any failure (empty set, below quorum, bad
+    //  parse, bad index, unknown key, bad signature).
+    bool verifyActiveValidatorSignatures(
+        State::StateAccess &state,
+        std::string_view domain,
+        const uint8_t *message, size_t message_len,
+        const uint8_t *signatures, size_t signatures_len,
+        const TxExecutionContext &ctx)
+    {
+      if (domain.size() != 4)
+        return false;
+
+      std::vector<Id> active = TransactionExecutor::loadActiveSet(state);
+      std::sort(active.begin(), active.end());
+
+      if (active.empty())
+        return false;
+
+      const size_t threshold = Core::bftQuorum(active.size());
+
+      std::vector<BridgeSignatureEntry> sigs;
+      if (!parseBridgeSignatureBlock(signatures, signatures_len, sigs))
+        return false;
+
+      if (sigs.size() < threshold)
+        return false;
+
+      std::vector<bool> seen(active.size(), false);
+      for (const auto &e : sigs)
+      {
+        if (e.signer_index >= active.size())
+          return false;
+        if (seen[e.signer_index])
+          return false;
+        seen[e.signer_index] = true;
+      }
+
+      const Crypto::Hash hash =
+          bridgeSigningHash(domain, message, message_len);
+
+      for (const auto &e : sigs)
+      {
+        const Id validator_id = active[e.signer_index];
+
+        auto pk = state.validatorKeyAtHeight(validator_id, ctx.current_height);
+        if (!pk.has_value())
+          return false;
+
+        if (!Crypto::verify(hash, *pk, e.signature))
+          return false;
+      }
+
+      return true;
+    }
   } // anonymous namespace
 
   //  Dispatch
@@ -360,44 +414,24 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    // ---- Structural validation ----
     if (!tx.isWellFormed())
-    {
       return failure;
-    }
 
-    // ---- Chain ID ----
     if (tx.chain_id != ctx.chain_id)
-    {
       return failure;
-    }
 
-    // ---- Expiry ----
     if (!checkExpiry(tx, ctx))
-    {
       return failure;
-    }
 
-    // ---- Signature ----
     if (!verifySignature(tx))
-    {
       return failure;
-    }
 
-    // ---- Nonce ----
     if (!verifyNonce(state, tx))
-    {
       return failure;
-    }
 
-    // ---- Fee charge ----
-    // Charge fee before dispatch. If the sender can't pay, fail.
     if (!chargeFee(state, tx))
-    {
       return failure;
-    }
 
-    // ---- Dispatch by type ----
     Receipt receipt{ReceiptStatus::Failure, tx.fee};
 
     switch (tx.tx_type)
@@ -543,19 +577,16 @@ namespace Core
       break;
 
     case TxType::RegisterBridgeWatcher:
-      receipt = executeRegisterBridgeWatcher(state, tx, ctx);
-      break;
-
     case TxType::UnregisterBridgeWatcher:
-      receipt = executeUnregisterBridgeWatcher(state, tx, ctx);
-      break;
+      //  Reserved types. Rejected by dispatch. There is no handler:
+      //  a validator is a bridge watcher, so there is nothing to
+      //  register or unregister separately.
+      return failure;
 
     default:
-      // Unhandled type — fail.
       return failure;
     }
 
-    // ---- Nonce bump on success ----
     if (receipt.status == ReceiptStatus::Success)
     {
       bumpNonce(state, tx);
@@ -796,10 +827,6 @@ namespace Core
     state.putValidator(validator);
     state.putValidatorByAddress(validator.reward_address, validator.id);
 
-    //  Initialize the key history with a single entry covering
-    //  from registration onward. The initial signing key is
-    //  whatever the record carries, which for a fresh
-    //  registration is the payload key.
     {
       std::vector<Core::KeyRotation> history;
       Core::KeyRotation entry;
@@ -941,28 +968,15 @@ namespace Core
     if (!state.getValidator(validator_id, validator))
       return failure;
 
-    //  Only the owner can rotate. In current deployments the owner
-    //  and reward_address are the same; the check is written
-    //  against owner so the invariant survives a future split.
     if (validator.owner != tx.from)
       return failure;
 
-    //  A no-op rotation is a user error. effectiveConsensusKey()
-    //  returns the current signing key whether it's the explicit
-    //  consensus_key or the reward_address fallback.
     if (validator.effectiveConsensusKey() == new_key)
       return failure;
 
-    //  A departing validator should not extend its signing window.
     if (validator.pending_unbond_height != 0)
       return failure;
 
-    //  Load the current history. If it doesn't exist (a validator
-    //  registered before the feature existed, or a record whose
-    //  history was never written), synthesize a single-entry
-    //  history covering from registration onward using the
-    //  record's current key. This migration path keeps every
-    //  pre-feature validator working through the first rotation.
     std::vector<Core::KeyRotation> history;
     if (!state.getValidatorKeyHistory(validator_id, history) ||
         history.empty())
@@ -975,10 +989,8 @@ namespace Core
       history.push_back(initial);
     }
 
-    //  Seal the previous last entry at the rotation height.
     history.back().valid_until_height = ctx.current_height;
 
-    //  Append the new entry.
     Core::KeyRotation entry;
     entry.key = new_key;
     entry.valid_from_height = ctx.current_height;
@@ -987,7 +999,6 @@ namespace Core
 
     state.putValidatorKeyHistory(validator_id, history);
 
-    //  Update the record's cached key.
     validator.consensus_key = new_key;
     state.putValidator(validator);
 
@@ -1129,10 +1140,6 @@ namespace Core
     if (!state.getToken(tx.token_id, token))
       return failure;
 
-    //  Bridged tokens are not user-burnable. The only way to
-    //  destroy a bridged token is BridgeBurn, which produces a
-    //  withdrawal record; a user BurnToken would decrement supply
-    //  without producing one, destroying value with no release.
     if (token.isBridged())
       return failure;
 
@@ -1240,18 +1247,6 @@ namespace Core
     if (fee_bps > AMM_MAX_FEE_BPS)
       return failure;
 
-    //  Enforce the pool-creation floor, but only on the CLRTY side.
-    //
-    //  MIN_POOL_LIQUIDITY is denominated in atomic units of the
-    //  native token. Applying it to a non-CLRTY side would mean a
-    //  token with low decimals — say, a token with decimals = 0
-    //  and max supply 100 — could never be pooled, because the
-    //  floor would exceed its entire supply.
-    //
-    //  A token/token pool has no CLRTY reference and therefore no
-    //  meaningful "1000 CLRTY equivalent" floor. Both reserves
-    //  must be positive; the exact amounts are the creator's
-    //  choice.
     if (token_a == NATIVE_TOKEN_ID &&
         amount_a < MIN_POOL_LIQUIDITY)
       return failure;
@@ -1533,9 +1528,6 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    //  Payload layout:
-    //    [8]  position_id (LE)
-    //    [8]  amount (LE)      — 0 = remove the whole position
     if (tx.payload.size() != 16)
       return failure;
 
@@ -1550,9 +1542,6 @@ namespace Core
     if (pos.liquidity == 0)
       return failure;
 
-    //  amount == 0 means "remove everything". amount > 0 must not
-    //  exceed the position's liquidity. Any value in between is a
-    //  partial removal.
     const uint64_t amount =
         (requested_amount == 0) ? pos.liquidity : requested_amount;
 
@@ -1563,22 +1552,6 @@ namespace Core
     if (!state.getAmmPool(pos.pool_id, pool))
       return failure;
 
-    //  Compute the LP's pro-rata share of both reserves.
-    //
-    //  Two issues with the naive form:
-    //
-    //    1. amount * pool.reserve_a overflows uint64_t for
-    //       realistic pool sizes. The products must be promoted
-    //       to unsigned __int128.
-    //
-    //    2. When the removal is the last of the pool's liquidity
-    //       (amount == pool.total_liquidity), rounding in the
-    //       pro-rata computation can leave dust in the reserves.
-    //       A pool with `1` unit on each side is not `isClosed()`
-    //       (which requires both reserves to be exactly zero) and
-    //       cannot be drained further. Special-case the last
-    //       removal: the LP gets everything, regardless of
-    //       rounding.
     const bool is_last_removal = (amount == pool.total_liquidity);
 
     uint64_t share_a = 0;
@@ -1604,7 +1577,6 @@ namespace Core
     pool.total_liquidity -= amount;
     state.putAmmPool(pool);
 
-    //  Credit the LP with both shares.
     if (pool.token_a == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1629,9 +1601,6 @@ namespace Core
       state.putTokenBalance(tx.from, pool.token_b, bal + share_b);
     }
 
-    //  Update the position. Partial removal decrements liquidity
-    //  and keeps the position record and index. Full removal
-    //  zeroes liquidity and drops the index entry.
     if (is_last_removal)
     {
       pos.liquidity = 0;
@@ -1642,11 +1611,8 @@ namespace Core
     {
       pos.liquidity -= amount;
       state.putAmmPosition(pos);
-      //  Position index unchanged.
     }
 
-    //  If the pool is now drained (last LP removed all their
-    //  liquidity), delete the pool record.
     if (pool.isClosed())
     {
       state.deleteAmmPool(pool.id);
@@ -1812,23 +1778,9 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    //  Structural validation. This is the same check the mempool
-    //  runs on admission, applied again here so a block built from
-    //  an unvalidated source cannot smuggle a malformed order into
-    //  state.
     if (!validateCreateOrderStructure(tx))
       return failure;
 
-    //  Re-parse the payload now that we know it is well-formed.
-    //
-    //  Layout:
-    //    [4]  buy_token (LE)
-    //    [8]  min_buy_amount (LE)
-    //    [1]  mode
-    //    [4]  pool_id (LE)
-    //    [8]  expires_at_height (LE)
-    //    [1]  condition_count
-    //    [N]  conditions (13 bytes each)
     size_t off = 0;
     uint32_t buy_token = uint32_t(tx.payload[off]) |
                          (uint32_t(tx.payload[off + 1]) << 8) |
@@ -1866,8 +1818,6 @@ namespace Core
     Id sell_token = tx.token_id;
     uint64_t sell_amount = tx.amount;
 
-    //  Allocate the order ID. The counter lives in the SMT under
-    //  "next_order_id"; the same key Genesis writes.
     std::vector<uint8_t> id_bytes;
     state.getGlobal("next_order_id", id_bytes);
 
@@ -1884,7 +1834,6 @@ namespace Core
       }
     }
 
-    //  Build the order record.
     Order order;
     order.id = next_id;
     order.owner = tx.from;
@@ -1906,8 +1855,6 @@ namespace Core
     if (!order.isValid())
       return failure;
 
-    //  Balance check. All other structural checks have already
-    //  passed in validateCreateOrderStructure.
     if (sell_token == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1921,20 +1868,6 @@ namespace Core
         return failure;
     }
 
-    //  ---- Pre-route validation for Active orders ----
-    //
-    //  An Active order with no conditions routes immediately on
-    //  creation. If the pool is missing, closed, or does not
-    //  contain the order's pair, the order can never fill and must
-    //  be rejected. This check has to happen BEFORE the sell-token
-    //  lock is taken and BEFORE the order record is written,
-    //  because a failure after those points would leave state
-    //  modified under a rejected transaction — the executor has no
-    //  rollback primitive, so "modify then fail" is a leak.
-    //
-    //  Active orders WITH conditions do not route on creation; they
-    //  wait for the epoch boundary. For them, the pool may not exist
-    //  yet, or may be created later, so we do NOT pre-validate.
     if (order.mode == OrderExecutionMode::Active &&
         order.condition_count == 0)
     {
@@ -1955,10 +1888,6 @@ namespace Core
         return failure;
     }
 
-    //  ---- All checks passed. Apply state changes. ----
-
-    //  Take the sell-token lock. Both the matcher and the router
-    //  require the lock to be in place before they run.
     if (sell_token == NATIVE_TOKEN_ID)
     {
       Account acct = state.getAccount(tx.from);
@@ -1971,11 +1900,8 @@ namespace Core
       state.putTokenBalance(tx.from, sell_token, bal - sell_amount);
     }
 
-    //  Persist the record. The matcher or the router may overwrite
-    //  or delete it.
     state.putOrder(order);
 
-    //  Execute.
     std::vector<Fill> fills;
 
     if (order.mode == OrderExecutionMode::Passive)
@@ -1984,43 +1910,20 @@ namespace Core
           state, order, ctx.current_height, ctx.tx_index_in_block);
       fills = std::move(outcome.fills);
     }
-    else // Active
+    else
     {
-      //  No conditions: route immediately against the order's pool.
-      //  The pre-route validation above guarantees the pool is
-      //  usable, so executeActiveOrder cannot return Unroutable for
-      //  a structural reason. It can still return Rested if the
-      //  pool's current price is unfavorable — that's fine, the
-      //  order rests.
-      //
-      //  With conditions: leave the order in state. The condition
-      //  evaluator, running at the next epoch boundary, will route
-      //  it if the conditions hold or cancel it if they do not.
       if (order.condition_count == 0)
       {
         const auto outcome = BlockProcessor::executeActiveOrder(
             state, order, ctx.current_height, ctx.tx_index_in_block, fills);
 
-        //  Defensive: the pre-route check should have caught any
-        //  structural reason for Unroutable, but if the state
-        //  changed between the check and here (it can't within a
-        //  single tx, but the invariant is worth asserting),
-        //  reject rather than leave a partially-applied state.
         if (outcome == ActiveRouteOutcome::Unroutable)
         {
           return failure;
         }
-
-        //  Filled: fills already contains the fill(s).
-        //  Rested: the order is in state with a remainder. The
-        //  expiry index below will pick it up if it has one.
       }
     }
 
-    //  Expiry index. Only if the order still exists after execution.
-    //  A fully filled order was deleted by the matcher or the
-    //  router, and indexing a deleted order would leave an expiry
-    //  row pointing at nothing.
     Order still_exists;
     if (state.getOrder(order.id, still_exists) &&
         expires_at_height != 0)
@@ -2028,16 +1931,12 @@ namespace Core
       state.addOrderExpiry(expires_at_height, order.id);
     }
 
-    //  Bump the next-order-id counter. The counter is advanced once
-    //  per successful CreateOrder, regardless of whether the order
-    //  rested or executed.
     uint64_t new_next = next_id + 1;
     std::vector<uint8_t> new_id_bytes(8);
     for (int i = 0; i < 8; ++i)
       new_id_bytes[i] = uint8_t(new_next >> (i * 8));
     state.putGlobal("next_order_id", new_id_bytes);
 
-    //  Receipt with fills.
     Receipt receipt{ReceiptStatus::Success, tx.fee};
     receipt.fills = std::move(fills);
     return receipt;
@@ -2085,25 +1984,13 @@ namespace Core
     return {ReceiptStatus::Success, tx.fee};
   }
 
-  //  Create NFT Collection
+  //  ---- NFT handlers (identical to the current version) ----
 
   Receipt TransactionExecutor::executeCreateNftCollection(
-      State::StateAccess &state,
-      const Transaction &tx,
+      State::StateAccess &state, const Transaction &tx,
       const TxExecutionContext &ctx)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
-
-    //  Payload layout:
-    //    [1]  name_len
-    //    [N]  name
-    //    [1]  symbol_len
-    //    [M]  symbol
-    //    [2]  uri_len (LE)
-    //    [K]  base_uri
-    //    [4]  reward_token_id (LE)   — 0 = no schedule
-    //    [8]  reward_rate_per_epoch  — 0 if no schedule
-    //    [8]  reward_escrow_amount   — funded from tx.from
     if (tx.payload.size() < 1)
       return failure;
 
@@ -2111,8 +1998,7 @@ namespace Core
     const uint8_t name_len = tx.payload[off++];
     if (off + name_len > tx.payload.size())
       return failure;
-    std::string name(reinterpret_cast<const char *>(tx.payload.data() + off),
-                     name_len);
+    std::string name(reinterpret_cast<const char *>(tx.payload.data() + off), name_len);
     off += name_len;
 
     if (off + 1 > tx.payload.size())
@@ -2120,8 +2006,7 @@ namespace Core
     const uint8_t sym_len = tx.payload[off++];
     if (off + sym_len > tx.payload.size())
       return failure;
-    std::string symbol(reinterpret_cast<const char *>(tx.payload.data() + off),
-                       sym_len);
+    std::string symbol(reinterpret_cast<const char *>(tx.payload.data() + off), sym_len);
     off += sym_len;
 
     if (off + 2 > tx.payload.size())
@@ -2131,8 +2016,7 @@ namespace Core
     off += 2;
     if (off + uri_len > tx.payload.size())
       return failure;
-    std::string base_uri(
-        reinterpret_cast<const char *>(tx.payload.data() + off), uri_len);
+    std::string base_uri(reinterpret_cast<const char *>(tx.payload.data() + off), uri_len);
     off += uri_len;
 
     if (off + 4 + 8 + 8 > tx.payload.size())
@@ -2144,7 +2028,6 @@ namespace Core
     const uint64_t reward_escrow_amount = readU64At(tx.payload, off);
     off += 8;
 
-    //  Allocate the collection id from the SMT global.
     uint64_t next_id = readU64GlobalInternal(state, "next_collection_id");
     if (next_id == 0)
       next_id = 1;
@@ -2162,43 +2045,26 @@ namespace Core
     if (!c.isValid())
       return failure;
 
-    //  Fund the reward escrow from tx.from. The escrow is a
-    //  balance at Keys::nftCollectionAddress(id). Debit tx.from
-    //  and credit the escrow address in one atomic pair — if
-    //  either fails, the tx fails and neither write persists.
     if (reward_escrow_amount > 0)
     {
       if (!debitToken(state, tx.from, reward_token_id, reward_escrow_amount))
         return failure;
-
       creditToken(state, State::Keys::nftCollectionAddress(c.id),
                   reward_token_id, reward_escrow_amount);
       c.reward_escrow_remaining = reward_escrow_amount;
     }
 
     state.putNftCollection(c);
-
-    //  Bump the id counter.
     writeU64GlobalInternal(state, "next_collection_id", c.id + 1);
 
     return {ReceiptStatus::Success, tx.fee};
   }
 
-  //  Mint NFT (standalone)
-
   Receipt TransactionExecutor::executeMintNft(
-      State::StateAccess &state,
-      const Transaction &tx,
+      State::StateAccess &state, const Transaction &tx,
       const TxExecutionContext &ctx)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
-
-    //  Payload layout:
-    //    [8]  collection_id (LE)    — 0 = no collection
-    //    [32] metadata_hash
-    //    [1]  has_hash (0 or 1)
-    //    [2]  uri_len (LE)
-    //    [N]  uri
     if (tx.payload.size() < 8 + 32 + 1 + 2)
       return failure;
 
@@ -2223,14 +2089,12 @@ namespace Core
     off += 2;
     if (off + uri_len > tx.payload.size())
       return failure;
-    std::string uri(reinterpret_cast<const char *>(tx.payload.data() + off),
-                    uri_len);
+    std::string uri(reinterpret_cast<const char *>(tx.payload.data() + off), uri_len);
     off += uri_len;
 
     if (uri.size() > NFT_URI_MAX)
       return failure;
 
-    //  Collection validation, if requested.
     Core::NftCollection collection;
     if (collection_id != 0)
     {
@@ -2238,18 +2102,11 @@ namespace Core
         return failure;
     }
 
-    //  Allocate the NFT id from the shared token counter. The
-    //  shadow token's id equals the NFT's id by construction, so
-    //  there is no separate next_nft_id global and no collision
-    //  class between user tokens and NFT shadows.
     uint64_t next_token_id = readU64GlobalInternal(state, "next_token_id");
     if (next_token_id == 0)
       next_token_id = 1;
     const uint64_t next_nft_id = next_token_id;
 
-    //  The shadow token. maxSupply = 1, decimals = 0. name and
-    //  symbol come from the collection if present, otherwise a
-    //  per-NFT default. The creator is tx.from.
     Core::TokenInfo shadow;
     shadow.id = static_cast<Id>(next_nft_id);
     shadow.decimals = 0;
@@ -2271,13 +2128,10 @@ namespace Core
     if (!shadow.isValid())
       return failure;
 
-    //  Mint the shadow token to tx.from. putToken records the
-    //  metadata; putTokenBalance gives the creator the balance of 1.
     state.putToken(shadow);
     state.putTokenSupply(shadow.id, 1);
     state.putTokenBalance(tx.from, shadow.id, 1);
 
-    //  Build and persist the NftInfo.
     Core::NftInfo nft;
     nft.id = next_nft_id;
     nft.owner = tx.from;
@@ -2296,7 +2150,6 @@ namespace Core
 
     state.putNft(nft);
 
-    //  Collection bookkeeping.
     if (collection_id != 0)
     {
       collection.minted_count += 1;
@@ -2308,23 +2161,11 @@ namespace Core
     return {ReceiptStatus::Success, tx.fee};
   }
 
-  //  Wrap NFT
-
   Receipt TransactionExecutor::executeWrapNft(
-      State::StateAccess &state,
-      const Transaction &tx,
+      State::StateAccess &state, const Transaction &tx,
       const TxExecutionContext &ctx)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
-
-    //  Payload layout:
-    //    [4]  underlying_token_id (LE)
-    //    [8]  wrapped_amount (LE)
-    //    [8]  collection_id (LE)    — 0 = no collection
-    //    [32] metadata_hash
-    //    [1]  has_hash
-    //    [2]  uri_len
-    //    [N]  uri
     if (tx.payload.size() < 4 + 8 + 8 + 32 + 1 + 2)
       return failure;
 
@@ -2353,8 +2194,7 @@ namespace Core
     off += 2;
     if (off + uri_len > tx.payload.size())
       return failure;
-    std::string uri(reinterpret_cast<const char *>(tx.payload.data() + off),
-                    uri_len);
+    std::string uri(reinterpret_cast<const char *>(tx.payload.data() + off), uri_len);
 
     if (underlying_token_id == 0)
       return failure;
@@ -2363,7 +2203,6 @@ namespace Core
     if (uri.size() > NFT_URI_MAX)
       return failure;
 
-    //  Collection validation.
     Core::NftCollection collection;
     if (collection_id != 0)
     {
@@ -2371,18 +2210,14 @@ namespace Core
         return failure;
     }
 
-    //  Allocate the NFT id from the shared token counter. The
-    //  shadow token's id equals the NFT's id by construction.
     uint64_t next_token_id = readU64GlobalInternal(state, "next_token_id");
     if (next_token_id == 0)
       next_token_id = 1;
     const uint64_t next_nft_id = next_token_id;
 
-    //  Underlying cannot be the NFT's own shadow token.
     if (underlying_token_id == next_nft_id)
       return failure;
 
-    //  Build the shadow token.
     Core::TokenInfo shadow;
     shadow.id = static_cast<Id>(next_nft_id);
     shadow.decimals = 0;
@@ -2404,21 +2239,16 @@ namespace Core
     if (!shadow.isValid())
       return failure;
 
-    //  Take custody of the underlying. Debit tx.from, credit the
-    //  NFT's virtual address. Both happen in this transaction or
-    //  neither does.
     if (!debitToken(state, tx.from, underlying_token_id, wrapped_amount))
       return failure;
 
     const Crypto::Address custody = State::Keys::nftAddress(next_nft_id);
     creditToken(state, custody, underlying_token_id, wrapped_amount);
 
-    //  Mint the shadow token.
     state.putToken(shadow);
     state.putTokenSupply(shadow.id, 1);
     state.putTokenBalance(tx.from, shadow.id, 1);
 
-    //  Build and persist the NftInfo.
     Core::NftInfo nft;
     nft.id = next_nft_id;
     nft.owner = tx.from;
@@ -2448,18 +2278,11 @@ namespace Core
     return {ReceiptStatus::Success, tx.fee};
   }
 
-  //  Transfer NFT
-
   Receipt TransactionExecutor::executeTransferNft(
-      State::StateAccess &state,
-      const Transaction &tx,
+      State::StateAccess &state, const Transaction &tx,
       const TxExecutionContext &ctx)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
-
-    //  Payload layout:
-    //    [8]  nft_id (LE)
-    //    [32] new_owner
     if (tx.payload.size() != 8 + 32)
       return failure;
 
@@ -2478,11 +2301,8 @@ namespace Core
       return failure;
 
     if (nft.owner == new_owner)
-      return failure; // no-op transfer
+      return failure;
 
-    //  Settle accrued rewards to the current owner before the
-    //  transfer. The NFT's last_accrual_height is reset so the
-    //  buyer starts accruing from this height.
     if (nft.collection_id != 0)
     {
       Core::NftCollection collection;
@@ -2492,7 +2312,6 @@ namespace Core
         const uint64_t accrued =
             (ctx.current_height - nft.last_accrual_height) /
             ROTATION_INTERVAL * collection.reward_rate_per_epoch;
-
         if (accrued > 0)
         {
           Core::Account acct = state.getAccount(nft.owner);
@@ -2502,52 +2321,33 @@ namespace Core
       }
     }
 
-    //  Move the shadow token balance from the seller to the buyer.
-    //  This is a normal token transfer under the shadow token's id.
     const uint64_t shadow_balance =
         state.getTokenBalance(nft.owner, nft.shadow_token_id);
     if (shadow_balance < 1)
-      return failure; // invariant violation
+      return failure;
 
-    state.putTokenBalance(nft.owner, nft.shadow_token_id,
-                          shadow_balance - 1);
+    state.putTokenBalance(nft.owner, nft.shadow_token_id, shadow_balance - 1);
 
     const uint64_t buyer_balance =
         state.getTokenBalance(new_owner, nft.shadow_token_id);
-    state.putTokenBalance(new_owner, nft.shadow_token_id,
-                          buyer_balance + 1);
+    state.putTokenBalance(new_owner, nft.shadow_token_id, buyer_balance + 1);
 
-    //  Unindex the old owner's row before rewriting the record.
-    //  putNft no longer does this itself: a read inside a write
-    //  path interleaves with the SMT's pending-update state, which
-    //  is what caused the reward-pass update in a subsequent txn
-    //  to be lost. The read here is safe because it's the same
-    //  record we just read at the top of the handler, and we're
-    //  passing it as data, not re-reading through the SMT.
     state.unindexNft(nft);
 
-    //  Update the NftInfo. Owner changes; custody stays at the
-    //  NFT's virtual address (the custody is a property of the
-    //  NFT, not of the owner). Wrapped_amount unchanged. Metadata
-    //  unchanged.
     nft.owner = new_owner;
     nft.last_accrual_height = ctx.current_height;
-    nft.accrued_owed = 0; // settled above
+    nft.accrued_owed = 0;
 
     state.putNft(nft);
 
     return {ReceiptStatus::Success, tx.fee};
   }
 
-  //  Burn NFT
-
   Receipt TransactionExecutor::executeBurnNft(
-      State::StateAccess &state,
-      const Transaction &tx,
+      State::StateAccess &state, const Transaction &tx,
       const TxExecutionContext &ctx)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
-
     if (tx.payload.size() != 8)
       return failure;
 
@@ -2560,8 +2360,6 @@ namespace Core
     if (nft.owner != tx.from)
       return failure;
 
-    //  Settle accrued rewards to the owner before burning, same
-    //  as a transfer.
     if (nft.collection_id != 0)
     {
       Core::NftCollection collection;
@@ -2571,7 +2369,6 @@ namespace Core
         const uint64_t accrued =
             (ctx.current_height - nft.last_accrual_height) /
             ROTATION_INTERVAL * collection.reward_rate_per_epoch;
-
         if (accrued > 0)
         {
           Core::Account acct = state.getAccount(nft.owner);
@@ -2581,36 +2378,26 @@ namespace Core
       }
     }
 
-    //  Burn the shadow token from the owner's balance.
     const uint64_t shadow_balance =
         state.getTokenBalance(nft.owner, nft.shadow_token_id);
     if (shadow_balance < 1)
       return failure;
 
-    state.putTokenBalance(nft.owner, nft.shadow_token_id,
-                          shadow_balance - 1);
+    state.putTokenBalance(nft.owner, nft.shadow_token_id, shadow_balance - 1);
     state.putTokenSupply(nft.shadow_token_id, 0);
 
-    //  For a wrapped NFT, release the custody back to the owner.
-    //  For a standalone NFT, there is no custody to release.
     if (nft.isWrapped() && nft.wrapped_amount > 0)
     {
       const Crypto::Address custody = State::Keys::nftAddress(nft_id);
-      if (!debitToken(state, custody, nft.underlying_token_id,
-                      nft.wrapped_amount))
+      if (!debitToken(state, custody, nft.underlying_token_id, nft.wrapped_amount))
       {
-        return failure; // invariant violation: custody is missing
+        return failure;
       }
-
-      creditToken(state, nft.owner, nft.underlying_token_id,
-                  nft.wrapped_amount);
+      creditToken(state, nft.owner, nft.underlying_token_id, nft.wrapped_amount);
     }
 
-    //  Delete the NFT record and its indexes.
     state.deleteNft(nft_id);
 
-    //  Collection bookkeeping. A burn reduces minted_count, so the
-    //  reward schedule sizes its per-epoch obligation correctly.
     if (nft.collection_id != 0)
     {
       Core::NftCollection collection;
@@ -2625,22 +2412,11 @@ namespace Core
     return {ReceiptStatus::Success, tx.fee};
   }
 
-  //  Update NFT Metadata
-
   Receipt TransactionExecutor::executeUpdateNftMetadata(
-      State::StateAccess &state,
-      const Transaction &tx,
+      State::StateAccess &state, const Transaction &tx,
       const TxExecutionContext & /*ctx*/)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
-
-    //  Payload layout:
-    //    [8]  nft_id (LE)
-    //    [32] metadata_hash
-    //    [1]  has_hash
-    //    [2]  uri_len
-    //    [N]  uri
-    //    [1]  freeze (0 or 1)
     if (tx.payload.size() < 8 + 32 + 1 + 2)
       return failure;
 
@@ -2664,8 +2440,7 @@ namespace Core
     if (off + uri_len + 1 > tx.payload.size())
       return failure;
 
-    std::string new_uri(
-        reinterpret_cast<const char *>(tx.payload.data() + off), uri_len);
+    std::string new_uri(reinterpret_cast<const char *>(tx.payload.data() + off), uri_len);
     off += uri_len;
 
     const uint8_t freeze = tx.payload[off];
@@ -2697,19 +2472,11 @@ namespace Core
     return {ReceiptStatus::Success, tx.fee};
   }
 
-  //  Top Up NFT
-
   Receipt TransactionExecutor::executeTopUpNft(
-      State::StateAccess &state,
-      const Transaction &tx,
+      State::StateAccess &state, const Transaction &tx,
       const TxExecutionContext & /*ctx*/)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
-
-    //  Payload layout:
-    //    [8]  nft_id (LE)
-    //    [4]  token_id (LE)
-    //    [8]  amount (LE)
     if (tx.payload.size() != 8 + 4 + 8)
       return failure;
 
@@ -2724,10 +2491,6 @@ namespace Core
     if (!state.getNft(nft_id, nft))
       return failure;
 
-    //  For a wrapped NFT, the top-up must be the underlying token.
-    //  For a standalone NFT, any token is accepted — the gift is
-    //  real custody, and a holder who later wraps the NFT to that
-    //  token will find the balance already there.
     if (nft.isWrapped() && token_id != nft.underlying_token_id)
       return failure;
 
@@ -2737,11 +2500,6 @@ namespace Core
     const Crypto::Address custody = State::Keys::nftAddress(nft_id);
     creditToken(state, custody, token_id, amount);
 
-    //  Update the NFT's recorded wrapped amount only when the
-    //  top-up matches the NFT's underlying. A standalone NFT
-    //  receiving a gift of an arbitrary token doesn't change its
-    //  wrapped_amount, because wrapped_amount is meaningful only
-    //  for wrapped NFTs.
     if (nft.isWrapped() && token_id == nft.underlying_token_id)
     {
       nft.wrapped_amount += amount;
@@ -2751,25 +2509,13 @@ namespace Core
     return {ReceiptStatus::Success, tx.fee};
   }
 
-  //  Claim NFT Reward
-
   Receipt TransactionExecutor::executeClaimNftReward(
-      State::StateAccess &state,
-      const Transaction &tx,
+      State::StateAccess &state, const Transaction &tx,
       const TxExecutionContext &ctx)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
-
     if (!tx.payload.empty())
       return failure;
-
-    //  Walk every NFT owned by tx.from. For each NFT in a
-    //  reward-bearing collection, compute the accrual since the
-    //  last settlement and credit tx.from's pending_rewards.
-    //
-    //  The walk is bounded by the number of NFTs the caller owns.
-    //  A holder with 10,000 NFTs pays 10,000 SMT writes to claim;
-    //  that's a tax on large holders but not a chain-wide cost.
 
     Core::Account acct = state.getAccount(tx.from);
     uint64_t total_claimed = 0;
@@ -2779,26 +2525,17 @@ namespace Core
                              {
                                if (nft.collection_id == 0)
                                  return;
-
                                Core::NftCollection collection;
                                if (!state.getNftCollection(nft.collection_id, collection))
                                  return;
-
                                if (!collection.hasReward())
                                  return;
-
                                const uint64_t accrued =
                                    (ctx.current_height - nft.last_accrual_height) /
                                    ROTATION_INTERVAL * collection.reward_rate_per_epoch;
-
                                if (accrued == 0)
                                  return;
-
                                total_claimed += accrued;
-
-                               //  Reset the NFT's accrual clock. The escrow was
-                               //  decremented at the epoch boundary; the claim just
-                               //  settles the pending amount to the holder.
                                Core::NftInfo updated = nft;
                                updated.last_accrual_height = ctx.current_height;
                                updated.accrued_owed = 0;
@@ -2814,18 +2551,11 @@ namespace Core
     return {ReceiptStatus::Success, tx.fee};
   }
 
-  //  Refill Collection Reward
-
   Receipt TransactionExecutor::executeRefillCollectionReward(
-      State::StateAccess &state,
-      const Transaction &tx,
+      State::StateAccess &state, const Transaction &tx,
       const TxExecutionContext & /*ctx*/)
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
-
-    //  Payload layout:
-    //    [8]  collection_id (LE)
-    //    [8]  amount (LE)
     if (tx.payload.size() != 16)
       return failure;
 
@@ -2842,11 +2572,6 @@ namespace Core
     if (!collection.hasReward())
       return failure;
 
-    //  Only the creator can refill. A third party topping up
-    //  someone else's escrow is a gift, but it's a policy the
-    //  creator should opt into explicitly, not have happen by
-    //  accident. Reject for now; a "gift to collection" op is a
-    //  follow-up if there's demand.
     if (collection.creator != tx.from)
       return failure;
 
@@ -2857,8 +2582,6 @@ namespace Core
                 collection.reward_token_id, amount);
 
     collection.reward_escrow_remaining += amount;
-
-    //  Un-pause if the refill restores the escrow.
     if (collection.reward_paused && collection.reward_escrow_remaining > 0)
       collection.reward_paused = false;
 
@@ -2868,98 +2591,37 @@ namespace Core
   }
 
   //  =========================================================================
-  //  Bridge — shared verifiers
+  //  Bridge — verifiers
   //  =========================================================================
   //
-  //  Two verifier flavors:
+  //  Both verifiers resolve the active validator set at
+  //  ctx.current_height, parse the [2] count || N*66 signature block,
+  //  enforce bftQuorum(active_count), and verify every entry
+  //  against the corresponding validator's consensus key at
+  //  ctx.current_height.
   //
-  //    verifyBridgeSignatures    — operational attestations (mint,
-  //                                ack). Signs against the active
-  //                                watcher set for a source chain.
-  //                                Threshold is bftQuorum(active_watchers).
-  //
-  //    verifyGovernanceSignatures — governance decisions (pause,
-  //                                 unpause, register-chain). Signs
-  //                                 against the active validator set.
-  //                                 Threshold is bftQuorum(active_validators).
-  //
-  //  Both accept the same `[2] count || N*66` signature block. The
-  //  only difference is which set the signer_index resolves against.
+  //  verifyAttestationSignatures and verifyGovernanceSignatures share
+  //  the same body. The two names exist because their call sites
+  //  pass different domains ("bmin"/"back" vs "bpau"/"bunp"/"brgr"),
+  //  and keeping the names keeps those call sites self-documenting.
+  //  The `source_chain_id` parameter on verifyAttestationSignatures is
+  //  retained for the same reason: it's not used to resolve a
+  //  per-chain set, but it tells a future reader which chain the
+  //  attestation is about.
 
-  bool TransactionExecutor::verifyBridgeSignatures(
+  bool TransactionExecutor::verifyAttestationSignatures(
       State::StateAccess &state,
-      uint64_t source_chain_id,
+      uint64_t /*source_chain_id*/,
       std::string_view domain,
       const uint8_t *message, size_t message_len,
       const uint8_t *signatures, size_t signatures_len,
       const TxExecutionContext &ctx)
   {
-    if (domain.size() != 4)
-      return false;
-
-    //  Resolve the active watcher set at this height. The
-    //  accessor returns each watcher's full record, filtered by
-    //  isInActiveSet(height).
-    std::vector<Core::BridgeWatcherInfo> active;
-    state.forEachActiveBridgeWatcherForChain(
-        source_chain_id, ctx.current_height,
-        [&](const Core::BridgeWatcherInfo &w)
-        { active.push_back(w); });
-
-    //  Sort by watcher id so signer_index is deterministic across
-    //  nodes. The owner-address index iteration is hash-ordered,
-    //  not id-ordered, so a caller that builds a signature block
-    //  with `signer_index = position in the active set` needs the
-    //  set to be in the same order on the verifier.
-    std::sort(active.begin(), active.end(),
-              [](const Core::BridgeWatcherInfo &a,
-                 const Core::BridgeWatcherInfo &b)
-              { return a.id < b.id; });
-
-    //  Chain registration must be present; it carries the
-    //  per-chain minimum active-watcher count.
-    Core::BridgeChainRegistration reg;
-    if (!state.getBridgeChainRegistration(source_chain_id, reg))
-      return false;
-    if (active.size() < reg.active_watcher_min)
-      return false;
-
-    const size_t threshold = Core::bftQuorum(active.size());
-
-    std::vector<BridgeSignatureEntry> sigs;
-    if (!parseBridgeSignatureBlock(signatures, signatures_len, sigs))
-      return false;
-
-    if (sigs.size() < threshold)
-      return false;
-
-    std::vector<bool> seen(active.size(), false);
-    for (const auto &e : sigs)
-    {
-      if (e.signer_index >= active.size())
-        return false;
-      if (seen[e.signer_index])
-        return false;
-      seen[e.signer_index] = true;
-    }
-
-    const Crypto::Hash hash =
-        bridgeSigningHash(domain, message, message_len);
-
-    for (const auto &e : sigs)
-    {
-      const Id validator_id = active[e.signer_index].validator_id;
-      auto pk = state.validatorKeyAtHeight(validator_id, ctx.current_height);
-      if (!pk.has_value())
-      {
-        return false;
-      }
-      const bool ok = Crypto::verify(hash, *pk, e.signature);
-      if (!ok)
-        return false;
-    }
-
-    return true;
+    return verifyActiveValidatorSignatures(
+        state, domain,
+        message, message_len,
+        signatures, signatures_len,
+        ctx);
   }
 
   bool TransactionExecutor::verifyGovernanceSignatures(
@@ -2969,88 +2631,16 @@ namespace Core
       const uint8_t *signatures, size_t signatures_len,
       const TxExecutionContext &ctx)
   {
-    if (domain.size() != 4)
-    {
-      return false;
-    }
-
-    std::vector<Id> active = loadActiveSet(state);
-    std::sort(active.begin(), active.end());
-
-    if (active.empty())
-      return false;
-
-    const size_t threshold = Core::bftQuorum(active.size());
-
-    std::vector<BridgeSignatureEntry> sigs;
-    if (!parseBridgeSignatureBlock(signatures, signatures_len, sigs))
-    {
-      return false;
-    }
-
-    if (sigs.size() < threshold)
-      return false;
-
-    std::vector<bool> seen(active.size(), false);
-    for (const auto &e : sigs)
-    {
-      if (e.signer_index >= active.size())
-        return false;
-      if (seen[e.signer_index])
-        return false;
-      seen[e.signer_index] = true;
-    }
-
-    const Crypto::Hash hash =
-        bridgeSigningHash(domain, message, message_len);
-
-    for (const auto &e : sigs)
-    {
-      const Id validator_id = active[e.signer_index];
-
-      auto pk = state.validatorKeyAtHeight(validator_id, ctx.current_height);
-      if (!pk.has_value())
-      {
-        return false;
-      }
-
-      const bool ok = Crypto::verify(hash, *pk, e.signature);
-      if (!ok)
-        return false;
-    }
-
-    return true;
+    return verifyActiveValidatorSignatures(
+        state, domain,
+        message, message_len,
+        signatures, signatures_len,
+        ctx);
   }
 
   //  =========================================================================
   //  Bridge — BridgeMint
   //  =========================================================================
-  //
-  //  Payload layout (little-endian):
-  //    [8]  source_chain_id
-  //    [32] source_tx_hash
-  //    [4]  source_output_index
-  //    [32] destination_address
-  //    [8]  amount                 — Clarity atomic units
-  //    [2]  signer_count           — LE
-  //    [N]  signatures             — each: [2] index LE || [64] sig
-  //
-  //  The signature block covers the mint message built by
-  //  encodeBridgeMintMessage. Signatures verify against the active
-  //  bridge watcher set for `source_chain_id` at `ctx.current_height`,
-  //  with threshold bftQuorum(active_watchers).
-  //
-  //  Mint checks, in order:
-  //    1. Bridge not paused.
-  //    2. Source chain registered and enabled.
-  //    3. Wrapped token exists and its fingerprint matches.
-  //    4. Deposit not already consumed.
-  //    5. Watcher signatures verify (active set, threshold, replay).
-  //    6. Mint to destination, write consumed-deposit record,
-  //       bump consumed count.
-  //
-  //  All failure modes return a Failure receipt; no state is
-  //  modified until every check passes.
 
   Receipt TransactionExecutor::executeBridgeMint(State::StateAccess &state,
                                                  const Transaction &tx,
@@ -3058,7 +2648,6 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    //  Payload minimum: the fixed fields before the signature block.
     if (tx.payload.size() < 8 + 32 + 4 + 32 + 8 + 2)
       return failure;
 
@@ -3083,13 +2672,9 @@ namespace Core
     const uint64_t amount = readU64At(tx.payload, off);
     off += 8;
 
-    //  The signature block, including its 2-byte count, is the
-    //  remainder of the payload. parseBridgeSignatureBlock expects
-    //  the count at data[0], so do NOT advance `off` past it here.
     const size_t sig_block_off = off;
     const size_t sig_block_len = tx.payload.size() - sig_block_off;
 
-    //  Peek at the count without consuming it, purely to bound-check.
     if (sig_block_len < 2)
       return failure;
     const uint16_t signer_count =
@@ -3106,19 +2691,16 @@ namespace Core
     if (destination.isNull())
       return failure;
 
-    //  Global bridge pause.
     GlobalStateReader reader(state);
     if (reader.bridgePaused())
       return failure;
 
-    //  Chain registration.
     Core::BridgeChainRegistration reg;
     if (!state.getBridgeChainRegistration(source_chain_id, reg))
       return failure;
     if (!reg.isWellFormed() || !reg.enabled)
       return failure;
 
-    //  Wrapped token fingerprint.
     Core::TokenInfo token;
     if (!state.getToken(reg.wrapped_token_id, token))
       return failure;
@@ -3127,44 +2709,35 @@ namespace Core
         *token.fingerprint != reg.fingerprint)
       return failure;
 
-    //  Replay guard: the deposit must not have been minted before.
     uint64_t existing_mint_height = 0;
     if (state.getBridgeConsumed(source_chain_id, source_tx_hash,
                                 source_output_index, existing_mint_height))
       return failure;
 
-    //  Build the message the federation signed, and verify.
     const std::vector<uint8_t> message = encodeBridgeMintMessage(
         source_chain_id, source_tx_hash, source_output_index,
         destination, amount);
 
-    if (!verifyBridgeSignatures(
+    if (!verifyAttestationSignatures(
             state, source_chain_id, "bmin",
             message.data(), message.size(),
             sigs_ptr, sigs_len, ctx))
       return failure;
 
-    //  All checks passed. Apply state changes.
-
-    //  Mint to the destination.
     const uint64_t existing_balance =
         state.getTokenBalance(destination, reg.wrapped_token_id);
     state.putTokenBalance(destination, reg.wrapped_token_id,
                           existing_balance + amount);
 
-    //  Bump the wrapped token's supply.
     const uint64_t supply = state.getTokenSupply(reg.wrapped_token_id);
     state.putTokenSupply(reg.wrapped_token_id, supply + amount);
 
-    //  Consumed-deposit record.
     state.putBridgeConsumed(source_chain_id, source_tx_hash,
                             source_output_index, ctx.current_height);
 
-    //  Aggregate counter.
     GlobalStateWriter writer(state);
     writer.setBridgeConsumedCount(reader.bridgeConsumedCount() + 1);
 
-    //  Aggregate stats.
     bumpBridgeStats(state, source_chain_id, ctx.current_height,
                     /*minted*/ amount, /*burned*/ 0, /*released*/ 0,
                     /*count_deposit*/ true,
@@ -3188,23 +2761,6 @@ namespace Core
   //  =========================================================================
   //  Bridge — BridgeBurn
   //  =========================================================================
-  //
-  //  Payload layout:
-  //    [8]  source_chain_id
-  //    [1]  blob_len
-  //    [N]  destination_blob      — N == blob_len
-  //    [8]  amount                — Clarity atomic units
-  //
-  //  No signature block. A burn is authorized by the user's own
-  //  signature over the tx's signing hash; the standard pipeline
-  //  verifies it before dispatch.
-  //
-  //  No watcher-set check either. Whether the watcher set can
-  //  currently mint is a mint-time concern; a burn just queues a
-  //  withdrawal. The withdrawal record is durable even if the
-  //  watcher set is temporarily below threshold, so the release
-  //  will happen once the set recovers. This asymmetry is
-  //  deliberate: a fake mint steals value, a burn doesn't.
 
   Receipt TransactionExecutor::executeBridgeBurn(State::StateAccess &state,
                                                  const Transaction &tx,
@@ -3225,9 +2781,6 @@ namespace Core
     const uint8_t blob_len = tx.payload[off];
     off += 1;
 
-    //  Minimum payload: source_chain_id(8) + blob_len(1) +
-    //  destination_blob(blob_len) + addr_len(1) +
-    //  destination_address(addr_len) + amount(8).
     if (tx.payload.size() < off + blob_len + 1 + 8)
       return failure;
 
@@ -3279,8 +2832,6 @@ namespace Core
     const uint64_t balance = state.getTokenBalance(tx.from, tx.token_id);
     if (balance < amount)
       return failure;
-
-    //  ---- Apply ----
 
     state.putTokenBalance(tx.from, tx.token_id, balance - amount);
 
@@ -3334,23 +2885,6 @@ namespace Core
   //  =========================================================================
   //  Bridge — Pause / Unpause (governance)
   //  =========================================================================
-  //
-  //  Payload layout (both):
-  //    [8]  current_height        — binds the pause to a specific
-  //                                 height, prevents a signature
-  //                                 harvested from one pause from
-  //                                 being replayed at a different
-  //                                 height
-  //    [2]  signer_count          — LE
-  //    [N]  signatures            — governance signatures
-  //
-  //  Message:
-  //    Blake2b("bpau" || LE64(current_height))   — for pause
-  //    Blake2b("bunp"  || LE64(current_height))   — for unpause
-  //
-  //  Governance signatures verify against the active validator set,
-  //  with bftQuorum threshold. The operational watcher set has no
-  //  authority to freeze or unfreeze the bridge.
 
   Receipt TransactionExecutor::executeBridgePause(State::StateAccess &state,
                                                   const Transaction &tx,
@@ -3368,9 +2902,6 @@ namespace Core
       bound_height |= uint64_t(tx.payload[off + i]) << (i * 8);
     off += 8;
 
-    //  The signature block, including its 2-byte count, is the
-    //  remainder of the payload. parseBridgeSignatureBlock expects
-    //  the count at data[0], so do NOT advance `off` past it here.
     const size_t sig_block_off = off;
     const size_t sig_block_len = tx.payload.size() - sig_block_off;
 
@@ -3385,7 +2916,6 @@ namespace Core
     const uint8_t *sigs_ptr = tx.payload.data() + sig_block_off;
     const size_t sigs_len = sig_block_len;
 
-    //  Build the signed message.
     std::vector<uint8_t> message;
     message.reserve(8);
     for (int i = 0; i < 8; ++i)
@@ -3397,7 +2927,6 @@ namespace Core
             sigs_ptr, sigs_len, ctx))
       return failure;
 
-    //  Apply.
     GlobalStateWriter writer(state);
     writer.setBridgePaused(true);
 
@@ -3420,9 +2949,6 @@ namespace Core
       bound_height |= uint64_t(tx.payload[off + i]) << (i * 8);
     off += 8;
 
-    //  The signature block, including its 2-byte count, is the
-    //  remainder of the payload. parseBridgeSignatureBlock expects
-    //  the count at data[0], so do NOT advance `off` past it here.
     const size_t sig_block_off = off;
     const size_t sig_block_len = tx.payload.size() - sig_block_off;
 
@@ -3457,37 +2983,6 @@ namespace Core
   //  =========================================================================
   //  Bridge — AckWithdrawal
   //  =========================================================================
-  //
-  //  Payload layout:
-  //    [8]  withdrawal_id
-  //    [32] release_tx_hash        — the source-chain (CCX) tx hash
-  //    [8]  release_height         — the source-chain block height
-  //    [2]  signer_count           — LE
-  //    [N]  signatures             — operational watcher signatures
-  //
-  //  Message:
-  //    Blake2b("back" || LE64(withdrawal_id))
-  //
-  //  The message is deliberately UNCHANGED from the pre-Phase-3
-  //  form. The release_tx_hash and release_height are not covered
-  //  by the watcher signatures — they are attestation data that
-  //  the submitting watcher provides, cross-checked against
-  //  CCX on-chain (payment ID), not against the signatures. The
-  //  signatures authorize "release withdrawal N"; the hash and
-  //  height record "the release was tx H at height X". Anyone can
-  //  verify the latter independently.
-  //
-  //  The ack is watcher-signed against the operational set for the
-  //  withdrawal's chain — the same set that signs mints. The chain
-  //  is resolved from the withdrawal record, not from the payload.
-  //
-  //  On success:
-  //    - the withdrawal record's release_* fields are populated;
-  //    - the record is NOT deleted (it is the permanent audit trail);
-  //    - the height index row is updated (the record drops out of
-  //      the unreleased scan by virtue of isReleased());
-  //    - the pending counter is decremented;
-  //    - BridgeStats.total_released += w.amount, release counters ++.
 
   Receipt TransactionExecutor::executeBridgeAckWithdrawal(
       State::StateAccess &state,
@@ -3496,7 +2991,6 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    //  Minimum: id(8) + release_hash(32) + release_height(8) + count(2)
     if (tx.payload.size() < 8 + 32 + 8 + 2)
       return failure;
 
@@ -3514,12 +3008,9 @@ namespace Core
     const uint64_t release_height = readU64At(tx.payload, off);
     off += 8;
 
-    //  The signature block, including its 2-byte count, is the
-    //  remainder of the payload.
     const size_t sig_block_off = off;
     const size_t sig_block_len = tx.payload.size() - sig_block_off;
 
-    //  Peek at the count without consuming it, purely to bound-check.
     if (sig_block_len < 2)
       return failure;
     const uint16_t signer_count =
@@ -3546,9 +3037,6 @@ namespace Core
     if (!w.isWellFormed())
       return failure;
 
-    //  Idempotency / conflict:
-    //    - already released with the SAME hash  → no-op success
-    //    - already released with a DIFFERENT hash → reject
     if (w.isReleased())
     {
       if (w.release_tx_hash == release_tx_hash &&
@@ -3563,51 +3051,41 @@ namespace Core
     if (!state.getBridgeChainRegistration(w.source_chain_id, reg))
       return failure;
 
-    //  Message: the withdrawal id.
     const std::vector<uint8_t> message = encodeBridgeAckMessage(withdrawal_id);
 
-    if (!verifyBridgeSignatures(
+    if (!verifyAttestationSignatures(
             state, w.source_chain_id, "back",
             message.data(), message.size(),
             sigs_ptr, sigs_len, ctx))
       return failure;
 
-    //  Apply: populate the release audit fields in place. The
-    //  record stays in state — it is the permanent audit trail.
     w.release_tx_hash = release_tx_hash;
     w.release_height = release_height;
     w.released_at_height = ctx.current_height;
     state.putBridgeWithdrawal(w);
 
-    //  Attribute the release to the submitting watcher, if the
-    //  sender is a registered watcher for this chain. It usually
-    //  is; if not (someone relaying a peer's release), leave 0.
+    //  Attribute the release to the submitting validator, if the
+    //  sender maps to a registered validator. Under the
+    //  validator-is-watcher model there is no per-chain watcher
+    //  lookup; the address either maps to a validator or it doesn't,
+    //  and the validator's presence on-chain is the attribution.
     {
-      uint64_t watcher_id = 0;
-      if (state.getBridgeWatcherIdByAddress(tx.from, watcher_id))
+      uint64_t validator_id = 0;
+      if (state.getValidatorByAddress(tx.from, validator_id))
       {
-        Core::BridgeWatcherInfo wi;
-        if (state.getBridgeWatcher(watcher_id, wi) &&
-            wi.source_chain_id == w.source_chain_id)
-        {
-          w.released_by_watcher_id = watcher_id;
-        }
+        w.released_by_validator_id = validator_id;
       }
     }
 
     if (!w.isWellFormed())
       return failure;
 
-    //  Rewrite the record in place. putBridgeWithdrawal reindexes
-    //  the height row; the record is now isReleased() and so drops
-    //  out of forEachUnreleasedBridgeWithdrawal.
     state.putBridgeWithdrawal(w);
 
     GlobalStateWriter writer(state);
     const uint64_t pending = reader.bridgeWithdrawalsPending();
     writer.setBridgeWithdrawalsPending(pending > 0 ? pending - 1 : 0);
 
-    //  Aggregate stats.
     bumpBridgeStats(state, w.source_chain_id, ctx.current_height,
                     /*minted*/ 0, /*burned*/ 0, /*released*/ w.amount,
                     /*count_deposit*/ false,
@@ -3631,15 +3109,6 @@ namespace Core
   //  =========================================================================
   //  Bridge — RegisterChain (governance)
   //  =========================================================================
-  //
-  //  Payload layout:
-  //    [1]  registration_len      — LE (1 byte)
-  //    [N]  registration_blob     — BridgeChainRegistration::serializeState()
-  //    [2]  signer_count
-  //    [N]  signatures            — governance signatures
-  //
-  //  The signature covers the registration blob, so the signers
-  //  commit to the exact bytes that will be stored.
 
   Receipt TransactionExecutor::executeBridgeRegisterChain(
       State::StateAccess &state,
@@ -3665,9 +3134,6 @@ namespace Core
       return failure;
     off += reg_len;
 
-    //  The signature block, including its 2-byte count, is the
-    //  remainder of the payload. parseBridgeSignatureBlock expects
-    //  the count at data[0], so do NOT advance `off` past it here.
     const size_t sig_block_off = off;
     const size_t sig_block_len = tx.payload.size() - sig_block_off;
 
@@ -3682,9 +3148,7 @@ namespace Core
     const uint8_t *sigs_ptr = tx.payload.data() + sig_block_off;
     const size_t sigs_len = sig_block_len;
 
-    //  The message covered by the signatures is the registration
-    //  blob (from the payload) — which is what will be written.
-    const uint8_t *msg_ptr = tx.payload.data() + 1; // skip len prefix
+    const uint8_t *msg_ptr = tx.payload.data() + 1;
     const size_t msg_len = reg_len;
 
     if (!verifyGovernanceSignatures(
@@ -3693,11 +3157,14 @@ namespace Core
             sigs_ptr, sigs_len, ctx))
       return failure;
 
-    //  Reject if a registration already exists for this chain id
-    //  (registrations are immutable; to change one, deregister and
-    //  re-register, or use a future "update" transaction).
     Core::BridgeChainRegistration existing;
     if (state.getBridgeChainRegistration(reg.source_chain_id, existing))
+      return failure;
+
+    if (!adoptOrCreateWrappedTokenImpl(state, reg))
+      return failure;
+
+    if (!reg.isWellFormed())
       return failure;
 
     state.putBridgeChainRegistration(reg);
@@ -3708,48 +3175,6 @@ namespace Core
   //  =========================================================================
   //  Bridge — BridgeAttest
   //  =========================================================================
-  //
-  //  Payload layout:
-  //    [8]  source_chain_id
-  //    [32] source_tx_hash
-  //    [4]  source_output_index
-  //    [32] destination_address
-  //    [8]  amount
-  //    [2]  signer_index (LE, position in sorted active watcher set)
-  //    [64] signature (ed25519 over the canonical mint message)
-  //
-  //  Total: 8 + 32 + 4 + 32 + 8 + 2 + 64 = 150 bytes, exact.
-  //
-  //  Each active watcher submits one BridgeAttest per deposit. The
-  //  transaction records the attestation in TBL_BRIDGE_ATTESTATIONS.
-  //  The submission assembler later reads the attestations back,
-  //  verifies that they form a quorum and agree on (destination,
-  //  amount), and assembles the [2] count || N*66 block that a
-  //  BridgeMint transaction carries.
-  //
-  //  The executor's job is to validate *one* attestation in
-  //  isolation:
-  //    - the bridge is not paused;
-  //    - the chain is registered and enabled;
-  //    - the deposit is not already consumed (minting already
-  //      happened; attesting to it is pointless);
-  //    - the signer_index is within the active watcher set;
-  //    - the resolved consensus key at ctx.current_height signs
-  //      the canonical message;
-  //    - no other attestation exists for the same (deposit,
-  //      validator_id) — resubmission is rejected;
-  //    - no other attestation exists for the same deposit with a
-  //      *different* (destination, amount) — this would be a
-  //      federation split and must not be silently recorded.
-  //
-  //  The last check is the important one. The executor does not
-  //  know which of two conflicting attestations is "the truth" —
-  //  both are signed by legitimate watchers. It refuses to record
-  //  the second, and the deposit never gets minted until the
-  //  federation resolves the conflict offline (a slash + a fresh
-  //  attestation, or a governance action). That's the correct
-  //  shape: silently picking one side would make the bridge a
-  //  silent authority over federation disputes.
 
   Receipt TransactionExecutor::executeBridgeAttest(State::StateAccess &state,
                                                    const Transaction &tx,
@@ -3757,17 +3182,8 @@ namespace Core
   {
     Receipt failure{ReceiptStatus::Failure, tx.fee};
 
-    std::cerr << "[attest] ==== executeBridgeAttest ====\n";
-    std::cerr << "[attest] current_height=" << ctx.current_height
-              << " chain_id=" << ctx.chain_id << "\n";
-    std::cerr << "[attest] tx.from=" << tx.from.toString().substr(0, 16) << "\n";
-    std::cerr << "[attest] payload.size()=" << tx.payload.size() << "\n";
-
     if (tx.payload.size() != 8 + 32 + 4 + 32 + 8 + 2 + 64)
-    {
-      std::cerr << "[attest] FAIL: payload size wrong\n";
       return failure;
-    }
 
     size_t off = 0;
 
@@ -3798,167 +3214,73 @@ namespace Core
     std::memcpy(signature.data.data(), tx.payload.data() + off, 64);
     off += 64;
 
-    std::cerr << "[attest] parsed: chain=0x" << std::hex << source_chain_id << std::dec
-              << " tx_hash=" << source_tx_hash.toString().substr(0, 16)
-              << " out_idx=" << source_output_index
-              << " amount=" << amount
-              << " signer_idx=" << signer_index << "\n";
-    std::cerr << "[attest] dest(first 8B): ";
-    for (int i = 0; i < 8; ++i)
-      std::cerr << std::hex << (int)destination.data[i];
-    std::cerr << std::dec << "\n";
-
     if (amount == 0)
-    {
-      std::cerr << "[attest] FAIL: amount==0\n";
       return failure;
-    }
     if (destination.isNull())
-    {
-      std::cerr << "[attest] FAIL: dest null\n";
       return failure;
-    }
 
     GlobalStateReader reader(state);
     if (reader.bridgePaused())
-    {
-      std::cerr << "[attest] FAIL: bridge paused\n";
       return failure;
-    }
 
     Core::BridgeChainRegistration reg;
     if (!state.getBridgeChainRegistration(source_chain_id, reg))
-    {
-      std::cerr << "[attest] FAIL: chain not registered\n";
       return failure;
-    }
-    std::cerr << "[attest] reg: enabled=" << (reg.enabled ? 1 : 0)
-              << " active_watcher_min=" << reg.active_watcher_min
-              << " wrapped_token=" << reg.wrapped_token_id << "\n";
     if (!reg.isWellFormed() || !reg.enabled)
-    {
-      std::cerr << "[attest] FAIL: reg malformed/disabled\n";
       return failure;
-    }
 
     uint64_t existing_mint_height = 0;
     if (state.getBridgeConsumed(source_chain_id, source_tx_hash,
                                 source_output_index, existing_mint_height))
-    {
-      std::cerr << "[attest] FAIL: deposit already consumed at height "
-                << existing_mint_height << "\n";
       return failure;
-    }
 
-    std::vector<Core::BridgeWatcherInfo> active;
-    state.forEachActiveBridgeWatcherForChain(
-        source_chain_id, ctx.current_height,
-        [&](const Core::BridgeWatcherInfo &w)
-        { active.push_back(w); });
-
-    std::cerr << "[attest] active set before sort (size=" << active.size() << "):\n";
-    for (const auto &w : active)
-    {
-      std::cerr << "[attest]   watcher.id=" << w.id
-                << " validator_id=" << w.validator_id
-                << " stake=" << w.stake
-                << " is_active=" << w.is_active << "\n";
-    }
+    std::vector<Core::ValidatorInfo> active;
+    state.forEachActiveValidator(
+        [&](const Core::ValidatorInfo &v)
+        { active.push_back(v); });
 
     std::sort(active.begin(), active.end(),
-              [](const Core::BridgeWatcherInfo &a, const Core::BridgeWatcherInfo &b)
+              [](const Core::ValidatorInfo &a, const Core::ValidatorInfo &b)
               { return a.id < b.id; });
 
-    std::cerr << "[attest] active set after sort:\n";
-    for (size_t i = 0; i < active.size(); ++i)
-    {
-      std::cerr << "[attest]   [" << i << "] watcher.id=" << active[i].id
-                << " validator_id=" << active[i].validator_id << "\n";
-    }
-
-    if (active.size() < reg.active_watcher_min)
-    {
-      std::cerr << "[attest] FAIL: active.size()=" << active.size()
-                << " < min=" << reg.active_watcher_min << "\n";
+    if (active.size() < reg.active_validator_min)
       return failure;
-    }
 
     if (signer_index >= active.size())
-    {
-      std::cerr << "[attest] FAIL: signer_index=" << signer_index
-                << " >= active.size()=" << active.size() << "\n";
       return failure;
-    }
 
-    const Id validator_id = active[signer_index].validator_id;
-    std::cerr << "[attest] signer_index=" << signer_index
-              << " -> watcher.id=" << active[signer_index].id
-              << " validator_id=" << validator_id << "\n";
+    const Id validator_id = active[signer_index].id;
 
     auto pk = state.validatorKeyAtHeight(validator_id, ctx.current_height);
     if (!pk.has_value())
-    {
-      std::cerr << "[attest] FAIL: no consensus key for validator "
-                << validator_id << " at height " << ctx.current_height << "\n";
       return failure;
-    }
-
-    std::cerr << "[attest] consensus pk (first 16B): ";
-    for (int i = 0; i < 16; ++i)
-      std::cerr << std::hex << (int)pk->data[i];
-    std::cerr << std::dec << "\n";
 
     const std::vector<uint8_t> message = encodeBridgeMintMessage(
         source_chain_id, source_tx_hash, source_output_index,
         destination, amount);
 
-    std::cerr << "[attest] message size=" << message.size() << " hex: ";
-    for (size_t i = 0; i < message.size(); ++i)
-      std::cerr << std::hex << std::setw(2) << std::setfill('0') << (int)message[i];
-    std::cerr << std::dec << "\n";
-
     const Crypto::Hash hash =
         bridgeSigningHash("bmin", message.data(), message.size());
 
-    std::cerr << "[attest] signing hash=" << hash.toString() << "\n";
-
-    std::cerr << "[attest] sig (first 16B): ";
-    for (int i = 0; i < 16; ++i)
-      std::cerr << std::hex << (int)signature.data[i];
-    std::cerr << std::dec << "\n";
-
-    if (!Crypto::verify(hash, *pk, signature))
-    {
-      std::cerr << "[attest] FAIL: signature verification failed\n";
+    const bool ok = Crypto::verify(hash, *pk, signature);
+    if (!ok)
       return failure;
-    }
 
-    std::cerr << "[attest] signature OK\n";
-
-    //  Duplicate check
     {
       Core::BridgeAttestation existing;
       if (state.getBridgeAttestation(
               source_chain_id, source_tx_hash, source_output_index,
               validator_id, existing))
-      {
-        std::cerr << "[attest] FAIL: already attested by validator "
-                  << validator_id << "\n";
         return failure;
-      }
     }
 
-    //  Conflict check
     bool has_conflict = false;
     state.forEachBridgeAttestationForDeposit(
         source_chain_id, source_tx_hash, source_output_index,
-        [&](uint64_t other_vid, const Core::BridgeAttestation &other) -> bool
+        [&](uint64_t /*other_vid*/, const Core::BridgeAttestation &other) -> bool
         {
           if (other.destination != destination || other.amount != amount)
           {
-            std::cerr << "[attest] CONFLICT: other validator=" << other_vid
-                      << " other.dest=" << other.destination.toString().substr(0, 16)
-                      << " other.amount=" << other.amount << "\n";
             has_conflict = true;
             return false;
           }
@@ -3966,10 +3288,7 @@ namespace Core
         });
 
     if (has_conflict)
-    {
-      std::cerr << "[attest] FAIL: conflicting attestation\n";
       return failure;
-    }
 
     Core::BridgeAttestation attestation;
     attestation.signer_index = signer_index;
@@ -3979,48 +3298,18 @@ namespace Core
     attestation.attested_at_height = ctx.current_height;
 
     if (!attestation.isWellFormed())
-    {
-      std::cerr << "[attest] FAIL: attestation not well-formed\n";
       return failure;
-    }
 
     state.putBridgeAttestation(source_chain_id, source_tx_hash,
                                source_output_index, validator_id,
                                attestation);
 
-    std::cerr << "[attest] SUCCESS: recorded attestation\n";
     return {ReceiptStatus::Success, tx.fee};
   }
 
   //  =========================================================================
   //  Bridge — BridgeAckAttest
   //  =========================================================================
-  //
-  //  Payload layout:
-  //    [8]  withdrawal_id
-  //    [2]  signer_index (LE, position in sorted active watcher set)
-  //    [64] signature (ed25519 over Blake2b("back" || LE64(withdrawal_id)))
-  //
-  //  Total: 8 + 2 + 64 = 74 bytes, exact.
-  //
-  //  Each active watcher submits one BridgeAckAttest per withdrawal.
-  //  The submission assembler later reads the attestations back,
-  //  verifies that they form a quorum, and assembles the
-  //  [2] count || N*66 block that a BridgeAckWithdrawal carries.
-  //
-  //  The executor's job is to validate *one* attestation in
-  //  isolation:
-  //    - the bridge is not paused;
-  //    - the withdrawal exists and is not already released;
-  //    - the signer_index is within the active watcher set;
-  //    - the resolved consensus key at ctx.current_height signs
-  //      the canonical message;
-  //    - no other attestation exists for (withdrawal, validator) —
-  //      resubmission is rejected.
-  //
-  //  There is no conflict check: the record carries no
-  //  destination/amount, so all watchers either attest to the same
-  //  withdrawal_id or not at all.
 
   Receipt TransactionExecutor::executeBridgeAckAttest(
       State::StateAccess &state,
@@ -4057,7 +3346,7 @@ namespace Core
     if (!w.isWellFormed())
       return failure;
     if (w.isReleased())
-      return failure; // pointless to attest to an already-released withdrawal
+      return failure;
 
     Core::BridgeChainRegistration reg;
     if (!state.getBridgeChainRegistration(w.source_chain_id, reg))
@@ -4065,26 +3354,22 @@ namespace Core
     if (!reg.isWellFormed() || !reg.enabled)
       return failure;
 
-    //  Resolve the active watcher set at this height, sorted by id
-    //  (same ordering as verifyBridgeSignatures).
-    std::vector<Core::BridgeWatcherInfo> active;
-    state.forEachActiveBridgeWatcherForChain(
-        w.source_chain_id, ctx.current_height,
-        [&](const Core::BridgeWatcherInfo &wi)
-        { active.push_back(wi); });
+    std::vector<Core::ValidatorInfo> active;
+    state.forEachActiveValidator(
+        [&](const Core::ValidatorInfo &v)
+        { active.push_back(v); });
 
     std::sort(active.begin(), active.end(),
-              [](const Core::BridgeWatcherInfo &a,
-                 const Core::BridgeWatcherInfo &b)
+              [](const Core::ValidatorInfo &a, const Core::ValidatorInfo &b)
               { return a.id < b.id; });
 
-    if (active.size() < reg.active_watcher_min)
+    if (active.size() < reg.active_validator_min)
       return failure;
 
     if (signer_index >= active.size())
       return failure;
 
-    const Id validator_id = active[signer_index].validator_id;
+    const Id validator_id = active[signer_index].id;
 
     auto pk = state.validatorKeyAtHeight(validator_id, ctx.current_height);
     if (!pk.has_value())
@@ -4097,7 +3382,10 @@ namespace Core
     if (!Crypto::verify(hash, *pk, signature))
       return failure;
 
-    //  Duplicate check.
+    std::cerr << "[executeBridgeAckAttest] verify="
+              << (Crypto::verify(hash, *pk, signature) ? "OK" : "FAIL")
+              << "\n";
+
     {
       Core::BridgeAckAttestation existing;
       if (state.getBridgeAckAttestation(withdrawal_id, validator_id, existing))
@@ -4124,186 +3412,6 @@ namespace Core
                       /*withdrawal_id=*/withdrawal_id,
                       /*amount=*/0,
                       /*counterparty=*/validator_id);
-
-    return {ReceiptStatus::Success, tx.fee};
-  }
-
-  //  =========================================================================
-  //  Bridge — RegisterBridgeWatcher
-  //  =========================================================================
-  //
-  //  Payload layout:
-  //    [8]  source_chain_id (LE)
-  //    [8]  stake           (LE)
-  //
-  //  No signature block. The watcher registers themselves; the
-  //  authorization is "caller is a validator with enough balance to
-  //  lock the stake." Registration is one-shot per (validator,
-  //  chain); a second one while the first is unbonding-expired is
-  //  allowed (re-registration), a second one while active is not.
-  //
-  //  The registration does not verify the caller's authority beyond
-  //  "has a validator record whose reward_address equals tx.from,"
-  //  because the validator record itself is the authority.
-
-  Receipt TransactionExecutor::executeRegisterBridgeWatcher(
-      State::StateAccess &state,
-      const Transaction &tx,
-      const TxExecutionContext &ctx)
-  {
-    Receipt failure{ReceiptStatus::Failure, tx.fee};
-
-    if (tx.payload.size() != 8 + 8)
-      return failure;
-
-    uint64_t source_chain_id = 0;
-    for (int i = 0; i < 8; ++i)
-      source_chain_id |= uint64_t(tx.payload[i]) << (i * 8);
-
-    uint64_t stake = 0;
-    for (int i = 0; i < 8; ++i)
-      stake |= uint64_t(tx.payload[8 + i]) << (i * 8);
-
-    if (stake < BRIDGE_WATCHER_MIN_STAKE)
-      return failure;
-
-    //  Caller must be a registered validator.
-    uint64_t validator_id = 0;
-    if (!state.getValidatorByAddress(tx.from, validator_id))
-      return failure;
-
-    //  Chain must be registered and enabled.
-    Core::BridgeChainRegistration reg;
-    if (!state.getBridgeChainRegistration(source_chain_id, reg))
-      return failure;
-    if (!reg.isWellFormed() || !reg.enabled)
-      return failure;
-
-    //  Caller must not already have an active (or unbonding) watcher
-    //  for this chain. The lookup is by owner address, which is the
-    //  validator's reward_address for a legacy validator and the
-    //  explicit reward_address for a modern one.
-    uint64_t existing = 0;
-    if (state.getBridgeWatcherIdByAddress(tx.from, existing))
-    {
-      Core::BridgeWatcherInfo w;
-      if (state.getBridgeWatcher(existing, w) &&
-          w.source_chain_id == source_chain_id &&
-          !w.isUnbondExpired(ctx.current_height))
-        return failure;
-    }
-
-    //  Caller must not be pending-unbond as a validator; the
-    //  watcher stake and the validator stake would both be locked
-    //  at departure and the accounting gets confusing.
-    Core::ValidatorInfo v;
-    if (!state.getValidator(validator_id, v))
-      return failure;
-    if (v.pending_unbond_height != 0)
-      return failure;
-
-    //  Debit the stake. Locks it out of the balance until the
-    //  watcher unbonds (or gets slashed), matching the validator
-    //  stake model.
-    Core::Account acct = state.getAccount(tx.from);
-    if (acct.balance < stake)
-      return failure;
-    acct.balance -= stake;
-    acct.recalculateStaked(GlobalConfig::AUTO_STAKE_THRESHOLD);
-    state.putAccount(tx.from, acct);
-
-    //  Allocate the watcher id.
-    GlobalStateReader reader(state);
-    uint64_t next_id = reader.bridgeNextWatcherId();
-    if (next_id == 0)
-      next_id = 1;
-
-    Core::BridgeWatcherInfo w;
-    w.id = next_id;
-    w.validator_id = validator_id;
-    w.source_chain_id = source_chain_id;
-    w.reward_address = tx.from;
-    w.registered_at_height = ctx.current_height;
-    w.stake = stake;
-    w.last_seen_height = ctx.current_height;
-    w.is_active = true;
-    w.became_active_at = ctx.current_height;
-    w.last_active_at = ctx.current_height;
-
-    if (!w.isWellFormed())
-      return failure;
-
-    state.putBridgeWatcher(w);
-
-    GlobalStateWriter writer(state);
-    writer.setBridgeNextWatcherId(next_id + 1);
-
-    return {ReceiptStatus::Success, tx.fee};
-  }
-
-  //  =========================================================================
-  //  Bridge — UnregisterBridgeWatcher
-  //  =========================================================================
-  //
-  //  Payload layout:
-  //    [8]  source_chain_id (LE)
-  //
-  //  Starts the watcher's unbonding. The watcher is removed from
-  //  the active set immediately (is_active = false) but the record
-  //  and stake stay until pending_unbond_height. During the window
-  //  the stake is slashable; at expiry the record is deleted and
-  //  the stake is returned to the owner.
-  //
-  //  Refused if removing this watcher would drop the active set
-  //  below the registration's active_watcher_min.
-
-  Receipt TransactionExecutor::executeUnregisterBridgeWatcher(
-      State::StateAccess &state,
-      const Transaction &tx,
-      const TxExecutionContext &ctx)
-  {
-    Receipt failure{ReceiptStatus::Failure, tx.fee};
-
-    if (tx.payload.size() != 8)
-      return failure;
-
-    uint64_t source_chain_id = 0;
-    for (int i = 0; i < 8; ++i)
-      source_chain_id |= uint64_t(tx.payload[i]) << (i * 8);
-
-    uint64_t watcher_id = 0;
-    if (!state.getBridgeWatcherIdByAddress(tx.from, watcher_id))
-      return failure;
-
-    Core::BridgeWatcherInfo w;
-    if (!state.getBridgeWatcher(watcher_id, w))
-      return failure;
-    if (w.source_chain_id != source_chain_id)
-      return failure;
-    if (w.pending_unbond_height != 0)
-      return failure;
-
-    Core::BridgeChainRegistration reg;
-    if (!state.getBridgeChainRegistration(source_chain_id, reg))
-      return failure;
-
-    //  Refuse if removing this watcher would drop the active set
-    //  below the registration's minimum. The caller can retry once
-    //  more watchers register.
-    const size_t active_count =
-        state.countActiveBridgeWatchersForChain(
-            source_chain_id, ctx.current_height);
-
-    if (active_count <= reg.active_watcher_min)
-      return failure;
-
-    //  Mark unbonding. Record stays until pending_unbond_height;
-    //  stake is locked and slashable for the whole window.
-    w.is_active = false;
-    w.last_active_at = ctx.current_height;
-    w.pending_unbond_height =
-        ctx.current_height + BRIDGE_WATCHER_UNBONDING_PERIOD;
-    state.putBridgeWatcher(w);
 
     return {ReceiptStatus::Success, tx.fee};
   }
@@ -4351,8 +3459,6 @@ namespace Core
 
   bool TransactionExecutor::validateCreateOrderStructure(const Transaction &tx)
   {
-    //  Minimum length: buy_token(4) + min_buy_amount(8) + mode(1)
-    //  + pool_id(4) + expires_at_height(8) + condition_count(1) = 26.
     if (tx.payload.size() < 26)
       return false;
 
@@ -4390,7 +3496,6 @@ namespace Core
         mode != static_cast<uint8_t>(OrderExecutionMode::Active))
       return false;
 
-    //  pool_id is meaningful only for Active orders.
     if (mode == static_cast<uint8_t>(OrderExecutionMode::Active))
     {
       if (pool_id == 0)
@@ -4412,8 +3517,6 @@ namespace Core
       }
     }
 
-    //  Cheap structural checks that mirror Order::isValid without
-    //  needing a full Order record.
     if (tx.token_id == buy_token)
       return false;
     if (tx.amount == 0)
@@ -4421,11 +3524,6 @@ namespace Core
     if (min_buy_amount == 0)
       return false;
 
-    //  Overflow guard for Passive orders: an order whose canonical
-    //  price cannot fit in u64 cannot enter the book, so reject it
-    //  up front rather than creating a lock the matcher will never
-    //  release. Active orders do not go through the book and so do
-    //  not need this check.
     if (mode == static_cast<uint8_t>(OrderExecutionMode::Passive))
     {
       Order probe;
@@ -4439,6 +3537,15 @@ namespace Core
     }
 
     return true;
+  }
+
+  //  adoptOrCreateWrappedToken (public wrapper)
+
+  bool TransactionExecutor::adoptOrCreateWrappedToken(
+      State::StateAccess &state,
+      Core::BridgeChainRegistration &reg)
+  {
+    return adoptOrCreateWrappedTokenImpl(state, reg);
   }
 
 } // namespace Core

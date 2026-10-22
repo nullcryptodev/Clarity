@@ -85,6 +85,9 @@ namespace Rpc
       return "BridgeChainNotRegistered";
     case ErrorCode::BridgeWithdrawalNotFound:
       return "BridgeWithdrawalNotFound";
+    //  Reserved: never emitted by the current node. The name is
+    //  kept so an older client or log parser that switches on the
+    //  numeric code gets something meaningful back.
     case ErrorCode::BridgeWatcherNotFound:
       return "BridgeWatcherNotFound";
     case ErrorCode::BridgeReadInternal:
@@ -192,10 +195,16 @@ namespace Rpc
       return "No bridge registration for this source chain";
     case ErrorCode::BridgeWithdrawalNotFound:
       return "Bridge withdrawal not found";
+    //  Reserved: never emitted by the current node. The message
+    //  says so, so an operator who sees one in a log from an
+    //  older binary does not chase a condition the current
+    //  protocol model cannot produce.
     case ErrorCode::BridgeWatcherNotFound:
-      return "No bridge watcher registered for this address";
+      return "No bridge watcher registered for this address "
+             "(reserved; not emitted by the current node)";
     case ErrorCode::BridgeReadInternal:
-      return "Bridge state read failed";
+      return "Bridge state read failed "
+             "(reserved; not emitted by the current node)";
 
     case ErrorCode::BlockNotFound:
       return "Block not found";
@@ -269,6 +278,31 @@ namespace Rpc
       return ErrorCode::TxMalformed;
 
     case Core::MempoolAddResult::Rejected_TokenPrecondition:
+      return ErrorCode::TxPrecondition;
+
+    //  Bridge rejections. The mempool runs the same signature
+    //  checks the executor runs at apply time (see
+    //  Node::verifyBridgeAttestationTxAtAdmission and
+    //  Node::verifyGovernanceTxAtAdmission), against the same
+    //  active validator set. A tx that fails them is well-formed
+    //  at the byte level but cannot apply against the current tip,
+    //  which is exactly what TxPrecondition means.
+    //
+    //  Rejected_BridgePayloadMalformed is structurally different:
+    //  the payload bytes are in the wrong shape (wrong length, a
+    //  declared count that overruns the buffer, a missing fixed
+    //  field), so it maps to TxMalformed like every other
+    //  malformed-payload rejection.
+    //
+    //  Neither gets a dedicated bridge-specific code. From the
+    //  client's perspective the remedy is the same in both cases:
+    //  fix the bridge transaction and resubmit. A future bridge
+    //  failure that a client could act on differently — for
+    //  example "quorum not yet reached, retry later" — would
+    //  warrant a new code; these do not.
+    case Core::MempoolAddResult::Rejected_BridgePayloadMalformed:
+      return ErrorCode::TxMalformed;
+    case Core::MempoolAddResult::Rejected_BridgeSignature:
       return ErrorCode::TxPrecondition;
     }
 

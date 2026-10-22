@@ -311,15 +311,16 @@ namespace Rpc
   //    burner                 (Bech32m)
   //    amount                 (hex)
   //    destination_blob       (0x-prefixed hex)
+  //    destination_address    (string)
   //    created_at_height      (hex)
   //    well_formed            (bool; derived)
   //
   //  release audit fields:
-  //    is_released            (bool; derived)
-  //    release_tx_hash        (0x-prefixed hex; all-zero if unreleased)
-  //    release_height         (hex; 0 if unreleased)
-  //    released_at_height     (hex; 0 if unreleased)
-  //    released_by_watcher_id (hex; 0 if unreleased)
+  //    is_released              (bool; derived)
+  //    release_tx_hash          (0x-prefixed hex; null if unreleased)
+  //    release_height           (hex; 0 if unreleased)
+  //    released_at_height       (hex; 0 if unreleased)
+  //    released_by_validator_id (hex; 0 if unreleased)
   Common::Json encodeBridgeWithdrawal(
       const Core::BridgeWithdrawal &w,
       const std::string &hrp);

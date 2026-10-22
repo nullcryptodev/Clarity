@@ -90,9 +90,9 @@ namespace GlobalConfig
   // error, instead of silently diverging from other nodes on the same
   // network.
   // When creating new hashes, rotate the addresses too.
-  inline constexpr const char *MAINNET_GENESIS_HASH = "877684213774ccb31963923827281bb640bed151d4f733ab3d9b520b5caec958";
-  inline constexpr const char *TESTNET_GENESIS_HASH = "1e5e5376f78aac8a819445fd8f3d4abc2c259dac2c62ae17fb85d81462ab9447";
-  inline constexpr const char *REGTEST_GENESIS_HASH = "30d2a74b4477e1a6f0ec5fec2bae6492fb3a9e64cebf47fad6e591a583d1d5c9";
+  inline constexpr const char *MAINNET_GENESIS_HASH = "52b0315622e472d456bf291173ee8c3fef9f813ba9dc2c0487bd9f5e2a699f26";
+  inline constexpr const char *TESTNET_GENESIS_HASH = "2b28a361be18d81310dc37cf81f94d4318c80f118be63aaa314c633eda989d69";
+  inline constexpr const char *REGTEST_GENESIS_HASH = "b1ce2e5a131acd20bbdbfd60f9f13c5a04ca56e9de0c66455ee86ebde63718f1";
 
   // Seed validators.
   //

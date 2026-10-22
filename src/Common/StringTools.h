@@ -10,6 +10,7 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <optional>
 
 #include "Crypto/Types.h"
 #include "Crypto/Blake2b.h"
@@ -129,6 +130,23 @@ namespace Common
     stream << value;
     text += stream.str();
   }
+
+  //  0x-prefixed (or bare) lower- or upper-case hex, decoded into
+  //  bytes. Returns nullopt on any malformed input.
+  std::optional<std::vector<uint8_t>> decodeHex(const std::string &s);
+
+  //  Encode bytes as 0x-prefixed hex.
+  std::string encodeHex(const uint8_t *data, size_t len);
+  std::string encodeHex(const std::vector<uint8_t> &bytes);
+
+  //  Encode a uint64 / uint32 as the canonical "0x…" hex string
+  //  used by the RPC params (no leading zeros).
+  std::string encodeU64Hex(uint64_t v);
+  std::string encodeU32Hex(uint32_t v);
+
+  //  Decode a "0x…" string back to uint64. Returns nullopt on
+  //  malformed input.
+  std::optional<uint64_t> decodeU64Hex(const std::string &s);
 
   //  Network and formatting
 

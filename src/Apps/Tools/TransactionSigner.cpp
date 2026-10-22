@@ -53,6 +53,18 @@
 //        --registration-blob <hex> --signature-block <hex> \
 //        --fee <clrty> --nonce <n> [...]
 //
+//  Governance-blob helper:
+//
+//    transaction_signer sign sign-governance-blob --keystore <path> \
+//        --blob <hex55>
+//
+//  Hashes the blob under the `brgr` domain and signs the hash with
+//  the keystore's key, then prints a single line "index:0x<sig>"
+//  suitable for pasting into the webwallet's "Other seeds'
+//  signatures" field. The index is the signer's position in the
+//  active validator set at the current height, resolved via the
+//  node's RPC (default 127.0.0.1:9633).
+//
 //  Output discipline:
 //    stdout  — the raw hex (with --raw), or a summary (default).
 //    stderr  — prompts, warnings, errors, and the password input.
@@ -66,10 +78,12 @@
 #include "Wallet/EncryptedKeyStore.h"
 #include "Wallet/HdPath.h"
 #include "Wallet/LocalSigner.h"
+#include "Wallet/RpcClient.h"
 #include "Wallet/TransactionBuilder.h"
 #include "Wallet/WalletError.h"
 #include "Wallet/WalletTypes.h"
 
+#include "Crypto/Blake2b.h"
 #include "Crypto/Types.h"
 
 #include <cstdint>
@@ -105,6 +119,12 @@ namespace
     BridgePause,
     BridgeUnpause,
     BridgeRegisterChain,
+
+    //  Sign a governance blob hash and print the signature.
+    //  Used to collect a quorum of validator signatures for
+    //  BridgeRegisterChain. Outputs a single "index:0xhex" line
+    //  suitable for pasting into the webwallet's dialog.
+    GovernanceBlob,
   };
 
   struct SignArgs
@@ -118,6 +138,12 @@ namespace
     uint64_t fee{0};
     bool raw{false};
     bool dry_run{false};
+
+    // RPC endpoint (used only by sign-governance-blob to resolve
+    // the signer's index in the active set). Default is the
+    // operator's local node, matching clarity_wallet's default.
+    std::string rpc_host{"127.0.0.1"};
+    uint16_t rpc_port{9633};
 
     // Transfer
     std::string to;
@@ -155,6 +181,9 @@ namespace
 
     // BridgeRegisterChain
     std::string registration_blob_hex;
+
+    // GovernanceBlob
+    std::string governance_blob_hex;
 
     // Signature block shared by all governance / attestation
     // transactions. Stored once; used by whichever subcommand is
@@ -195,6 +224,9 @@ namespace
       return SignType::BridgeUnpause;
     if (s == "bridge-register-chain")
       return SignType::BridgeRegisterChain;
+
+    if (s == "sign-governance-blob")
+      return SignType::GovernanceBlob;
 
     throw std::runtime_error("unknown transaction type: " + s);
   }
@@ -288,6 +320,38 @@ namespace
     return h;
   }
 
+  //  Parse a hex id (up to 8 bytes) into a uint64.
+  uint64_t parseHexU64OrDie(const std::string &s, const char *flag)
+  {
+    size_t i = 0;
+    if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+      i = 2;
+    if (i >= s.size() || s.size() - i > 16)
+    {
+      throw std::runtime_error(
+          std::string(flag) + ": not a hex id: " + s);
+    }
+    uint64_t v = 0;
+    for (; i < s.size(); ++i)
+    {
+      const char c = s[i];
+      int nib = -1;
+      if (c >= '0' && c <= '9')
+        nib = c - '0';
+      else if (c >= 'a' && c <= 'f')
+        nib = c - 'a' + 10;
+      else if (c >= 'A' && c <= 'F')
+        nib = c - 'A' + 10;
+      if (nib < 0)
+      {
+        throw std::runtime_error(
+            std::string(flag) + ": non-hex character in: " + s);
+      }
+      v = (v << 4) | static_cast<uint64_t>(nib);
+    }
+    return v;
+  }
+
   // ===========================================================================
   //  Argument parsing
   // ===========================================================================
@@ -347,6 +411,29 @@ namespace
       if (arg == "--dry-run")
       {
         args.dry_run = true;
+        continue;
+      }
+      if (arg == "--rpc")
+      {
+        const std::string spec = next();
+        const size_t colon = spec.find(':');
+        if (colon == std::string::npos || colon == 0 ||
+            colon + 1 >= spec.size())
+        {
+          throw std::runtime_error(
+              "--rpc: expected host:port, got '" + spec + "'");
+        }
+        args.rpc_host = spec.substr(0, colon);
+        char *end = nullptr;
+        const unsigned long port =
+            std::strtoul(spec.c_str() + colon + 1, &end, 10);
+        if (end == spec.c_str() + colon + 1 || *end != '\0' ||
+            port == 0 || port > 65535)
+        {
+          throw std::runtime_error(
+              "--rpc: invalid port in '" + spec + "'");
+        }
+        args.rpc_port = static_cast<uint16_t>(port);
         continue;
       }
 
@@ -454,6 +541,13 @@ namespace
         continue;
       }
 
+      //  ---- GovernanceBlob ----
+      if (arg == "--blob")
+      {
+        args.governance_blob_hex = next();
+        continue;
+      }
+
       throw std::runtime_error("unknown argument: " + arg);
     }
 
@@ -462,7 +556,9 @@ namespace
     if (args.keystore.empty())
       throw std::runtime_error("--keystore is required");
 
-    if (args.fee == 0)
+    //  GovernanceBlob doesn't submit a transaction, so it doesn't
+    //  need a fee. Every other type does.
+    if (args.fee == 0 && args.type != SignType::GovernanceBlob)
       throw std::runtime_error("--fee is required and must be non-zero");
 
     switch (args.type)
@@ -512,8 +608,6 @@ namespace
         throw std::runtime_error("bridge-burn requires --wrapped-token-id");
       if (args.destination_blob_hex.empty())
         throw std::runtime_error("bridge-burn requires --destination-blob");
-      if (args.destination_blob_hex.empty())
-        throw std::runtime_error("bridge-burn requires --destination-blob");
       if (args.amount == 0)
         throw std::runtime_error("bridge-burn requires --amount (non-zero)");
       break;
@@ -527,8 +621,6 @@ namespace
 
     case SignType::BridgePause:
     case SignType::BridgeUnpause:
-      //  bound_height may be zero (a pause bound at height 0 is
-      //  unusual but valid). signature_block is required.
       if (args.signature_block_hex.empty())
         throw std::runtime_error(
             "bridge-pause/bridge-unpause requires --signature-block");
@@ -541,6 +633,12 @@ namespace
       if (args.signature_block_hex.empty())
         throw std::runtime_error(
             "bridge-register-chain requires --signature-block");
+      break;
+
+    case SignType::GovernanceBlob:
+      if (args.governance_blob_hex.empty())
+        throw std::runtime_error(
+            "sign-governance-blob requires --blob");
       break;
     }
 
@@ -706,6 +804,153 @@ namespace
   }
 
   // ===========================================================================
+  //  Governance blob: hash + sign, print "index:0x<sig>"
+  // ===========================================================================
+
+  //  Resolve the signer's index in the active validator set at the
+  //  current height. Two RPC calls: the validator record for the
+  //  keystore's address, then the active set; the index is the
+  //  position of the caller's validator id in the sorted `ids`
+  //  array.
+  //
+  //  Returns nullopt if either call fails, if the address is not
+  //  a validator, or if the validator is not in the active set.
+  //  The caller then prints the signature with a "?" index and a
+  //  warning, so the operator can figure out the index by hand.
+  std::optional<uint64_t> resolveActiveSetIndex(
+      const std::string &rpc_host, uint16_t rpc_port,
+      const std::string &bech32_address,
+      std::string *error_out)
+  {
+    try
+    {
+      Wallet::RpcEndpoint ep;
+      ep.host = rpc_host;
+      ep.port = rpc_port;
+      Wallet::RpcClient rpc(ep);
+
+      std::string err;
+      bool not_a_validator = false;
+      auto validator = Wallet::getValidatorByAddress(
+          rpc, bech32_address, &not_a_validator, &err);
+      if (not_a_validator)
+      {
+        if (error_out)
+          *error_out = "address is not a validator";
+        return std::nullopt;
+      }
+      if (!validator.has_value() || !validator->is_object() ||
+          !validator->contains("id") || !(*validator)["id"].is_string())
+      {
+        if (error_out)
+          *error_out = err.empty() ? "getValidatorByAddress failed" : err;
+        return std::nullopt;
+      }
+      const uint64_t my_id = parseHexU64OrDie(
+          (*validator)["id"].get<std::string>(), "validator.id");
+
+      auto active = Wallet::getActiveSet(rpc, &err);
+      if (!active.has_value() || !active->is_object() ||
+          !active->contains("ids") || !(*active)["ids"].is_array())
+      {
+        if (error_out)
+          *error_out = err.empty() ? "getActiveSet failed" : err;
+        return std::nullopt;
+      }
+      const auto &ids = (*active)["ids"];
+      for (size_t i = 0; i < ids.size(); ++i)
+      {
+        if (!ids[i].is_string())
+          continue;
+        try
+        {
+          const std::string id_str = ids[i].get<std::string>();
+          const uint64_t id_i = parseHexU64OrDie(id_str, "active_set.id");
+          if (id_i == my_id)
+            return static_cast<uint64_t>(i);
+        }
+        catch (...)
+        {
+          continue;
+        }
+      }
+      if (error_out)
+        *error_out = "validator is not in the active set";
+      return std::nullopt;
+    }
+    catch (const std::exception &e)
+    {
+      if (error_out)
+        *error_out = std::string("RPC: ") + e.what();
+      return std::nullopt;
+    }
+  }
+
+  int runGovernanceBlob(const SignArgs &args,
+                        Wallet::KeyStore &ks)
+  {
+    const auto blob = parseHexBytesOrDie(args.governance_blob_hex, "--blob");
+    if (blob.size() != 55)
+    {
+      std::cerr << "error: --blob must be 55 bytes, got "
+                << blob.size() << "\n";
+      return 1;
+    }
+
+    //  Hash: Blake2b("brgr" || blob), matching the executor's
+    //  verifyGovernanceSignatures.
+    std::vector<uint8_t> input = {'b', 'r', 'g', 'r'};
+    input.insert(input.end(), blob.begin(), blob.end());
+
+    Crypto::Hash hash;
+    Crypto::blake2b(input.data(), input.size(),
+                    hash.data.data(), hash.data.size());
+
+    //  Sign the hash with the keystore's account key.
+    Wallet::LocalSigner signer(ks);
+    Wallet::WalletStatus st;
+    auto sig = signer.signAtPath(Wallet::clrtyPath(0, 0, 0), hash, &st);
+    if (!sig.has_value())
+    {
+      reportWalletError("cannot sign governance blob", st);
+      return 1;
+    }
+
+    //  Resolve the signer's index in the active set, so the output
+    //  can be pasted straight into the webwallet dialog. If the
+    //  node is unreachable or the caller is not in the set, print
+    //  the signature with a "?" index; the operator can resolve it
+    //  from the active-set listing.
+    std::string rpc_err;
+    const auto index = resolveActiveSetIndex(
+        args.rpc_host, args.rpc_port, ks.address(), &rpc_err);
+
+    if (args.raw)
+    {
+      std::cout << "0x"
+                << bytesToHex(sig->data.data(), sig->data.size())
+                << "\n";
+    }
+    else if (index.has_value())
+    {
+      std::cout << *index << ":0x"
+                << bytesToHex(sig->data.data(), sig->data.size())
+                << "\n";
+    }
+    else
+    {
+      std::cerr << "warning: could not resolve signer index: "
+                << rpc_err << "\n";
+      std::cerr << "         paste this line into the webwallet dialog, "
+                   "replacing '?' with the correct index\n";
+      std::cout << "?:0x"
+                << bytesToHex(sig->data.data(), sig->data.size())
+                << "\n";
+    }
+    return 0;
+  }
+
+  // ===========================================================================
   //  Sign flow
   // ===========================================================================
 
@@ -720,9 +965,6 @@ namespace
       return 1;
     }
 
-    std::cerr << "DEBUG source_chain_id = " << args.source_chain_id
-              << " (0x" << std::hex << args.source_chain_id << std::dec << ")\n";
-
     // ---- Unlock ----
     const std::string password = resolvePassword(args);
     const Wallet::WalletError err = (*ks)->unlock(password);
@@ -732,6 +974,10 @@ namespace
       reportWalletError("cannot unlock keystore", unlock_err);
       return 1;
     }
+
+    // ---- GovernanceBlob: hash and sign, no transaction ----
+    if (args.type == SignType::GovernanceBlob)
+      return runGovernanceBlob(args, **ks);
 
     // ---- Resolve the signer's account address ----
     auto from_addr = Wallet::decodeAddress((*ks)->address(), (*ks)->network());
@@ -847,8 +1093,7 @@ namespace
       p.common.nonce = args.nonce;
       p.common.fee = args.fee;
       p.source_chain_id = args.source_chain_id;
-      p.wrapped_token_id =
-          static_cast<Id>(args.wrapped_token_id);
+      p.wrapped_token_id = static_cast<Id>(args.wrapped_token_id);
       p.destination_blob = parseHexBytesOrDie(args.destination_blob_hex,
                                               "--destination-blob");
       p.destination_address = args.destination_address;
@@ -905,6 +1150,10 @@ namespace
       tx = Wallet::buildBridgeRegisterChain(*from_addr, p, &st);
       break;
     }
+
+    case SignType::GovernanceBlob:
+      //  Handled above; unreachable here.
+      return 1;
     }
 
     if (!tx.has_value())
@@ -965,14 +1214,19 @@ namespace
         << "  bridge-pause             pause the bridge (governance)\n"
         << "  bridge-unpause           unpause the bridge (governance)\n"
         << "  bridge-register-chain    register a new source chain\n"
+        << "  sign-governance-blob     sign a governance blob hash; prints\n"
+        << "                           'index:0x<sig>' for the webwallet\n"
         << "\n"
         << "Common options:\n"
         << "  --keystore <path>        encrypted keystore to sign with (required)\n"
         << "  --password-file <path>   read password from file (default: prompt)\n"
         << "  --nonce <n>              transaction nonce (required)\n"
-        << "  --fee <clrty>            fee in CLRTY, e.g. 0.001 (required)\n"
+        << "  --fee <clrty>            fee in CLRTY, e.g. 0.001\n"
         << "  --raw                    print only the hex on stdout\n"
         << "  --dry-run                show the transaction without signing\n"
+        << "  --rpc <host:port>        RPC endpoint for the index lookup\n"
+        << "                           (default 127.0.0.1:9633; only used\n"
+        << "                           by sign-governance-blob)\n"
         << "\n"
         << "Wallet-specific options:\n"
         << "  transfer:              --to <addr> --amount <clrty> [--token <id>]\n"
@@ -992,6 +1246,7 @@ namespace
         << "  bridge-unpause:        --bound-height <n> --signature-block <hex>\n"
         << "  bridge-register-chain: --registration-blob <hex>\n"
         << "                         --signature-block <hex>\n"
+        << "  sign-governance-blob:  --blob <hex55>\n"
         << "\n"
         << "The signed hex is printed on stdout. Submit it with:\n"
         << "  curl -s http://127.0.0.1:9633 -H 'Content-Type: application/json' \\\n"
