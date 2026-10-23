@@ -1,0 +1,29 @@
+{
+  "app_name": "clarity-bridge",
+  "clarity_rpc": "127.0.0.1:9633",
+  "no_wizard": true,
+  "state_dir": "/tmp/bridge-state",
+  "mint_destination": "rclrty1qzjrjdw68zqmxa744ewv7sstgdstlxw9yx7llhtz9nwmf5r74fetumsykpj",
+  "view_key_file": "ccx-view.key",
+  "chains": [
+    {
+      "name": "btc",
+      "transport": "mempool",
+      "mempool_url": "https://mempool.space/testnet/api",
+      "confirmation_depth": 6,
+      "start_height": 5195988,
+      "bridge_address": "muAxGHp6JPJineuAWwoPKxcgH5zkgP8Che",
+      "burn_finality_depth": 3
+    },
+    {
+      "name": "ccx",
+      "rpc": "116.203.223.188:16000",
+      "wallet_rpc": "127.0.0.1:16001",
+      "confirmation_depth": 20,
+      "start_height": 2180000,
+      "bridge_address": "ccx7ZN848PUEbD2q4WYqjtGSaAZwiygJqQae7uzmPVWc83J1joskuSeB4UaF5ec8gyA6H5RTKqw2NUxu7nmuLX9h1BD7bBv6VV",
+      "ccx_network_prefix": 31444,
+      "burn_finality_depth": 3
+    }
+  ]
+}
