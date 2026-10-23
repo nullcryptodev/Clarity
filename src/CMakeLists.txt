@@ -12,6 +12,10 @@ endif()
 # Add definitions
 add_definitions(-DMINIUPNP_STATICLIB)
 
+#Include directories
+include_directories(SYSTEM ${CMAKE_SOURCE_DIR}/external/parallel_hashmap)
+include_directories(${MDBX_INCLUDE_DIR})
+
 # Grab src modules
 add_subdirectory(Common)
 add_subdirectory(Consensus)
@@ -24,10 +28,6 @@ add_subdirectory(RPC)
 add_subdirectory(Serialization)
 add_subdirectory(State)
 add_subdirectory(Wallet)
-
-#Include directories
-include_directories(SYSTEM ${CMAKE_SOURCE_DIR}/external/parallel_hashmap)
-include_directories(${MDBX_INCLUDE_DIR})
 
 # Bundle all object files into one static library
 add_library(CoreLibs STATIC
