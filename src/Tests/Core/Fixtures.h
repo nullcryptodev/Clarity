@@ -13,7 +13,6 @@
 #include "Crypto/Helpers.h"
 
 #include "Core/BridgeTypes.h"
-#include "Core/BridgeWatcherTypes.h"
 #include "Core/GlobalState.h"
 
 #include "TransactionBuilder.h"
@@ -494,16 +493,32 @@ namespace Tests
     }
 
     //  Build a BridgeBurn transaction.
+    //
+    //  Payload layout (matching executeBridgeBurn):
+    //    [8]  source_chain_id
+    //    [1]  blob_len
+    //    [N]  destination_blob
+    //    [1]  addr_len
+    //    [M]  destination_address
+    //    [8]  amount
+    //
+    //  `destination_address` is the human-readable source-chain address
+    //  the user supplied; the executor stores it verbatim on the
+    //  withdrawal record. It must be non-empty. The blob is the binary
+    //  form; per-chain bounds are checked by the executor against the
+    //  chain registration's destination_blob_min_len/max_len, not here.
     Transaction makeBridgeBurnTx(
         const Crypto::KeyPair &from,
         uint64_t source_chain_id,
         const std::vector<uint8_t> &destination_blob,
+        const std::string &destination_address,
         uint64_t amount,
         Id wrapped_token_id,
         uint64_t nonce)
     {
       std::vector<uint8_t> payload;
-      payload.reserve(8 + 1 + destination_blob.size() + 8);
+      payload.reserve(8 + 1 + destination_blob.size() + 1 +
+                      destination_address.size() + 8);
 
       for (int i = 0; i < 8; ++i)
         payload.push_back(uint8_t(source_chain_id >> (i * 8)));
@@ -511,6 +526,10 @@ namespace Tests
       payload.insert(payload.end(),
                      destination_blob.begin(),
                      destination_blob.end());
+      payload.push_back(static_cast<uint8_t>(destination_address.size()));
+      payload.insert(payload.end(),
+                     destination_address.begin(),
+                     destination_address.end());
       for (int i = 0; i < 8; ++i)
         payload.push_back(uint8_t(amount >> (i * 8)));
 

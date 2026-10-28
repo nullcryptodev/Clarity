@@ -417,6 +417,167 @@ namespace Wallet
       WalletStatus *error_out = nullptr);
 
   //  =========================================================================
+  //  AMM Farming
+  //
+  //  A farm is an escrow + a rate attached to one pool. These
+  //  builders produce the transactions that the executor's
+  //  executeAmm* handlers accept. The payload layouts match the
+  //  parsers in TransactionExecutor.cpp byte-for-byte.
+  //
+  //  None of these builders set tx.to, tx.token_id, or tx.amount.
+  //  All type-specific data lives in the payload, matching the
+  //  pattern the NFT collection builders use. The fee is the only
+  //  amount carried in the transaction record itself.
+  //
+  //  Escrow transfers (CreateAmmFarm, RefillAmmFarm) reference
+  //  the reward token and the escrow amount from the payload, not
+  //  from the transaction record. The executor's debitToken call
+  //  reads tx.from, so the creator pays from their own balance.
+  //  =========================================================================
+
+  //  ---- AMM Farm: Create ----
+  //
+  //  Payload layout (matching executeCreateAmmFarm):
+  //    [8]  pool_id
+  //    [4]  reward_token_id
+  //    [8]  reward_rate_per_epoch
+  //    [8]  reward_escrow_amount
+  //  Total: 28 bytes.
+  //
+  //  The reward token may be CLRTY (NATIVE_TOKEN_ID == 0) or any
+  //  on-chain token. The escrow amount is debited from `from` and
+  //  credited to the farm's virtual custody address in the same
+  //  transaction.
+
+  struct CreateAmmFarmParams
+  {
+    TxCommonParams common;
+    uint64_t pool_id{0};
+    Id reward_token_id{NATIVE_TOKEN_ID};
+    uint64_t reward_rate_per_epoch{0};
+    uint64_t reward_escrow_amount{0};
+  };
+
+  std::optional<Core::Transaction> buildCreateAmmFarm(
+      const Crypto::Address &from,
+      const CreateAmmFarmParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- AMM Farm: Update Rate ----
+  //
+  //  Payload layout (matching executeUpdateAmmFarm):
+  //    [8]  pool_id
+  //    [8]  new_rate_per_epoch
+  //  Total: 16 bytes.
+  //
+  //  The new rate applies at the next epoch boundary, not the
+  //  current one. The executor rejects new_rate_per_epoch == 0;
+  //  use PauseAmmFarm to stop emissions.
+
+  struct UpdateAmmFarmParams
+  {
+    TxCommonParams common;
+    uint64_t pool_id{0};
+    uint64_t new_rate_per_epoch{0};
+  };
+
+  std::optional<Core::Transaction> buildUpdateAmmFarm(
+      const Crypto::Address &from,
+      const UpdateAmmFarmParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- AMM Farm: Pause ----
+  //
+  //  Payload layout (matching executePauseAmmFarm):
+  //    [8]  pool_id
+  //  Total: 8 bytes.
+  //
+  //  Pausing is idempotent: pausing an already-paused farm is a
+  //  no-op success. A refill un-pauses automatically.
+
+  struct PauseAmmFarmParams
+  {
+    TxCommonParams common;
+    uint64_t pool_id{0};
+  };
+
+  std::optional<Core::Transaction> buildPauseAmmFarm(
+      const Crypto::Address &from,
+      const PauseAmmFarmParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- AMM Farm: Refill ----
+  //
+  //  Payload layout (matching executeRefillAmmFarm):
+  //    [8]  pool_id
+  //    [8]  amount
+  //  Total: 16 bytes.
+  //
+  //  Adds `amount` of the farm's reward token to the escrow,
+  //  debited from `from`. If the farm was paused, this un-pauses
+  //  it. Refilling an unpaused farm is a no-op on the pause state
+  //  and just adds to the escrow.
+
+  struct RefillAmmFarmParams
+  {
+    TxCommonParams common;
+    uint64_t pool_id{0};
+    uint64_t amount{0};
+  };
+
+  std::optional<Core::Transaction> buildRefillAmmFarm(
+      const Crypto::Address &from,
+      const RefillAmmFarmParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- AMM Farm: Close ----
+  //
+  //  Payload layout (matching executeCloseAmmFarm):
+  //    [8]  pool_id
+  //  Total: 8 bytes.
+  //
+  //  A farm can only be closed when the pool has no liquidity
+  //  and the farm is paused. The path is: pause, drain the pool
+  //  (last LP's RemoveLiquidity closes the pool and the farm
+  //  together), or pause then close. Any remaining escrow is
+  //  refunded to the farm's creator.
+
+  struct CloseAmmFarmParams
+  {
+    TxCommonParams common;
+    uint64_t pool_id{0};
+  };
+
+  std::optional<Core::Transaction> buildCloseAmmFarm(
+      const Crypto::Address &from,
+      const CloseAmmFarmParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  ---- AMM Farm: Claim Rewards ----
+  //
+  //  Empty payload. Settles every position the caller holds on
+  //  every farmed pool into pending_rewards. The actual balance
+  //  movement is a separate ClaimRewards transaction, matching
+  //  the two-step pattern NFT rewards use (ClaimNftReward then
+  //  ClaimRewards).
+  //
+  //  This is the correct behavior even though it's two
+  //  transactions: the settle step is O(positions held) and the
+  //  balance step is O(1). Bundling them would mean every claim
+  //  pays for the settle whether or not the caller wanted to
+  //  move the balance to spendable CLRTY in that same moment.
+
+  struct ClaimAmmFarmRewardsParams
+  {
+    TxCommonParams common;
+  };
+
+  std::optional<Core::Transaction> buildClaimAmmFarmRewards(
+      const Crypto::Address &from,
+      const ClaimAmmFarmRewardsParams &params,
+      WalletStatus *error_out = nullptr);
+
+  //  =========================================================================
   //  Bridge
   //
   //  The builders below produce transactions that the executor's

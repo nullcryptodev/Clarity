@@ -1702,6 +1702,100 @@ namespace Core
           state.putNftCollection(updated);
         });
 
+    //  AMM farm emission.
+    //
+    //  Runs before the staker early-return below, for the same
+    //  reason the NFT pass does: the escrow decrement is
+    //  independent of whether stakers were paid this epoch.
+    //
+    //  For each farm with an active emission, the per-epoch
+    //  obligation is `min(rate_per_epoch, escrow_remaining)`. The
+    //  emission is split pro-rata across the pool's total_liquidity
+    //  at this boundary via the reward-per-share accumulator:
+    //
+    //    inc = emission * FARM_RPS_SCALE / pool.total_liquidity
+    //    rps_per_share += inc
+    //
+    //  No individual LP is credited here. The credit happens
+    //  lazily at claim time (executeClaimAmmFarmRewards) and at
+    //  removal time (executeRemoveLiquidity), both of which read
+    //  the delta between the farm's current rps and the position's
+    //  stored last_rps. This is the same accrue-then-claim model
+    //  the NFT collection pass uses, with the same invariant: the
+    //  sum of all pending claims is always <= the total the escrow
+    //  has decremented for.
+    //
+    //  This is the only place rps_per_share changes, and the only
+    //  place the farm escrow decreases except the refund on
+    //  close/drain. The single-writer property is what makes the
+    //  accounting sound.
+    //
+    //  The pass is O(farmed pools), not O(LPs).
+    state.forEachAmmFarm(
+        [&](const Core::AmmFarmSchedule &farm)
+        {
+          if (!farm.hasEmission())
+            return;
+          if (farm.reward_paused)
+            return;
+
+          Core::AmmPool pool;
+          if (!state.getAmmPool(farm.pool_id, pool))
+            return; // pool gone; the full-drain close handles cleanup
+          if (pool.total_liquidity == 0)
+            return; // no shares to emit to; escrow holds
+
+          const uint64_t emission =
+              std::min(farm.reward_rate_per_epoch,
+                       farm.reward_escrow_remaining);
+          if (emission == 0)
+            return;
+
+          //  Compute the per-share increment in 128 bits. The
+          //  max value is (emission * FARM_RPS_SCALE), where
+          //  emission <= total token supply and FARM_RPS_SCALE
+          //  is 10^10; for a 10^18 supply that is ~10^28, well
+          //  within __uint128_t. The division brings it back to
+          //  a uint64 if the increment is small enough to fit;
+          //  the sum with the existing rps is what can overflow.
+          const __uint128_t inc_128 =
+              static_cast<__uint128_t>(emission) * FARM_RPS_SCALE /
+              pool.total_liquidity;
+
+          Core::AmmFarmSchedule updated = farm;
+
+          if (updated.rps_per_share + static_cast<uint64_t>(inc_128) <
+              updated.rps_per_share)
+          {
+            //  rps_per_share would overflow. This is reachable only
+            //  on an extreme pool configuration (tiny total_liquidity
+            //  plus huge emission, repeated over many epochs). The
+            //  safe response is to drain the escrow, mark the farm
+            //  paused, and skip the bump — the emission this epoch
+            //  is accounted for by the pause, and the remaining
+            //  escrow is refundable to the creator. The alternative
+            //  (emit into an overflowing accumulator) would corrupt
+            //  every position's accrual.
+            updated.reward_escrow_remaining = 0;
+            updated.reward_paused = true;
+            state.putAmmFarm(updated);
+            return;
+          }
+
+          updated.rps_per_share += static_cast<uint64_t>(inc_128);
+          updated.reward_escrow_remaining -= emission;
+
+          //  If this epoch drained the escrow, pause. The emission
+          //  itself was already accounted for above (the increment
+          //  and the debit are both in `updated`), so the drain
+          //  produces the correct accrual for this epoch and
+          //  correctly stops future emissions.
+          if (updated.reward_escrow_remaining == 0)
+            updated.reward_paused = true;
+
+          state.putAmmFarm(updated);
+        });
+
     if (adj.distributed == 0 || total_staked == 0 || staker_count == 0)
       return;
 

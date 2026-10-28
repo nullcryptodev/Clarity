@@ -440,6 +440,76 @@ namespace Rpc
       emitGauge(out, "clrty_blocks_until_epoch", blocks_until_next);
     }
 
+    // ---- AMM farming ----
+    //
+    //  Fixed cardinality. Ten time series regardless of how many
+    //  farms or how many LPs exist on the chain. The per-token
+    //  escrow breakdown is deliberately not reported here: it
+    //  would be one series per distinct reward token, which is
+    //  bounded in practice but not by a constant. The
+    //  `getAmmFarmStats` RPC method provides that breakdown for
+    //  operators who need it.
+    //
+    //  The pass is one walk of TBL_AMM_FARMS, which is O(farms),
+    //  not O(LPs). On a chain with a handful of farms this is a
+    //  handful of SMT reads per scrape; on a chain with hundreds
+    //  of farms it is still cheaper than the storage metrics.
+    {
+      const uint64_t height = s.height;
+      State::StateAccess state(node_.stateDB(), height);
+
+      uint64_t total_farms = 0;
+      uint64_t active_farms = 0;
+      uint64_t paused_farms = 0;
+      uint64_t escrow_total = 0;
+      uint64_t rate_total_per_epoch = 0;
+
+      state.forEachAmmFarm(
+          [&](const Core::AmmFarmSchedule &farm)
+          {
+            ++total_farms;
+
+            if (farm.reward_paused)
+              ++paused_farms;
+            else if (farm.isActive())
+              ++active_farms;
+
+            escrow_total += farm.reward_escrow_remaining;
+
+            //  Sum the per-epoch emission across all *active*
+            //  farms. A paused farm's rate is meaningless (it
+            //  emits nothing) and a farm with rate 0 has no
+            //  per-epoch obligation, so isActive() is the right
+            //  gate. This is the number to watch against the
+            //  treasury's token supply: "how much does the
+            //  chain pay out per epoch, currently?"
+            if (farm.isActive())
+              rate_total_per_epoch += farm.reward_rate_per_epoch;
+          });
+
+      beginMetric(out, "clrty_amm_farms_total", "gauge",
+                  "Number of farms registered on the chain (active and paused)");
+
+      beginMetric(out, "clrty_amm_farms_active", "gauge",
+                  "Farms with a positive per-epoch emission and non-zero escrow, not paused");
+
+      beginMetric(out, "clrty_amm_farms_paused", "gauge",
+                  "Farms paused due to escrow exhaustion");
+
+      beginMetric(out, "clrty_amm_farm_escrow_total", "gauge",
+                  "Sum of all farm escrow balances across all reward tokens, in atomic units");
+
+      beginMetric(out, "clrty_amm_farm_emission_per_epoch_total", "gauge",
+                  "Sum of per-epoch emissions across all active farms, in atomic units per epoch");
+
+      emitGauge(out, "clrty_amm_farms_total", total_farms);
+      emitGauge(out, "clrty_amm_farms_active", active_farms);
+      emitGauge(out, "clrty_amm_farms_paused", paused_farms);
+      emitGauge(out, "clrty_amm_farm_escrow_total", escrow_total);
+      emitGauge(out, "clrty_amm_farm_emission_per_epoch_total",
+                rate_total_per_epoch);
+    }
+
     // ---- Consensus ----
 
     beginMetric(out, "clrty_consensus_height", "gauge",

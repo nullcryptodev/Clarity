@@ -201,6 +201,47 @@ namespace Core
                                                  const Transaction &tx,
                                                  const TxExecutionContext &ctx);
 
+    //  ---- AMM farming ----
+    //
+    //  A farm is an escrow + a rate attached to one pool. The escrow is
+    //  a real token balance at State::Keys::ammFarmAddress(pool_id); the
+    //  schedule is a companion record at State::Keys::ammFarm(pool_id);
+    //  each position's accrual is a companion record at
+    //  State::Keys::ammPositionAccrual(position_id).
+    //
+    //  Emission is pro-rata across the pool's total_liquidity at each
+    //  epoch boundary, using a reward-per-share accumulator
+    //  (AmmFarmSchedule::rps_per_share). Claims are lazily settled into
+    //  pending_rewards, then moved to balance by the existing
+    //  ClaimRewards.
+    //
+    //  Creator-only for update, pause, refill, close. Anyone can create
+    //  a farm on any pool (a third party funding a pool's emissions is
+    //  the DeFi norm).
+    static Receipt executeCreateAmmFarm(State::StateAccess &state,
+                                        const Transaction &tx,
+                                        const TxExecutionContext &ctx);
+
+    static Receipt executeUpdateAmmFarm(State::StateAccess &state,
+                                        const Transaction &tx,
+                                        const TxExecutionContext &ctx);
+
+    static Receipt executePauseAmmFarm(State::StateAccess &state,
+                                       const Transaction &tx,
+                                       const TxExecutionContext &ctx);
+
+    static Receipt executeRefillAmmFarm(State::StateAccess &state,
+                                        const Transaction &tx,
+                                        const TxExecutionContext &ctx);
+
+    static Receipt executeCloseAmmFarm(State::StateAccess &state,
+                                       const Transaction &tx,
+                                       const TxExecutionContext &ctx);
+
+    static Receipt executeClaimAmmFarmRewards(State::StateAccess &state,
+                                              const Transaction &tx,
+                                              const TxExecutionContext &ctx);
+
     //  ---- Bridge ----
     //
     //  There is no executeRegisterBridgeWatcher or

@@ -21,6 +21,7 @@
 
 #include "Node/Node.h"
 
+#include "State/Keys.h"
 #include "State/ProofKeys.h"
 
 namespace Rpc
@@ -463,6 +464,276 @@ namespace Rpc
       putU64(out, "count", emitted);
       putU64(out, "total", static_cast<uint64_t>(matches.size()));
       out["positions"] = std::move(arr);
+      return out;
+    }
+
+    //  =====================================================================
+    //  AMM farming
+    //
+    //  Read-only accessors for farm schedules and per-position
+    //  accrual. All five methods read through StateAccess at the
+    //  current chain height and are pure reads — none of them
+    //  settles accrual or mutates state. A wallet that wants to
+    //  claim must submit a ClaimAmmFarmRewards transaction; the RPC
+    //  only tells it how much that claim would credit.
+    //
+    //  The accrual companion is optional: a position that has never
+    //  settled has no companion record, and the encoder treats that
+    //  as "earning since the farm existed" (last_rps = 0). Every
+    //  method here reports `exists` so a client can distinguish the
+    //  two cases without a second round-trip.
+    //  =====================================================================
+
+    Common::Json method_getAmmFarm(Node::Node &node,
+                                   const RpcConfig & /*config*/,
+                                   const JsonRpcRequest &req)
+    {
+      const Id pool_id = requireU64(req.params, "pool_id");
+      const uint64_t height = node.chain().height();
+      const std::string hrp = hrpForNode(node);
+
+      State::StateAccess state(node.stateDB(), height);
+
+      Core::AmmFarmSchedule farm;
+      if (!state.getAmmFarm(pool_id, farm))
+      {
+        throw RpcMethodError(
+            ErrorCode::AmmFarmNotFound,
+            "no farm for pool " + encodeU64Hex(pool_id),
+            makeErrorData(ErrorCode::AmmFarmNotFound,
+                          {{"pool_id", encodeU64Hex(pool_id)}}));
+      }
+
+      //  Pass the pool (if it exists) so the encoder can derive
+      //  pool_total_liquidity, and the escrow balance from the
+      //  custody address so the client gets the authoritative
+      //  value, not just the record's cache.
+      Core::AmmPool pool;
+      const bool have_pool = state.getAmmPool(pool_id, pool);
+
+      const uint64_t escrow_balance = state.getTokenBalance(
+          State::Keys::ammFarmAddress(pool_id), farm.reward_token_id);
+
+      return encodeAmmFarm(farm, have_pool ? &pool : nullptr,
+                           escrow_balance, hrp);
+    }
+
+    Common::Json method_getAllAmmFarms(Node::Node &node,
+                                       const RpcConfig & /*config*/,
+                                       const JsonRpcRequest &req)
+    {
+      const PageParams page = parsePageParams(req.params);
+      const uint64_t height = node.chain().height();
+      const std::string hrp = hrpForNode(node);
+
+      State::StateAccess state(node.stateDB(), height);
+
+      //  Collect matching farms first so we can paginate cleanly.
+      //  A farm is O(number of farms), not O(number of LPs), so
+      //  materializing the list is bounded by the number of farmed
+      //  pools on the chain.
+      std::vector<Core::AmmFarmSchedule> all;
+      state.forEachAmmFarm(
+          [&](const Core::AmmFarmSchedule &f)
+          { all.push_back(f); });
+
+      Common::Json arr = Common::Json::array();
+      uint64_t emitted = 0;
+
+      for (size_t i = page.offset; i < all.size(); ++i)
+      {
+        if (emitted >= page.limit)
+          break;
+
+        Core::AmmPool pool;
+        const bool have_pool = state.getAmmPool(all[i].pool_id, pool);
+
+        const uint64_t escrow_balance = state.getTokenBalance(
+            State::Keys::ammFarmAddress(all[i].pool_id),
+            all[i].reward_token_id);
+
+        arr.push_back(encodeAmmFarm(all[i],
+                                    have_pool ? &pool : nullptr,
+                                    escrow_balance, hrp));
+        ++emitted;
+      }
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "count", emitted);
+      putU64(out, "offset", page.offset);
+      putU64(out, "limit", page.limit);
+      putU64(out, "total", static_cast<uint64_t>(all.size()));
+      out["farms"] = std::move(arr);
+      return out;
+    }
+
+    Common::Json method_getAmmFarmAccrual(Node::Node &node,
+                                          const RpcConfig & /*config*/,
+                                          const JsonRpcRequest &req)
+    {
+      const Id pool_id = requireU64(req.params, "pool_id");
+      const Id position_id = requireU64(req.params, "position_id");
+      const uint64_t height = node.chain().height();
+      const std::string hrp = hrpForNode(node);
+
+      State::StateAccess state(node.stateDB(), height);
+
+      Core::AmmFarmSchedule farm;
+      if (!state.getAmmFarm(pool_id, farm))
+      {
+        throw RpcMethodError(
+            ErrorCode::AmmFarmNotFound,
+            "no farm for pool " + encodeU64Hex(pool_id),
+            makeErrorData(ErrorCode::AmmFarmNotFound,
+                          {{"pool_id", encodeU64Hex(pool_id)}}));
+      }
+
+      Core::AmmPosition position;
+      if (!state.getAmmPosition(position_id, position))
+      {
+        throw RpcMethodError(
+            ErrorCode::PoolNotFound,
+            "no position with id " + encodeU64Hex(position_id),
+            makeErrorData(ErrorCode::PoolNotFound,
+                          {{"position_id", encodeU64Hex(position_id)}}));
+      }
+
+      //  Defensive: the position must actually belong to the farm's
+      //  pool. A caller who passes the wrong pair is asking a
+      //  nonsense question; return the same shape of error a
+      //  missing farm would.
+      if (position.pool_id != pool_id)
+      {
+        throw RpcMethodError(
+            ErrorCode::AmmFarmNotFound,
+            "position " + encodeU64Hex(position_id) +
+                " does not belong to pool " + encodeU64Hex(pool_id),
+            makeErrorData(ErrorCode::AmmFarmNotFound,
+                          {{"pool_id", encodeU64Hex(pool_id)},
+                           {"position_id", encodeU64Hex(position_id)}}));
+      }
+
+      //  The accrual companion may or may not exist. The encoder
+      //  handles both cases; we just pass whatever we found.
+      Core::AmmPositionAccrual accrual;
+      const bool have_accrual =
+          state.getAmmPositionAccrual(position_id, accrual);
+
+      return encodeAmmFarmAccrual(farm, position,
+                                  have_accrual ? &accrual : nullptr,
+                                  hrp);
+    }
+
+    Common::Json method_getAmmPositionAccrualsForOwner(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const std::string hrp = hrpForNode(node);
+      const Crypto::Address owner =
+          requireAddress(req.params, "address", hrp);
+
+      uint64_t limit = 100;
+      if (auto v = optionalU64(req.params, "limit"); v.has_value())
+        limit = *v;
+      if (limit == 0 || limit > 500)
+      {
+        throw RpcMethodError(
+            ErrorCode::InvalidParams,
+            "field 'limit' must be 1..500",
+            makeErrorData(ErrorCode::InvalidParams,
+                          {{"field", "limit"},
+                           {"value", encodeU64Hex(limit)}}));
+      }
+
+      const uint64_t height = node.chain().height();
+      State::StateAccess state(node.stateDB(), height);
+
+      Common::Json arr = Common::Json::array();
+      uint64_t emitted = 0;
+
+      state.forEachPositionForOwner(
+          owner,
+          [&](const Core::AmmPosition &pos)
+          {
+            if (emitted >= limit)
+              return;
+
+            //  Skip positions on pools with no farm. The method is
+            //  "my farm accruals", not "my positions".
+            Core::AmmFarmSchedule farm;
+            if (!state.getAmmFarm(pos.pool_id, farm))
+              return;
+
+            Core::AmmPositionAccrual accrual;
+            const bool have_accrual =
+                state.getAmmPositionAccrual(pos.id, accrual);
+
+            arr.push_back(encodeAmmFarmAccrual(
+                farm, pos, have_accrual ? &accrual : nullptr, hrp));
+            ++emitted;
+          });
+
+      Common::Json out = Common::Json::object();
+      putAddress(out, "address", owner, hrp);
+      putU64(out, "count", emitted);
+      putU64(out, "limit", limit);
+      out["accruals"] = std::move(arr);
+      return out;
+    }
+
+    Common::Json method_getAmmFarmStats(Node::Node &node,
+                                        const RpcConfig & /*config*/,
+                                        const JsonRpcRequest & /*req*/)
+    {
+      const uint64_t height = node.chain().height();
+      const std::string hrp = hrpForNode(node);
+
+      State::StateAccess state(node.stateDB(), height);
+
+      //  Aggregate counts. One pass over the farm table, O(farms),
+      //  which is bounded by the number of farmed pools on the
+      //  chain. Same complexity class as getAllAmmFarms' collection
+      //  step.
+      uint64_t total_farms = 0;
+      uint64_t active_farms = 0;
+      uint64_t paused_farms = 0;
+
+      //  Sum escrow by reward token. A chain with N farms paying
+      //  out M distinct tokens produces an M-entry object; M is
+      //  bounded by the number of distinct token ids ever used as a
+      //  farm reward, which is in practice small.
+      std::unordered_map<Id, uint64_t> escrow_by_token;
+
+      state.forEachAmmFarm(
+          [&](const Core::AmmFarmSchedule &farm)
+          {
+            ++total_farms;
+
+            if (farm.reward_paused)
+              ++paused_farms;
+            else if (farm.isActive())
+              ++active_farms;
+
+            escrow_by_token[farm.reward_token_id] +=
+                farm.reward_escrow_remaining;
+          });
+
+      Common::Json by_token = Common::Json::array();
+      for (const auto &[token_id, amount] : escrow_by_token)
+      {
+        Common::Json entry = Common::Json::object();
+        putU64(entry, "token_id", token_id);
+        putU64(entry, "escrow_total", amount);
+        by_token.push_back(std::move(entry));
+      }
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "height", height);
+      putU64(out, "total_farms", total_farms);
+      putU64(out, "active_farms", active_farms);
+      putU64(out, "paused_farms", paused_farms);
+      out["escrow_by_token"] = std::move(by_token);
       return out;
     }
 
@@ -2763,6 +3034,14 @@ namespace Rpc
           "getStateRoot",
       });
 
+      out["amm_farming"] = makeArray({
+          "getAmmFarm",
+          "getAllAmmFarms",
+          "getAmmFarmAccrual",
+          "getAmmPositionAccrualsForOwner",
+          "getAmmFarmStats",
+      });
+
       out["state"] = makeArray({
           "getBalance",
           "getAccount",
@@ -3703,6 +3982,16 @@ namespace Rpc
     d.registerMethod("getAllPools", method_getAllPools);
     d.registerMethod("getPoolsForToken", method_getPoolsForToken);
     d.registerMethod("getPositionsForPool", method_getPositionsForPool);
+  }
+
+  void registerAmmFarmMethods(JsonRpcDispatcher &d)
+  {
+    d.registerMethod("getAmmFarm", method_getAmmFarm);
+    d.registerMethod("getAllAmmFarms", method_getAllAmmFarms);
+    d.registerMethod("getAmmFarmAccrual", method_getAmmFarmAccrual);
+    d.registerMethod("getAmmPositionAccrualsForOwner",
+                     method_getAmmPositionAccrualsForOwner);
+    d.registerMethod("getAmmFarmStats", method_getAmmFarmStats);
   }
 
   void registerChainMethods(JsonRpcDispatcher &d)

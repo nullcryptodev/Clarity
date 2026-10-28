@@ -147,6 +147,14 @@ namespace Rpc
 
     AmmPoolEmpty = 1200,
     AmmSlippageTooHigh = 1201,
+    AmmFarmNotFound = 1202,
+    //  Reserved. Not emitted by the current node: getAmmFarmAccrual
+    //  reports an absent companion with `exists: false` and computes
+    //  the accrued amount as if last_rps were 0, which is the
+    //  correct semantic. A future strict-mode variant of the method
+    //  could emit this; the slot is reserved so that a future error
+    //  that wants it doesn't collide with an older protocol version.
+    AmmFarmAccrualNotFound = 1203,
 
     // ---- Application: admin / auth (1250..1299) ----
 

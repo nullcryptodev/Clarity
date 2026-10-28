@@ -175,7 +175,24 @@ namespace State
       //  as one that did.
       TBL_BRIDGE_EVENTS = 44,
 
-      TBL_COUNT = 45,
+      //  Per-pool farm schedule. Key = pool_id (8 LE). Value =
+      //  serialized AmmFarmSchedule. Mirror of the SMT record at
+      //  Keys::ammFarm(pool_id). Written by putAmmFarm and
+      //  deleteAmmFarm; iterated by forEachAmmFarm for the
+      //  epoch-boundary emission pass. Not part of the state root:
+      //  this is a local mirror, the SMT leaf is authoritative.
+      TBL_AMM_FARMS = 45,
+
+      //  Per-position farm accrual companion. Key = position_id
+      //  (8 LE). Value = serialized AmmPositionAccrual. Mirror of
+      //  the SMT record at Keys::ammPositionAccrual(position_id).
+      //  Written by putAmmPositionAccrual and
+      //  deleteAmmPositionAccrual; read by getAmmPositionAccrual
+      //  on every settle. Not part of the state root, same as
+      //  TBL_AMM_FARMS.
+      TBL_AMM_POSITION_ACCRUALS = 46,
+
+      TBL_COUNT = 47,
     };
 
     //  Per-table diagnostic information. Reported by the metrics

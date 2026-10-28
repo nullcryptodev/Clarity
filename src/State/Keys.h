@@ -249,5 +249,48 @@ namespace State
     {
       return Crypto::hashDomain("brga", address.data.data(), 32);
     }
+
+    //  -------------------------------------------------------------------
+    //  AMM farming
+    //  -------------------------------------------------------------------
+    //
+    //  A farm is a companion record to a pool (Keys::ammFarm), the
+    //  per-position accrual tracker is a companion record to an
+    //  LP position (Keys::ammPositionAccrual), and the farm's
+    //  escrow lives at a virtual address derived from the pool id
+    //  (Keys::ammFarmAddress), the same pattern nftAddress and
+    //  nftCollectionAddress use for NFT custody.
+
+    inline Crypto::Hash ammFarm(uint64_t pool_id) noexcept
+    {
+      uint8_t buf[8];
+      for (int i = 0; i < 8; ++i)
+        buf[i] = uint8_t(pool_id >> (i * 8));
+      return Crypto::hashDomain("farm", buf, 8);
+    }
+
+    inline Crypto::Hash ammPositionAccrual(uint64_t position_id) noexcept
+    {
+      uint8_t buf[8];
+      for (int i = 0; i < 8; ++i)
+        buf[i] = uint8_t(position_id >> (i * 8));
+      return Crypto::hashDomain("pacc", buf, 8);
+    }
+
+    inline Crypto::Address ammFarmAddress(uint64_t pool_id) noexcept
+    {
+      uint8_t buf[8];
+      for (int i = 0; i < 8; ++i)
+        buf[i] = uint8_t(pool_id >> (i * 8));
+
+      uint8_t domain_buf[4 + 8];
+      std::memcpy(domain_buf, "fma ", 4);
+      std::memcpy(domain_buf + 4, buf, 8);
+
+      Crypto::Address addr;
+      Crypto::blake2b(domain_buf, sizeof(domain_buf),
+                      addr.data.data(), addr.data.size());
+      return addr;
+    }
   } // namespace Keys
 }

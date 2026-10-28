@@ -8,6 +8,7 @@
 #include "Common/Json.h"
 
 #include "Core/Account.h"
+#include "Core/AmmFarmTypes.h"
 #include "Core/AmmPool.h"
 #include "Core/AmmPosition.h"
 #include "Core/Block.h"
@@ -383,4 +384,63 @@ namespace Rpc
   //    counterparty          (hex)
   Common::Json encodeBridgeEvent(const Core::BridgeEvent &evt,
                                  const std::string &hrp);
+
+  //  AmmFarmSchedule -> JSON
+  //
+  //  Fields:
+  //    pool_id                    (hex)
+  //    creator                    (Bech32m)
+  //    reward_token_id            (hex; 0 means CLRTY)
+  //    reward_rate_per_epoch      (hex)
+  //    reward_escrow_remaining    (hex; cache of the on-chain balance)
+  //    reward_paused              (bool)
+  //    rps_per_share              (hex; monotone accumulator)
+  //    created_at_height          (hex)
+  //
+  //  Derived (require the pool and the escrow balance; passed in):
+  //    reward_escrow_balance      (hex; authoritative on-chain balance
+  //                                at Keys::ammFarmAddress(pool_id))
+  //    pool_total_liquidity       (hex; 0 if the pool has been deleted)
+  //    is_active                  (bool; farm.isActive())
+  //    epochs_remaining           (hex; escrow_balance / rate, floored;
+  //                                0 if rate == 0)
+  //    escrow_address             (Bech32m; so a client can getBalance
+  //                                against the custody address directly)
+  //
+  //  `escrow_balance` is passed in rather than read here so this
+  //  encoder is a pure function of its arguments. It differs from
+  //  `reward_escrow_remaining` only if the cache is stale, which
+  //  should never happen on a healthy node but is worth surfacing.
+  Common::Json encodeAmmFarm(const Core::AmmFarmSchedule &farm,
+                             const Core::AmmPool *pool,
+                             uint64_t escrow_balance,
+                             const std::string &hrp);
+
+  //  AmmPositionAccrual -> JSON
+  //
+  //  This encoder produces a *computed* accrual view, not just the
+  //  stored companion record. It combines the farm, the position,
+  //  and (optionally) the accrual companion into a single object:
+  //
+  //    pool_id                  (hex)
+  //    position_id              (hex)
+  //    position_liquidity       (hex)
+  //    reward_token_id          (hex)
+  //    exists                   (bool; true if the accrual companion
+  //                              was present)
+  //    last_rps                 (hex; 0 if `exists` is false)
+  //    current_rps              (hex; farm.rps_per_share)
+  //    accrued_unclaimed        (hex; (current - last) * liquidity /
+  //                              FARM_RPS_SCALE; what a claim right
+  //                              now would credit to pending_rewards)
+  //    farm_paused              (bool)
+  //
+  //  `accrual` may be null. When it is, the encoder treats last_rps
+  //  as 0, which is the correct semantic for a position that has
+  //  never settled: the farm also started at rps_per_share = 0, so
+  //  the position has been earning since the farm existed.
+  Common::Json encodeAmmFarmAccrual(const Core::AmmFarmSchedule &farm,
+                                    const Core::AmmPosition &position,
+                                    const Core::AmmPositionAccrual *accrual,
+                                    const std::string &hrp);
 } // namespace Rpc

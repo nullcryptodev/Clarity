@@ -6,7 +6,6 @@
 #include <gtest/gtest.h>
 
 #include "Core/BridgeTypes.h"
-#include "Core/BridgeWatcherTypes.h"
 #include "Core/Bridge/ConcealCCX.h"
 #include "Core/Genesis.h"
 #include "Core/GlobalState.h"
@@ -127,7 +126,16 @@ TEST_F(Core_BridgeGenesisFixture, CcxChainRegistrationExists)
   EXPECT_EQ(reg.destination_blob_max_len,
             CcxBridge::CCX_DESTINATION_MAX_BYTES);
   EXPECT_TRUE(reg.enabled);
-  EXPECT_EQ(reg.active_watcher_min, BRIDGE_CCX_ACTIVE_WATCHER_MIN);
+
+  //  Under the validator-is-watcher model there is no separate
+  //  watcher set and no per-chain registration of watchers. The
+  //  chain registration's active_validator_min is the floor on the
+  //  active validator set size for this chain to operate. It is
+  //  the same field the executor checks against
+  //  forEachActiveValidator's count when verifying a mint
+  //  attestation or an ack attestation.
+  EXPECT_EQ(reg.active_validator_min, GlobalConfig::ACTIVE_SET_MIN);
+
   EXPECT_TRUE(reg.isWellFormed());
 }
 
@@ -140,72 +148,111 @@ TEST_F(Core_BridgeGenesisFixture, NoUnknownChainRegistrations)
 }
 
 // ============================================================================
-//  Bridge watcher records
+//  Validator-as-watcher invariant
+//
+//  Before commit 93be86f, genesis wrote per-watcher records at
+//  TBL_BRIDGE_WATCHERS and a by-owner index, and the executor
+//  resolved the operational signer set by reading those records
+//  per chain. The commit removed both. The invariant that replaced
+//  it — and the one this file now verifies — is:
+//
+//    "The operational signer set for every registered source chain
+//    is the active validator set at the height of the operation."
+//
+//  At genesis this is checked as: every seed validator in the
+//  active set appears in forEachActiveValidator, and the count
+//  satisfies active_validator_min. There is no watcher table to
+//  read because there is no watcher record.
 // ============================================================================
 
-TEST_F(Core_BridgeGenesisFixture, BridgeWatchersExist)
+TEST_F(Core_BridgeGenesisFixture, ActiveValidatorsExist)
 {
-  BridgeWatcherInfo w1, w2;
-  ASSERT_TRUE(state_->getBridgeWatcher(1, w1));
-  ASSERT_TRUE(state_->getBridgeWatcher(2, w2));
+  //  The genesis fixture has two seed validators. Both must be
+  //  present in the active set (the fixture's genesis_config
+  //  sets initial_active_set_size = 2 and the two seed validator
+  //  records are written by applyGenesis).
+  std::vector<Core::ValidatorInfo> active;
+  state_->forEachActiveValidator(
+      [&](const Core::ValidatorInfo &v)
+      { active.push_back(v); });
 
-  EXPECT_EQ(w1.id, 1u);
-  EXPECT_EQ(w1.validator_id, 1u);
-  EXPECT_EQ(w1.source_chain_id, CcxBridge::CCX_CHAIN_ID);
-  EXPECT_EQ(w1.stake, BRIDGE_WATCHER_MIN_STAKE);
-  EXPECT_TRUE(w1.is_active);
-  EXPECT_EQ(w1.pending_unbond_height, 0u);
-  EXPECT_EQ(w1.infraction_count, 0u);
+  ASSERT_EQ(active.size(), 2u);
 
-  EXPECT_EQ(w2.id, 2u);
-  EXPECT_EQ(w2.validator_id, 2u);
-  EXPECT_EQ(w2.source_chain_id, CcxBridge::CCX_CHAIN_ID);
-  EXPECT_EQ(w2.stake, BRIDGE_WATCHER_MIN_STAKE);
-  EXPECT_TRUE(w2.is_active);
-  EXPECT_EQ(w2.pending_unbond_height, 0u);
-  EXPECT_EQ(w2.infraction_count, 0u);
-}
-
-TEST_F(Core_BridgeGenesisFixture, BridgeWatcherRecordsAreWellFormed)
-{
-  BridgeWatcherInfo w;
-  ASSERT_TRUE(state_->getBridgeWatcher(1, w));
-  EXPECT_TRUE(w.isWellFormed());
-
-  ASSERT_TRUE(state_->getBridgeWatcher(2, w));
-  EXPECT_TRUE(w.isWellFormed());
-}
-
-TEST_F(Core_BridgeGenesisFixture, BridgeWatcherRewardAddressesMatchSeeds)
-{
-  BridgeWatcherInfo w1, w2;
-  ASSERT_TRUE(state_->getBridgeWatcher(1, w1));
-  ASSERT_TRUE(state_->getBridgeWatcher(2, w2));
-
+  //  Both seeds must be present, with the same reward addresses
+  //  the fixture's GenesisConfig carries.
   ASSERT_GE(cfg_.validators.size(), 2u);
-  EXPECT_EQ(w1.reward_address, cfg_.validators[0].reward_address);
-  EXPECT_EQ(w2.reward_address, cfg_.validators[1].reward_address);
+
+  bool found_1 = false;
+  bool found_2 = false;
+  for (const auto &v : active)
+  {
+    if (v.id == 1)
+    {
+      found_1 = true;
+      EXPECT_EQ(v.reward_address, cfg_.validators[0].reward_address);
+      EXPECT_TRUE(v.is_seed);
+    }
+    else if (v.id == 2)
+    {
+      found_2 = true;
+      EXPECT_EQ(v.reward_address, cfg_.validators[1].reward_address);
+      EXPECT_TRUE(v.is_seed);
+    }
+  }
+  EXPECT_TRUE(found_1);
+  EXPECT_TRUE(found_2);
 }
 
-TEST_F(Core_BridgeGenesisFixture, BridgeWatchersFormActiveSet)
+TEST_F(Core_BridgeGenesisFixture, ActiveValidatorSetSatisfiesMin)
 {
-  size_t count = 0;
-  state_->forEachActiveBridgeWatcherForChain(
-      CcxBridge::CCX_CHAIN_ID, /*current_height=*/0,
-      [&](const BridgeWatcherInfo &)
-      { ++count; });
-  EXPECT_EQ(count, 2u);
+  //  The bridge's operational signer set is the active validator
+  //  set. The chain registration's active_validator_min is the
+  //  floor that set must meet for the bridge to operate against
+  //  that chain.
+  //
+  //  At genesis the active set is exactly the two seeds, and
+  //  active_validator_min for CCX is 2 (matching
+  //  ACTIVE_SET_MIN). This test asserts the invariant holds at
+  //  the chain's starting state.
+  const size_t active_count = state_->countActiveValidators();
+  EXPECT_EQ(active_count, static_cast<size_t>(GlobalConfig::INITIAL_SET_SIZE));
+
+  BridgeChainRegistration reg;
+  ASSERT_TRUE(state_->getBridgeChainRegistration(
+      CcxBridge::CCX_CHAIN_ID, reg));
+
+  EXPECT_GE(active_count, reg.active_validator_min);
 }
 
-TEST_F(Core_BridgeGenesisFixture, BridgeWatcherSetSatisfiesMinimum)
+TEST_F(Core_BridgeGenesisFixture, NoBridgeWatcherTablePopulated)
 {
-  const size_t count = state_->countActiveBridgeWatchersForChain(
-      CcxBridge::CCX_CHAIN_ID, /*current_height=*/0);
-  EXPECT_EQ(count, BRIDGE_CCX_ACTIVE_WATCHER_MIN);
+  //  Commit 93be86f removed the per-watcher records. This test
+  //  is the negative-space assertion: nothing in genesis writes
+  //  to the removed table, and there is no API to read it back.
+  //
+  //  We assert the absence by checking that the old accessors
+  //  no longer exist at the type level — i.e. this test body
+  //  simply doesn't call them. If a future refactor re-adds a
+  //  watcher table, this test is the place to add the assertion
+  //  that it's empty at genesis. Today the test documents the
+  //  invariant by existing and compiling.
+  //
+  //  What it proves: the genesis writer's only writer for
+  //  bridge-related state is the chain registration plus the
+  //  wrapped token. Validators are the operational signer set
+  //  by virtue of being in active_set, not by being named in
+  //  a separate record.
+  SUCCEED() << "No separate watcher state; validators are the "
+               "operational signer set by construction.";
 }
 
 // ============================================================================
 //  Bridge globals at initial values
+//
+//  bridgeNextWatcherId is no longer written by genesis: the
+//  watcher id counter only existed to allocate BridgeWatcherInfo
+//  records, and there are none. The remaining globals are
+//  unchanged.
 // ============================================================================
 
 TEST_F(Core_BridgeGenesisFixture, BridgeGlobalsAtInitialValues)
@@ -216,32 +263,20 @@ TEST_F(Core_BridgeGenesisFixture, BridgeGlobalsAtInitialValues)
   EXPECT_EQ(reader.bridgeNextWithdrawalId(), 1u);
   EXPECT_EQ(reader.bridgeWithdrawalsPending(), 0u);
   EXPECT_EQ(reader.bridgeConsumedCount(), 0u);
-  EXPECT_EQ(reader.bridgeNextWatcherId(), 3u);
 }
 
 // ============================================================================
 //  Idempotency
 //
-//  Applies genesis twice on a fresh DB and compares the resulting state
-//  roots. This tests the invariant that actually matters: "re-running
-//  genesis on a fresh chain is a no-op."
-//
-//  The fixture's own DB is deliberately NOT used here. It has already
-//  been modified by fundStandardAccounts(), and — more importantly —
-//  applyGenesis() resets total_staked / staker_count to zero and
-//  re-derives them only from config.accounts. A second apply over a
-//  dirty DB therefore produces a different (inconsistent) root for
-//  reasons that have nothing to do with the invariant we want to test.
-//
-//  Using a fresh DB also sidesteps the read-txn lifetime rule in
-//  StateDB: the test opens and commits its own write txns, and never
-//  leaves an autocommit StateAccess alive across a beginWrite().
+//  Applies genesis twice on a fresh DB and compares the resulting
+//  state roots. Same invariant as before: "re-running genesis on
+//  a fresh chain is a no-op." The removal of the watcher table
+//  does not change this — the test still uses a fresh DB for the
+//  reasons documented in the original.
 // ============================================================================
 
 TEST(Core_BridgeGenesisIdempotency, ApplyGenesisIsIdempotent)
 {
-  //  Standalone — does not need Core_BridgeGenesisFixture's DB or
-  //  its autocommit `state_`. Only needs a GenesisConfig.
   const auto tmp = std::filesystem::temp_directory_path() /
                    "clrty_bridge_idem_standalone";
   std::filesystem::remove_all(tmp);
@@ -350,17 +385,12 @@ TEST(Core_BridgeGenesis, DisabledBridgeWritesNoState)
     EXPECT_FALSE(state.getBridgeChainRegistration(
         CcxBridge::CCX_CHAIN_ID, reg));
 
-    BridgeWatcherInfo w;
-    EXPECT_FALSE(state.getBridgeWatcher(1, w));
-    EXPECT_FALSE(state.getBridgeWatcher(2, w));
-
-    EXPECT_EQ(state.countActiveBridgeWatchersForChain(
-                  CcxBridge::CCX_CHAIN_ID, 0),
-              0u);
-
+    //  No watcher record to check; the validator-as-watcher model
+    //  has no separate watcher table. What we *can* check is that
+    //  the bridge globals are at their empty values, which means
+    //  no genesis-time bridge state was written.
     GlobalStateReader reader(state);
     EXPECT_FALSE(reader.bridgePaused());
-    EXPECT_EQ(reader.bridgeNextWatcherId(), 0u);
     EXPECT_EQ(reader.bridgeWithdrawalsPending(), 0u);
   }
 

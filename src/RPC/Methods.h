@@ -18,7 +18,7 @@ namespace Rpc
 
   void registerAdminMethods(JsonRpcDispatcher &d);
   void registerAmmMethods(JsonRpcDispatcher &d);
-
+  void registerAmmFarmMethods(JsonRpcDispatcher &d);
   void registerChainMethods(JsonRpcDispatcher &d);
   void registerTxMethods(JsonRpcDispatcher &d);
   void registerStateMethods(JsonRpcDispatcher &d);

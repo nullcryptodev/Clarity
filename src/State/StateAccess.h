@@ -14,6 +14,7 @@
 #include "Core/Account.h"
 #include "Core/AmmPool.h"
 #include "Core/AmmPosition.h"
+#include "Core/AmmFarmTypes.h"
 #include "Core/BridgeTypes.h"
 #include "Core/Order.h"
 #include "Core/Receipt.h"
@@ -386,6 +387,33 @@ namespace State
                           uint64_t position_id);
     void deletePositionIndex(const Crypto::Address &owner,
                              uint64_t pool_id);
+
+    //  AMM farming
+    //
+    //  A farm schedule is a companion record to a pool
+    //  (Keys::ammFarm(pool_id)). The accrual companion is a companion
+    //  record to an LP position (Keys::ammPositionAccrual(position_id)).
+    //  Both are pure SMT records; the escrow custody is a real token
+    //  balance at Keys::ammFarmAddress(pool_id), not an SMT record.
+    //
+    //  putAmmFarm and putAmmPositionAccrual follow the same rule as
+    //  every other put in this file: they release their held read
+    //  txn before their first write, and they do not read the old
+    //  record — the caller does that, and calls the corresponding
+    //  delete/unindex method if cleanup is needed. See the comment
+    //  on putNft for why.
+
+    bool getAmmFarm(Id pool_id, Core::AmmFarmSchedule &out) const;
+    void putAmmFarm(const Core::AmmFarmSchedule &farm);
+    void deleteAmmFarm(Id pool_id);
+
+    void forEachAmmFarm(
+        const std::function<void(const Core::AmmFarmSchedule &)> &fn) const;
+
+    bool getAmmPositionAccrual(Id position_id,
+                               Core::AmmPositionAccrual &out) const;
+    void putAmmPositionAccrual(const Core::AmmPositionAccrual &accrual);
+    void deleteAmmPositionAccrual(Id position_id);
 
     //  =====================================================================
     //  Transaction history indexes

@@ -2354,6 +2354,122 @@ namespace State
   }
 
   //  =========================================================================
+  //  AMM farming
+  //
+  //  putAmmFarm and putAmmPositionAccrual are pure writes. They do
+  //  not read the old record; the caller does, and calls
+  //  deleteAmmFarm / deleteAmmPositionAccrual separately if cleanup
+  //  is needed. This is the same discipline putNft follows (see the
+  //  comment on putNft): a read interleaved with the tree's
+  //  content-addressed node update buffer can cause subsequent
+  //  updates in the same transaction to be silently dropped.
+  //
+  //  deleteAmmFarm does not refund the escrow. The refund is the
+  //  caller's job: executeRemoveLiquidity refunds to the creator on
+  //  a full-drain close, and executeCloseAmmFarm refunds on an
+  //  explicit close. StateAccess primitives are pure data operations;
+  //  policy lives in the executor.
+  //  =========================================================================
+
+  bool StateAccess::getAmmFarm(Id pool_id,
+                               Core::AmmFarmSchedule &out) const
+  {
+    Crypto::Hash key = Keys::ammFarm(pool_id);
+    auto value = smt_.get(key);
+    if (!value.has_value())
+      return false;
+    return Core::AmmFarmSchedule::deserializeState(
+        value->data(), value->size(), out);
+  }
+
+  void StateAccess::putAmmFarm(const Core::AmmFarmSchedule &farm)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::ammFarm(farm.pool_id);
+    auto value = farm.serializeState();
+    smt_.update(key, value, version_);
+
+    uint8_t id_key[8];
+    Common::writeU64(id_key, farm.pool_id);
+    putBlobRow(StateDB::TBL_AMM_FARMS, id_key, sizeof(id_key),
+               value.data(), value.size());
+  }
+
+  void StateAccess::deleteAmmFarm(Id pool_id)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::ammFarm(pool_id);
+    smt_.remove(key, version_);
+
+    uint8_t id_key[8];
+    Common::writeU64(id_key, pool_id);
+    deleteRow(StateDB::TBL_AMM_FARMS, id_key, sizeof(id_key));
+  }
+
+  void StateAccess::forEachAmmFarm(
+      const std::function<void(const Core::AmmFarmSchedule &)> &fn) const
+  {
+    auto visitor = [&fn](const std::vector<uint8_t> &key,
+                         const std::vector<uint8_t> &value) -> bool
+    {
+      if (key.size() != 8)
+        return true;
+
+      Core::AmmFarmSchedule farm;
+      if (!Core::AmmFarmSchedule::deserializeState(
+              value.data(), value.size(), farm))
+        return true;
+
+      fn(farm);
+      return true;
+    };
+
+    readForEach(StateDB::TBL_AMM_FARMS, visitor);
+  }
+
+  bool StateAccess::getAmmPositionAccrual(
+      Id position_id, Core::AmmPositionAccrual &out) const
+  {
+    Crypto::Hash key = Keys::ammPositionAccrual(position_id);
+    auto value = smt_.get(key);
+    if (!value.has_value())
+      return false;
+    return Core::AmmPositionAccrual::deserializeState(
+        value->data(), value->size(), out);
+  }
+
+  void StateAccess::putAmmPositionAccrual(
+      const Core::AmmPositionAccrual &accrual)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::ammPositionAccrual(accrual.position_id);
+    auto value = accrual.serializeState();
+    smt_.update(key, value, version_);
+
+    uint8_t id_key[8];
+    Common::writeU64(id_key, accrual.position_id);
+    putBlobRow(StateDB::TBL_AMM_POSITION_ACCRUALS,
+               id_key, sizeof(id_key),
+               value.data(), value.size());
+  }
+
+  void StateAccess::deleteAmmPositionAccrual(Id position_id)
+  {
+    releaseReadTxnIfHeld();
+
+    Crypto::Hash key = Keys::ammPositionAccrual(position_id);
+    smt_.remove(key, version_);
+
+    uint8_t id_key[8];
+    Common::writeU64(id_key, position_id);
+    deleteRow(StateDB::TBL_AMM_POSITION_ACCRUALS,
+              id_key, sizeof(id_key));
+  }
+
+  //  =========================================================================
   //  Receipts
   //  =========================================================================
 

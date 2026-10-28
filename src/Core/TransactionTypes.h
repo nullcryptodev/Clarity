@@ -23,6 +23,7 @@ namespace Core
   //    0x50–0x5F  Token management
   //    0x60–0x6F  Governance (reserved)
   //    0x70–0x7F  Cross-chain / Bridge
+  //    0x80–0x8F  AMM Farming
   //    0xF0–0xFE  System (implicit)
   //    0xFF       Invalid sentinel
   //
@@ -68,6 +69,12 @@ namespace Core
     RotateConsensusKey = 0x23,
 
     //  ---- AMM (0x30–0x3F) ----
+    //
+    //  Pool and liquidity primitives. Farming (which attaches a
+    //  reward schedule to a pool) lives in its own range below; the
+    //  split is intentional so that "AMM" reads as "the pool and
+    //  its swaps" and "AMM Farming" reads as "emissions on top of
+    //  it."
 
     CreatePool = 0x30,
     AddLiquidity = 0x31,
@@ -119,6 +126,37 @@ namespace Core
     //  distinct validator_ids is what makes a BridgeAckWithdrawal
     //  valid — and what authorizes the corresponding CCX release.
     BridgeAckAttest = 0x7A,
+
+    //  ---- AMM Farming (0x80–0x8F) ----
+    //
+    //  A farm is an escrow + a rate attached to one pool. Emission is
+    //  pro-rata across the pool's LP shares at each epoch boundary,
+    //  using a reward-per-share accumulator; claims are lazily
+    //  settled into pending_rewards, then moved to balance by the
+    //  existing ClaimRewards. The escrow is a real token balance at
+    //  Keys::ammFarmAddress(pool_id).
+    //
+    //  CreateAmmFarm     creates the schedule and funds the escrow
+    //                    from the creator's balance of reward_token_id.
+    //  UpdateAmmFarm     changes the per-epoch rate. Applies at the
+    //                    *next* epoch boundary, not the current one.
+    //  PauseAmmFarm      stops emissions without closing the farm.
+    //  RefillAmmFarm     adds to the escrow and un-pauses.
+    //  CloseAmmFarm      refunds any remaining escrow to the creator
+    //                    and deletes the schedule. Refused while the
+    //                    pool has liquidity; a full drain closes the
+    //                    farm automatically.
+    //  ClaimAmmFarmRewards
+    //                    settles every position the caller holds
+    //                    across every farmed pool into
+    //                    pending_rewards. Empty payload.
+
+    CreateAmmFarm = 0x80,
+    UpdateAmmFarm = 0x81,
+    PauseAmmFarm = 0x82,
+    RefillAmmFarm = 0x83,
+    CloseAmmFarm = 0x84,
+    ClaimAmmFarmRewards = 0x85,
 
     //  ---- System (0xF0–0xFE) ----
 
@@ -216,6 +254,18 @@ namespace Core
       return "bridge_attest";
     case BridgeAckAttest:
       return "bridge_ack_attest";
+    case CreateAmmFarm:
+      return "create_amm_farm";
+    case UpdateAmmFarm:
+      return "update_amm_farm";
+    case PauseAmmFarm:
+      return "pause_amm_farm";
+    case RefillAmmFarm:
+      return "refill_amm_farm";
+    case CloseAmmFarm:
+      return "close_amm_farm";
+    case ClaimAmmFarmRewards:
+      return "claim_amm_farm_rewards";
     case BlockReward:
       return "block_reward";
     case OrderExpired:

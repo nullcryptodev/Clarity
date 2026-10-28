@@ -112,6 +112,11 @@ namespace Rpc
       return "AmmPoolEmpty";
     case ErrorCode::AmmSlippageTooHigh:
       return "AmmSlippageTooHigh";
+    case ErrorCode::AmmFarmNotFound:
+      return "AmmFarmNotFound";
+    //  Reserved: never emitted by the current node.
+    case ErrorCode::AmmFarmAccrualNotFound:
+      return "AmmFarmAccrualNotFound";
 
     // ---- Admin ----
     case ErrorCode::Unauthorized:
@@ -222,6 +227,13 @@ namespace Rpc
       return "AMM pool has no liquidity";
     case ErrorCode::AmmSlippageTooHigh:
       return "Swap slippage exceeds the tolerance";
+    case ErrorCode::AmmFarmNotFound:
+      return "AMM farm not found";
+    //  Reserved: never emitted by the current node. The message
+    //  says so, matching how BridgeWatcherNotFound is handled.
+    case ErrorCode::AmmFarmAccrualNotFound:
+      return "AMM farm accrual not found "
+             "(reserved; not emitted by the current node)";
 
     case ErrorCode::Unauthorized:
       return "Admin token missing or invalid";

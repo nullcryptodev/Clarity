@@ -6,6 +6,7 @@
 #include "TransactionExecutor.h"
 
 #include "ActiveRouter.h"
+#include "AmmFarmTypes.h"
 #include "AmmPool.h"
 #include "AmmPosition.h"
 #include "BlockProcessor.h"
@@ -250,15 +251,6 @@ namespace Core
       state.putBridgeStats(stats);
     }
 
-    uint16_t readU16At(const std::vector<uint8_t> &p, size_t &off)
-    {
-      if (off + 2 > p.size())
-        return 0;
-      const uint16_t v = uint16_t(p[off]) | (uint16_t(p[off + 1]) << 8);
-      off += 2;
-      return v;
-    }
-
     bool debitToken(State::StateAccess &state,
                     const Crypto::Address &addr,
                     Id token_id, uint64_t amount)
@@ -297,6 +289,72 @@ namespace Core
 
       uint64_t bal = state.getTokenBalance(addr, token_id);
       state.putTokenBalance(addr, token_id, bal + amount);
+    }
+
+    //  Settle a position's farm accrual since its last settle.
+    //
+    //  Computes (farm.rps_per_share - accrual.last_rps) * pos.liquidity
+    //  / FARM_RPS_SCALE, updates the accrual companion's last_rps to
+    //  the farm's current rps_per_share, and RETURNS the accrued
+    //  amount WITHOUT touching any account. The caller decides how to
+    //  credit the beneficiary:
+    //
+    //    - executeRemoveLiquidity credits tx.from inline (one position,
+    //      one account write);
+    //    - executeClaimAmmFarmRewards accumulates across every position
+    //      the caller holds and does one account write at the end.
+    //
+    //  Returns 0 if:
+    //    - the pool has no farm;
+    //    - the position has zero liquidity;
+    //    - nothing has accrued since the last settle.
+    //
+    //  If the accrual companion is absent (a position created before
+    //  the farm existed), last_rps is treated as 0 — which is correct,
+    //  because the farm's rps_per_share was also 0 when the position
+    //  was created. The position earns from the farm's start.
+    //
+    //  This function writes the accrual companion (updates last_rps)
+    //  whenever the position has positive liquidity and a farm exists,
+    //  even if the computed accrual is 0. That keeps last_rps in sync
+    //  so a subsequent call sees a zero delta rather than a stale one.
+    uint64_t settleAmmFarmAccrual(State::StateAccess &state,
+                                  const Core::AmmPosition &pos)
+    {
+      if (pos.liquidity == 0)
+        return 0;
+
+      Core::AmmFarmSchedule farm;
+      if (!state.getAmmFarm(pos.pool_id, farm))
+        return 0;
+
+      Core::AmmPositionAccrual accrual;
+      const bool have_accrual =
+          state.getAmmPositionAccrual(pos.id, accrual);
+
+      const uint64_t last_rps = have_accrual ? accrual.last_rps : 0;
+
+      uint64_t accrued = 0;
+      if (farm.rps_per_share > last_rps)
+      {
+        const __uint128_t delta =
+            static_cast<__uint128_t>(farm.rps_per_share - last_rps);
+        const __uint128_t num = delta * pos.liquidity;
+        accrued = static_cast<uint64_t>(num / FARM_RPS_SCALE);
+      }
+
+      //  Persist the new last_rps. Do this even when accrued == 0 so
+      //  a subsequent settle doesn't recompute a delta we've already
+      //  accounted for. (The only case where a stale last_rps would
+      //  hurt is a farm that bumps rps and a position that reads but
+      //  doesn't write; skipping the write would let the next settle
+      //  re-credit the same delta.)
+      Core::AmmPositionAccrual updated;
+      updated.position_id = pos.id;
+      updated.last_rps = farm.rps_per_share;
+      state.putAmmPositionAccrual(updated);
+
+      return accrued;
     }
 
     uint32_t readU32At(const std::vector<uint8_t> &p, size_t off)
@@ -542,6 +600,30 @@ namespace Core
 
     case TxType::RefillCollectionReward:
       receipt = executeRefillCollectionReward(state, tx, ctx);
+      break;
+
+    case TxType::CreateAmmFarm:
+      receipt = executeCreateAmmFarm(state, tx, ctx);
+      break;
+
+    case TxType::UpdateAmmFarm:
+      receipt = executeUpdateAmmFarm(state, tx, ctx);
+      break;
+
+    case TxType::PauseAmmFarm:
+      receipt = executePauseAmmFarm(state, tx, ctx);
+      break;
+
+    case TxType::RefillAmmFarm:
+      receipt = executeRefillAmmFarm(state, tx, ctx);
+      break;
+
+    case TxType::CloseAmmFarm:
+      receipt = executeCloseAmmFarm(state, tx, ctx);
+      break;
+
+    case TxType::ClaimAmmFarmRewards:
+      receipt = executeClaimAmmFarmRewards(state, tx, ctx);
       break;
 
     case TxType::BridgeMint:
@@ -1485,6 +1567,20 @@ namespace Core
       AmmPosition pos;
       if (state.getAmmPosition(existing_pos_id, pos))
       {
+        //  Settle farm accrual before the position's shares change.
+        //  The accrual for the epochs up to this point must be
+        //  computed against the *current* liquidity, not the
+        //  post-add liquidity. Without this, a mid-epoch add
+        //  retroactively over-credits the position for past epochs
+        //  at the new, larger share count.
+        const uint64_t accrued = settleAmmFarmAccrual(state, pos);
+        if (accrued > 0)
+        {
+          Core::Account acct = state.getAccount(tx.from);
+          acct.pending_rewards += accrued;
+          state.putAccount(tx.from, acct);
+        }
+
         pos.liquidity += liquidity_minted;
         state.putAmmPosition(pos);
         return {ReceiptStatus::Success, tx.fee};
@@ -1510,6 +1606,22 @@ namespace Core
     state.putAmmPosition(pos);
 
     state.putPositionIndex(tx.from, pool_id, next_pos_id);
+
+    //  If a farm exists on this pool, initialize the accrual
+    //  companion with last_rps = the farm's current rps_per_share.
+    //  A position that joins a running farm starts earning from the
+    //  next boundary, not from the farm's beginning. If the farm
+    //  does not exist yet, this is a no-op; the first settle will
+    //  see last_rps = 0, which is correct because the farm's
+    //  rps_per_share is also 0 at creation.
+    Core::AmmFarmSchedule farm;
+    if (state.getAmmFarm(pool_id, farm))
+    {
+      Core::AmmPositionAccrual accrual;
+      accrual.position_id = pos.id;
+      accrual.last_rps = farm.rps_per_share;
+      state.putAmmPositionAccrual(accrual);
+    }
 
     uint64_t new_next = next_pos_id + 1;
     std::vector<uint8_t> new_id_bytes(8);
@@ -1551,6 +1663,22 @@ namespace Core
     AmmPool pool;
     if (!state.getAmmPool(pos.pool_id, pool))
       return failure;
+
+    //  Settle farm accrual BEFORE the position's shares change.
+    //  The accrual is computed against the pre-removal liquidity,
+    //  so this must run before `pos.liquidity -= amount` (or the
+    //  last-removal zeroing below).
+    //
+    //  settleAmmFarmAccrual persists the new last_rps and returns
+    //  the accrued amount. We credit it to pending_rewards here;
+    //  one position, one account write.
+    const uint64_t farm_accrued = settleAmmFarmAccrual(state, pos);
+    if (farm_accrued > 0)
+    {
+      Account acct = state.getAccount(tx.from);
+      acct.pending_rewards += farm_accrued;
+      state.putAccount(tx.from, acct);
+    }
 
     const bool is_last_removal = (amount == pool.total_liquidity);
 
@@ -1606,6 +1734,11 @@ namespace Core
       pos.liquidity = 0;
       state.putAmmPosition(pos);
       state.deletePositionIndex(pos.owner, pos.pool_id);
+      //  Delete the farm accrual companion too. The AmmPosition
+      //  record lingers (v1 policy), but the accrual record has no
+      //  reason to; leaving it would be an orphan key, and it
+      //  would cost 16 bytes per position ever created.
+      state.deleteAmmPositionAccrual(pos.id);
     }
     else
     {
@@ -1615,6 +1748,31 @@ namespace Core
 
     if (pool.isClosed())
     {
+      //  A full drain closes the farm too. Refund any remaining
+      //  escrow to the creator, then delete the schedule. The
+      //  debit is guaranteed to succeed by the invariant that the
+      //  escrow custody balance always equals
+      //  farm.reward_escrow_remaining; a failure here means state
+      //  corruption and should fail the whole remove so the block
+      //  is rejected and the operator investigates.
+      Core::AmmFarmSchedule farm;
+      if (state.getAmmFarm(pool.id, farm))
+      {
+        if (farm.reward_escrow_remaining > 0)
+        {
+          const Crypto::Address custody =
+              State::Keys::ammFarmAddress(pool.id);
+          if (!debitToken(state, custody, farm.reward_token_id,
+                          farm.reward_escrow_remaining))
+          {
+            return failure;
+          }
+          creditToken(state, farm.creator, farm.reward_token_id,
+                      farm.reward_escrow_remaining);
+        }
+        state.deleteAmmFarm(pool.id);
+      }
+
       state.deleteAmmPool(pool.id);
     }
 
@@ -2586,6 +2744,276 @@ namespace Core
       collection.reward_paused = false;
 
     state.putNftCollection(collection);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  //  =========================================================================
+  //  AMM farming
+  //  =========================================================================
+
+  Receipt TransactionExecutor::executeCreateAmmFarm(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    //  Payload:
+    //    [8] pool_id
+    //    [4] reward_token_id
+    //    [8] reward_rate_per_epoch
+    //    [8] reward_escrow_amount
+    //  Total: 28 bytes.
+    if (tx.payload.size() != 8 + 4 + 8 + 8)
+      return failure;
+
+    size_t off = 0;
+    const uint64_t pool_id = readU64At(tx.payload, off);
+    off += 8;
+    const Id reward_token_id = readU32At(tx.payload, off);
+    off += 4;
+    const uint64_t reward_rate_per_epoch = readU64At(tx.payload, off);
+    off += 8;
+    const uint64_t reward_escrow_amount = readU64At(tx.payload, off);
+    off += 8;
+
+    if (reward_rate_per_epoch == 0)
+      return failure;
+    if (reward_escrow_amount == 0)
+      return failure;
+
+    AmmPool pool;
+    if (!state.getAmmPool(pool_id, pool))
+      return failure;
+    if (!pool.active)
+      return failure;
+
+    //  One farm per pool.
+    AmmFarmSchedule existing;
+    if (state.getAmmFarm(pool_id, existing))
+      return failure;
+
+    AmmFarmSchedule farm;
+    farm.pool_id = pool_id;
+    farm.creator = tx.from;
+    farm.reward_token_id = reward_token_id;
+    farm.reward_rate_per_epoch = reward_rate_per_epoch;
+    farm.reward_escrow_remaining = reward_escrow_amount;
+    farm.reward_paused = false;
+    farm.rps_per_share = 0;
+    farm.created_at_height = ctx.current_height;
+
+    if (!farm.isValid())
+      return failure;
+
+    if (!debitToken(state, tx.from, reward_token_id, reward_escrow_amount))
+      return failure;
+
+    creditToken(state, State::Keys::ammFarmAddress(pool_id),
+                reward_token_id, reward_escrow_amount);
+
+    //  Put the record last, so it only exists after the escrow has
+    //  actually moved. If a future change makes creditToken able to
+    //  fail, this order leaves no phantom farm with a phantom escrow.
+    state.putAmmFarm(farm);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  Receipt TransactionExecutor::executeUpdateAmmFarm(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext & /*ctx*/)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    //  Payload:
+    //    [8] pool_id
+    //    [8] new_rate_per_epoch
+    //  Total: 16 bytes.
+    if (tx.payload.size() != 8 + 8)
+      return failure;
+
+    const uint64_t pool_id = readU64At(tx.payload, 0);
+    const uint64_t new_rate = readU64At(tx.payload, 8);
+
+    if (new_rate == 0)
+      return failure;
+
+    AmmFarmSchedule farm;
+    if (!state.getAmmFarm(pool_id, farm))
+      return failure;
+
+    if (farm.creator != tx.from)
+      return failure;
+
+    farm.reward_rate_per_epoch = new_rate;
+    state.putAmmFarm(farm);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  Receipt TransactionExecutor::executePauseAmmFarm(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext & /*ctx*/)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    //  Payload:
+    //    [8] pool_id
+    //  Total: 8 bytes.
+    if (tx.payload.size() != 8)
+      return failure;
+
+    const uint64_t pool_id = readU64At(tx.payload, 0);
+
+    AmmFarmSchedule farm;
+    if (!state.getAmmFarm(pool_id, farm))
+      return failure;
+
+    if (farm.creator != tx.from)
+      return failure;
+
+    farm.reward_paused = true;
+    state.putAmmFarm(farm);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  Receipt TransactionExecutor::executeRefillAmmFarm(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext & /*ctx*/)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    //  Payload:
+    //    [8] pool_id
+    //    [8] amount
+    //  Total: 16 bytes.
+    if (tx.payload.size() != 8 + 8)
+      return failure;
+
+    const uint64_t pool_id = readU64At(tx.payload, 0);
+    const uint64_t amount = readU64At(tx.payload, 8);
+
+    if (amount == 0)
+      return failure;
+
+    AmmFarmSchedule farm;
+    if (!state.getAmmFarm(pool_id, farm))
+      return failure;
+
+    if (farm.creator != tx.from)
+      return failure;
+
+    if (!debitToken(state, tx.from, farm.reward_token_id, amount))
+      return failure;
+
+    creditToken(state, State::Keys::ammFarmAddress(pool_id),
+                farm.reward_token_id, amount);
+
+    farm.reward_escrow_remaining += amount;
+    if (farm.reward_paused && farm.reward_escrow_remaining > 0)
+      farm.reward_paused = false;
+
+    state.putAmmFarm(farm);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  Receipt TransactionExecutor::executeCloseAmmFarm(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext & /*ctx*/)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    //  Payload:
+    //    [8] pool_id
+    //  Total: 8 bytes.
+    if (tx.payload.size() != 8)
+      return failure;
+
+    const uint64_t pool_id = readU64At(tx.payload, 0);
+
+    AmmFarmSchedule farm;
+    if (!state.getAmmFarm(pool_id, farm))
+      return failure;
+
+    if (farm.creator != tx.from)
+      return failure;
+
+    //  A live pool cannot have its farm closed. The path to close is:
+    //  pause, drain the pool (last LP's remove closes the pool and
+    //  the farm together), or close while the pool is already
+    //  drained. A pause is required even after the pool is drained,
+    //  because closing a running farm forfeits unclaimed accrual and
+    //  the pause is the creator's signal to LPs that emissions have
+    //  stopped.
+    AmmPool pool;
+    if (state.getAmmPool(pool_id, pool))
+    {
+      if (pool.total_liquidity > 0)
+        return failure;
+    }
+
+    if (!farm.reward_paused)
+      return failure;
+
+    if (farm.reward_escrow_remaining > 0)
+    {
+      const Crypto::Address custody =
+          State::Keys::ammFarmAddress(pool_id);
+      if (!debitToken(state, custody, farm.reward_token_id,
+                      farm.reward_escrow_remaining))
+        return failure;
+      creditToken(state, farm.creator, farm.reward_token_id,
+                  farm.reward_escrow_remaining);
+    }
+
+    state.deleteAmmFarm(pool_id);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
+
+  Receipt TransactionExecutor::executeClaimAmmFarmRewards(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext & /*ctx*/)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    if (!tx.payload.empty())
+      return failure;
+
+    //  Settle every position the caller holds, accumulating into one
+    //  pending_rewards credit. This matches executeClaimNftReward's
+    //  shape: one account write for the whole claim, no matter how
+    //  many positions were settled.
+    //
+    //  The actual balance movement is done by the standard
+    //  ClaimRewards transaction, exactly as for staking and NFT
+    //  rewards. This tx only settles accrual into pending_rewards.
+    uint64_t total_accrued = 0;
+
+    state.forEachPositionForOwner(
+        tx.from,
+        [&](const Core::AmmPosition &pos)
+        {
+          const uint64_t accrued = settleAmmFarmAccrual(state, pos);
+          if (accrued > 0)
+            total_accrued += accrued;
+        });
+
+    if (total_accrued > 0)
+    {
+      Account acct = state.getAccount(tx.from);
+      acct.pending_rewards += total_accrued;
+      state.putAccount(tx.from, acct);
+    }
 
     return {ReceiptStatus::Success, tx.fee};
   }

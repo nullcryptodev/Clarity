@@ -108,6 +108,10 @@ namespace State
       return "bridge_stats";
     case TBL_BRIDGE_EVENTS:
       return "bridge_events";
+    case TBL_AMM_FARMS:
+      return "amm_farms";
+    case TBL_AMM_POSITION_ACCRUALS:
+      return "amm_position_accruals";
     default:
       return "<unknown>";
     }

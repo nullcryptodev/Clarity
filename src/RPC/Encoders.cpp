@@ -900,5 +900,109 @@ namespace Rpc
 
     return j;
   }
-  
+
+  // ===========================================================================
+  //  AMM farming
+  // ===========================================================================
+
+  Common::Json encodeAmmFarm(const Core::AmmFarmSchedule &farm,
+                             const Core::AmmPool *pool,
+                             uint64_t escrow_balance,
+                             const std::string &hrp)
+  {
+    Common::Json j = Common::Json::object();
+    JsonWriter w(j);
+
+    w.setHexU64("pool_id", farm.pool_id);
+    w.setAddress("creator", farm.creator, hrp);
+    w.setHexU64("reward_token_id", farm.reward_token_id);
+    w.setHexU64("reward_rate_per_epoch", farm.reward_rate_per_epoch);
+    w.setHexU64("reward_escrow_remaining",
+                farm.reward_escrow_remaining);
+    w.setBool("reward_paused", farm.reward_paused);
+    w.setHexU64("rps_per_share", farm.rps_per_share);
+    w.setHexU64("created_at_height", farm.created_at_height);
+
+    //  Derived.
+
+    //  The on-chain escrow balance. This is the authoritative value;
+    //  the record's `reward_escrow_remaining` is a cache. On a
+    //  healthy node they always match. A client that wants to be
+    //  paranoid can compare them.
+    w.setHexU64("reward_escrow_balance", escrow_balance);
+
+    //  The pool's current total_liquidity, or 0 if the pool has been
+    //  deleted (in which case the next `executeCloseAmmFarm` will
+    //  refund the escrow and remove the farm).
+    if (pool != nullptr)
+      w.setHexU64("pool_total_liquidity", pool->total_liquidity);
+    else
+      w.setHexU64("pool_total_liquidity", 0);
+
+    w.setBool("is_active", farm.isActive());
+
+    //  How many more full epochs the escrow can cover, at the
+    //  current rate. Floor division, so a partial epoch does not
+    //  round up. Zero if the rate is zero (a farm with a rate of
+    //  zero emits nothing regardless of escrow).
+    uint64_t epochs_remaining = 0;
+    if (farm.reward_rate_per_epoch > 0)
+    {
+      epochs_remaining =
+          farm.reward_escrow_remaining / farm.reward_rate_per_epoch;
+    }
+    w.setHexU64("epochs_remaining", epochs_remaining);
+
+    //  The escrow custody address, so a client can call getBalance
+    //  against it directly without knowing the derivation.
+    w.setAddress("escrow_address",
+                 State::Keys::ammFarmAddress(farm.pool_id), hrp);
+
+    return j;
+  }
+
+  Common::Json encodeAmmFarmAccrual(const Core::AmmFarmSchedule &farm,
+                                    const Core::AmmPosition &position,
+                                    const Core::AmmPositionAccrual *accrual,
+                                    const std::string & /*hrp*/)
+  {
+    Common::Json j = Common::Json::object();
+    JsonWriter w(j);
+
+    w.setHexU64("pool_id", farm.pool_id);
+    w.setHexU64("position_id", position.id);
+    w.setHexU64("position_liquidity", position.liquidity);
+    w.setHexU64("reward_token_id", farm.reward_token_id);
+    w.setBool("exists", accrual != nullptr);
+    w.setHexU64("current_rps", farm.rps_per_share);
+    w.setBool("farm_paused", farm.reward_paused);
+
+    //  last_rps: the record's value if present, else zero. Absent
+    //  means "the position has been earning since the farm
+    //  existed", because the farm also started at rps = 0.
+    const uint64_t last_rps = accrual != nullptr ? accrual->last_rps : 0;
+    w.setHexU64("last_rps", last_rps);
+
+    //  accrued_unclaimed: what a ClaimAmmFarmRewards call right now
+    //  would credit to pending_rewards. Computed with the same
+    //  formula the executor's settle uses:
+    //
+    //    (current_rps - last_rps) * position.liquidity / SCALE
+    //
+    //  Saturates at zero if rps somehow went backwards (which the
+    //  executor never does, but a corrupted DB could). 128-bit
+    //  intermediate to match the settle path.
+    uint64_t accrued_unclaimed = 0;
+    if (farm.rps_per_share > last_rps && position.liquidity > 0)
+    {
+      const __uint128_t delta =
+          static_cast<__uint128_t>(farm.rps_per_share - last_rps) *
+          position.liquidity;
+      accrued_unclaimed =
+          static_cast<uint64_t>(delta / Core::FARM_RPS_SCALE);
+    }
+    w.setHexU64("accrued_unclaimed", accrued_unclaimed);
+
+    return j;
+  }
 } // namespace Rpc

@@ -6,7 +6,6 @@
 #include <gtest/gtest.h>
 
 #include "Core/BridgeTypes.h"
-#include "Core/BridgeWatcherTypes.h"
 #include "Core/Bridge/ConcealCCX.h"
 #include "Core/GlobalState.h"
 
@@ -77,6 +76,14 @@ namespace
   {
     return Crypto::hashDomain(domain, message.data(), message.size());
   }
+
+  //  A non-empty destination address string used by every burn
+  //  test. The executor stores it verbatim on the withdrawal
+  //  record and requires it non-empty; its content is opaque to
+  //  the tests. Real CCX addresses are base58 strings, but these
+  //  tests never call the CCX release path, so any non-empty
+  //  string suffices.
+  constexpr const char *TEST_CCX_DESTINATION = "test-ccx-destination";
 } // anonymous namespace
 
 // ============================================================================
@@ -254,21 +261,67 @@ TEST_F(Core_BlockProcessorFixture, BridgeMint_RejectsDuplicateSigner)
 }
 
 // ============================================================================
-//  BridgeMint — active-set minimum
+//  BridgeMint — active-validator-set minimum
+//
+//  Under the validator-is-watcher model, the operational signer set
+//  for a source chain is the active validator set at the height of
+//  the operation. There is no separate watcher record to deactivate;
+//  to drive the set below the chain's active_validator_min you shrink
+//  the active set itself.
+//
+//  CCX's active_validator_min is CcxBridge::CCX_ACTIVE_VALIDATOR_MIN,
+//  which at genesis equals GlobalConfig::INITIAL_SET_SIZE (2). The
+//  fixture's active set is {1, 2}. Shrinking it to {1} makes
+//  active.size() == 1 < reg.active_validator_min, and the executor's
+//  executeBridgeMint returns failure before any signature is checked.
+//
+//  This is the direct analogue of the old
+//  BridgeMint_RejectsIfWatcherSetDropsBelowMin: same rejection, same
+//  reason ("the operational signer set is too small"), expressed in
+//  the post-watcher model.
 // ============================================================================
 
-TEST_F(Core_BlockProcessorFixture, BridgeMint_RejectsIfWatcherSetDropsBelowMin)
+TEST_F(Core_BlockProcessorFixture, BridgeMint_RejectsIfActiveSetDropsBelowMin)
 {
   const Crypto::Address alice_addr = addressOf(alice_);
   const Crypto::Hash source_tx_hash = hashWithFirstByte(0xFF);
 
+  //  Shrink the active set from {1, 2} to {1}. The fixture's
+  //  activeSet() helper returns {1, 2}; this test overrides it by
+  //  writing the "active_set" global directly. Do the same on the
+  //  validator records so is_active is consistent with the set —
+  //  the executor's forEachActiveValidator filters on both, so an
+  //  is_active mismatch would be a fixture bug, not a test bug.
   withState([&](State::StateAccess &s)
             {
-    BridgeWatcherInfo w2;
-    ASSERT_TRUE(s.getBridgeWatcher(2, w2));
-    w2.is_active = false;
-    s.putBridgeWatcher(w2); });
+              std::vector<uint8_t> bytes(8);
+              for (int i = 0; i < 8; ++i)
+                bytes[i] = uint8_t(uint64_t{1} >> (i * 8));
+              s.putGlobal("active_set", bytes);
 
+              Core::ValidatorInfo v2;
+              ASSERT_TRUE(s.getValidator(2, v2));
+              v2.is_active = false;
+              s.putValidator(v2); });
+
+  //  The signature block is still signed by both seeds. The point of
+  //  the test is that the *set* is too small, not that the
+  //  signatures are bad — a set of size 1 with two valid signatures
+  //  must still be rejected on the size check.
+  //
+  //  Note: signBridgeMintMessage's signers vector uses indices into
+  //  the *active set at signing time*. Since we've shrunk the set to
+  //  {1}, only index 0 (validator 1) is valid. The second entry is
+  //  included anyway — the size check runs before signature
+  //  verification, so its presence doesn't matter to the outcome,
+  //  but keeping it makes the test's intent explicit: "even with
+  //  signatures from every validator, a shrunken set cannot mint."
+  //
+  //  If a future change moves the size check after the signature
+  //  check, this test will start failing for the wrong reason
+  //  (signer_index 1 out of range) and the fix will be to trim the
+  //  signers vector — which is the right behaviour anyway, since
+  //  "signature from a non-member" is a different, weaker test.
   const std::vector<uint8_t> sigs = signBridgeMintMessage(
       CcxBridge::CCX_CHAIN_ID, source_tx_hash, 0, alice_addr, 1'000,
       {{0, seed1_}, {1, seed2_}});
@@ -277,7 +330,12 @@ TEST_F(Core_BlockProcessorFixture, BridgeMint_RejectsIfWatcherSetDropsBelowMin)
       alice_, CcxBridge::CCX_CHAIN_ID, source_tx_hash, 0,
       alice_addr, 1'000, sigs, 0);
 
-  const BlockResult r = applyBlock(1, genesis_hash_, {tx});
+  //  The block is built against the shrunken active set. The block's
+  //  validator_set_root and quorum signatures come from the same
+  //  set, so the block-level check passes; the executor rejects the
+  //  transaction and the block fails to apply.
+  const BlockResult r = applyBlock(1, genesis_hash_, {tx}, /*dry_run=*/false,
+                                   /*active_set=*/{1});
   EXPECT_FALSE(r.valid);
 }
 
@@ -375,8 +433,8 @@ TEST_F(Core_BlockProcessorFixture, BridgeBurn_SucceedsAndEnqueues)
   ASSERT_EQ(blob.size(), CcxBridge::CCX_DESTINATION_BYTES);
 
   const Transaction tx = makeBridgeBurnTx(
-      alice_, CcxBridge::CCX_CHAIN_ID, blob, /*amount=*/2'000,
-      wrapped, /*nonce=*/0);
+      alice_, CcxBridge::CCX_CHAIN_ID, blob, TEST_CCX_DESTINATION,
+      /*amount=*/2'000, wrapped, /*nonce=*/0);
 
   const uint64_t before = balanceOfToken(alice_addr, wrapped);
 
@@ -399,6 +457,7 @@ TEST_F(Core_BlockProcessorFixture, BridgeBurn_SucceedsAndEnqueues)
   EXPECT_EQ(w.burner, alice_addr);
   EXPECT_EQ(w.amount, 2'000u);
   EXPECT_EQ(w.destination_blob, blob);
+  EXPECT_EQ(w.destination_address, std::string(TEST_CCX_DESTINATION));
   EXPECT_TRUE(w.isWellFormed());
 }
 
@@ -416,8 +475,8 @@ TEST_F(Core_BlockProcessorFixture, BridgeBurn_RejectsInsufficientBalance)
       bob_addr, pubkeyWithFirstByte(0x02));
 
   const Transaction tx = makeBridgeBurnTx(
-      alice_, CcxBridge::CCX_CHAIN_ID, blob, /*amount=*/1'000,
-      wrapped, /*nonce=*/0);
+      alice_, CcxBridge::CCX_CHAIN_ID, blob, TEST_CCX_DESTINATION,
+      /*amount=*/1'000, wrapped, /*nonce=*/0);
 
   const BlockResult r = applyBlock(1, genesis_hash_, {tx});
   EXPECT_FALSE(r.valid);
@@ -434,8 +493,8 @@ TEST_F(Core_BlockProcessorFixture, BridgeBurn_RejectsWrongToken)
       bob_addr, pubkeyWithFirstByte(0x03));
 
   const Transaction tx = makeBridgeBurnTx(
-      alice_, CcxBridge::CCX_CHAIN_ID, blob, /*amount=*/1'000,
-      /*wrapped_token_id=*/100, /*nonce=*/0);
+      alice_, CcxBridge::CCX_CHAIN_ID, blob, TEST_CCX_DESTINATION,
+      /*amount=*/1'000, /*wrapped_token_id=*/100, /*nonce=*/0);
 
   const BlockResult r = applyBlock(1, genesis_hash_, {tx});
   EXPECT_FALSE(r.valid);
@@ -456,7 +515,8 @@ TEST_F(Core_BlockProcessorFixture, BridgeBurn_RejectsWhenPaused)
       bob_addr, pubkeyWithFirstByte(0x04));
 
   const Transaction tx = makeBridgeBurnTx(
-      alice_, CcxBridge::CCX_CHAIN_ID, blob, 1'000, wrapped, 0);
+      alice_, CcxBridge::CCX_CHAIN_ID, blob, TEST_CCX_DESTINATION,
+      1'000, wrapped, 0);
 
   const BlockResult r = applyBlock(1, genesis_hash_, {tx});
   EXPECT_FALSE(r.valid);
@@ -472,8 +532,8 @@ TEST_F(Core_BlockProcessorFixture, BridgeBurn_RejectsBlobTooShort)
   std::vector<uint8_t> short_blob(32, 0xAA);
 
   const Transaction tx = makeBridgeBurnTx(
-      alice_, CcxBridge::CCX_CHAIN_ID, short_blob, 1'000,
-      wrapped, 0);
+      alice_, CcxBridge::CCX_CHAIN_ID, short_blob, TEST_CCX_DESTINATION,
+      1'000, wrapped, 0);
 
   const BlockResult r = applyBlock(1, genesis_hash_, {tx});
   EXPECT_FALSE(r.valid);
@@ -489,8 +549,8 @@ TEST_F(Core_BlockProcessorFixture, BridgeBurn_RejectsBlobTooLong)
   std::vector<uint8_t> long_blob(128, 0xBB);
 
   const Transaction tx = makeBridgeBurnTx(
-      alice_, CcxBridge::CCX_CHAIN_ID, long_blob, 1'000,
-      wrapped, 0);
+      alice_, CcxBridge::CCX_CHAIN_ID, long_blob, TEST_CCX_DESTINATION,
+      1'000, wrapped, 0);
 
   const BlockResult r = applyBlock(1, genesis_hash_, {tx});
   EXPECT_FALSE(r.valid);
@@ -518,27 +578,53 @@ TEST_F(Core_BlockProcessorFixture, BridgeAck_DeletesRecordAndDecrementsPending)
 
   //  Create a withdrawal. This is the last write before the ack.
   const Transaction burn = makeBridgeBurnTx(
-      alice_, CcxBridge::CCX_CHAIN_ID, blob, 1'000, wrapped, 0);
+      alice_, CcxBridge::CCX_CHAIN_ID, blob, TEST_CCX_DESTINATION,
+      1'000, wrapped, 0);
   ASSERT_TRUE(applyBlock(1, genesis_hash_, {burn}).valid);
 
   //  Build the ack.
-  const std::vector<uint8_t> msg = leU64(1);
-  const Crypto::Hash signing_hash = signGovernanceMessage("back", msg);
+  //
+  //  Payload layout (matching executeBridgeAckWithdrawal):
+  //    [8]  withdrawal_id
+  //    [32] release_tx_hash
+  //    [8]  release_height
+  //    [2]  count
+  //    [N]  signatures (66 bytes each)
+  const std::vector<uint8_t> withdrawal_msg = leU64(1);
+  const Crypto::Hash signing_hash =
+      signGovernanceMessage("back", withdrawal_msg);
 
   const std::vector<uint8_t> sig_block = makeSignatureBlock(
       {{0, seed1_}, {1, seed2_}}, signing_hash);
 
+  //  A fake source-chain release tx hash (non-null) and height
+  //  (non-zero) — the executor only checks nullness/zero, not
+  //  authenticity.
+  const Crypto::Hash release_tx_hash = hashWithFirstByte(0x99);
+  const uint64_t release_height = 1'234;
+
   std::vector<uint8_t> payload;
-  payload.insert(payload.end(), msg.begin(), msg.end());
+  payload.reserve(8 + 32 + 8 + sig_block.size());
+  payload.insert(payload.end(), withdrawal_msg.begin(), withdrawal_msg.end());
+  payload.insert(payload.end(),
+                 release_tx_hash.data.begin(), release_tx_hash.data.end());
+  for (int i = 0; i < 8; ++i)
+    payload.push_back(uint8_t(release_height >> (i * 8)));
   payload.insert(payload.end(), sig_block.begin(), sig_block.end());
 
+  //  The ack must be submitted by a validator's reward address:
+  //  executeBridgeAckWithdrawal attributes the release to tx.from
+  //  via getValidatorByAddress, and BridgeWithdrawal::isWellFormed()
+  //  requires released_by_validator_id != 0. seed1_ is validator 1's
+  //  reward address in the fixture genesis. seed1_ has never
+  //  submitted a transaction, so its nonce is 0.
   const Transaction ack = TransactionBuilder()
                               .type(Core::TxType::BridgeAckWithdrawal)
-                              .from(alice_)
+                              .from(seed1_)
                               .to(Crypto::Address{})
                               .amount(0)
                               .fee(1)
-                              .nonce(1)
+                              .nonce(0)
                               .tokenId(NATIVE_TOKEN_ID)
                               .chainId(genesis_config_.chain_id)
                               .payload(payload)
@@ -547,11 +633,22 @@ TEST_F(Core_BlockProcessorFixture, BridgeAck_DeletesRecordAndDecrementsPending)
   const BlockResult r = applyBlock(2, currentStateRoot(), {ack});
   ASSERT_TRUE(r.valid) << r.error;
 
-  //  Record gone.
+  //  The withdrawal record is NOT deleted. Per the lifecycle
+  //  comment on BridgeWithdrawal, it is the on-chain audit trail
+  //  for the release, and getPendingWithdrawals filters on
+  //  release_tx_hash being null rather than on the record's
+  //  existence. Verify the record is still present and carries
+  //  the release fields the ack populated.
+  BridgeWithdrawal w;
   readState([&](State::StateAccess &s)
-            {
-    BridgeWithdrawal w;
-    EXPECT_FALSE(s.getBridgeWithdrawal(1, w)); });
+            { ASSERT_TRUE(s.getBridgeWithdrawal(1, w)); });
+
+  EXPECT_TRUE(w.isReleased());
+  EXPECT_FALSE(w.release_tx_hash.isNull());
+  EXPECT_EQ(w.release_height, 1'234u);
+  EXPECT_EQ(w.released_at_height, 2u);       // block height of the ack
+  EXPECT_EQ(w.released_by_validator_id, 1u); // seed1_ = validator 1
+  EXPECT_TRUE(w.isWellFormed());
 
   //  Pending count is now 0 (was 0, burn added 1, ack removed 1).
   EXPECT_EQ(makeGlobalReader().bridgeWithdrawalsPending(), 0u);
@@ -594,7 +691,8 @@ TEST_F(Core_BlockProcessorFixture, BridgeAck_RejectsBelowThreshold)
   const std::vector<uint8_t> blob = CcxBridge::encodeDestination(
       bob_addr, pubkeyWithFirstByte(0x06));
   const Transaction burn = makeBridgeBurnTx(
-      alice_, CcxBridge::CCX_CHAIN_ID, blob, 1'000, wrapped, 0);
+      alice_, CcxBridge::CCX_CHAIN_ID, blob, TEST_CCX_DESTINATION,
+      1'000, wrapped, 0);
   ASSERT_TRUE(applyBlock(1, genesis_hash_, {burn}).valid);
 
   const std::vector<uint8_t> msg = leU64(1);
@@ -769,7 +867,8 @@ TEST_F(Core_BlockProcessorFixture, BridgeBurn_SimulateAndApplyProduceSameRoot)
   const std::vector<uint8_t> blob = CcxBridge::encodeDestination(
       bob_addr, pubkeyWithFirstByte(0x08));
   const Transaction tx = makeBridgeBurnTx(
-      alice_, CcxBridge::CCX_CHAIN_ID, blob, 2'000, wrapped, 0);
+      alice_, CcxBridge::CCX_CHAIN_ID, blob, TEST_CCX_DESTINATION,
+      2'000, wrapped, 0);
 
   const Core::Block block =
       makeProcessableBlock(1, genesis_hash_, {tx}, activeSet());

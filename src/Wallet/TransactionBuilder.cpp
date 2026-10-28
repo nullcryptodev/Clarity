@@ -1256,6 +1256,194 @@ namespace Wallet
   }
 
   //  =========================================================================
+  //  AMM Farming
+  //  =========================================================================
+
+  //  ---- AMM Farm: Create ----
+
+  std::optional<Core::Transaction> buildCreateAmmFarm(
+      const Crypto::Address &from,
+      const CreateAmmFarmParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.pool_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "pool_id is zero");
+      return std::nullopt;
+    }
+
+    if (params.reward_rate_per_epoch == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "reward_rate_per_epoch must be non-zero");
+      return std::nullopt;
+    }
+
+    if (params.reward_escrow_amount == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "reward_escrow_amount must be non-zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::CreateAmmFarm, from, params.common);
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.pool_id);
+    appendU32(p, params.reward_token_id);
+    appendU64(p, params.reward_rate_per_epoch);
+    appendU64(p, params.reward_escrow_amount);
+
+    return tx;
+  }
+
+  //  ---- AMM Farm: Update Rate ----
+
+  std::optional<Core::Transaction> buildUpdateAmmFarm(
+      const Crypto::Address &from,
+      const UpdateAmmFarmParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.pool_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "pool_id is zero");
+      return std::nullopt;
+    }
+
+    if (params.new_rate_per_epoch == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter,
+            "new_rate_per_epoch must be non-zero "
+            "(use PauseAmmFarm to stop emissions)");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::UpdateAmmFarm, from, params.common);
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.pool_id);
+    appendU64(p, params.new_rate_per_epoch);
+
+    return tx;
+  }
+
+  //  ---- AMM Farm: Pause ----
+
+  std::optional<Core::Transaction> buildPauseAmmFarm(
+      const Crypto::Address &from,
+      const PauseAmmFarmParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.pool_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "pool_id is zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::PauseAmmFarm, from, params.common);
+    appendU64(tx.payload, params.pool_id);
+    return tx;
+  }
+
+  //  ---- AMM Farm: Refill ----
+
+  std::optional<Core::Transaction> buildRefillAmmFarm(
+      const Crypto::Address &from,
+      const RefillAmmFarmParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.pool_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "pool_id is zero");
+      return std::nullopt;
+    }
+
+    if (params.amount == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "amount is zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::RefillAmmFarm, from, params.common);
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.pool_id);
+    appendU64(p, params.amount);
+
+    return tx;
+  }
+
+  //  ---- AMM Farm: Close ----
+
+  std::optional<Core::Transaction> buildCloseAmmFarm(
+      const Crypto::Address &from,
+      const CloseAmmFarmParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.pool_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "pool_id is zero");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::CloseAmmFarm, from, params.common);
+    appendU64(tx.payload, params.pool_id);
+    return tx;
+  }
+
+  //  ---- AMM Farm: Claim Rewards ----
+
+  std::optional<Core::Transaction> buildClaimAmmFarmRewards(
+      const Crypto::Address &from,
+      const ClaimAmmFarmRewardsParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    return makeBase(Core::TxType::ClaimAmmFarmRewards,
+                    from, params.common);
+  }
+
+  //  =========================================================================
   //  Bridge
   //  =========================================================================
 
