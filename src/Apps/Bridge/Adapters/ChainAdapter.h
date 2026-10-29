@@ -26,6 +26,35 @@ namespace Bridge
         : std::runtime_error("BridgeError: " + what) {}
   };
 
+  //  One entry in the CCX deposit-subaddress cache.
+  //
+  //  The scanner reverse-derives the spend pubkey for each vout of
+  //  a CCX transaction and looks it up here. On a hit, the deposit
+  //  mints to `destination` (the rclrty1... address the user
+  //  registered). On a miss, the vout is not a bridge deposit (or
+  //  the cache is stale — see the "unresolved heights" note on
+  //  ScanLoop).
+  //
+  //  Chain-agnostic by accident: Bitcoin doesn't use it (its
+  //  deposits carry the destination in the OP_RETURN output), but
+  //  the fields are generic enough that a future chain whose
+  //  deposit format also can't carry a 32-byte destination inline
+  //  could reuse it. Kept in ChainAdapter.h rather than Session.h
+  //  to avoid a header cycle when CcxAdapter needs to know the
+  //  type.
+  struct BridgeDepositCacheEntry
+  {
+    uint64_t index{0};
+    Crypto::Address destination{};
+    Crypto::Address authority{};
+    uint64_t registered_at_height{0};
+  };
+
+  using BridgeDepositCache = std::unordered_map<
+      Crypto::PublicKey,
+      BridgeDepositCacheEntry,
+      std::hash<Crypto::PublicKey>>;
+
   struct ObservedDeposit
   {
     uint64_t source_chain_id{0};
@@ -33,7 +62,43 @@ namespace Bridge
     uint32_t source_output_index{0};
     uint64_t amount_source_atomic{0};
     uint64_t block_height{0};
+
+    //  The depositor-supplied intent bytes, in the adapter's own
+    //  format. This is what the attestation is over, and it's the
+    //  only per-deposit information that distinguishes one deposit
+    //  from another on the same chain.
+    //
+    //    Bitcoin: 32-byte OP_RETURN payload (the mint pubkey).
+    //    CCX:     8-byte payment-ID tag (constant in v1; a
+    //             follow-up will let it encode a destination
+    //             selector).
+    //
+    //  Empty is not a valid deposit. Submission rejects empty.
     std::vector<uint8_t> deposit_blob;
+
+    //  Where the mint goes. Populated by the adapter from
+    //  deposit_blob (or from an on-chain lookup keyed by it, for
+    //  CCX in a future binding). Null is not a valid deposit.
+    //  Submission rejects null.
+    //
+    //  The type is Crypto::Address, not a byte vector, because
+    //  BridgeAttestation::destination is the same type and the
+    //  attestation quorum check (executeBridgeAttest) is already a
+    //  byte-equality comparison on it. Making the field the same
+    //  type at the watcher boundary means no conversion, no length
+    //  check, and the on-chain "conflicting attestation" rejection
+    //  is the natural consequence of two validators having
+    //  observed different deposits.
+    Crypto::Address destination{};
+
+    //  Convenience: true iff the deposit is well-formed for
+    //  submission. Adapters that populate destination should
+    //  produce a deposit for which this returns true; the
+    //  submission layer uses it as a precondition.
+    bool hasIntent() const noexcept
+    {
+      return !deposit_blob.empty() && !destination.isNull();
+    }
   };
 
   struct ReleaseRequest
@@ -212,7 +277,8 @@ namespace Bridge
       return std::nullopt;
     }
 
-    virtual std::optional<Crypto::Hash> find_existing_release(const Crypto::Hash &/*payment_id*/) const {
+    virtual std::optional<Crypto::Hash> find_existing_release(const Crypto::Hash &/*payment_id*/) const
+    {
       return std::nullopt;
     }
 
@@ -278,6 +344,29 @@ namespace Bridge
     {
       return 2;
     }
+
+    virtual std::optional<uint64_t> highestFullyResolvedHeight() const
+    {
+      return std::nullopt;
+    }
+
+    //  Derive the deposit address at a chain-specific index. For a
+    //  chain whose deposits go to a fresh address per registration,
+    //  this is how the wallet learns the address to show the user:
+    //  the index comes from the BridgeRegisterDeposit tx, and this
+    //  call turns it into a bech32 (or whatever the chain uses)
+    //  string. The default returns nullopt, meaning "this adapter
+    //  has no per-registration deposit-address concept."
+    virtual std::optional<std::string> deriveDepositAddress(
+        uint64_t index,
+        std::string *error_out) const
+    {
+      (void)index;
+      if (error_out)
+        *error_out = "adapter '" + short_name() +
+                     "' does not derive per-registration deposit addresses";
+      return std::nullopt;
+    }
   };
 
   class ChainAdapterRegistry
@@ -291,4 +380,8 @@ namespace Bridge
     static std::vector<std::shared_ptr<ChainAdapter>> &storage();
   };
 
+  //  Register every chain adapter compiled into this binary. See
+  //  ChainAdapterRegistry.cpp for details. Call from main() before
+  //  any code that touches the registry.
+  void registerAllChainAdapters();
 } // namespace Bridge

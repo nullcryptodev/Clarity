@@ -3147,6 +3147,10 @@ namespace Rpc
           "getPendingWithdrawals",
           "getBridgeStats",
           "getBridgeEvents",
+          "getBridgeDepositDestination",
+          "getBridgeDepositsForAuthority",
+          "getBridgeDepositsForChain",
+          "getBridgeDepositStats",
       });
 
       return out;
@@ -3951,6 +3955,181 @@ namespace Rpc
       out["events"] = std::move(arr);
       return out;
     }
+
+    Common::Json method_getBridgeDepositDestination(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const uint64_t source_chain_id =
+          requireU64(req.params, "source_chain_id");
+      const uint64_t index = requireU64(req.params, "index");
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+      const std::string hrp = hrpForNode(node);
+
+      Core::BridgeDepositRecord rec;
+      if (!state.getBridgeDepositDestination(source_chain_id, index, rec))
+      {
+        throw RpcMethodError(
+            ErrorCode::BridgeDepositNotFound,
+            "no deposit destination at index " + encodeU64Hex(index),
+            makeErrorData(ErrorCode::BridgeDepositNotFound,
+                          {{"source_chain_id", encodeU64Hex(source_chain_id)},
+                           {"index", encodeU64Hex(index)}}));
+      }
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "source_chain_id", rec.source_chain_id);
+      putU64(out, "index", rec.index);
+      putAddress(out, "destination", rec.destination, hrp);
+      putAddress(out, "authority", rec.authority, hrp);
+      putU64(out, "registered_at_height", rec.registered_at_height);
+      return out;
+    }
+
+    Common::Json method_getBridgeDepositsForAuthority(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const uint64_t source_chain_id =
+          requireU64(req.params, "source_chain_id");
+      const std::string hrp = hrpForNode(node);
+      const Crypto::Address authority =
+          requireAddress(req.params, "address", hrp);
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      Common::Json arr = Common::Json::array();
+      state.forEachBridgeDepositForAuthority(
+          source_chain_id, authority,
+          [&](uint64_t index, const Core::BridgeDepositRecord &rec) -> bool
+          {
+            Common::Json entry = Common::Json::object();
+            putU64(entry, "index", index);
+            putAddress(entry, "destination", rec.destination, hrp);
+            putU64(entry, "registered_at_height",
+                   rec.registered_at_height);
+            arr.push_back(std::move(entry));
+            return true;
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "source_chain_id", source_chain_id);
+      putAddress(out, "authority", authority, hrp);
+      putU64(out, "count", static_cast<uint64_t>(arr.size()));
+      putU64(out, "max_per_authority",
+             Core::MAX_BRIDGE_DEPOSITS_PER_AUTHORITY);
+      out["deposits"] = std::move(arr);
+      return out;
+    }
+
+    Common::Json method_getBridgeDepositsForChain(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const uint64_t source_chain_id =
+          requireU64(req.params, "source_chain_id");
+
+      uint64_t from_index = 0;
+      if (auto v = optionalU64(req.params, "from_index"); v.has_value())
+        from_index = *v;
+
+      const PageParams page = parsePageParams(req.params, 10'000);
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+      const std::string hrp = hrpForNode(node);
+
+      Common::Json arr = Common::Json::array();
+      uint64_t emitted = 0;
+      uint64_t last_seen_index = 0;
+
+      //  Page over the chain. We cannot paginate cleanly here
+      //  because the underlying iterator yields ascending indices
+      //  with no cheap offset primitive; instead we scan from
+      //  from_index, skip `page.offset` rows, and stop after
+      //  `page.limit`. For the scanner's use case (fresh cache on
+      //  startup, incremental after) offset is 0 and limit is
+      //  MAX_BRIDGE_DEPOSITS_PER_CHAIN; for RPC pagination the
+      //  skip is linear in offset, which is acceptable for a
+      //  table bounded by 100,000.
+      uint64_t skipped = 0;
+
+      state.forEachBridgeDepositForChain(
+          source_chain_id, from_index, /*max_results=*/0,
+          [&](uint64_t index,
+              const Core::BridgeDepositRecord &rec) -> bool
+          {
+            if (skipped < page.offset)
+            {
+              ++skipped;
+              last_seen_index = index;
+              return true;
+            }
+            if (emitted >= page.limit)
+              return false;
+
+            Common::Json entry = Common::Json::object();
+            putU64(entry, "index", index);
+            putAddress(entry, "destination", rec.destination, hrp);
+            putAddress(entry, "authority", rec.authority, hrp);
+            putU64(entry, "registered_at_height",
+                   rec.registered_at_height);
+            arr.push_back(std::move(entry));
+
+            last_seen_index = index;
+            ++emitted;
+            return true;
+          });
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "source_chain_id", source_chain_id);
+      putU64(out, "from_index", from_index);
+      putU64(out, "count", emitted);
+      putU64(out, "offset", page.offset);
+      putU64(out, "limit", page.limit);
+      putU64(out, "last_seen_index", last_seen_index);
+
+      //  next_from_index is what a caller resumes at, or
+      //  last_seen_index + 1 when the page ended before the
+      //  chain's tip. If the chain has no more registrations,
+      //  last_seen_index is the highest one returned, and
+      //  next_from_index is that + 1 — which is what the
+      //  scanner wants for "have I caught up?".
+      const uint64_t next_from_index =
+          emitted > 0 ? last_seen_index + 1 : from_index;
+      putU64(out, "next_from_index", next_from_index);
+
+      out["deposits"] = std::move(arr);
+      return out;
+    }
+
+    Common::Json method_getBridgeDepositStats(
+        Node::Node &node,
+        const RpcConfig & /*config*/,
+        const JsonRpcRequest &req)
+    {
+      const uint64_t source_chain_id =
+          requireU64(req.params, "source_chain_id");
+
+      State::StateAccess state(node.stateDB(), node.chain().height());
+
+      char key[64];
+      std::snprintf(key, sizeof(key),
+                    "bridge:deposit_count:%llu",
+                    static_cast<unsigned long long>(source_chain_id));
+      const uint64_t registered = readU64Global(state, key);
+
+      Common::Json out = Common::Json::object();
+      putU64(out, "source_chain_id", source_chain_id);
+      putU64(out, "registered_count", registered);
+      putU64(out, "max_count", Core::MAX_BRIDGE_DEPOSITS_PER_CHAIN);
+      putU64(out, "max_per_authority",
+             Core::MAX_BRIDGE_DEPOSITS_PER_AUTHORITY);
+      return out;
+    }
   } // anon namespace
 
   void registerBridgeMethods(JsonRpcDispatcher &d)
@@ -3963,6 +4142,10 @@ namespace Rpc
     d.registerMethod("getPendingWithdrawals", method_getPendingWithdrawals);
     d.registerMethod("getBridgeStats", method_getBridgeStats);
     d.registerMethod("getBridgeEvents", method_getBridgeEvents);
+    d.registerMethod("getBridgeDepositDestination", method_getBridgeDepositDestination);
+    d.registerMethod("getBridgeDepositsForAuthority", method_getBridgeDepositsForAuthority);
+    d.registerMethod("getBridgeDepositsForChain", method_getBridgeDepositsForChain);
+    d.registerMethod("getBridgeDepositStats", method_getBridgeDepositStats);
   }
 
   void registerAdminMethods(JsonRpcDispatcher &d)

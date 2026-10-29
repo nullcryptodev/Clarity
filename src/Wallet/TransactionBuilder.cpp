@@ -1760,6 +1760,51 @@ namespace Wallet
     return tx;
   }
 
+  //  ---- BridgeRegisterDeposit ----
+
+  std::optional<Core::Transaction> buildBridgeRegisterDeposit(
+      const Crypto::Address &from,
+      const BridgeRegisterDepositParams &params,
+      WalletStatus *error_out)
+  {
+    if (!validateCommon(from, params.common, error_out))
+      return std::nullopt;
+
+    if (params.source_chain_id == 0)
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "source_chain_id is zero");
+      return std::nullopt;
+    }
+
+    if (params.destination.isNull())
+    {
+      if (error_out)
+        *error_out = WalletStatus::fail(
+            WalletError::InvalidParameter, "destination is null");
+      return std::nullopt;
+    }
+
+    Core::Transaction tx =
+        makeBase(Core::TxType::BridgeRegisterDeposit, from, params.common);
+
+    //  No `to`, no `token_id`, no `amount`: everything the
+    //  executor needs is in the payload, matching the pattern
+    //  BridgeRegisterChain follows.
+    tx.to = from;
+    tx.token_id = 0;
+    tx.amount = 0;
+
+    std::vector<uint8_t> &p = tx.payload;
+    appendU64(p, params.source_chain_id);
+    p.insert(p.end(),
+             params.destination.data.begin(),
+             params.destination.data.end());
+
+    return tx;
+  }
+
   //  ---- Sign ----
 
   std::optional<Crypto::Hash> signTransaction(

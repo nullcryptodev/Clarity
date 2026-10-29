@@ -23,3 +23,9 @@ add_executable(token Token.cpp)
 target_link_libraries(token PRIVATE CoreLibs)
 target_include_directories(token PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(token PRIVATE cxx_std_17)
+
+# ./wipe_consensus_wal
+add_executable(wipe_consensus_wal WipeConsensusWal.cpp)
+target_link_libraries(wipe_consensus_wal PRIVATE CoreLibs)
+target_include_directories(wipe_consensus_wal PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(wipe_consensus_wal PRIVATE cxx_std_17)

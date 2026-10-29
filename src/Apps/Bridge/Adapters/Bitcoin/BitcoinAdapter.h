@@ -5,13 +5,16 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "Adapters/ChainAdapter.h"
+#include "Adapters/Bitcoin/Custody.h"
 #include "Common/Json.h"
 #include "Crypto/Types.h"
 #include "Wallet/RpcClient.h"
@@ -22,20 +25,10 @@ namespace Bridge
   //  source chain. Two transports, deliberately:
   //
   //    BitcoindRpc  — a self-hosted bitcoind (or a provider that
-  //                   speaks bitcoind's JSON-RPC, e.g. Chainstack,
-  //                   QuickNode). Free if you run your own node,
-  //                   full data, no rate limits.
+  //                   speaks bitcoind's JSON-RPC).
   //
   //    MempoolSpace — mempool.space's free public REST API
-  //                   (Esplora-shaped). No API key, no signup,
-  //                   generous rate limits for read traffic.
-  //                   Third-party dependency, so a deployment
-  //                   that can run a node should.
-  //
-  //  Adding a third transport later is additive (a new enum
-  //  case, a new per-transport branch in the four public
-  //  methods, a new parser above it) — not a change to the
-  //  ChainAdapter interface.
+  //                   (Esplora-shaped).
   enum class BitcoinTransport
   {
     BitcoindRpc,
@@ -47,69 +40,24 @@ namespace Bridge
     BitcoinTransport transport{BitcoinTransport::BitcoindRpc};
 
     //  ---- BitcoindRpc fields ----
-    //
-    //  RPC host and port. bitcoind mainnet is 8332, testnet
-    //  18332, regtest 18443. Empty host means "not configured";
-    //  the adapter's methods fail with a clear error rather than
-    //  attempting to reach an empty endpoint.
     std::string rpc_host;
     uint16_t rpc_port{0};
-
-    //  RPC credentials. bitcoind accepts rpcuser/rpcpassword
-    //  (the fields here) or a cookie file (which the adapter
-    //  does not implement — the operator supplies credentials).
     std::string rpc_user;
     std::string rpc_password;
 
     //  ---- MempoolSpace fields ----
-    //
-    //  Base URL for mempool.space's REST API. Defaults to the
-    //  public instance; a deployment that runs a private
-    //  mempool.space instance (or a compatible instance) points
-    //  this at its own URL. The path suffix "/api" is included;
-    //  the adapter appends the endpoint path ("/blocks/tip/height",
-    //  etc.) to it.
     std::string mempool_url{"https://mempool.space/api"};
-
-    //  Reserved: a future private mempool.space instance that
-    //  gates access could accept an API key here. The public
-    //  instance does not use it; sending one is harmless.
     std::string mempool_api_key;
   };
 
   //  Bitcoin source-chain adapter.
   //
-  //  The second implementation of ChainAdapter, and the proof that
-  //  the interface is genuinely chain-agnostic: adding this class
-  //  required no change to Scan/, Release/, Repl/, or Cli/.
-  //
-  //  Bitcoin differs from CCX in every place the interface was
-  //  designed to absorb:
-  //
-  //    - Address model: base58/bech32 scriptPubKey, not a 64-byte
-  //      spend‖view blob. parse_deposit_address returns the script;
-  //      validate_destination checks it parses.
-  //
-  //    - Release model: a signed transaction from a bitcoind-held
-  //      key (or, for mempool.space, a raw transaction broadcast
-  //      through the public /tx endpoint). Same "a key signs a tx"
-  //      custody shape, different tooling.
-  //
-  //    - No view key: deposits are addressed directly. set_deposit_
-  //      ident_secret is a no-op.
-  //
-  //    - No payment ID: releases carry no payment-ID tag. find_
-  //      existing_release is left at the default (nullopt), and
-  //      the scan loop's double-release check is a no-op for
-  //      Bitcoin.
-  //
-  //    - Finality: confirmation-based, same as CCX's, but Bitcoin's
-  //      depth is 6 rather than 20.
-  //
-  //    - Two transports: bitcoind JSON-RPC (self-hosted or a
-  //      provider) or mempool.space REST (free public). The
-  //      transport is selected by config, and the daemon never
-  //      sees the choice.
+  //  Deposits go to per-registration derived addresses. The
+  //  adapter does not hold a static deposit script; it consults
+  //  the per-runtime BitcoinCustody (set_custody) to find the set
+  //  of scripts it is watching, and the per-runtime deposit cache
+  //  (set_deposit_cache) to resolve a matched index to the
+  //  rclrty1 destination the user registered.
   class BitcoinAdapter : public ChainAdapter
   {
   public:
@@ -129,12 +77,33 @@ namespace Bridge
 
     ChainStatus fetch_status(Wallet::RpcClient &rpc) const override;
 
+    //  Scan Bitcoin blocks for deposits.
+    //
+    //  Requires custody_ (set by set_custody). For each vout in
+    //  each tx, matches the scriptPubKey against custody's
+    //  scriptsInWindow(); on a hit, looks up the index in the
+    //  deposit cache and, if found, emits ObservedDeposit with
+    //  the cache's destination.
+    //
+    //  A vout whose script is in the custody window but not in
+    //  the cache is "unresolved": the registration is on-chain
+    //  but the cache hasn't been refreshed yet. The adapter sets
+    //  highestFullyResolvedHeight() to hold the cursor at the
+    //  last fully-resolved block, exactly like CcxAdapter.
     void scan_deposits(
         Wallet::RpcClient &rpc,
         uint64_t from_height,
         uint64_t to_height,
         const std::function<bool(const ObservedDeposit &)> &on_deposit)
         const override;
+
+    //  The highest height at which every in-window vout resolved
+    //  to a cache entry. nullopt means "the first chunk stalled";
+    //  the scan loop clamps its cursor to this value.
+    std::optional<uint64_t> highestFullyResolvedHeight() const override
+    {
+      return highest_fully_resolved_height_;
+    }
 
     ReleaseSubmission submit_release(
         Wallet::RpcClient &rpc,
@@ -161,56 +130,61 @@ namespace Bridge
     void set_deposit_address(
         const std::vector<uint8_t> &blob) override;
 
-    //  Configure the Bitcoin wallet RPC endpoint. For bitcoind,
-    //  chain reads and wallet operations share one port; the
-    //  endpoint is the same as the daemon RPC. Populates the
-    //  BitcoindRpc half of the config, so a deployment that only
-    //  sets wallet_rpc_host / wallet_rpc_port continues to work
-    //  without a "transport" field.
     void set_wallet_rpc_endpoint(
         const std::string &host,
         uint16_t port,
         const std::string &user = {},
         const std::string &password = {}) override;
 
-    //  Configure the adapter's source-chain transport from a JSON
-    //  config block. Reads "transport" ("bitcoind-rpc" or
-    //  "mempool"), "mempool_url", "mempool_api_key". A config
-    //  that omits "transport" leaves the adapter on BitcoindRpc,
-    //  which the existing wallet_rpc_* fields configure.
-    //
-    //  "esplora" is accepted as an alias for "mempool" (and
-    //  "esplora_url" / "esplora_api_key" as aliases for
-    //  "mempool_url" / "mempool_api_key"), so a config that was
-    //  written before the rename keeps working.
     void set_transport_config(const Common::Json &config) override;
 
+    //  ChainAdapter override. Returns the bech32 deposit address
+    //  for `index`, derived from custody_. Returns nullopt if
+    //  custody is not installed.
+    std::optional<std::string> deriveDepositAddress(
+        uint64_t index,
+        std::string *error_out = nullptr) const override;
+
+    //  Install the per-runtime custody state. Non-owning; the
+    //  ChainRuntime owns the BitcoinCustody and outlives the
+    //  adapter pointer. Set by cmd_start before Scan::startScan.
+    void set_custody(BitcoinCustody *custody) noexcept
+    {
+      custody_ = custody;
+    }
+
+    //  Install the per-runtime deposit cache: index -> destination.
+    //  Non-owning; owned by ChainRuntime, populated by
+    //  refreshBridgeDeposits. Set by cmd_start before
+    //  Scan::startScan, mirroring CcxAdapter::set_bridge_deposits_cache.
+    void set_deposit_cache(
+        const std::map<uint64_t, Crypto::Address> *cache) noexcept
+    {
+      deposit_cache_ = cache;
+    }
+
     //  ---- Registration support ----
-    //
-    //  Bitcoin is not genesis-registered: the genesis writer
-    //  registers CCX only. The bridge daemon registers BTC via
-    //  `register-chain btc`, which builds a BridgeRegisterChain
-    //  tx from these values. The fingerprint, decimals, and
-    //  confirmation depth all come from Core/Bridge/Bitcoin.h so
-    //  there is one source of truth.
     bool supports_registration() const override { return true; }
     Crypto::Hash wrapped_token_fingerprint() const override;
     std::pair<uint8_t, uint8_t> registration_blob_bounds() const override;
     uint32_t registration_active_validator_min() const override;
 
-private:
-    //  The deposit scriptPubKey, decoded from the configured
-    //  address string. Empty until set_deposit_address is called.
+  private:
     std::vector<uint8_t> deposit_script_;
-
-    //  Transport configuration. Populated by
-    //  set_wallet_rpc_endpoint (BitcoindRpc half) and
-    //  set_transport_config (both halves).
     BitcoinConfig config_;
 
-    //  Per-transport implementations. The public methods dispatch
-    //  on config_.transport; a future transport adds a third
-    //  pair here without touching the public methods.
+    BitcoinCustody *custody_{nullptr};
+    const std::map<uint64_t, Crypto::Address> *deposit_cache_{nullptr};
+
+    mutable std::optional<uint64_t> highest_fully_resolved_height_;
+
+    //  After a `highestFullyResolvedHeight` read, this flag tells
+    //  cmd_start (via ScanRegistry, on the next poll) whether the
+    //  deposit cache should be refreshed before the next scan.
+    //  Currently unused; refreshBridgeDeposits is called each
+    //  poll anyway. Retained for symmetry with CcxAdapter.
+    mutable bool cache_miss_detected_{false};
+
     void scan_deposits_bitcoind(
         Wallet::RpcClient &rpc,
         uint64_t from_height,
@@ -231,16 +205,9 @@ private:
     std::optional<uint64_t> fetch_release_height_mempool(
         const Crypto::Hash &tx_hash) const;
 
-    //  Decode a base58/bech32 address to its scriptPubKey via
-    //  mempool.space's /api/v1/validate-address endpoint. Used by
-    //  parse_deposit_address when the transport is MempoolSpace;
-    //  a bitcoind deployment passes the scriptPubKey hex
-    //  directly, which the parse_deposit_address path handles
-    //  first.
     std::optional<std::vector<uint8_t>> decodeAddressViaMempool(
         const std::string &address, std::string *error_out) const;
 
-    uint64_t default_start_height() const override { return 0; };
+    uint64_t default_start_height() const override { return 0; }
   };
-
 } // namespace Bridge

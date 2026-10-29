@@ -183,13 +183,6 @@ namespace Bridge
         continue;
       }
 
-      if (a == "--mint-destination")
-      {
-        requireValue(i, argc, "--mint-destination");
-        args.config.mint_destination = argv[++i];
-        continue;
-      }
-
       if (a == "--rpc-clarity")
       {
         requireValue(i, argc, "--rpc-clarity");

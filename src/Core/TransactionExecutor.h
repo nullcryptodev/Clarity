@@ -314,6 +314,18 @@ namespace Core
         const uint8_t *signatures, size_t signatures_len,
         const TxExecutionContext &ctx);
 
+    //  Register a per-authority deposit destination for a bridge
+    //  source chain. The executor assigns the index from a
+    //  per-chain counter (see BridgeDepositRecord in
+    //  Core/BridgeTypes.h). Bounds:
+    //    - MAX_BRIDGE_DEPOSITS_PER_AUTHORITY per (chain, sender)
+    //    - MAX_BRIDGE_DEPOSITS_PER_CHAIN per chain.
+    //  The fee is the transaction's own tx.fee; there is no
+    //  additional charge inside the handler.
+    static Receipt executeBridgeRegisterDeposit(State::StateAccess &state,
+                                                const Transaction &tx,
+                                                const TxExecutionContext &ctx);
+
     // ---- Common helpers ----
 
     // Charge the fee from `tx.from`. Returns true if the fee was charged.

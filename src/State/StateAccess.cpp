@@ -3002,6 +3002,211 @@ namespace State
                value.data(), value.size());
   }
 
+  //  =========================================================================
+  //  Bridge — deposit destinations
+  //  =========================================================================
+
+  bool StateAccess::getBridgeDepositDestination(
+      uint64_t source_chain_id,
+      uint64_t index,
+      Core::BridgeDepositRecord &out) const
+  {
+    Crypto::Hash key = Keys::bridgeDepositDestination(source_chain_id, index);
+    auto value = smt_.get(key);
+    if (!value.has_value())
+      return false;
+    return Core::BridgeDepositRecord::deserializeState(
+        value->data(), value->size(), out);
+  }
+
+  void StateAccess::putBridgeDepositDestination(
+      const Core::BridgeDepositRecord &rec)
+  {
+    if (!rec.isWellFormed())
+      throw StateDBError("putBridgeDepositDestination: malformed record");
+
+    releaseReadTxnIfHeld();
+
+    //  The record lives in the SMT under its (chain, index) key.
+    Crypto::Hash key =
+        Keys::bridgeDepositDestination(rec.source_chain_id, rec.index);
+    auto value = rec.serializeState();
+    smt_.update(key, value, version_);
+
+    //  The by-authority index lives in a plain MDBX table. The
+    //  key layout is chosen so a prefix scan over
+    //  (chain, authority) yields the authority's registrations
+    //  in ascending index order:
+    //
+    //    [8]  chain_id  (BE)
+    //    [32] authority
+    //    [8]  index     (BE)
+    uint8_t idx_key[48];
+    for (int i = 0; i < 8; ++i)
+      idx_key[i] = uint8_t(rec.source_chain_id >> ((7 - i) * 8));
+    std::memcpy(idx_key + 8, rec.authority.data.data(), 32);
+    for (int i = 0; i < 8; ++i)
+      idx_key[40 + i] = uint8_t(rec.index >> ((7 - i) * 8));
+
+    //  The value is the destination pubkey (32 bytes). Storing it
+    //  inline avoids a second SMT read when the caller only wants
+    //  the destination, which is the common case for the watcher.
+    //  A caller that wants the full record (authority,
+    //  registered_at_height) reads the SMT.
+    putBlobRow(StateDB::TBL_INDEX_BRIDGE_DEPOSITS_BY_AUTHORITY,
+               idx_key, sizeof(idx_key),
+               rec.destination.data.data(), rec.destination.data.size());
+
+    //  By-chain index row. Key = [8] chain_id BE || [8] index BE.
+    //  Value = destination(32) || authority(32), so a chain-wide
+    //  scan that only needs (index, destination, authority) doesn't
+    //  do an SMT read per row.
+    uint8_t chain_idx_key[16];
+    for (int i = 0; i < 8; ++i)
+      chain_idx_key[i] = uint8_t(rec.source_chain_id >> ((7 - i) * 8));
+    for (int i = 0; i < 8; ++i)
+      chain_idx_key[8 + i] = uint8_t(rec.index >> ((7 - i) * 8));
+
+    uint8_t chain_idx_val[64];
+    std::memcpy(chain_idx_val, rec.destination.data.data(), 32);
+    std::memcpy(chain_idx_val + 32, rec.authority.data.data(), 32);
+
+    putBlobRow(StateDB::TBL_INDEX_BRIDGE_DEPOSITS_BY_CHAIN,
+               chain_idx_key, sizeof(chain_idx_key),
+               chain_idx_val, sizeof(chain_idx_val));
+  }
+
+  uint64_t StateAccess::getBridgeDepositAuthorityCount(
+      uint64_t source_chain_id,
+      const Crypto::Address &authority) const
+  {
+    uint8_t prefix_bytes[40];
+    for (int i = 0; i < 8; ++i)
+      prefix_bytes[i] = uint8_t(source_chain_id >> ((7 - i) * 8));
+    std::memcpy(prefix_bytes + 8, authority.data.data(), 32);
+    std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 40);
+
+    uint64_t count = 0;
+    auto visitor = [&count](const std::vector<uint8_t> &key,
+                            const std::vector<uint8_t> &) -> bool
+    {
+      if (key.size() == 48)
+        ++count;
+      return true;
+    };
+
+    readForEachWithPrefix(
+        StateDB::TBL_INDEX_BRIDGE_DEPOSITS_BY_AUTHORITY,
+        prefix, visitor);
+    return count;
+  }
+
+  void StateAccess::forEachBridgeDepositForAuthority(
+      uint64_t source_chain_id,
+      const Crypto::Address &authority,
+      const std::function<bool(uint64_t index,
+                               const Core::BridgeDepositRecord &)> &fn) const
+  {
+    uint8_t prefix_bytes[40];
+    for (int i = 0; i < 8; ++i)
+      prefix_bytes[i] = uint8_t(source_chain_id >> ((7 - i) * 8));
+    std::memcpy(prefix_bytes + 8, authority.data.data(), 32);
+    std::vector<uint8_t> prefix(prefix_bytes, prefix_bytes + 40);
+
+    auto visitor = [this, &fn, source_chain_id, &authority](
+                       const std::vector<uint8_t> &key,
+                       const std::vector<uint8_t> &) -> bool
+    {
+      if (key.size() != 48)
+        return true;
+
+      uint64_t index = 0;
+      for (int i = 0; i < 8; ++i)
+        index = (index << 8) | key[40 + i];
+
+      Core::BridgeDepositRecord rec;
+      if (!getBridgeDepositDestination(source_chain_id, index, rec))
+        return true;
+      if (rec.source_chain_id != source_chain_id || rec.index != index)
+        return true; // corrupted record; skip
+      if (rec.authority != authority)
+        return true; // corrupted record; skip
+      return fn(index, rec);
+    };
+
+    readForEachWithPrefix(
+        StateDB::TBL_INDEX_BRIDGE_DEPOSITS_BY_AUTHORITY,
+        prefix, visitor);
+  }
+
+  void StateAccess::forEachBridgeDepositForChain(
+      uint64_t source_chain_id,
+      uint64_t from_index,
+      size_t max_results,
+      const std::function<bool(uint64_t index,
+                               const Core::BridgeDepositRecord &)> &fn) const
+  {
+    uint8_t seek_bytes[16];
+    for (int i = 0; i < 8; ++i)
+      seek_bytes[i] = uint8_t(source_chain_id >> ((7 - i) * 8));
+    for (int i = 0; i < 8; ++i)
+      seek_bytes[8 + i] = uint8_t(from_index >> ((7 - i) * 8));
+    std::vector<uint8_t> seek_key(seek_bytes, seek_bytes + 16);
+
+    size_t yielded = 0;
+    bool stopped = false;
+
+    auto visitor = [this, &fn, &yielded, &stopped, max_results,
+                    source_chain_id](
+                       const std::vector<uint8_t> &key,
+                       const std::vector<uint8_t> &) -> bool
+    {
+      if (stopped)
+        return false;
+      if (key.size() != 16)
+        return true;
+
+      //  Chain id must match — defensive, since seek_key already
+      //  filtered, but a future index that scanned across chains
+      //  would want this check.
+      uint64_t chain_id = 0;
+      for (int i = 0; i < 8; ++i)
+        chain_id = (chain_id << 8) | key[i];
+      if (chain_id != source_chain_id)
+        return false;
+
+      uint64_t index = 0;
+      for (int i = 0; i < 8; ++i)
+        index = (index << 8) | key[8 + i];
+
+      Core::BridgeDepositRecord rec;
+      if (!getBridgeDepositDestination(source_chain_id, index, rec))
+        return true;
+      if (rec.source_chain_id != source_chain_id || rec.index != index)
+        return true;
+      if (stopped)
+        return false;
+
+      if (!fn(index, rec))
+      {
+        stopped = true;
+        return false;
+      }
+
+      ++yielded;
+      if (max_results != 0 && yielded >= max_results)
+      {
+        stopped = true;
+        return false;
+      }
+      return true;
+    };
+
+    readForEachFromKey(
+        StateDB::TBL_INDEX_BRIDGE_DEPOSITS_BY_CHAIN,
+        seek_key, visitor);
+  }
+
   size_t StateAccess::countBridgeAttestationsForDeposit(
       uint64_t source_chain_id,
       const Crypto::Hash &source_tx_hash,

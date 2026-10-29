@@ -66,12 +66,16 @@ namespace Bridge
     std::string clarity_rpc_user;
     std::string clarity_rpc_password;
 
+    //  Deposit-address HTTP API. Set deposit_api_port to 0 to
+    //  disable. Bind address defaults to loopback; expose only
+    //  with the bind-address override below.
+    uint16_t deposit_api_port{9638};
+    std::string deposit_api_bind{"127.0.0.1"};
+
     std::string keystore_path;
     std::string password_file;
     std::string consensus_key_file;
     std::string view_key_file;
-
-    std::string mint_destination;
 
     std::string state_dir;
 

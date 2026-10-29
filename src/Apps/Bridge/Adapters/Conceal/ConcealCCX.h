@@ -6,8 +6,10 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../ChainAdapter.h"
@@ -36,12 +38,46 @@ namespace Bridge
 
     ChainStatus fetch_status(Wallet::RpcClient &rpc) const override;
 
+    //  Scan CCX blocks for deposits.
+    //
+    //  Uses per-output reverse derivation (Crypto::reverseDeriveCandidate)
+    //  against each vout's on-chain output pubkey. A vout matches if
+    //  the reverse-derived spend pubkey is in the registered-subaddress
+    //  cache installed via set_bridge_deposits_cache. On a match the
+    //  deposit is emitted with its destination (from the cache entry).
+    //
+    //  Cache misses (a vout whose candidate is not in the cache) do
+    //  NOT emit a deposit and are reported through the adapter's
+    //  highestFullyResolvedHeight() mechanism: the scan loop uses that
+    //  to avoid advancing its cursor past a block whose vouts couldn't
+    //  all be resolved, so the next poll after refreshBridgeDeposits
+    //  re-scans and matches.
+    //
+    //  Preconditions: set_deposit_address (64-byte custody blob) and
+    //  set_deposit_ident_secret (view key) must have been called;
+    //  otherwise this method throws. The cache may be null, in which
+    //  case no deposits are emitted (fail-closed).
     void scan_deposits(
         Wallet::RpcClient &rpc,
         uint64_t from_height,
         uint64_t to_height,
         const std::function<bool(const ObservedDeposit &)> &on_deposit)
         const override;
+
+    //  The highest height at which the most recent scan_deposits call
+    //  fully resolved every vout it examined. nullopt means "no scan
+    //  has run yet, or the last scan was stalled at its very first
+    //  block." The scan loop clamps its cursor to this value (if
+    //  present and < the requested to_height) so it doesn't skip
+    //  past a cache-miss block.
+    //
+    //  Overrides ChainAdapter::highestFullyResolvedHeight, which
+    //  returns nullopt for adapters that don't have this concept
+    //  (Bitcoin).
+    std::optional<uint64_t> highestFullyResolvedHeight() const override
+    {
+      return highest_fully_resolved_height_;
+    }
 
     //  Release request. Delegates to the configured CCX wallet RPC
     //  (conceal-wallet-rpc or compatible) because the CCX daemon
@@ -75,24 +111,6 @@ namespace Bridge
     //  Look up the block height of a CCX transaction that is
     //  already in a block. Returns std::nullopt if the tx is
     //  not in a block (still in the mempool, or unknown).
-    //
-    //  Used by the withdrawal scan loop's Released phase to
-    //  populate the release_height field that
-    //  buildBridgeAckWithdrawal requires. Without it, the
-    //  BridgeAckWithdrawal tx can't be built (release_height
-    //  must be non-zero) and the Clarity-side audit record
-    //  stays unpopulated.
-    //
-    //  The lookup goes through the CCX daemon's /gettransactions
-    //  endpoint (not the wallet RPC — the wallet can already tell
-    //  us this via get_transfers, but that's a much heavier call
-    //  and requires the wallet to be in a state where the transfer
-    //  is visible, which it always is by the time submit_release
-    //  returns). The daemon endpoint is cheap and direct.
-    //
-    //  Uses the daemon RPC configured on this adapter via its
-    //  Wallet::RpcClient argument, matching probe_rpc and
-    //  fetch_status.
     std::optional<uint64_t> fetch_release_height(
         Wallet::RpcClient &rpc,
         const Crypto::Hash &tx_hash) const override;
@@ -123,6 +141,15 @@ namespace Bridge
     //  Store the custody wallet's private view key. Also derives
     //  custody_spend_pub_ from bridge_deposit_address_ if it's
     //  already set.
+    //
+    //  IMPORTANT: the view key must be a *reduced scalar* (the
+    //  output of sc_reduce32), not the ed25519 seed. In a CCX
+    //  wallet, `query_key` returns the reduced scalar; the mnemonic
+    //  or `get_seed` returns the seed and will NOT work here. If
+    //  the caller passes a seed, generateKeyDerivation's sc_check
+    //  will fail and no deposits will ever be detected — the scan
+    //  loop reports this once, but it is a configuration error the
+    //  operator must fix.
     void set_deposit_ident_secret(
         const Crypto::SecretKey &secret) override;
 
@@ -131,41 +158,14 @@ namespace Bridge
     //  services: the daemon (default port 16000) provides chain
     //  reads; the wallet (default port 16001) provides transaction
     //  construction and signing.
-    //
-    //  The password is supplied as a plain string for the same
-    //  reason Wallet::RpcEndpoint supplies it that way — the
-    //  caller is responsible for reading it from wherever it lives
-    //  and for not logging it.
-    //
-    //  Calling this with an empty host disables submit_release;
-    //  it will report "no CCX wallet RPC configured" and return
-    //  ok=false. That's the intended behaviour for a deployment
-    //  that has not yet provisioned a wallet RPC.
     void set_wallet_rpc_endpoint(const std::string &host,
                                  uint16_t port,
                                  const std::string &user = {},
                                  const std::string &password = {});
 
-    //  Configure the CCX address network prefix byte.
-    //
-    //  This is the varint written at the start of a decoded CCX
-    //  address. It is a *deployment* property: mainnet and testnet
-    //  share a chain id (as the bridge sees it) but use different
-    //  prefix bytes, and the CCX wallet RPC on the other side will
-    //  reject an address whose prefix doesn't match its own network.
-    //
-    //  Common values:
-    //    - CCX mainnet: 0x13 (addresses begin with "ccx7")
-    //    - CCX testnet: 0x53 (addresses begin with "ccxT")
-    //
-    //  If you are unsure which value your wallet uses, decode one of
-    //  its own addresses with `parse_deposit_address` and inspect the
-    //  varint (or just ask the wallet: `get_address`). Getting this
-    //  wrong causes releases to fail with a "wrong address" error
-    //  from the wallet RPC, not a silent fund loss — but it will
-    //  block all withdrawals until fixed.
-    //
-    //  Default: 0x13 (CCX mainnet).
+    //  Configure the CCX address network prefix byte (varint prefix
+    //  at the start of a decoded base58 address). Default: 0x13
+    //  (mainnet; addresses begin with "ccx7").
     void set_network_prefix(uint64_t prefix);
 
     //  Set the custody address string (base58) alongside the
@@ -176,7 +176,35 @@ namespace Bridge
       custody_address_string_ = addr;
     }
 
-    std::optional<Crypto::Hash> find_existing_release(const Crypto::Hash &payment_id) const override;
+    std::optional<Crypto::Hash> find_existing_release(
+        const Crypto::Hash &payment_id) const override;
+
+    //  Install the cache of registered deposit subaddresses. The
+    //  adapter stores a non-owning pointer to the caller's map; the
+    //  caller (ChainRuntime) owns it and must keep it alive for the
+    //  adapter's lifetime. Passing nullptr clears the cache, and
+    //  scan_deposits will then emit no deposits (fail-closed, not
+    //  fail-open: without a cache, nothing can be matched).
+    //
+    //  The map is keyed by the derived subaddress's spend pubkey,
+    //  which is what the scanner reverse-derives for each vout.
+    void set_bridge_deposits_cache(
+        const BridgeDepositCache *cache) noexcept
+    {
+      bridge_deposits_by_spend_ = cache;
+    }
+
+    //  Test-visible helper. Same as the one scan_deposits uses
+    //  internally; exposed so the scanner's per-tx logic can be
+    //  tested without going through HTTP. Not part of the
+    //  ChainAdapter interface and not meant for external callers.
+    static bool populateDepositsFromJson(
+        const Common::Json &tx,
+        const BridgeDepositCache *cache,
+        const std::vector<uint8_t> &bridge_deposit_address,
+        const std::optional<Crypto::SecretKey> &custody_view_key,
+        std::vector<ObservedDeposit> &out,
+        bool &had_unresolved_vout);
 
   private:
     std::vector<uint8_t> bridge_deposit_address_;
@@ -195,6 +223,26 @@ namespace Bridge
 
     //  CCX address network prefix byte. Default: mainnet (0x13).
     uint64_t ccx_network_prefix_{0x13};
+
+    //  Non-owning pointer to ChainRuntime::bridge_deposits_by_spend.
+    //  Set by cmd_start (or by refreshBridgeDeposits) after the
+    //  cache is populated. Null means "no cache" — scan_deposits
+    //  emits nothing and every vout is treated as unresolved.
+    //
+    //  The map's lifetime is ChainRuntime's, which outlives the
+    //  adapter (both are owned by WatcherSession and destroyed
+    //  together). A raw pointer here avoids the ownership
+    //  ambiguity of shared_ptr<unordered_map> for a map that's
+    //  never really shared.
+    const BridgeDepositCache *bridge_deposits_by_spend_{nullptr};
+
+    //  Mutable state written by scan_deposits and read by
+    //  highestFullyResolvedHeight. Reset at the top of each
+    //  scan_deposits call; populated as the scanner walks blocks.
+    //  `mutable` because scan_deposits is a const method (the
+    //  ChainAdapter interface requires it) and this is
+    //  observational cache state, not logical state.
+    mutable std::optional<uint64_t> highest_fully_resolved_height_;
   };
 
 } // namespace Bridge

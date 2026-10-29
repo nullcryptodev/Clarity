@@ -10,6 +10,9 @@
 #include "Wallet/RpcClient.h"
 #include "Wallet/WalletError.h"
 
+#include "Core/Bridge/ConcealCCX.h"
+#include "Core/Bridge/Bitcoin.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -17,6 +20,15 @@
 
 namespace Bridge
 {
+  namespace
+  {
+    std::filesystem::path cursorFileFor(const ChainRuntime &rt)
+    {
+      return std::filesystem::path(rt.config.state_subdir) /
+             rt.chain_short_name() / "cursor";
+    }
+  } // anonymous namespace
+
   ChainRuntime *WatcherSession::current() noexcept
   {
     if (current_chain.empty())
@@ -163,7 +175,6 @@ namespace Bridge
     validator_id = 0;
     consensus_key.reset();
     custody_view_key.reset();
-    mint_destination.reset();
 
     if (clarity_rpc)
       clarity_rpc.reset();
@@ -253,6 +264,7 @@ namespace Bridge
     session.address = *decoded;
     session.address_bech32m = bech;
     session.keystore_path = path;
+    session.keystore_password = password;
     session.keystore = std::move(*ks);
     session.signer = std::make_unique<Wallet::LocalSigner>(*session.keystore);
 
@@ -279,21 +291,22 @@ namespace Bridge
       session.keystore.reset();
     }
 
+    std::fill(session.keystore_password.begin(),
+              session.keystore_password.end(), '\0');
+    session.keystore_password.clear();
+
     session.address.reset();
     session.address_bech32m.clear();
     session.keystore_path.clear();
     session.validator_id = 0;
     session.consensus_key.reset();
     session.custody_view_key.reset();
-    session.mint_destination.reset();
 
     std::cout << "Keystore closed.\n";
   }
 
   //  Helper: extract a 0x-prefixed hex uint64 from a JSON string.
-  //  Returns std::nullopt on any parse failure. Local to this
-  //  translation unit; the signer index resolution uses the same
-  //  shape.
+  //  Returns std::nullopt on any parse failure.
   namespace
   {
     std::optional<uint64_t> parseHexU64(const Common::Json &v)
@@ -341,7 +354,7 @@ namespace Bridge
       auto res = Wallet::getValidatorByAddress(
           clarity_rpc, bech, &is_not_found, &err);
       if (is_not_found)
-        return 0; // not a registered validator yet; not an error
+        return 0;
       if (!res.has_value())
       {
         std::cerr << "resolveValidatorId: RPC failed: " << err << "\n";
@@ -461,4 +474,346 @@ namespace Bridge
       config.state_subdir = adapter.short_name();
   }
 
+  //  ===========================================================================
+  //  refreshBridgeDeposits
+  //
+  //  Populate the per-chain deposit-destination cache from the
+  //  chain's registration table (via Wallet::getBridgeDepositsForChain).
+  //
+  //  The cache shape depends on the chain:
+  //
+  //    CCX: keyed by the derived subaddress spend_pub. The scanner
+  //         reverse-derives P - Hs(D, i)*G for each vout and looks
+  //         up the result. See ChainRuntime::bridge_deposits_by_spend.
+  //
+  //    BTC: keyed by the registration index. The scanner matches a
+  //         vout's scriptPubKey against BitcoinCustody's window
+  //         (which yields the index), then looks up the destination
+  //         here by index. See ChainRuntime::btc_deposit_cache.
+  //
+  //  Both caches live on ChainRuntime, both outlive the adapter's
+  //  non-owning pointer, and both are populated by this function.
+  //  A chain that is neither CCX nor BTC is a no-op (returns true):
+  //  an adapter with no registration concept has no cache to fill.
+  //
+  //  Partial-success semantics: a registration whose record can't be
+  //  parsed is skipped with a warning. The high-water mark is advanced
+  //  only past registrations we successfully cached, so a subsequent
+  //  call retries the failed ones. If a record is permanently
+  //  malformed (a bug), the retry loop will spin — but the
+  //  alternative is silently dropping the registration, which is
+  //  worse.
+  //  ===========================================================================
+  bool refreshBridgeDeposits(WatcherSession &session,
+                             ChainRuntime &rt)
+  {
+    if (!session.clarity_rpc || !rt.adapter)
+      return false;
+
+    const uint64_t chain_id = rt.adapter->source_chain_id();
+
+    if (chain_id == Core::CcxBridge::CCX_CHAIN_ID)
+    {
+      if (!rt.bridge_custody_spend_pub.has_value() ||
+          !rt.bridge_custody_view_priv.has_value())
+      {
+        std::cerr << "[" << rt.chain_short_name()
+                  << "] refreshBridgeDeposits: custody keys not set "
+                     "(bridge_deposit_address or view key missing)\n";
+        return false;
+      }
+
+      const Wallet::Network net = session.currentNetwork();
+      uint64_t from_index = rt.bridge_deposits_high_index + 1;
+
+      for (;;)
+      {
+        std::string err;
+        auto page = Wallet::getBridgeDepositsForChain(
+            *session.clarity_rpc,
+            Core::CcxBridge::CCX_CHAIN_ID,
+            from_index,
+            /*limit=*/1000,
+            /*offset=*/0,
+            &err);
+        if (!page.has_value())
+        {
+          std::cerr << "[" << rt.chain_short_name()
+                    << "] refreshBridgeDeposits: RPC failed: "
+                    << err << "\n";
+          return false;
+        }
+
+        if (page->deposits.empty())
+          break;
+
+        for (const auto &d : page->deposits)
+        {
+          auto dest = Wallet::decodeAddress(d.destination_bech32m, net);
+          auto auth = Wallet::decodeAddress(d.authority_bech32m, net);
+          if (!dest.has_value() || !auth.has_value())
+          {
+            std::cerr << "[" << rt.chain_short_name()
+                      << "] refreshBridgeDeposits: bad address in "
+                         "registration index "
+                      << d.index << "\n";
+            continue;
+          }
+
+          Crypto::PublicKey sub_spend, sub_view;
+          if (!Core::CcxBridge::deriveSubaddress(
+                  *rt.bridge_custody_spend_pub,
+                  *rt.bridge_custody_view_priv,
+                  Core::CcxBridge::CCX_CHAIN_ID,
+                  d.index,
+                  sub_spend, sub_view))
+          {
+            std::cerr << "[" << rt.chain_short_name()
+                      << "] refreshBridgeDeposits: deriveSubaddress "
+                         "failed for index "
+                      << d.index << "\n";
+            continue;
+          }
+
+          BridgeDepositCacheEntry entry;
+          entry.index = d.index;
+          entry.destination = *dest;
+          entry.authority = *auth;
+          entry.registered_at_height = d.registered_at_height;
+
+          rt.bridge_deposits_by_spend[sub_spend] = entry;
+
+          if (d.index > rt.bridge_deposits_high_index)
+            rt.bridge_deposits_high_index = d.index;
+        }
+
+        if (page->deposits.size() < 1000)
+          break;
+
+        from_index = page->next_from_index;
+      }
+
+      std::string hdr_err;
+      auto hdr = Wallet::getCurrentHeader(*session.clarity_rpc, &hdr_err);
+      if (hdr.has_value())
+        rt.bridge_deposits_cached_at_height = hdr->height;
+
+      return true;
+    }
+
+    if (chain_id == Core::BitcoinBridge::BTC_CHAIN_ID)
+    {
+      if (rt.btc_custody == nullptr)
+      {
+        //  Custody not installed yet. This is not fatal — the
+        //  scanner will refuse to scan without it, and cmd_start
+        //  installs it before startScan — but logging it here makes
+        //  the "why is nothing being minted" question answerable
+        //  from a single log line.
+        std::cerr << "[" << rt.chain_short_name()
+                  << "] refreshBridgeDeposits: Bitcoin custody not "
+                     "installed yet; skipping (no addresses to "
+                     "watch)\n";
+        return false;
+      }
+
+      //  We page from 0 every time rather than tracking a
+      //  high-water mark: BTC registrations are indexed the same
+      //  way CCX ones are, but the BTC scanner needs the full
+      //  index -> destination map on every poll (the custody
+      //  window can grow on demand, and a new index that
+      //  appeared since the last refresh must be visible before
+      //  the next scan). The table is bounded by
+      //  MAX_BRIDGE_DEPOSITS_PER_CHAIN (100,000) and typical
+      //  deployments will have orders of magnitude fewer. If
+      //  this ever becomes a polling cost, add a
+      //  btc_deposits_high_index field and page from there, same
+      //  as CCX.
+      const Wallet::Network net = session.currentNetwork();
+      uint64_t from_index = 0;
+      uint64_t highest_seen = 0;
+
+      for (;;)
+      {
+        std::string err;
+        auto page = Wallet::getBridgeDepositsForChain(
+            *session.clarity_rpc,
+            Core::BitcoinBridge::BTC_CHAIN_ID,
+            from_index,
+            /*limit=*/1000,
+            /*offset=*/0,
+            &err);
+        if (!page.has_value())
+        {
+          std::cerr << "[" << rt.chain_short_name()
+                    << "] refreshBridgeDeposits: RPC failed: "
+                    << err << "\n";
+          return false;
+        }
+
+        if (page->deposits.empty())
+          break;
+
+        for (const auto &d : page->deposits)
+        {
+          auto dest = Wallet::decodeAddress(d.destination_bech32m, net);
+          if (!dest.has_value())
+          {
+            std::cerr << "[" << rt.chain_short_name()
+                      << "] refreshBridgeDeposits: bad destination "
+                         "address in BTC registration index "
+                      << d.index << "\n";
+            continue;
+          }
+
+          rt.btc_deposit_cache[d.index] = *dest;
+
+          //  Also index by (authority, destination) so the
+          //  deposit-address API can look up the index for a
+          //  given user without an RPC. Auth is the authority's
+          //  bech32m string; we decode it here to make the key
+          //  type consistent with the deposit cache.
+          {
+            auto auth_addr = Wallet::decodeAddress(
+                d.authority_bech32m, net);
+            if (auth_addr.has_value())
+            {
+              rt.btc_deposit_index_by_authority[std::make_pair(*auth_addr, *dest)] = d.index;
+            }
+            else
+            {
+              std::cerr << "[" << rt.chain_short_name()
+                        << "] refreshBridgeDeposits: bad authority "
+                           "address in BTC registration index "
+                        << d.index << "\n";
+            }
+          }
+
+          //  Make sure the custody window covers this index, so
+          //  the scanner is watching the corresponding script
+          //  from the moment this refresh returns. Idempotent;
+          //  a no-op for indices already in the window.
+          if (!rt.btc_custody->ensureIndexInWindow(d.index))
+          {
+            std::cerr << "[" << rt.chain_short_name()
+                      << "] refreshBridgeDeposits: could not extend "
+                         "custody window for BTC index "
+                      << d.index << "\n";
+            //  Continue: the destination is cached, and the
+            //  window will be retried next refresh. Holding the
+            //  whole refresh on one derivation failure would
+            //  stall every registration.
+          }
+
+          if (d.index > highest_seen)
+            highest_seen = d.index;
+        }
+
+        if (page->deposits.size() < 1000)
+          break;
+
+        from_index = page->next_from_index;
+      }
+
+      std::string hdr_err;
+      auto hdr = Wallet::getCurrentHeader(*session.clarity_rpc, &hdr_err);
+      if (hdr.has_value())
+        rt.bridge_deposits_cached_at_height = hdr->height;
+
+      std::cerr << "[" << rt.chain_short_name()
+                << "] refreshBridgeDeposits: BTC cache now has "
+                << rt.btc_deposit_cache.size() << " entries, "
+                << "highest index " << highest_seen << "\n";
+
+      return true;
+    }
+
+    //  Chain has no registration concept; nothing to refresh.
+    return true;
+  }
+
+  bool readChainCursor(const ChainRuntime &rt, uint64_t &out_height)
+  {
+    const std::filesystem::path file = cursorFileFor(rt);
+
+    std::ifstream in(file);
+    if (!in.good())
+      return false;
+
+    std::string line;
+    if (!std::getline(in, line))
+      return false;
+
+    //  Trim trailing whitespace and any \r (Windows-style file
+    //  transported to a Linux host).
+    while (!line.empty() &&
+           (line.back() == '\r' || line.back() == ' ' ||
+            line.back() == '\t'))
+      line.pop_back();
+
+    if (line.empty())
+      return false;
+
+    //  Strict decimal parse. A malformed file is a hard "ignore
+    //  the cursor" — we never guess.
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long long v = std::strtoull(line.c_str(), &end, 10);
+    if (errno != 0 || end == line.c_str() || *end != '\0')
+    {
+      std::cerr << "[" << rt.chain_short_name()
+                << "] cursor file " << file.string()
+                << " is malformed; ignoring\n";
+      return false;
+    }
+
+    out_height = static_cast<uint64_t>(v);
+    return true;
+  }
+
+  bool writeChainCursor(const ChainRuntime &rt, uint64_t height)
+  {
+    const std::filesystem::path file = cursorFileFor(rt);
+
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    if (ec)
+    {
+      std::cerr << "[" << rt.chain_short_name()
+                << "] could not create cursor dir "
+                << file.parent_path().string() << ": " << ec.message()
+                << "\n";
+      return false;
+    }
+
+    const std::filesystem::path tmp = file.string() + ".tmp";
+    {
+      std::ofstream out(tmp, std::ios::trunc);
+      if (!out)
+      {
+        std::cerr << "[" << rt.chain_short_name()
+                  << "] could not open " << tmp.string()
+                  << " for writing\n";
+        return false;
+      }
+      out << height << "\n";
+      if (!out)
+      {
+        std::cerr << "[" << rt.chain_short_name()
+                  << "] could not write " << tmp.string() << "\n";
+        return false;
+      }
+    }
+
+    std::filesystem::rename(tmp, file, ec);
+    if (ec)
+    {
+      std::cerr << "[" << rt.chain_short_name()
+                << "] could not rename " << tmp.string() << " to "
+                << file.string() << ": " << ec.message() << "\n";
+      return false;
+    }
+
+    return true;
+  }
 } // namespace Bridge

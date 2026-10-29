@@ -227,33 +227,53 @@ namespace Bridge::Submission
       std::memcpy(out->data.data(), bytes, 32);
     }
 
-    //  Pick the destination that a mint / attestation should use.
+    //  Resolve the destination a deposit mints to.
     //
-    //  Two paths:
+    //  A deposit's destination is a property of the deposit, not
+    //  of the daemon watching it: every validator that sees the
+    //  same deposit must derive the same destination, or the
+    //  on-chain BridgeAttestation quorum will disagree on
+    //  `destination` and the executor will reject the second
+    //  attestation as ConflictingAttestation. That is exactly
+    //  the desired failure mode — the alternative (each
+    //  validator filling in its own config value) mints every
+    //  deposit to the operator's address, which is the bug the
+    //  per-deposit binding exists to eliminate.
     //
-    //    (a) session.mint_destination is set (--mint-destination
-    //        flag): use it. All validators in the federation must
-    //        use the same address, otherwise the executor
-    //        rejects the second attestation with "conflicting
-    //        attestation." This is a test-only shortcut until
-    //        the deposit format carries the destination
-    //        on-chain.
+    //  The adapter is responsible for populating
+    //  ObservedDeposit::destination from the deposit's own data:
+    //  on Bitcoin, the 32-byte OP_RETURN payload; on CCX, the
+    //  subaddress registration the user submitted on Clarity
+    //  (see docs/BRIDGE.md for the CCX binding design). If the
+    //  adapter could not determine a destination — e.g. a CCX
+    //  deposit arriving before the CCX binding is implemented,
+    //  or a deposit that failed every binding check — it leaves
+    //  `destination` null and the submission layer refuses the
+    //  deposit rather than guessing.
     //
-    //    (b) session.mint_destination is not set: use the
-    //        daemon's own keystore address. This only works for
-    //        a single-validator federation; with two or more
-    //        validators, each signs a different destination and
-    //        the mint never assembles.
-    //
-    //  A production deployment needs (c): the destination
-    //  embedded in the source-chain deposit, read by every
-    //  validator from chain data. That's a deposit-format change
-    //  for a future batch.
-    Crypto::Address effectiveDestination(const WatcherSession &session)
+    //  A null return here is a hard error, not a "skip"; the
+    //  caller is expected to distinguish "this deposit has no
+    //  binding (rejected)" from "the deposit was already
+    //  consumed / we are not a writer (skip)". Both are
+    //  non-fatal for the scan loop, but they are different
+    //  outcomes and the log lines should say which.
+    std::optional<Crypto::Address> effectiveDestination(
+        const ObservedDeposit &deposit,
+        std::string *error_out)
     {
-      if (session.mint_destination.has_value())
-        return *session.mint_destination;
-      return *session.address;
+      if (deposit.destination.isNull())
+      {
+        if (error_out)
+          *error_out =
+              "deposit has no bound destination. The adapter did not "
+              "populate ObservedDeposit::destination — the deposit's "
+              "own binding (Bitcoin OP_RETURN, CCX subaddress "
+              "registration) either was not present or is not yet "
+              "implemented for this chain. Refusing to attest rather "
+              "than mint to a default address.";
+        return std::nullopt;
+      }
+      return deposit.destination;
     }
   } // anonymous namespace
 
@@ -302,6 +322,22 @@ namespace Bridge::Submission
         *error_out = "chain adapter is null";
       return SubmitOutcome::Failed;
     }
+
+    //  ---- Precondition: the deposit must carry its destination ----
+    //
+    //  Reject before doing any RPC work. A deposit with no bound
+    //  destination is a bug in the adapter, not a transient state,
+    //  and the caller should see the specific reason rather than
+    //  a downstream "build failed" from the transaction builder.
+    std::string dest_err;
+    auto dest_opt = effectiveDestination(deposit, &dest_err);
+    if (!dest_opt.has_value())
+    {
+      if (error_out)
+        *error_out = dest_err;
+      return SubmitOutcome::Failed;
+    }
+    const Crypto::Address destination = *dest_opt;
 
     Wallet::RpcClient &clarity = *session.clarity_rpc;
 
@@ -380,8 +416,6 @@ namespace Bridge::Submission
     }
 
     //  ---- Step 4: build the transaction ----
-
-    const Crypto::Address destination = effectiveDestination(session);
 
     Wallet::BridgeMintParams p;
     p.common.chain_id = session.keystore->chainId();
@@ -500,6 +534,24 @@ namespace Bridge::Submission
       return AttestOutcome::NotAWriter;
     }
 
+    //  ---- Precondition: the deposit must carry its destination ----
+    //
+    //  Same reason as SubmitDeposit: this is what every validator
+    //  is signing over, and it must come from the deposit, not
+    //  from config. A null destination here is an adapter bug or
+    //  an unimplemented binding, not a transient condition; fail
+    //  before the RPC round-trips that would otherwise reject the
+    //  attestation downstream as malformed.
+    std::string dest_err;
+    auto dest_opt = effectiveDestination(deposit, &dest_err);
+    if (!dest_opt.has_value())
+    {
+      if (error_out)
+        *error_out = dest_err;
+      return AttestOutcome::Failed;
+    }
+    const Crypto::Address destination = *dest_opt;
+
     Wallet::RpcClient &clarity = *session.clarity_rpc;
 
     //  ---- Step 1: deposit already minted? ----
@@ -596,13 +648,11 @@ namespace Bridge::Submission
 
     //  ---- Step 5: compute the canonical mint signing hash ----
     //
-    //  The destination must match what every other validator in
-    //  the federation is attesting to. See effectiveDestination's
-    //  comment on why: with per-validator destinations, the
-    //  executor rejects the second attestation as a conflict
-    //  and no mint ever assembles.
-    const Crypto::Address destination = effectiveDestination(session);
-
+    //  The destination came from the deposit, not from session
+    //  config (see effectiveDestination). Every validator that
+    //  scanned this deposit derives the same destination from
+    //  the same on-chain data, so the quorum's signatures agree
+    //  by construction.
     const auto message = Bridge::Signing::EncodeBridgeMintMessage(
         deposit.source_chain_id,
         deposit.source_tx_hash,

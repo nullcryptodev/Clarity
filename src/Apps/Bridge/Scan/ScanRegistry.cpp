@@ -44,6 +44,27 @@ namespace Bridge
       if (g_scans.find(chain_name) != g_scans.end())
         return;
 
+      //  Refresh the CCX deposit-destination cache before the scan
+      //  thread is spawned. This is a no-op for Bitcoin (its
+      //  refreshBridgeDeposits returns true immediately without
+      //  touching state) and for any adapter that doesn't have a
+      //  registration concept.
+      //
+      //  The cache lives on ChainRuntime and outlives the scan
+      //  thread; refreshBridgeDeposits mutates it in place, so the
+      //  adapter's non-owning pointer (installed in cmd_start via
+      //  set_bridge_deposits_cache) stays valid and sees new
+      //  registrations on subsequent refreshes without any
+      //  re-installation.
+      //
+      //  A failed refresh is logged internally and does not abort
+      //  the start — the scan thread runs with whatever cache was
+      //  populated and its first poll will retry the refresh.
+      if (ChainRuntime *rt = session.findChain(chain_name))
+      {
+        refreshBridgeDeposits(session, *rt);
+      }
+
       auto stop = std::make_shared<std::atomic<bool>>(false);
       ScanHandle handle;
       handle.stop_requested = stop;

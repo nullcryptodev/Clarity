@@ -126,6 +126,15 @@ namespace Core
     //  distinct validator_ids is what makes a BridgeAckWithdrawal
     //  valid — and what authorizes the corresponding CCX release.
     BridgeAckAttest = 0x7A,
+    //  Register a per-authority deposit destination for a bridge
+    //  source chain. The executor assigns the index (see
+    //  BridgeDepositRecord in Core/BridgeTypes.h); the caller
+    //  provides only (source_chain_id, destination). A CCX user
+    //  submits one of these to bind their rclrty1... reward
+    //  address to a subaddress of the bridge's custody wallet.
+    //  Bitcoin does not require registration: the OP_RETURN on the
+    //  deposit carries the destination directly.
+    BridgeRegisterDeposit = 0x7B,
 
     //  ---- AMM Farming (0x80–0x8F) ----
     //
@@ -254,6 +263,8 @@ namespace Core
       return "bridge_attest";
     case BridgeAckAttest:
       return "bridge_ack_attest";
+    case BridgeRegisterDeposit:
+      return "bridge_register_deposit";
     case CreateAmmFarm:
       return "create_amm_farm";
     case UpdateAmmFarm:

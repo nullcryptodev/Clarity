@@ -152,6 +152,30 @@ namespace Bridge
         throw std::runtime_error(
             "config file is not a JSON object: " + path);
 
+      //  ---- Reject the legacy `mint_destination` field ----
+      //
+      //  A config that still carries `mint_destination` was written
+      //  against the old model where every deposit minted to one
+      //  operator-chosen address. That model cannot coexist with the
+      //  per-deposit binding the bridge now requires: if we silently
+      //  ignored the field, an operator who upgraded without reading
+      //  the migration notes would see their deposits mint to their
+      //  keystore address (the old fallback path), which is exactly
+      //  the silent-wrong-mint failure the per-deposit binding is
+      //  designed to eliminate. Fail loudly instead.
+      if (j.contains("mint_destination") && !j["mint_destination"].is_null())
+      {
+        throw std::runtime_error(
+            "config file contains the removed field 'mint_destination' "
+            "(path: " +
+            path + ").\n"
+                   "  A single global mint destination is no longer supported.\n"
+                   "  Deposits now mint to the destination carried by the deposit\n"
+                   "  itself: on Bitcoin, a 32-byte OP_RETURN output; on CCX, the\n"
+                   "  subaddress the user registered. Delete the field from the\n"
+                   "  config file to continue.");
+      }
+
       WatcherConfig &cfg = args.config;
 
       cfg.app_name = getString(j, "app_name", "clarity-bridge");
@@ -178,7 +202,6 @@ namespace Bridge
       cfg.password_file = getString(j, "password_file");
       cfg.consensus_key_file = getString(j, "consensus_key_file");
       cfg.view_key_file = getString(j, "view_key_file");
-      cfg.mint_destination = getString(j, "mint_destination");
       cfg.state_dir = getString(j, "state_dir", "./bridge-state");
       cfg.log_level = getString(j, "log_level", "info");
 

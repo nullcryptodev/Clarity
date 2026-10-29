@@ -7,12 +7,14 @@
 
 #include "Adapters/ChainAdapter.h"
 #include "Adapters/Conceal/ConcealCCX.h"
+#include "Adapters/Bitcoin/BitcoinAdapter.h"
 #include "Release/ReleaseTracker.h"
 #include "Release/Submission.h"
 #include "Scan/ScanRegistry.h"
 #include "Session/Session.h"
 
 #include "Core/BridgeTypes.h"
+#include "Core/Bridge/ConcealCCX.h"
 
 #include "Common/StringTools.h"
 
@@ -36,6 +38,8 @@
 
 namespace Bridge
 {
+  inline constexpr uint64_t BTC_CHAIN_ID = 0x42544331ULL;
+
   //  ---- Scan lifecycle forwarder ----
   //
   //  The scan registry lives in Scan/ScanRegistry.cpp and owns the
@@ -100,8 +104,7 @@ namespace Bridge
          cmd_pending},
 
         {"start", "start [<chain>] [--bridge-address <addr>] "
-                  "[--consensus-key <hex> | --consensus-key-file <path>] "
-                  "[--mint-destination <addr>]",
+                  "[--consensus-key <hex> | --consensus-key-file <path>]",
          "Start the scan worker for a chain (the current chain if no\n"
          "argument).\n"
          "--bridge-address is the CCX address that deposits must pay\n"
@@ -114,11 +117,48 @@ namespace Bridge
          "is passed on the start command, a key loaded at process\n"
          "startup (from --consensus-key-file on the main command\n"
          "line) is used.\n"
-         "--mint-destination sets the address wrapped tokens are\n"
-         "minted to; it must be identical across all federation\n"
-         "validators. If omitted, the daemon's own keystore address\n"
-         "is used (only works for a single-validator federation).",
+         "\n"
+         "The destination a deposit mints to is a property of the\n"
+         "deposit itself, not of this command: on Bitcoin it is the\n"
+         "32-byte OP_RETURN output the depositor included in the\n"
+         "deposit transaction; on CCX it is the subaddress\n"
+         "registration the depositor submitted on Clarity. There is\n"
+         "deliberately no --mint-destination flag.",
          cmd_start},
+
+        {"address", "address <index>",
+         "Show the deposit address for a registration index on the\n"
+         "current chain. Read-only; no state is changed.\n"
+         "\n"
+         "The index is the one `register-deposit` assigned. Look it\n"
+         "up with getBridgeDepositsForAuthority if you don't have it.\n"
+         "For Bitcoin this returns a bech32 (bc1q...) address; for\n"
+         "chains whose deposits don't have a per-registration address,\n"
+         "it errors.\n"
+         "\n"
+         "The wallet calls this via the getBridgeDepositAddress RPC;\n"
+         "the REPL form exists for operator checks and debugging.",
+         cmd_address},
+
+        {"register-deposit",
+         "register-deposit <chain> <rclrty-address>",
+         "Register a deposit destination for a bridge source chain.\n"
+         "The executor assigns an index from a per-chain counter; that\n"
+         "index identifies the address you deposit to.\n"
+         "\n"
+         "For Bitcoin: the index becomes a bech32 deposit address\n"
+         "(bc1q...) derived from the bridge's custody xpub. After the\n"
+         "registration tx confirms, ask the bridge for the address\n"
+         "with `address <index>`, or call the getBridgeDepositAddress\n"
+         "RPC. Send any normal Bitcoin transaction to that address.\n"
+         "\n"
+         "For CCX: the index becomes a subaddress derived by the\n"
+         "scanner. Query it with getBridgeDepositsForAuthority after\n"
+         "the tx confirms.\n"
+         "\n"
+         "Either way: one registration, one destination, one address.\n"
+         "No OP_RETURN, no raw script construction.",
+         cmd_register_deposit},
 
         {"register-chain",
          "register-chain <chain> [--collect <idx>:0x<sig>] "
@@ -995,6 +1035,37 @@ namespace Bridge
     std::cout << " withdrawals: " << rt->pending_withdrawals << "\n";
   }
 
+  void cmd_address(WatcherSession &session,
+                   const std::vector<std::string> &args)
+  {
+    ChainRuntime *rt = requireCurrent(session, "address");
+    if (!rt)
+      return;
+
+    if (args.size() < 2)
+    {
+      std::cerr << "usage: address <index>\n";
+      return;
+    }
+
+    auto idx = parseU64(args[1]);
+    if (!idx.has_value())
+    {
+      std::cerr << "error: index must be a non-negative integer\n";
+      return;
+    }
+
+    std::string err;
+    auto addr = rt->adapter->deriveDepositAddress(*idx, &err);
+    if (!addr.has_value())
+    {
+      std::cerr << "error: " << err << "\n";
+      return;
+    }
+
+    std::cout << *addr << "\n";
+  }
+
   void cmd_start(WatcherSession &session,
                  const std::vector<std::string> &args)
   {
@@ -1033,17 +1104,6 @@ namespace Bridge
       else if (args[i] == "--bridge-address" && i + 1 < args.size())
       {
         bridge_address_str = args[++i];
-      }
-      else if (args[i] == "--mint-destination" && i + 1 < args.size())
-      {
-        auto decoded =
-            Wallet::decodeAddress(args[++i], session.currentNetwork());
-        if (!decoded.has_value())
-        {
-          std::cerr << "error: --mint-destination: invalid bech32m address\n";
-          return;
-        }
-        session.mint_destination = *decoded;
       }
       else if (rt == nullptr && args[i].rfind("--", 0) != 0)
       {
@@ -1124,6 +1184,8 @@ namespace Bridge
       session.consensus_key = key;
     }
 
+    //  ---- Bridge address (per-chain custody / deposit address) ----
+
     const std::string configured_address = rt->config.bridge_address;
     if (!bridge_address_str.empty() &&
         !configured_address.empty() &&
@@ -1139,7 +1201,21 @@ namespace Bridge
             ? bridge_address_str
             : configured_address;
 
-    if (!effective_bridge_address.empty())
+    const bool is_btc_chain =
+        (rt->adapter->source_chain_id() == BTC_CHAIN_ID);
+
+    if (is_btc_chain)
+    {
+      if (!effective_bridge_address.empty() ||
+          !rt->config.bridge_deposit_address.empty())
+      {
+        std::cerr << "warning: Bitcoin no longer uses a static "
+                     "bridge_address; ignoring it. Deposit addresses "
+                     "are derived per registration index from the "
+                     "per-chain custody seed.\n";
+      }
+    }
+    else if (!effective_bridge_address.empty())
     {
       std::string parse_err;
       auto blob = rt->adapter->parse_deposit_address(
@@ -1170,6 +1246,8 @@ namespace Bridge
                    "adapter will refuse to scan until one is set\n";
     }
 
+    //  ---- Custody view key ----
+
     if (session.custody_view_key.has_value())
     {
       rt->adapter->set_deposit_ident_secret(*session.custody_view_key);
@@ -1180,22 +1258,110 @@ namespace Bridge
                    "amounts may be wrong on multi-output transactions\n";
     }
 
-    if (!rt->config.wallet_rpc_host.empty() &&
-        rt->config.wallet_rpc_port != 0)
+    //  ---- CCX-specific: deposit-destination cache ----
+    if (rt->adapter->source_chain_id() ==
+        Core::CcxBridge::CCX_CHAIN_ID)
     {
-      rt->adapter->set_wallet_rpc_endpoint(
-          rt->config.wallet_rpc_host,
-          rt->config.wallet_rpc_port,
-          rt->config.wallet_rpc_user,
-          rt->config.wallet_rpc_password);
-      std::cout << "Wallet RPC configured: "
-                << rt->config.wallet_rpc_host << ":"
-                << rt->config.wallet_rpc_port << "\n";
+      if (auto *ccx = dynamic_cast<CcxAdapter *>(rt->adapter.get()))
+      {
+        if (!rt->bridge_deposit_address.empty())
+        {
+          std::string parse_err;
+          auto blob = ccx->parse_deposit_address(
+              rt->bridge_deposit_address, &parse_err);
+          if (blob.has_value() && blob->size() >= 32)
+          {
+            Crypto::PublicKey sp;
+            std::memcpy(sp.data.data(), blob->data(), 32);
+            rt->bridge_custody_spend_pub = sp;
+          }
+        }
+        if (session.custody_view_key.has_value())
+          rt->bridge_custody_view_priv = *session.custody_view_key;
+
+        ccx->set_bridge_deposits_cache(
+            &rt->bridge_deposits_by_spend);
+      }
     }
-    else
+
+    //  ---- Bitcoin custody ----
+    if (is_btc_chain)
     {
-      std::cout << "warning: no CCX wallet RPC configured; "
-                   "withdrawals will not be released by this validator\n";
+      if (auto *btc = dynamic_cast<BitcoinAdapter *>(rt->adapter.get()))
+      {
+        if (!rt->config.raw_json.is_object() ||
+            !rt->config.raw_json.contains("network") ||
+            !rt->config.raw_json["network"].is_string())
+        {
+          std::cerr << "error: Bitcoin chain has no \"network\" field "
+                       "in its config. Set it explicitly to one of "
+                       "\"mainnet\", \"testnet\", or \"regtest\". "
+                       "Refusing to start without it.\n";
+          return;
+        }
+
+        const std::string net_name =
+            rt->config.raw_json["network"].get<std::string>();
+        Crypto::BitcoinNetwork net;
+        if (net_name == "mainnet" || net_name == "main")
+          net = Crypto::BitcoinNetwork::Mainnet;
+        else if (net_name == "testnet" || net_name == "test")
+          net = Crypto::BitcoinNetwork::Testnet;
+        else if (net_name == "regtest" || net_name == "reg")
+          net = Crypto::BitcoinNetwork::Regtest;
+        else
+        {
+          std::cerr << "error: unknown Bitcoin network '" << net_name
+                    << "' (expected mainnet|testnet|regtest)\n";
+          return;
+        }
+
+        const std::string custody_dir =
+            rt->config.state_subdir.empty()
+                ? rt->chain_short_name()
+                : rt->config.state_subdir;
+
+        std::string custody_err;
+        auto custody = BitcoinCustody::create_or_load(
+            custody_dir,
+            net,
+            session.keystore_password,
+            &custody_err);
+
+        if (!custody)
+        {
+          std::cerr << "error: Bitcoin custody setup failed: "
+                    << custody_err << "\n";
+          return;
+        }
+
+        rt->btc_custody = std::move(custody);
+        btc->set_custody(rt->btc_custody.get());
+        btc->set_deposit_cache(&rt->btc_deposit_cache);
+      }
+    }
+
+    //  ---- Wallet RPC (releases) ----
+    if (rt->adapter->source_chain_id() ==
+        Core::CcxBridge::CCX_CHAIN_ID)
+    {
+      if (!rt->config.wallet_rpc_host.empty() &&
+          rt->config.wallet_rpc_port != 0)
+      {
+        rt->adapter->set_wallet_rpc_endpoint(
+            rt->config.wallet_rpc_host,
+            rt->config.wallet_rpc_port,
+            rt->config.wallet_rpc_user,
+            rt->config.wallet_rpc_password);
+        std::cout << "Wallet RPC configured: "
+                  << rt->config.wallet_rpc_host << ":"
+                  << rt->config.wallet_rpc_port << "\n";
+      }
+      else
+      {
+        std::cout << "warning: no CCX wallet RPC configured; "
+                     "withdrawals will not be released by this validator\n";
+      }
     }
 
     rt->adapter->set_network_prefix(
@@ -1204,21 +1370,55 @@ namespace Bridge
     if (rt->config.raw_json.is_object())
       rt->adapter->set_transport_config(rt->config.raw_json);
 
-    if (rt->last_source_height == 0 && rt->config.start_height != 0)
+    //  ---- Cursor ----
+    //
+    //  Precedence:
+    //
+    //    1. Persisted cursor file, if it exists and is >= start_height - 1.
+    //    2. start_height - 1 (which is 0 when start_height == 0,
+    //       meaning "scan from genesis").
+    //
+    //  The persisted cursor wins over start_height: start_height is
+    //  an initial "don't scan from genesis" hint, not a reset. To
+    //  reset, delete the cursor file or use `rescan --from N`.
+    //
+    //  NOTE: this must happen *before* Scan::startScan, because the
+    //  scan thread reads rt->last_source_height once at the top of
+    //  its loop. Writing it after startScan races the scan thread.
     {
-      rt->last_source_height = rt->config.start_height - 1;
-      std::cout << "Starting scan from height " << rt->config.start_height
-                << " (from config)\n";
+      const uint64_t config_floor =
+          (rt->config.start_height == 0)
+              ? 0
+              : rt->config.start_height - 1;
+
+      uint64_t persisted = 0;
+      const bool have_persisted = readChainCursor(*rt, persisted);
+
+      if (have_persisted && persisted >= config_floor)
+      {
+        rt->last_source_height = persisted;
+        std::cout << "Resuming scan from persisted cursor at height "
+                  << rt->last_source_height << "\n";
+      }
+      else
+      {
+        rt->last_source_height = config_floor;
+        if (have_persisted && persisted < config_floor)
+        {
+          std::cout << "Persisted cursor (" << persisted
+                    << ") is below start_height; using start_height - 1 ("
+                    << config_floor << ")\n";
+        }
+        else if (rt->config.start_height != 0)
+        {
+          std::cout << "Starting scan from height "
+                    << rt->config.start_height << " (from config)\n";
+        }
+      }
     }
 
     Scan::startScan(session, rt->chain_short_name());
-    if (rt->last_source_height == 0 && rt->config.start_height != 0)
-    {
-      rt->last_source_height = rt->config.start_height - 1;
-      std::cout << "Initialising scan cursor for "
-                << rt->chain_short_name() << " at height "
-                << rt->config.start_height << " (from config)\n";
-    }
+
     rt->running = true;
     rt->started_at = static_cast<int64_t>(std::time(nullptr));
 
@@ -1228,6 +1428,118 @@ namespace Bridge
                  "quorum of validator attestations is present.\n";
     std::cout << "Withdrawals will be acked, released, and recorded "
                  "as they progress through the pipeline.\n";
+  }
+
+  void cmd_register_deposit(WatcherSession &session,
+                            const std::vector<std::string> &args)
+  {
+    if (args.size() < 3)
+    {
+      std::cerr << "usage: register-deposit <chain> <rclrty-address>\n";
+      return;
+    }
+
+    const std::string &chain_name = args[1];
+
+    ChainRuntime *rt = session.findChain(chain_name);
+    if (!rt)
+    {
+      std::cerr << "error: chain '" << chain_name
+                << "' is not enabled\n";
+      return;
+    }
+    if (!rt->adapter)
+    {
+      std::cerr << "error: chain has no adapter\n";
+      return;
+    }
+    if (!session.hasKeystore() || !session.signer)
+    {
+      std::cerr << "error: an open keystore is required\n";
+      return;
+    }
+    if (!session.clarity_rpc || !session.clarity_connected)
+    {
+      std::cerr << "error: Clarity RPC is not connected\n";
+      return;
+    }
+
+    //  Parse the destination.
+    auto dest = Wallet::decodeAddress(args[2], session.currentNetwork());
+    if (!dest.has_value())
+    {
+      std::cerr << "error: '" << args[2]
+                << "' is not a valid rclrty1... address for the "
+                   "current network\n";
+      return;
+    }
+
+    Wallet::BridgeRegisterDepositParams p;
+    p.common.chain_id = session.keystore->chainId();
+    p.common.nonce = Wallet::getNonce(
+                         *session.clarity_rpc,
+                         session.address_bech32m)
+                         .value_or(0);
+    p.common.fee = 100000;
+    p.source_chain_id = rt->adapter->source_chain_id();
+    p.destination = *dest;
+
+    Wallet::WalletStatus build_st;
+    auto tx = Wallet::buildBridgeRegisterDeposit(
+        session.address.value(), p, &build_st);
+    if (!tx.has_value())
+    {
+      std::cerr << "error: buildBridgeRegisterDeposit failed: "
+                << (build_st.detail.empty()
+                        ? Wallet::walletErrorMessage(build_st.code)
+                        : build_st.detail)
+                << "\n";
+      return;
+    }
+
+    Wallet::WalletStatus sign_st;
+    auto hash = Wallet::signTransaction(
+        *tx, *session.signer, Wallet::clrtyPath(0, 0, 0), &sign_st);
+    if (!hash.has_value())
+    {
+      std::cerr << "error: signTransaction failed: "
+                << (sign_st.detail.empty()
+                        ? Wallet::walletErrorMessage(sign_st.code)
+                        : sign_st.detail)
+                << "\n";
+      return;
+    }
+
+    auto tx_bytes = tx->serialize();
+    static const char HEX[] = "0123456789abcdef";
+    std::string hex = "0x";
+    hex.reserve(2 + tx_bytes.size() * 2);
+    for (uint8_t b : tx_bytes)
+    {
+      hex.push_back(HEX[b >> 4]);
+      hex.push_back(HEX[b & 0xF]);
+    }
+
+    std::string submit_err;
+    auto txid = Wallet::sendRawTransaction(
+        *session.clarity_rpc, hex, &submit_err);
+    if (!txid.has_value())
+    {
+      std::cerr << "error: sendRawTransaction failed: "
+                << submit_err << "\n";
+      return;
+    }
+
+    std::cout << "Registration submitted: " << *txid << "\n";
+    std::cout << "Chain:       " << chain_name << "\n";
+    std::cout << "Destination: " << args[2] << "\n";
+    std::cout << "\nOnce the transaction confirms, query the assigned "
+                 "index with:\n";
+    std::cout << "  getBridgeDepositsForAuthority("
+              << "chain_id=0x" << std::hex
+              << rt->adapter->source_chain_id()
+              << ", address=" << session.address_bech32m
+              << ")\n";
   }
 
   void cmd_register_chain(WatcherSession &session,

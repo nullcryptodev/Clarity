@@ -515,4 +515,125 @@ namespace Wallet
   std::optional<Common::Json> getActiveSet(
       RpcClient &rpc,
       std::string *error_out = nullptr);
+
+  //  =========================================================================
+  //  Bridge deposit-destination registry
+  //
+  //  The CCX watcher derives a per-user subaddress for every
+  //  registration on a chain. It reads the full set with
+  //  getBridgeDepositsForChain at startup, and increments it with
+  //  the same call (from_index = cache.high + 1) when it detects
+  //  new indices on-chain.
+  //
+  //  getBridgeDepositDestination is the single-record accessor,
+  //  used for one-off lookups (a wallet displaying "my index 3",
+  //  a debugging tool inspecting a specific deposit). The paged
+  //  form is what the scanner uses.
+  //
+  //  There is no "for authority" form here because that's a
+  //  wallet-facing operation and belongs in the wallet's command
+  //  layer, not in the bridge daemon's RPC surface; the
+  //  corresponding chain RPC (getBridgeDepositsForAuthority) is
+  //  reachable from RpcClient::call if a caller wants it.
+  //  =========================================================================
+
+  struct BridgeDepositEntry
+  {
+    uint64_t index{0};
+    std::string destination_bech32m;
+    std::string authority_bech32m;
+    uint64_t registered_at_height{0};
+  };
+
+  struct BridgeDepositPage
+  {
+    uint64_t source_chain_id{0};
+    uint64_t from_index{0};
+    uint64_t last_seen_index{0};
+    uint64_t next_from_index{0};
+    std::vector<BridgeDepositEntry> deposits;
+  };
+
+  //  Fetch one page of the chain-wide deposit registry.
+  //
+  //  Sends: { "source_chain_id": "0x...", "from_index": "0x...",
+  //           "limit": "0x...", "offset": "0x..." }
+  //  Expects: { "deposits": [ { index, destination, authority,
+  //                             registered_at_height }, ... ],
+  //             "count": ..., "next_from_index": ... }
+  //
+  //  On success, returns the parsed page. On any error, nullopt
+  //  and error_out describes it.
+  std::optional<BridgeDepositPage> getBridgeDepositsForChain(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      uint64_t from_index,
+      uint64_t limit,
+      uint64_t offset,
+      std::string *error_out = nullptr);
+
+  //  Fetch all deposit registrations for one authority on a chain.
+  //
+  //  Sends: { "source_chain_id": "0x...",
+  //           "address": <authority-beck32m>,
+  //           "limit": "0x...", "offset": "0x..." }
+  //  Expects: { "deposits": [ { index, destination,
+  //                             registered_at_height }, ... ],
+  //             "count": ..., ... }
+  //
+  //  On BridgeChainNotRegistered or an empty authority, returns a
+  //  page with no deposits. On any other error, nullopt and
+  //  error_out describes it.
+  //
+  //  This is the "what did I register" call. The deposit-address
+  //  HTTP API uses it (as the slow path) to find the index for a
+  //  given (authority, destination) when the in-memory cache
+  //  misses. The wallet uses it to enumerate the caller's
+  //  registrations for a chain.
+  //
+  //  The RPC returns the authority's registrations in ascending
+  //  index order, capped at MAX_BRIDGE_DEPOSITS_PER_AUTHORITY
+  //  (currently 8). That's small enough that callers do not need
+  //  pagination: fetch once, scan the list.
+  struct BridgeAuthorityDepositEntry
+  {
+      uint64_t index{0};
+      std::string destination_bech32m;
+      uint64_t registered_at_height{0};
+  };
+
+  struct BridgeAuthorityDepositPage
+  {
+      uint64_t source_chain_id{0};
+      std::string authority_bech32m;
+      std::vector<BridgeAuthorityDepositEntry> deposits;
+  };
+
+  std::optional<BridgeAuthorityDepositPage> getBridgeDepositsForAuthority(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      const std::string &authority_bech32m,
+      std::string *error_out = nullptr);
+
+  //  Fetch one deposit-destination record by index.
+  //
+  //  Sends: { "source_chain_id": "0x...", "index": "0x..." }
+  //  Expects: { source_chain_id, index, destination, authority,
+  //             registered_at_height }
+  //
+  //  On BridgeDepositNotFound (code 1065), `is_not_found` is set
+  //  to true and the function returns nullopt. On other errors,
+  //  `is_not_found` is false and error_out describes the error.
+  //
+  //  This is what a caller that already knows an index uses to
+  //  resolve it to a destination without a page scan. The
+  //  scanner doesn't need it (it has the full page), but the
+  //  bridge's diagnostic tools and the wallet's "show me my
+  //  index 3 registration" path do.
+  std::optional<Common::Json> getBridgeDepositDestination(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      uint64_t index,
+      bool *is_not_found,
+      std::string *error_out = nullptr);
 } // namespace Wallet

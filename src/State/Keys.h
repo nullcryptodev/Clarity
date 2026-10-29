@@ -292,5 +292,47 @@ namespace State
                       addr.data.data(), addr.data.size());
       return addr;
     }
+
+    //  ---- Deposit destinations ----
+    //
+    //  A registration assigns a per-chain, monotonic index to a
+    //  (authority, destination) pair. See BridgeDepositRecord in
+    //  Core/BridgeTypes.h. The index is what the watcher uses to
+    //  derive the CCX subaddress the user deposits to; the record
+    //  is what resolves that subaddress back to the destination.
+    //
+    //  bridgeDepositDestination (indexed by chain+index) is what
+    //  the watcher reads. bridgeDepositByAuthority (indexed by
+    //  chain+authority+index) is what the wallet's "list my
+    //  registrations" RPC reads. Both are needed: the first is
+    //  used by the scanner for each deposit it sees, the second
+    //  is used once at wallet startup to enumerate the caller's
+    //  existing registrations.
+
+    inline Crypto::Hash bridgeDepositDestination(uint64_t source_chain_id,
+                                                 uint64_t index) noexcept
+    {
+      uint8_t buf[8 + 8];
+      for (int i = 0; i < 8; ++i)
+        buf[i] = uint8_t(source_chain_id >> (i * 8));
+      for (int i = 0; i < 8; ++i)
+        buf[8 + i] = uint8_t(index >> (i * 8));
+      return Crypto::hashDomain("brgd", buf, sizeof(buf));
+    }
+
+    inline Crypto::Hash bridgeDepositByAuthority(
+        uint64_t source_chain_id,
+        const Crypto::Address &authority,
+        uint64_t index) noexcept
+    {
+      uint8_t buf[8 + 32 + 8];
+      for (int i = 0; i < 8; ++i)
+        buf[i] = uint8_t(source_chain_id >> (i * 8));
+      std::memcpy(buf + 8, authority.data.data(), 32);
+      for (int i = 0; i < 8; ++i)
+        buf[40 + i] = uint8_t(index >> (i * 8));
+      return Crypto::hashDomain("brgA", buf, sizeof(buf));
+    }
+
   } // namespace Keys
 }

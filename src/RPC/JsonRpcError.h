@@ -30,6 +30,7 @@ namespace Rpc
   //      1050..1060      Account, token, validator, pool, order,
   //                      receipt, proof, NFT
   //      1061..1070      Bridge
+  //      1065            BridgeDepositNotFound
   //      1071..1099      Reserved
   //
   //  Codes are stable forever. If a method gains a new failure mode,
@@ -131,6 +132,19 @@ namespace Rpc
     BridgeWithdrawalNotFound = 1062,
     BridgeWatcherNotFound = 1063, // reserved; not emitted
     BridgeReadInternal = 1064,    // reserved; not emitted
+
+    //  No deposit-destination record at the requested
+    //  (source_chain_id, index). Emitted by
+    //  getBridgeDepositDestination when the chain is
+    //  registered but no registration exists at that index.
+    //
+    //  Distinct from BridgeChainNotRegistered, which means
+    //  the chain itself is unregistered. A client that
+    //  branches on the code needs the distinction: "you're
+    //  asking about a chain that doesn't exist" and "you're
+    //  asking about an index on a chain that does exist"
+    //  have different remedies.
+    BridgeDepositNotFound = 1065,
 
     // ---- Application: chain lookup (1100..1149) ----
 

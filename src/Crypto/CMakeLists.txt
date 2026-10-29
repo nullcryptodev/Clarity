@@ -60,6 +60,8 @@ target_include_directories(Crypto
 
 target_link_libraries(Crypto PUBLIC monocypher)
 
+target_link_libraries(Crypto PRIVATE secp256k1)
+
 # Compile definitions
 target_compile_definitions(Crypto
   PUBLIC

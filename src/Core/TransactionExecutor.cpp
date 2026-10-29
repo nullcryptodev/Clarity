@@ -658,6 +658,10 @@ namespace Core
       receipt = executeBridgeAckAttest(state, tx, ctx);
       break;
 
+    case TxType::BridgeRegisterDeposit:
+      receipt = executeBridgeRegisterDeposit(state, tx, ctx);
+      break;
+
     case TxType::RegisterBridgeWatcher:
     case TxType::UnregisterBridgeWatcher:
       //  Reserved types. Rejected by dispatch. There is no handler:
@@ -3067,8 +3071,118 @@ namespace Core
   }
 
   //  =========================================================================
-  //  Bridge — BridgeMint
+  //  Bridge — BridgeRegisterDeposit
+  //
+  //  Assigns an index to a (chain, destination) pair on behalf of
+  //  the sender, and persists a BridgeDepositRecord. The index is
+  //  the watcher's CCX subaddress index; see BridgeDepositRecord
+  //  for the design.
+  //
+  //  Payload (fixed 40 bytes):
+  //    [8]  source_chain_id (LE)
+  //    [32] destination (Ed25519 pubkey, i.e. an rclrty1... address
+  //         with the HRP and checksum stripped)
+  //
+  //  There is no index in the payload. The executor assigns it
+  //  from bridge:next_deposit_index:<chain_id>. There is also no
+  //  signer in the payload: tx.from is the authority, and the
+  //  record stores it verbatim.
+  //
+  //  Preconditions:
+  //    - The chain is registered and enabled.
+  //    - The destination is non-null.
+  //    - The sender holds fewer than MAX_BRIDGE_DEPOSITS_PER_AUTHORITY
+  //      registrations for this chain.
+  //    - The chain holds fewer than MAX_BRIDGE_DEPOSITS_PER_CHAIN
+  //      registrations in total.
+  //
+  //  No postcondition on uniqueness of (chain, destination): two
+  //  authorities may register the same destination, and one
+  //  authority may register the same destination twice. The
+  //  second registration gets a fresh index. Deposits to either
+  //  index mint to the same destination; the user simply wastes
+  //  a fee. Making duplicate-registration a failure would create
+  //  a lookup-before-write step that races with concurrent
+  //  submissions on the same block, which is more complexity
+  //  than the wasted-fee case justifies.
   //  =========================================================================
+
+  Receipt TransactionExecutor::executeBridgeRegisterDeposit(
+      State::StateAccess &state,
+      const Transaction &tx,
+      const TxExecutionContext &ctx)
+  {
+    Receipt failure{ReceiptStatus::Failure, tx.fee};
+
+    //  ---- Step 1: parse ----
+
+    if (tx.payload.size() != 8 + 32)
+      return failure;
+
+    const uint64_t source_chain_id = readU64At(tx.payload, 0);
+
+    Crypto::Address destination;
+    std::memcpy(destination.data.data(),
+                tx.payload.data() + 8, 32);
+
+    if (destination.isNull())
+      return failure;
+
+    //  ---- Step 2: chain must be registered and enabled ----
+
+    Core::BridgeChainRegistration reg;
+    if (!state.getBridgeChainRegistration(source_chain_id, reg))
+      return failure;
+    if (!reg.isWellFormed() || !reg.enabled)
+      return failure;
+
+    //  ---- Step 3: per-authority cap ----
+
+    const uint64_t authority_count =
+        state.getBridgeDepositAuthorityCount(source_chain_id, tx.from);
+    if (authority_count >= Core::MAX_BRIDGE_DEPOSITS_PER_AUTHORITY)
+      return failure;
+
+    //  ---- Step 4: per-chain cap ----
+
+    const std::string chain_counter_key =
+        "bridge:deposit_count:" + std::to_string(source_chain_id);
+
+    const uint64_t chain_count =
+        state.getGlobalU64(chain_counter_key);
+    if (chain_count >= Core::MAX_BRIDGE_DEPOSITS_PER_CHAIN)
+      return failure;
+
+    //  ---- Step 5: allocate the index ----
+
+    const std::string next_index_key =
+        "bridge:next_deposit_index:" + std::to_string(source_chain_id);
+
+    uint64_t next_index = state.getGlobalU64(next_index_key);
+    if (next_index == 0)
+      next_index = 1;
+
+    //  ---- Step 6: write the record ----
+
+    Core::BridgeDepositRecord rec;
+    rec.source_chain_id = source_chain_id;
+    rec.index = next_index;
+    rec.destination = destination;
+    rec.authority = tx.from;
+    rec.registered_at_height = ctx.current_height;
+
+    if (!rec.isWellFormed())
+      return failure;
+
+    state.putBridgeDepositDestination(rec);
+
+    //  ---- Step 7: bump the two counters ----
+
+    state.putGlobalU64(next_index_key, next_index + 1);
+    state.putGlobalU64(chain_counter_key, chain_count + 1);
+
+    return {ReceiptStatus::Success, tx.fee};
+  }
 
   Receipt TransactionExecutor::executeBridgeMint(State::StateAccess &state,
                                                  const Transaction &tx,

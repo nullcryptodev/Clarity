@@ -92,6 +92,8 @@ namespace Rpc
       return "BridgeWatcherNotFound";
     case ErrorCode::BridgeReadInternal:
       return "BridgeReadInternal";
+    case ErrorCode::BridgeDepositNotFound:
+      return "BridgeDepositNotFound";
 
     // ---- Chain ----
     case ErrorCode::BlockNotFound:
@@ -210,6 +212,8 @@ namespace Rpc
     case ErrorCode::BridgeReadInternal:
       return "Bridge state read failed "
              "(reserved; not emitted by the current node)";
+    case ErrorCode::BridgeDepositNotFound:
+      return "No deposit destination registered at this index";
 
     case ErrorCode::BlockNotFound:
       return "Block not found";

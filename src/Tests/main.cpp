@@ -6,6 +6,8 @@
 #include <mdbx.h>
 #include <gtest/gtest.h>
 
+#include "Apps/Bridge/Adapters/ChainAdapter.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -179,6 +181,8 @@ int main(int argc, char **argv)
   // Create default log
   if (log_path.empty())
     log_path = "clarity_tests.log";
+
+  Bridge::registerAllChainAdapters();
 
   testing::InitGoogleTest(&filtered_argc, argv_vec.data());
 

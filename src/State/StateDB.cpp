@@ -112,6 +112,12 @@ namespace State
       return "amm_farms";
     case TBL_AMM_POSITION_ACCRUALS:
       return "amm_position_accruals";
+    case TBL_BRIDGE_DEPOSIT_DESTINATIONS:
+      return "bridge_deposit_destinations";
+    case TBL_INDEX_BRIDGE_DEPOSITS_BY_AUTHORITY:
+      return "index_bridge_deposits_by_authority";
+    case TBL_INDEX_BRIDGE_DEPOSITS_BY_CHAIN:
+      return "index_bridge_deposits_by_chain";
     default:
       return "<unknown>";
     }

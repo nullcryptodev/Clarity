@@ -47,7 +47,7 @@ namespace Bridge
     constexpr int BTC_HTTP_TIMEOUT_SECONDS = 30;
     constexpr size_t BTC_MAX_SCRIPT_BYTES = 10'000;
 
-    //  ---- URL parsing -------------------------------------------------------
+    //  ---- URL parsing ----
 
     struct ParsedUrl
     {
@@ -106,17 +106,7 @@ namespace Bridge
       return out;
     }
 
-    //  ---- Synchronous HTTPS/HTTP client -------------------------------------
-    //
-    //  Raw asio::ssl::stream (or tcp::socket for http) with an
-    //  OS-level SO_RCVTIMEO/SO_SNDTIMEO timeout. Synchronous — no
-    //  handlers, no lifetimes. The OS enforces the timeout at the
-    //  socket level, so a stuck handshake or a stuck read fails
-    //  with an error instead of hanging.
-    //
-    //  HTTP/1.1 request, read-until for the headers, then a
-    //  Content-Length-bounded body read. Handles Content-Length
-    //  and Connection: close (the latter by reading until EOF).
+    //  ---- Synchronous HTTPS/HTTP client ----
 
     struct HttpResult
     {
@@ -129,10 +119,6 @@ namespace Bridge
 
     void setSocketTimeout(tcp::socket &sock, int seconds)
     {
-      //  SO_RCVTIMEO / SO_SNDTIMEO via native handle. asio doesn't
-      //  expose these portably, but on POSIX they're the OS
-      //  enforcement of a synchronous read/write timeout, which is
-      //  exactly what we want here.
       const int fd = sock.native_handle();
       struct timeval tv;
       tv.tv_sec = seconds;
@@ -230,12 +216,6 @@ namespace Bridge
             return result;
           }
 
-          //  Read the entire response to EOF. The request sent
-          //  Connection: close, so the server will close after the
-          //  body. read_some returns as soon as there's some data,
-          //  and reports eof with n == 0 on close. Net::read (the
-          //  "fill the buffer" version) returns eof with n > 0 on
-          //  the last chunk, which would silently discard it.
           std::string response_str;
           for (;;)
           {
@@ -264,7 +244,6 @@ namespace Bridge
               break;
           }
 
-          //  Split headers and body.
           const size_t header_end = response_str.find("\r\n\r\n");
           if (header_end == std::string::npos)
           {
@@ -276,7 +255,6 @@ namespace Bridge
           std::string body_bytes =
               response_str.substr(header_end + 4);
 
-          //  Parse the status line.
           std::istringstream hs(header_block);
           std::string status_line;
           std::getline(hs, status_line);
@@ -288,7 +266,6 @@ namespace Bridge
                 std::stoul(status_line.substr(9, 3)));
           }
 
-          //  Decode chunked bodies if the server used them.
           bool chunked = false;
           std::string header_line;
           while (std::getline(hs, header_line))
@@ -339,7 +316,6 @@ namespace Bridge
         }
         else
         {
-          //  Plain HTTP: same read-to-EOF and split.
           tcp::socket sock(ioc);
           net::connect(sock, endpoints);
           setSocketTimeout(sock, timeout_seconds);
@@ -479,7 +455,7 @@ namespace Bridge
       }
     }
 
-    //  ---- JSON wrappers -----------------------------------------------------
+    //  ---- JSON wrappers ----
 
     std::optional<Common::Json> jsonGet(
         const std::string &url,
@@ -532,7 +508,7 @@ namespace Bridge
       }
     }
 
-    //  ---- bitcoind JSON-RPC call --------------------------------------------
+    //  ---- bitcoind JSON-RPC call ----
 
     std::optional<Common::Json> callBitcoinRpc(
         const Wallet::RpcEndpoint &ep,
@@ -588,7 +564,7 @@ namespace Bridge
       return (*resp)["result"];
     }
 
-    //  ---- mempool.space calls ----------------------------------------------
+    //  ---- mempool.space calls ----
 
     std::optional<Common::Json> callMempoolGet(
         const BitcoinConfig &config,
@@ -649,7 +625,7 @@ namespace Bridge
       return result.body;
     }
 
-    //  ---- Hex helpers -------------------------------------------------------
+    //  ---- Hex helpers ----
 
     std::string hexOf(const std::vector<uint8_t> &bytes)
     {
@@ -729,6 +705,21 @@ namespace Bridge
               (c >= 'A' && c <= 'F')))
           return false;
       }
+      return true;
+    }
+
+    //  Turn a 22-byte P2WPKH scriptPubKey into the lookup key used
+    //  by BitcoinCustody::scriptsInWindow(). We copy into a fixed
+    //  array (not a vector) because that's what the custody map's
+    //  key type is.
+    bool scriptToCustodyKey(const std::vector<uint8_t> &script,
+                            std::array<uint8_t, 22> &out)
+    {
+      if (script.size() != 22)
+        return false;
+      if (script[0] != 0x00 || script[1] != 0x14)
+        return false;
+      std::memcpy(out.data(), script.data(), 22);
       return true;
     }
   } // anonymous namespace
@@ -859,10 +850,18 @@ namespace Bridge
       uint64_t to_height,
       const std::function<bool(const ObservedDeposit &)> &on_deposit) const
   {
-    if (deposit_script_.empty())
+    highest_fully_resolved_height_.reset();
+    cache_miss_detected_ = false;
+
+    if (custody_ == nullptr)
       throw BridgeError(
-          "scan_deposits: deposit script not set; call "
-          "set_deposit_address first");
+          "scan_deposits: Bitcoin custody not configured; call "
+          "set_custody first");
+
+    if (deposit_cache_ == nullptr)
+      throw BridgeError(
+          "scan_deposits: Bitcoin deposit cache not installed; call "
+          "set_deposit_cache first");
 
     if (to_height < from_height)
       return;
@@ -872,6 +871,88 @@ namespace Bridge
     else
       scan_deposits_bitcoind(rpc, from_height, to_height, on_deposit);
   }
+
+  namespace
+  {
+    //  Shared per-vout logic. Given a scriptPubKey (in a std::vector
+    //  from the JSON parser) and the tx's {txid, block_height,
+    //  output_index, amount}, decide whether to emit a deposit.
+    //
+    //    - If the script is not in the custody window -> not ours.
+    //    - If the script is in the window but the index is not in
+    //      the deposit cache -> no on-chain registration exists for
+    //      this index. The executor assigns indices monotonically
+    //      and never reuses them, so this will never become a
+    //      registration; it is a payment to a custody address that
+    //      nobody registered as a deposit destination (a mistake,
+    //      or a griefing attempt). SKIP it. Holding the cursor here
+    //      would let one satoshi sent to any future custody address
+    //      freeze the scanner forever — that is a denial-of-service
+    //      vector, not a safety guarantee.
+    //    - If the script is in the window and the index is in the
+    //      cache -> emit the deposit with the cache's destination.
+    //
+    //  There is no "unresolved" state. A deposit to a registered
+    //  index is always resolvable: the cache is refreshed at the
+    //  top of every scan poll (from ScanRegistry::startScan ->
+    //  refreshBridgeDeposits), so a registration that confirmed
+    //  before this scan started is in the cache. A registration
+    //  that confirms *during* a scan will be picked up on the next
+    //  poll; the deposit is still in a block we've already
+    //  processed, so the only cost is that the mint happens one
+    //  poll later, not never.
+    struct VoutLookup
+    {
+      bool matched{false};
+      std::optional<ObservedDeposit> deposit;
+    };
+
+    VoutLookup classifyVout(
+        const std::vector<uint8_t> &script,
+        const Crypto::Hash &txid,
+        uint64_t block_height,
+        uint32_t output_index,
+        uint64_t amount_sat,
+        const BitcoinCustody &custody,
+        const std::map<uint64_t, Crypto::Address> &cache)
+    {
+      VoutLookup r;
+
+      std::array<uint8_t, 22> key{};
+      if (!scriptToCustodyKey(script, key))
+        return r; // not P2WPKH-shaped; not ours
+
+      const auto &window = custody.scriptsInWindow();
+      auto it = window.find(key);
+      if (it == window.end())
+        return r; // not in our window; not ours
+
+      r.matched = true;
+
+      const DerivedScript &ds = it->second;
+      auto cit = cache.find(ds.index);
+      if (cit == cache.end())
+      {
+        //  In-window script with no on-chain registration for its
+        //  index. Not a bridge deposit. Skip. See the block
+        //  comment above for why this is not "unresolved."
+        return r;
+      }
+
+      ObservedDeposit d;
+      d.source_chain_id = BTC_CHAIN_ID;
+      d.source_tx_hash = txid;
+      d.source_output_index = output_index;
+      d.amount_source_atomic = amount_sat;
+      d.block_height = block_height;
+      d.destination = cit->second;
+
+      d.deposit_blob.assign(script.begin(), script.end());
+
+      r.deposit = std::move(d);
+      return r;
+    }
+  } // anonymous namespace
 
   void BitcoinAdapter::scan_deposits_bitcoind(
       Wallet::RpcClient &rpc,
@@ -946,9 +1027,6 @@ namespace Bridge
           if (!scriptFromHex(spk["hex"].get<std::string>(), script_bytes))
             continue;
 
-          if (script_bytes != deposit_script_)
-            continue;
-
           if (!vout.contains("value") || !vout["value"].is_number())
             continue;
 
@@ -956,15 +1034,18 @@ namespace Bridge
           const uint64_t sat_value = static_cast<uint64_t>(
               std::llround(btc_value * 100'000'000.0));
 
-          ObservedDeposit deposit;
-          deposit.source_chain_id = BTC_CHAIN_ID;
-          deposit.source_tx_hash = txid;
-          deposit.source_output_index = static_cast<uint32_t>(vout_index);
-          deposit.amount_source_atomic = sat_value;
-          deposit.block_height = height;
-          deposit.deposit_blob = script_bytes;
+          if (sat_value == 0)
+            continue;
 
-          if (!on_deposit(deposit))
+          const VoutLookup look = classifyVout(
+              script_bytes, txid, height,
+              static_cast<uint32_t>(vout_index),
+              sat_value, *custody_, *deposit_cache_);
+
+          if (!look.deposit.has_value())
+            continue;
+
+          if (!on_deposit(*look.deposit))
             return;
         }
       }
@@ -1020,8 +1101,7 @@ namespace Bridge
           continue;
         const std::string txid_hex = txid_val.get<std::string>();
 
-        auto tx_resp = callMempoolGet(
-            config_, "/tx/" + txid_hex, &err);
+        auto tx_resp = callMempoolGet(config_, "/tx/" + txid_hex, &err);
         if (!tx_resp.has_value() || !tx_resp->is_object())
           continue;
 
@@ -1051,24 +1131,25 @@ namespace Bridge
                   script_bytes))
             continue;
 
-          if (script_bytes != deposit_script_)
-            continue;
-
           if (!vout.contains("value") || !vout["value"].is_number())
             continue;
 
           const double sat_value_d = vout["value"].get<double>();
-          const uint64_t sat_value = static_cast<uint64_t>(std::llround(sat_value_d));
+          const uint64_t sat_value =
+              static_cast<uint64_t>(std::llround(sat_value_d));
 
-          ObservedDeposit deposit;
-          deposit.source_chain_id = BTC_CHAIN_ID;
-          deposit.source_tx_hash = txid;
-          deposit.source_output_index = static_cast<uint32_t>(vout_index);
-          deposit.amount_source_atomic = sat_value;
-          deposit.block_height = height;
-          deposit.deposit_blob = script_bytes;
+          if (sat_value == 0)
+            continue;
 
-          if (!on_deposit(deposit))
+          const VoutLookup look = classifyVout(
+              script_bytes, txid, height,
+              static_cast<uint32_t>(vout_index),
+              sat_value, *custody_, *deposit_cache_);
+
+          if (!look.deposit.has_value())
+            continue;
+
+          if (!on_deposit(*look.deposit))
             return;
         }
       }
@@ -1189,20 +1270,28 @@ namespace Bridge
 
   std::string BitcoinAdapter::deposit_address_display() const
   {
-    if (deposit_script_.empty())
-      return {};
-    return hexOf(deposit_script_);
+    //  No static deposit address any more. If we ever want a
+    //  human-readable summary here, it would be "first N custody
+    //  addresses"; for now, empty is honest.
+    return {};
   }
 
   void BitcoinAdapter::set_deposit_address(
       const std::vector<uint8_t> &blob)
   {
-    if (blob.empty() || blob.size() > BTC_MAX_SCRIPT_BYTES)
+    //  Legacy. The static-script model is gone; this is kept as a
+    //  no-op so the ChainAdapter interface stays uniform, and so a
+    //  stale config that calls set_deposit_address doesn't silently
+    //  poison the scanner. If a future deployment needs a static
+    //  address (it shouldn't), this is where it would go, guarded
+    //  by a check that custody_ is null.
+    if (!blob.empty())
     {
-      deposit_script_.clear();
-      return;
+      std::cerr << "[btc] ignoring set_deposit_address("
+                << blob.size() << " bytes): deposit addresses are "
+                                  "derived per registration index from the custody "
+                                  "seed; the static-address model is no longer used\n";
     }
-    deposit_script_ = blob;
   }
 
   std::optional<std::vector<uint8_t>>
@@ -1251,39 +1340,31 @@ namespace Bridge
   BitcoinAdapter::parse_deposit_address(const std::string &address_str,
                                         std::string *error_out) const
   {
-    if (address_str.empty())
+    //  Legacy. Kept for interface uniformity; deposits no longer
+    //  go to a static address. Returning nullopt with a message
+    //  that names the current model is more honest than pretending
+    //  we can parse one.
+    (void)address_str;
+    if (error_out)
+      *error_out = "Bitcoin deposits go to per-registration derived "
+                   "addresses (ask the bridge for one via address "
+                   "<index> / getBridgeDepositAddress). There is no "
+                   "static Bitcoin deposit address to parse.";
+    return std::nullopt;
+  }
+
+  std::optional<std::string>
+  BitcoinAdapter::deriveDepositAddress(uint64_t index,
+                                       std::string *error_out) const
+  {
+    if (custody_ == nullptr)
     {
       if (error_out)
-        *error_out = "empty deposit address";
+        *error_out = "Bitcoin custody is not configured. Start the "
+                     "chain before requesting deposit addresses.";
       return std::nullopt;
     }
-
-    if (looksLikeScriptHex(address_str))
-    {
-      std::vector<uint8_t> script;
-      if (!scriptFromHex(address_str, script))
-      {
-        if (error_out)
-          *error_out = "deposit address is hex but does not parse as a "
-                       "scriptPubKey";
-        return std::nullopt;
-      }
-      return script;
-    }
-
-    if (config_.transport == BitcoinTransport::MempoolSpace)
-    {
-      auto script = decodeAddressViaMempool(address_str, error_out);
-      if (script.has_value())
-        return script;
-      return std::nullopt;
-    }
-
-    if (error_out)
-      *error_out = "deposit address is not scriptPubKey hex; a "
-                   "BitcoindRpc deployment must pass the scriptPubKey "
-                   "hex form (getaddressinfo's scriptPubKey field)";
-    return std::nullopt;
+    return custody_->deriveAddress(index, error_out);
   }
 
   //  ==========================================================================
@@ -1307,7 +1388,7 @@ namespace Bridge
   {
     if (!config.is_object())
       return;
-    
+
     std::cerr << "[btc] set_transport_config: "
               << (config.is_object() ? config.dump() : "(not object)")
               << "\n";

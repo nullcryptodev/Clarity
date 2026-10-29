@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "RpcClient.h"
+#include "AddressCodec.h"
 
 #include "RPC/JsonRpcError.h"
 
@@ -1214,5 +1215,264 @@ namespace Wallet
     }
 
     return result.result;
+  }
+
+  //  ---- Bridge deposit-destination registry ----
+
+  std::optional<BridgeDepositPage> getBridgeDepositsForChain(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      uint64_t from_index,
+      uint64_t limit,
+      uint64_t offset,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["source_chain_id"] = encodeU64Hex(source_chain_id);
+    params["from_index"] = encodeU64Hex(from_index);
+    params["limit"] = encodeU64Hex(limit);
+    params["offset"] = encodeU64Hex(offset);
+
+    auto res = rpc.call("getBridgeDepositsForChain", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    if (!res.result.is_object())
+    {
+      if (error_out)
+        *error_out = "getBridgeDepositsForChain: response is not an object";
+      return std::nullopt;
+    }
+
+    const auto &obj = res.result;
+
+    auto parse_hex_field = [](const Common::Json &o,
+                              const char *name,
+                              uint64_t &out,
+                              std::string *err) -> bool
+    {
+      if (!o.contains(name) || !o[name].is_string())
+      {
+        if (err)
+          *err = std::string("getBridgeDepositsForChain: missing or "
+                             "malformed '") +
+                 name + "'";
+        return false;
+      }
+      auto parsed = parseHexU64(o[name].get<std::string>());
+      if (!parsed.has_value())
+      {
+        if (err)
+          *err = std::string("getBridgeDepositsForChain: '") + name +
+                 "' is not valid hex";
+        return false;
+      }
+      out = *parsed;
+      return true;
+    };
+
+    BridgeDepositPage page;
+    if (!parse_hex_field(obj, "source_chain_id",
+                         page.source_chain_id, error_out))
+      return std::nullopt;
+    if (!parse_hex_field(obj, "from_index", page.from_index, error_out))
+      return std::nullopt;
+    if (!parse_hex_field(obj, "last_seen_index",
+                         page.last_seen_index, error_out))
+      return std::nullopt;
+    if (!parse_hex_field(obj, "next_from_index",
+                         page.next_from_index, error_out))
+      return std::nullopt;
+
+    if (!obj.contains("deposits") || !obj["deposits"].is_array())
+    {
+      if (error_out)
+        *error_out = "getBridgeDepositsForChain: 'deposits' is not an array";
+      return std::nullopt;
+    }
+
+    for (const auto &entry : obj["deposits"])
+    {
+      if (!entry.is_object())
+        continue;
+
+      BridgeDepositEntry d;
+      if (!parse_hex_field(entry, "index", d.index, error_out))
+        return std::nullopt;
+      if (!parse_hex_field(entry, "registered_at_height",
+                           d.registered_at_height, error_out))
+        return std::nullopt;
+
+      if (!entry.contains("destination") ||
+          !entry["destination"].is_string())
+      {
+        if (error_out)
+          *error_out = "getBridgeDepositsForChain: deposit missing "
+                       "'destination'";
+        return std::nullopt;
+      }
+      if (!entry.contains("authority") || !entry["authority"].is_string())
+      {
+        if (error_out)
+          *error_out = "getBridgeDepositsForChain: deposit missing "
+                       "'authority'";
+        return std::nullopt;
+      }
+
+      //  The RPC returns bech32m strings. Store them verbatim;
+      //  the caller decodes against whatever network it's on.
+      //  This keeps the transport wrapper network-agnostic — a
+      //  mainnet wallet doesn't need to fake "regtest" to decode
+      //  a mainnet address.
+      d.destination_bech32m = entry["destination"].get<std::string>();
+      d.authority_bech32m = entry["authority"].get<std::string>();
+
+      page.deposits.push_back(std::move(d));
+    }
+
+    return page;
+  }
+
+  std::optional<Common::Json> getBridgeDepositDestination(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      uint64_t index,
+      bool *is_not_found,
+      std::string *error_out)
+  {
+    if (is_not_found)
+      *is_not_found = false;
+
+    Common::Json params = Common::Json::object();
+    params["source_chain_id"] = encodeU64Hex(source_chain_id);
+    params["index"] = encodeU64Hex(index);
+
+    auto res = rpc.call("getBridgeDepositDestination", params);
+    if (!res.ok())
+    {
+      //  BridgeDepositNotFound = 1065 (see Rpc/JsonRpcError.h).
+      if (is_not_found && res.error.has_value() &&
+          res.error->code == 1065)
+      {
+        *is_not_found = true;
+        return std::nullopt;
+      }
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    return res.result;
+  }
+
+  //  ---- Bridge deposit-destination registry: for-authority ----
+
+  std::optional<BridgeAuthorityDepositPage>
+  getBridgeDepositsForAuthority(
+      RpcClient &rpc,
+      uint64_t source_chain_id,
+      const std::string &authority_bech32m,
+      std::string *error_out)
+  {
+    Common::Json params = Common::Json::object();
+    params["source_chain_id"] = encodeU64Hex(source_chain_id);
+    params["address"] = authority_bech32m;
+
+    auto res = rpc.call("getBridgeDepositsForAuthority", params);
+    if (!res.ok())
+    {
+      if (error_out)
+        *error_out = res.error.has_value() ? res.error->message
+                                           : "RPC call failed";
+      return std::nullopt;
+    }
+
+    if (!res.result.is_object())
+    {
+      if (error_out)
+        *error_out = "getBridgeDepositsForAuthority: response is not "
+                     "an object";
+      return std::nullopt;
+    }
+
+    const auto &obj = res.result;
+
+    auto parse_hex_field = [](const Common::Json &o,
+                              const char *name,
+                              uint64_t &out,
+                              std::string *err) -> bool
+    {
+      if (!o.contains(name) || !o[name].is_string())
+      {
+        if (err)
+          *err = std::string("getBridgeDepositsForAuthority: missing or "
+                             "malformed '") +
+                 name + "'";
+        return false;
+      }
+      auto parsed = parseHexU64(o[name].get<std::string>());
+      if (!parsed.has_value())
+      {
+        if (err)
+          *err = std::string("getBridgeDepositsForAuthority: '") + name +
+                 "' is not valid hex";
+        return false;
+      }
+      out = *parsed;
+      return true;
+    };
+
+    BridgeAuthorityDepositPage page;
+    if (!parse_hex_field(obj, "source_chain_id",
+                         page.source_chain_id, error_out))
+      return std::nullopt;
+
+    if (obj.contains("authority") && obj["authority"].is_string())
+      page.authority_bech32m = obj["authority"].get<std::string>();
+    else
+      page.authority_bech32m = authority_bech32m;
+
+    if (!obj.contains("deposits") || !obj["deposits"].is_array())
+    {
+      if (error_out)
+        *error_out = "getBridgeDepositsForAuthority: 'deposits' is not "
+                     "an array";
+      return std::nullopt;
+    }
+
+    for (const auto &entry : obj["deposits"])
+    {
+      if (!entry.is_object())
+        continue;
+
+      BridgeAuthorityDepositEntry d;
+      if (!parse_hex_field(entry, "index", d.index, error_out))
+        return std::nullopt;
+      if (!parse_hex_field(entry, "registered_at_height",
+                           d.registered_at_height, error_out))
+        return std::nullopt;
+
+      if (!entry.contains("destination") ||
+          !entry["destination"].is_string())
+      {
+        if (error_out)
+          *error_out = "getBridgeDepositsForAuthority: deposit missing "
+                       "'destination'";
+        return std::nullopt;
+      }
+
+      d.destination_bech32m =
+          entry["destination"].get<std::string>();
+
+      page.deposits.push_back(std::move(d));
+    }
+
+    return page;
   }
 } // namespace Wallet

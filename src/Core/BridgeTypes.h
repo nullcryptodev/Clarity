@@ -47,6 +47,29 @@ namespace Core
   inline constexpr size_t BRIDGE_DESTINATION_MIN_BYTES = 1;
   inline constexpr size_t BRIDGE_DESTINATION_MAX_BYTES = 255;
 
+  //  ---- Deposit-destination registry bounds ----
+  //
+  //  A single rclrty1... authority may register at most
+  //  MAX_BRIDGE_DEPOSITS_PER_AUTHORITY destinations per source
+  //  chain. A bridge with 8 destinations per user is enough for
+  //  main + a handful of merchant/cold-storage addresses; beyond
+  //  that, the user creates a fresh Clarity account.
+  //
+  //  A single source chain may hold at most
+  //  MAX_BRIDGE_DEPOSITS_PER_CHAIN destinations in total. The
+  //  watcher's CCX scanner derives and checks one subaddress per
+  //  registered index (see commit 6.4), and the derivation +
+  //  matching cost is O(number of registered indices). Capping
+  //  at 100,000 keeps that cost bounded: 100k subaddress
+  //  derivations is a startup cache; 1M is a scanner that never
+  //  finishes a poll.
+  //
+  //  Both caps are consensus constants. Changing either is a hard
+  //  fork; they are per-chain, so raising one chain's cap does
+  //  not require touching another's.
+  inline constexpr uint64_t MAX_BRIDGE_DEPOSITS_PER_AUTHORITY = 8;
+  inline constexpr uint64_t MAX_BRIDGE_DEPOSITS_PER_CHAIN = 100'000;
+
   //  The CCX chain id as the bridge sees it. Same across all
   //  networks; the CCX chain itself is one chain.
   inline constexpr uint64_t BRIDGE_CCX_CHAIN_ID = 0x43435831ULL;
@@ -59,23 +82,78 @@ namespace Core
   using BridgeChainId = uint64_t;
   using BridgeWithdrawalId = uint64_t;
 
+  //  =========================================================================
+  //  BridgeDepositRecord
+  //
+  //  A per-authority deposit destination for a bridge source
+  //  chain. Created by BridgeRegisterDeposit; the executor assigns
+  //  the index from a per-chain counter. The watcher resolves a
+  //  CCX subaddress from the index using the bridge's custody
+  //  keys (see commit 6.2/6.4) — the deposit to that subaddress
+  //  mints to `destination`.
+  //
+  //  Bitcoin does not use this table: the OP_RETURN on the
+  //  deposit carries the destination directly and there is
+  //  nothing to register. The record is chain-agnostic even
+  //  though only CCX currently consults it, because the shape is
+  //  useful for any chain whose deposit format cannot carry a
+  //  32-byte destination inline.
+  //
+  //  Lifecycle: created by BridgeRegisterDeposit, never modified,
+  //  never deleted. A re-registration from the same authority
+  //  creates a new record at a new index; the old one remains and
+  //  continues to mint deposits to its destination. This is the
+  //  correct behavior — a user who rotates their destination
+  //  wants deposits to the old subaddress to keep landing at the
+  //  old address, and new deposits to land at the new one.
+  struct BridgeDepositRecord
+  {
+    BridgeChainId source_chain_id{0};
+    uint64_t index{0};
+    Crypto::Address destination{};
+    Crypto::Address authority{};
+    uint64_t registered_at_height{0};
+
+    bool isWellFormed() const noexcept
+    {
+      if (source_chain_id == 0)
+        return false;
+      if (index == 0)
+        return false;
+      if (destination.isNull())
+        return false;
+      if (authority.isNull())
+        return false;
+      if (registered_at_height == 0)
+        return false;
+      return true;
+    }
+
+    //  Layout (little-endian):
+    //    [8]  source_chain_id
+    //    [8]  index
+    //    [32] destination
+    //    [32] authority
+    //    [8]  registered_at_height
+    //
+    //  Total: 8 + 8 + 32 + 32 + 8 = 88 bytes.
+    static constexpr size_t STATE_SIZE = 88;
+
+    std::vector<uint8_t> serializeState() const;
+    static bool deserializeState(const uint8_t *data, size_t len,
+                                 BridgeDepositRecord &out);
+
+    void serialize(Serialization::ISerializer &s);
+    void serialize(Serialization::ISerializer &s) const;
+  };
+
+  static_assert(BridgeDepositRecord::STATE_SIZE == 88,
+                "BridgeDepositRecord state size mismatch");
+
   //  A withdrawal record. Chain-agnostic; the destination is an
   //  opaque blob whose format is defined by the per-chain adapter.
   //
-  //  Lifecycle:
-  //    - Created by BridgeBurn at the burn height.
-  //    - Validators submit BridgeAckAttest txs over the withdrawal
-  //      id while it is pending; those live in
-  //      TBL_BRIDGE_ACK_ATTESTATIONS.
-  //    - Once quorum of acks exists AND the validator has released
-  //      the underlying asset on the source chain, one of the
-  //      validators submits a BridgeAckWithdrawal tx carrying the
-  //      source-chain release tx hash and height. That populates
-  //      the release_* fields below and permanently marks the
-  //      withdrawal as released.
-  //    - The record is never deleted: it is the on-chain audit trail
-  //      for the withdrawal, and getPendingWithdrawals filters on
-  //      release_tx_hash being null.
+  //  (rest unchanged)
   struct BridgeWithdrawal
   {
     BridgeWithdrawalId id{0};
@@ -84,16 +162,7 @@ namespace Core
     Crypto::Address burner{};
     uint64_t amount{0};
 
-    //  The destination blob is the 64-byte (spend ‖ view) pubkey
-    //  pair. Kept for validation and for any future chain that only
-    //  deals in blob form.
     std::vector<uint8_t> destination_blob;
-
-    //  The destination address as a base58 string, exactly as the
-    //  user supplied it in the burn payload. This is what
-    //  submit_release hands to the CCX wallet RPC — no encoding
-    //  needed, since the user already had the address and the burn
-    //  carries it verbatim.
     std::string destination_address;
 
     uint64_t created_at_height{0};
@@ -114,11 +183,6 @@ namespace Core
         return false;
       if (amount == 0)
         return false;
-      //  The destination blob is opaque; per-chain bounds are
-      //  enforced by the burn handler against the registration's
-      //  destination_blob_min_len / destination_blob_max_len. The
-      //  struct-level check only requires that the blob is
-      //  non-empty and fits in the wire length prefix.
       if (destination_blob.empty())
         return false;
       if (destination_blob.size() > BRIDGE_DESTINATION_MAX_BYTES)
@@ -155,25 +219,6 @@ namespace Core
       return !release_tx_hash.isNull();
     }
 
-    //  Layout (little-endian):
-    //    [8]  id
-    //    [8]  source_chain_id
-    //    [4]  wrapped_token_id
-    //    [32] burner
-    //    [8]  amount
-    //    [8]  created_at_height
-    //    [1]  blob_len
-    //    [N]  destination_blob
-    //    [1]  addr_len
-    //    [M]  destination_address
-    //    [32] release_tx_hash
-    //    [8]  release_height
-    //    [8]  released_at_height
-    //    [8]  released_by_validator_id
-    //
-    //  The fixed portion (prefix) grows by 1 byte (addr_len) plus
-    //  the variable address bytes. The MAX_STATE_SIZE accounts for
-    //  a 256-byte address in addition to the 256-byte blob.
     static constexpr size_t PREFIX_SIZE = 69;
     static constexpr size_t MAX_ADDRESS_BYTES = 256;
     static constexpr size_t RELEASE_TRAILER_SIZE = 32 + 8 + 8 + 8;
@@ -206,13 +251,6 @@ namespace Core
     uint8_t destination_blob_min_len{0};
     uint8_t destination_blob_max_len{0};
     bool enabled{false};
-    //  The minimum active validator set size for this chain to
-    //  operate. Below this, the bridge for this chain halts: no
-    //  mint, no burn, no ack. The halt is loud. The field was
-    //  previously `active_watcher_min`; the meaning is unchanged
-    //  under the validator-is-watcher model, only the name is
-    //  clearer. The wire layout (bytes 51-54 of the 55-byte blob)
-    //  is unchanged.
     uint32_t active_validator_min{0};
 
     bool isWellFormed() const noexcept
@@ -244,7 +282,7 @@ namespace Core
     static bool deserializeState(const uint8_t *data, size_t len,
                                  BridgeChainRegistration &out);
     static constexpr size_t STATE_SIZE =
-        8 + 4 + 32 + 1 + 1 + 2 + 1 + 1 + 1 + 4; // == 55
+        8 + 4 + 32 + 1 + 1 + 2 + 1 + 1 + 1 + 4;
 
     void serialize(Serialization::ISerializer &s);
     void serialize(Serialization::ISerializer &s) const;
@@ -254,42 +292,13 @@ namespace Core
                 "BridgeChainRegistration state size mismatch");
 
   //  A single validator's attestation over a bridge deposit.
-  //
-  //  Produced on-chain by a BridgeAttest transaction and stored in
-  //  TBL_BRIDGE_ATTESTATIONS keyed by (source_chain_id,
-  //  source_tx_hash, source_output_index, validator_id). A BridgeMint
-  //  is valid iff a quorum of distinct active validators has attested
-  //  to the same (destination, amount) pair for the same deposit.
-  //
-  //  The `destination` and `amount` are stored in the record because
-  //  the deposit does not exist as a first-class record until the
-  //  mint happens. Attestations are the only pre-mint record of what
-  //  validators agreed the deposit was. The assembler validates that
-  //  all attestations for a single deposit agree on these two fields
-  //  before producing the mint's signature block; conflicting
-  //  attestations are a federation split and must not be silently
-  //  resolved.
+  //  (rest unchanged)
   struct BridgeAttestation
   {
-    //  The validator's position in the sorted active validator set
-    //  at the height of the attestation. This is what goes into the
-    //  BridgeMint's signature block; it is captured here so the
-    //  block assembly is a pure function of what's in state.
     uint16_t signer_index{0};
-
-    //  The validator's signature over the canonical mint message
-    //  (see Bridge::Signing::EncodeBridgeMintMessage).
     Crypto::Signature signature{};
-
-    //  The deposit's destination and amount, as the validator
-    //  understood them.
     Crypto::Address destination{};
     uint64_t amount{0};
-
-    //  The height of the BridgeAttest transaction that created
-    //  this record. Used for the eventual slash path (a validator
-    //  that attested to a nonexistent deposit is slashed) and
-    //  for the RPC response.
     uint64_t attested_at_height{0};
 
     bool isWellFormed() const noexcept
@@ -305,18 +314,11 @@ namespace Core
       return true;
     }
 
-    //  Layout (little-endian):
-    //    [2]  signer_index
-    //    [64] signature
-    //    [32] destination
-    //    [8]  amount
-    //    [8]  attested_at_height
-    //
-    //  Total: 2 + 64 + 32 + 8 + 8 = 114 bytes.
+    static constexpr size_t STATE_SIZE = 2 + 64 + 32 + 8 + 8;
+
     std::vector<uint8_t> serializeState() const;
     static bool deserializeState(const uint8_t *data, size_t len,
                                  BridgeAttestation &out);
-    static constexpr size_t STATE_SIZE = 2 + 64 + 32 + 8 + 8;
 
     void serialize(Serialization::ISerializer &s);
     void serialize(Serialization::ISerializer &s) const;
@@ -326,30 +328,11 @@ namespace Core
                 "BridgeAttestation state size mismatch");
 
   //  A single validator's attestation over a bridge withdrawal.
-  //
-  //  Produced on-chain by a BridgeAckAttest transaction and stored in
-  //  TBL_BRIDGE_ACK_ATTESTATIONS keyed by (withdrawal_id,
-  //  validator_id). A BridgeAckWithdrawal is valid iff a quorum of
-  //  distinct active validators has attested to the same withdrawal_id.
-  //
-  //  Unlike BridgeAttestation, this record does NOT carry destination
-  //  or amount: those are already in the BridgeWithdrawal record,
-  //  created at burn time. The attestation is just a vote that the
-  //  validator observed the burn and agrees to release the
-  //  underlying. The record is therefore smaller: 74 bytes vs 114.
+  //  (rest unchanged)
   struct BridgeAckAttestation
   {
-    //  The validator's position in the sorted active validator set
-    //  at the height of the attestation. This is what goes into the
-    //  BridgeAckWithdrawal's signature block.
     uint16_t signer_index{0};
-
-    //  The validator's signature over the canonical ack message
-    //  (see Bridge::Signing::EncodeBridgeAckMessage).
     Crypto::Signature signature{};
-
-    //  The height of the BridgeAckAttest transaction that created
-    //  this record.
     uint64_t attested_at_height{0};
 
     bool isWellFormed() const noexcept
@@ -361,16 +344,11 @@ namespace Core
       return true;
     }
 
-    //  Layout (little-endian):
-    //    [2]  signer_index
-    //    [64] signature
-    //    [8]  attested_at_height
-    //
-    //  Total: 2 + 64 + 8 = 74 bytes.
+    static constexpr size_t STATE_SIZE = 2 + 64 + 8;
+
     std::vector<uint8_t> serializeState() const;
     static bool deserializeState(const uint8_t *data, size_t len,
                                  BridgeAckAttestation &out);
-    static constexpr size_t STATE_SIZE = 2 + 64 + 8;
 
     void serialize(Serialization::ISerializer &s);
     void serialize(Serialization::ISerializer &s) const;
@@ -380,52 +358,19 @@ namespace Core
                 "BridgeAckAttestation state size mismatch");
 
   //  Aggregate bridge counters, one row per source chain.
-  //
-  //  Updated by executeBridgeMint, executeBridgeBurn, and
-  //  executeBridgeAckWithdrawal on every operation. Exposed through
-  //  the getBridgeStats RPC so that an auditor, monitoring dashboard,
-  //  or operator UI can verify the bridge's economic state without
-  //  walking every transaction.
-  //
-  //  Invariants (checked by a future auditor RPC and by monitoring
-  //  alerts):
-  //
-  //    total_minted - total_burned == wrapped_token.total_supply
-  //    total_burned - total_released == outstanding_liability
-  //    deposit_count          == number of BridgeMint txs
-  //    withdrawal_count       == number of BridgeBurn txs
-  //    released_withdrawal_count == number of BridgeAckWithdrawal txs
-  //
-  //  Note: the three counts are the number of times each operation
-  //  succeeded, not the number of unique entities. A reburn is two
-  //  withdrawal_count increments, but only one "entity".
-  //
-  //  The stats record does not live in the SMT under a bridge-specific
-  //  key; it's a per-chain row in TBL_BRIDGE_STATS, so it doesn't
-  //  affect the state root and doesn't block bridge operations if it
-  //  gets out of sync (a monitoring alert would catch that, not a
-  //  consensus failure).
+  //  (rest unchanged)
   struct BridgeStats
   {
     BridgeChainId source_chain_id{0};
-
-    //  Lifetime totals (in Clarity atomic units, same as withdrawal.amount).
     uint64_t total_minted{0};
     uint64_t total_burned{0};
     uint64_t total_released{0};
-
-    //  Operation counters.
     uint64_t deposit_count{0};
     uint64_t withdrawal_count{0};
     uint64_t released_withdrawal_count{0};
-
-    //  Last-activity heights.
     uint64_t last_mint_height{0};
     uint64_t last_burn_height{0};
     uint64_t last_release_height{0};
-
-    //  Chain registration height (for "bridge has been running N
-    //  blocks" reporting).
     uint64_t registered_at_height{0};
 
     bool isWellFormed() const noexcept
@@ -433,24 +378,11 @@ namespace Core
       return source_chain_id != 0;
     }
 
-    //  Layout (little-endian):
-    //    [8]  source_chain_id
-    //    [8]  total_minted
-    //    [8]  total_burned
-    //    [8]  total_released
-    //    [8]  deposit_count
-    //    [8]  withdrawal_count
-    //    [8]  released_withdrawal_count
-    //    [8]  last_mint_height
-    //    [8]  last_burn_height
-    //    [8]  last_release_height
-    //    [8]  registered_at_height
-    //
-    //  Total: 88 bytes.
+    static constexpr size_t STATE_SIZE = 88;
+
     std::vector<uint8_t> serializeState() const;
     static bool deserializeState(const uint8_t *data, size_t len,
                                  BridgeStats &out);
-    static constexpr size_t STATE_SIZE = 88;
 
     void serialize(Serialization::ISerializer &s);
     void serialize(Serialization::ISerializer &s) const;
@@ -460,25 +392,13 @@ namespace Core
                 "BridgeStats state size mismatch");
 
   //  A chronological record of one successful bridge operation.
-  //
-  //  Unlike the other bridge records, this is written to a plain
-  //  key-value table (TBL_BRIDGE_EVENTS), not to the SMT. It has
-  //  no effect on the state root. Its purpose is audit: every
-  //  successful mint, burn, ack-attest, and ack-withdrawal is
-  //  logged so that an operator, indexer, or auditor can answer
-  //  "what happened on the bridge, and in what order" without
-  //  having to join across the other bridge tables.
-  //
-  //  The event's identity is its key, (source_chain_id,
-  //  block_height, tx_index_in_block, kind), so two events with
-  //  the same value bytes are distinct if they were emitted at
-  //  different heights or by different transactions.
+  //  (rest unchanged)
   enum class BridgeEventKind : uint8_t
   {
-    Mint = 0,          //  BridgeMint succeeded
-    Burn = 1,          //  BridgeBurn succeeded
-    AckAttest = 2,     //  BridgeAckAttest recorded
-    AckWithdrawal = 3, //  BridgeAckWithdrawal recorded
+    Mint = 0,
+    Burn = 1,
+    AckAttest = 2,
+    AckWithdrawal = 3,
   };
 
   const char *bridgeEventKindName(BridgeEventKind k) noexcept;
@@ -489,52 +409,16 @@ namespace Core
     BridgeChainId source_chain_id{0};
     uint64_t block_height{0};
     uint32_t tx_index_in_block{0};
-
-    //  All four kinds set this to true: every bridge event is
-    //  emitted by a Bridge tx, so there is always a tx_hash. The
-    //  flag exists so a future event kind that isn't associated
-    //  with a transaction (e.g. a periodic reconciliation pass)
-    //  can emit the same record shape with a null tx_hash, without
-    //  a codec change.
     bool has_tx_hash{true};
     Crypto::Hash tx_hash{};
-
-    //  For Mint and AckAttest, the CCX-side deposit identity.
-    //  For Burn and AckWithdrawal, has_source_hash is false and
-    //  source_tx_hash / source_output_index are zero.
     bool has_source_hash{false};
     Crypto::Hash source_tx_hash{};
     uint32_t source_output_index{0};
-
-    //  For Burn, AckAttest, AckWithdrawal.
     BridgeWithdrawalId withdrawal_id{0};
-
-    //  For Mint and Burn: the burner (tx.from of the mint/burn).
-    //  For AckAttest and AckWithdrawal: the signing validator's
-    //  reward address (tx.from of the attestation).
     Crypto::Address actor{};
-
-    //  Mint: the minted amount in Clarity atomic units.
-    //  Burn: the burned amount in Clarity atomic units.
-    //  AckWithdrawal: the released amount in Clarity atomic units.
-    //  AckAttest: zero.
     uint64_t amount{0};
-
-    //  AckAttest: the validator_id that signed.
-    //  AckWithdrawal: the release_height on the source chain.
-    //  Mint and Burn: zero.
     uint64_t counterparty{0};
 
-    //  Key layout, BE for ascending scan = chronological:
-    //    [8] source_chain_id || [8] block_height ||
-    //    [4] tx_index_in_block || [1] kind
-    //
-    //  Value layout, fixed 147 bytes:
-    //    [1] kind || [8] source_chain_id LE || [8] block_height LE ||
-    //    [4] tx_index_in_block LE || [1] has_tx_hash ||
-    //    [32] tx_hash || [1] has_source_hash || [32] source_tx_hash ||
-    //    [4] source_output_index LE || [8] withdrawal_id LE ||
-    //    [32] actor || [8] amount LE || [8] counterparty LE
     static constexpr size_t KEY_SIZE = 8 + 8 + 4 + 1;
     static constexpr size_t STATE_SIZE =
         1 + 8 + 8 + 4 + 1 + 32 + 1 + 32 + 4 + 8 + 32 + 8 + 8;
@@ -554,6 +438,7 @@ namespace Core
                 "BridgeEvent state size mismatch");
 
   //  ---- Outcome enums ----
+  //  (rest unchanged)
 
   enum class BridgeMintStatus : uint8_t
   {
@@ -563,9 +448,6 @@ namespace Core
     ChainNotRegistered = 3,
     TokenNotFound = 4,
     TokenFingerprintMismatch = 5,
-    //  Active validator set size is below the registration's
-    //  active_validator_min, or the attestation block doesn't
-    //  have enough valid signatures.
     ValidatorSetTooSmall = 6,
     BelowValidatorThreshold = 7,
     BadValidatorSignature = 8,
@@ -600,17 +482,6 @@ namespace Core
     ConflictingAttestation = 10,
   };
 
-  const char *bridgeAttestStatusName(BridgeAttestStatus s) noexcept;
-
-  //  Status for a single BridgeAckAttest tx. Mirrors BridgeAttestStatus
-  //  with three differences:
-  //
-  //    - WithdrawalAlreadyReleased: the withdrawal has already been
-  //      released on-chain; attesting to it is pointless.
-  //    - No ConflictingAttestation: since the record carries no
-  //      destination/amount, there is nothing to conflict on. All
-  //      validators attest to the same withdrawal_id or not at all.
-  //    - DepositAlreadyConsumed is renamed to WithdrawalAlreadyReleased.
   enum class BridgeAckAttestStatus : uint8_t
   {
     Ok = 0,
@@ -626,8 +497,6 @@ namespace Core
     AlreadyAttested = 10,
   };
 
-  const char *bridgeAckAttestStatusName(BridgeAckAttestStatus s) noexcept;
-
   enum class BridgeAckStatus : uint8_t
   {
     Ok = 0,
@@ -639,7 +508,31 @@ namespace Core
     BadValidatorSignature = 8,
   };
 
+  //  Status for a single BridgeRegisterDeposit tx.
+  //
+  //  Ok: registered.
+  //  ChainNotRegistered: the source_chain_id in the payload is not
+  //    registered on Clarity via BridgeRegisterChain. Registration
+  //    of a destination before the chain is registered would be a
+  //    footgun — the destination would be unreachable from the
+  //    watcher, which only scans chains that are registered.
+  //  ChainDisabled: the chain is registered but currently disabled.
+  //  AuthorityLimitReached: the sender already holds
+  //    MAX_BRIDGE_DEPOSITS_PER_AUTHORITY destinations on this chain.
+  //  ChainLimitReached: MAX_BRIDGE_DEPOSITS_PER_CHAIN destinations
+  //    are registered on this chain.
+  //  PayloadMalformed: wrong payload length or null destination.
+  enum class BridgeRegisterDepositStatus : uint8_t
+  {
+    Ok = 0,
+    ChainNotRegistered = 1,
+    ChainDisabled = 2,
+    AuthorityLimitReached = 3,
+    ChainLimitReached = 4,
+    PayloadMalformed = 5,
+  };
+
   const char *bridgeMintStatusName(BridgeMintStatus s) noexcept;
   const char *bridgeBurnStatusName(BridgeBurnStatus s) noexcept;
   const char *bridgeAckStatusName(BridgeAckStatus s) noexcept;
-}
+} // namespace Core

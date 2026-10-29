@@ -65,6 +65,7 @@ target_compile_definitions(CoreLibs
 target_link_libraries(CoreLibs
   PUBLIC
     monocypher
+    secp256k1
     ${Boost_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     ${MDBX_LIBRARY_TARGET}

@@ -105,4 +105,12 @@ namespace Crypto
                         std::vector<uint8_t> &out,
                         bool pad) noexcept;
 
+  // Encode pre-converted 5-bit data (each entry 0..31) with the given
+  // HRP and checksum variant. This is the primitive BIP-173 uses for
+  // segwit address encoding, where the data part is
+  // [witness_version_5bit] ++ convertbits(program_8bit, 8, 5, pad=true)
+  // and must NOT be re-converted.
+  std::string bech32Encode5(std::string_view hrp,
+                            const std::vector<uint8_t> &data5,
+                            Bech32Encoding encoding = Bech32Encoding::Bech32m);
 } // namespace Crypto

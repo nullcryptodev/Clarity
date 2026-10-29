@@ -780,6 +780,50 @@ namespace Wallet
       const BridgeRegisterChainParams &params,
       WalletStatus *error_out = nullptr);
 
+  //  BridgeRegisterDeposit: register a per-authority deposit
+  //  destination for a bridge source chain.
+  //
+  //  Payload layout (matching executeBridgeRegisterDeposit):
+  //    [8]  source_chain_id
+  //    [32] destination
+  //  Total: 40 bytes.
+  //
+  //  There is no signature block. The registration is authorized
+  //  by the sender's own transaction signature (tx.from becomes
+  //  the record's `authority`), so the builder does not take,
+  //  produce, or validate one.
+  //
+  //  The on-chain index is assigned by the executor from a
+  //  per-chain counter; the caller does not supply it and cannot
+  //  predict it. To learn the assigned index after submission,
+  //  call getBridgeDepositsForAuthority for the sender's address
+  //  once the transaction has confirmed, or watch the receipt.
+  //
+  //  Caps enforced by the executor:
+  //    - MAX_BRIDGE_DEPOSITS_PER_AUTHORITY per (chain, sender)
+  //    - MAX_BRIDGE_DEPOSITS_PER_CHAIN per chain.
+  //
+  //  This builder does not check either cap: both are live
+  //  chain state, not something the wallet can see without an
+  //  RPC round-trip. A registration that hits either cap
+  //  returns Failure at apply time, and the fee is charged.
+  //
+  //  The chain must be registered and enabled at apply time.
+  //  Same rationale for not checking it here: it is live
+  //  chain state, and the executor rejects with Failure if
+  //  the chain is not registered.
+  struct BridgeRegisterDepositParams
+  {
+    TxCommonParams common;
+    uint64_t source_chain_id{0};
+    Crypto::Address destination{};
+  };
+
+  std::optional<Core::Transaction> buildBridgeRegisterDeposit(
+      const Crypto::Address &from,
+      const BridgeRegisterDepositParams &params,
+      WalletStatus *error_out = nullptr);
+
   //  ---- Sign ----
 
   std::optional<Crypto::Hash> signTransaction(

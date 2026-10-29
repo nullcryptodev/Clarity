@@ -16,10 +16,16 @@
 #include "Common/Varint.h"
 
 #include "Crypto/Blake2b.h"
+#include "Crypto/Ed25519.h"
 #include "Crypto/Types.h"
 #include "Crypto/Keccak.h"
 #include "Core/BridgeTypes.h"
 #include "Core/TokenTypes.h"
+
+extern "C"
+{
+#include "Crypto/crypto-ops.h"
+}
 
 namespace Core
 {
@@ -186,6 +192,176 @@ namespace Core
         return false;
 
       return true;
+    }
+
+    //  ---------------------------------------------------------------------
+    //  Subaddress derivation
+    //  ---------------------------------------------------------------------
+    //
+    //  The bridge owns the CCX custody wallet end-to-end. To let each
+    //  Clarity user deposit to a distinct CCX address, the bridge
+    //  derives a fresh subaddress per registration index from the
+    //  custody wallet's (spend_pub, view_priv) pair. The derivation
+    //  is bridge-owned — it does NOT match conceal-wallet-rpc's
+    //  internal Monero-compatible subaddress construction, and is
+    //  not meant to. The custody wallet is exclusively bridge-owned,
+    //  so its own subaddress set is never queried; a derived
+    //  subaddress is only ever seen by CCX as "an address someone
+    //  sent to," which is exactly what it is.
+    //
+    //  Construction:
+    //
+    //    domain        = "clrty-sa" || LE64(source_chain_id) || LE64(index)
+    //    m             = sc_reduce32(cnFastHash(domain))
+    //    sub_spend_pub = spend_pub + m*G
+    //    sub_view_pub  = view_priv * sub_spend_pub
+    //
+    //  The domain tag "clrty-sa" (8 bytes, unlike the 4-byte tags in
+    //  Keys.h, because this isn't an SMT key and there's no
+    //  collision space to share) distinguishes the bridge's
+    //  subaddress space from any other use of the custody wallet's
+    //  keys. The chain id is included so a subaddress derived on
+    //  one CCX deployment (mainnet, testnet) never collides with a
+    //  subaddress derived on another — the two have different
+    //  chain ids from the bridge's perspective.
+    //
+    //  The `index` is the value stored in BridgeDepositRecord.index,
+    //  assigned by the executor. Every caller (the deposit scanner,
+    //  the RPC, the wallet) derives the same subaddress for the same
+    //  (chain, index) pair because the inputs are identical and the
+    //  construction is deterministic.
+    //
+    //  Returns false if:
+    //    - spend_pub is not a valid curve point (ge_frombytes_vartime
+    //      fails),
+    //    - view_priv is not a valid scalar (sc_check fails),
+    //    - or the resulting spend or view key is null (would indicate
+    //      a hostile input rather than a computation failure — the
+    //      check is defensive).
+    //
+    //  The null-key check is the same loss-of-funds guard
+    //  encodeDestination applies: a subaddress with a null half is
+    //  not spendable, and must not be handed out as a deposit
+    //  destination.
+
+    inline bool deriveSubaddress(
+        const Crypto::PublicKey &spend_pub,
+        const Crypto::SecretKey &view_priv,
+        uint64_t source_chain_id,
+        uint64_t index,
+        Crypto::PublicKey &sub_spend_out,
+        Crypto::PublicKey &sub_view_out)
+    {
+      if (spend_pub.isNull() || view_priv.isNull())
+        return false;
+
+      //  ---- Domain ----
+      //
+      //  "clrty-sa" is 8 bytes; source_chain_id and index are 8
+      //  bytes each LE; total 24 bytes.
+      unsigned char domain[8 + 8 + 8];
+      std::memcpy(domain, "clrty-sa", 8);
+      for (int i = 0; i < 8; ++i)
+        domain[8 + i] = uint8_t(source_chain_id >> (i * 8));
+      for (int i = 0; i < 8; ++i)
+        domain[16 + i] = uint8_t(index >> (i * 8));
+
+      //  ---- m = sc_reduce32(cnFastHash(domain)) ----
+      //
+      //  sc_reduce32 takes a 32-byte hash and reduces it modulo ℓ.
+      //  The intermediate hash buffer is zeroed after use.
+      unsigned char m[32];
+      Crypto::cnFastHash(domain, sizeof(domain), m);
+      sc_reduce32(m);
+
+      //  ---- sub_spend_pub = spend_pub + m*G ----
+
+      ge_p3 spend_p3;
+      if (ge_frombytes_vartime(
+              &spend_p3,
+              reinterpret_cast<const unsigned char *>(
+                  spend_pub.data.data())) != 0)
+      {
+        Crypto::secureZero(m, sizeof(m));
+        return false;
+      }
+
+      ge_p3 mG;
+      ge_cached cached;
+      ge_p1p1 p1p1;
+      ge_p2 spend_p2;
+
+      ge_scalarmult_base(&mG, m);
+      ge_p3_to_cached(&cached, &mG);
+      ge_add(&p1p1, &spend_p3, &cached);
+      ge_p1p1_to_p2(&spend_p2, &p1p1);
+
+      unsigned char spend_buf[32];
+      ge_tobytes(spend_buf, &spend_p2);
+      std::memcpy(sub_spend_out.data.data(), spend_buf, 32);
+
+      //  ---- sub_view_pub = view_priv * sub_spend_pub ----
+
+      if (sc_check(reinterpret_cast<const unsigned char *>(
+              view_priv.data.data())) != 0)
+      {
+        Crypto::secureZero(m, sizeof(m));
+        Crypto::secureZero(spend_buf, sizeof(spend_buf));
+        return false;
+      }
+
+      //  sub_spend_out is now a valid point (the result of an
+      //  addition of two valid points), so this ge_frombytes_vartime
+      //  cannot fail — but we check anyway for symmetry with the
+      //  spend input above, and because a future change to ge_add
+      //  semantics would be caught here rather than downstream.
+      ge_p3 sub_spend_p3;
+      if (ge_frombytes_vartime(&sub_spend_p3, spend_buf) != 0)
+      {
+        Crypto::secureZero(m, sizeof(m));
+        Crypto::secureZero(spend_buf, sizeof(spend_buf));
+        return false;
+      }
+
+      ge_p2 view_p2;
+      ge_scalarmult(
+          &view_p2,
+          reinterpret_cast<const unsigned char *>(view_priv.data.data()),
+          &sub_spend_p3);
+
+      unsigned char view_buf[32];
+      ge_tobytes(view_buf, &view_p2);
+      std::memcpy(sub_view_out.data.data(), view_buf, 32);
+
+      Crypto::secureZero(m, sizeof(m));
+      Crypto::secureZero(spend_buf, sizeof(spend_buf));
+      Crypto::secureZero(view_buf, sizeof(view_buf));
+
+      //  ---- Null-key guard ----
+
+      if (sub_spend_out.isNull() || sub_view_out.isNull())
+        return false;
+
+      return true;
+    }
+
+    //  Convenience: derive the subaddress and encode it as the
+    //  64-byte (spend || view) destination blob. Same checks as the
+    //  typed overload; an empty return means the derivation failed
+    //  (invalid spend_pub, invalid view_priv, or a null resulting
+    //  key).
+    inline std::vector<uint8_t> deriveSubaddressBlob(
+        const Crypto::PublicKey &spend_pub,
+        const Crypto::SecretKey &view_priv,
+        uint64_t source_chain_id,
+        uint64_t index)
+    {
+      Crypto::PublicKey sub_spend, sub_view;
+      if (!deriveSubaddress(spend_pub, view_priv,
+                            source_chain_id, index,
+                            sub_spend, sub_view))
+        return {};
+      return encodeDestination(sub_spend, sub_view);
     }
 
     //  Encode a (spend ‖ view) blob as a CCX base58 address.

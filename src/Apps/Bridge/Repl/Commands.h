@@ -82,6 +82,11 @@ namespace Bridge
   void cmd_help(WatcherSession &session, const std::vector<std::string> &args);
   void cmd_exit(WatcherSession &session, const std::vector<std::string> &args);
 
+  void cmd_register_deposit(WatcherSession &session, const std::vector<std::string> &args);
+
+  void cmd_address(WatcherSession &session,
+                   const std::vector<std::string> &args);
+
   //  Register a chain on Clarity. This is a one-time setup step
   //  per source chain: after it succeeds, every subsequent
   //  deposit attestation for that chain passes the executor's

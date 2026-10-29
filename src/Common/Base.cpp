@@ -9,9 +9,19 @@
 #include "Common/Varint.h"
 
 #include "Crypto/Types.h"
+#include "Crypto/Sha256.h"
 
 namespace
 {
+  constexpr size_t CHECKSUM_BYTES = 4;
+
+  void sha256d(const uint8_t *data, size_t len, uint8_t *out) noexcept
+  {
+    uint8_t first[Crypto::SHA256_OUTPUT_SIZE];
+    Crypto::sha256(data, len, first);
+    Crypto::sha256(first, sizeof(first), out);
+  }
+
   // Base58 Implementation
   constexpr std::string_view alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
   constexpr size_t alphabetSize = alphabet.size();
@@ -347,5 +357,146 @@ namespace Common
     }
 
     return result;
+  }
+
+  //  ---- Base58Check (Bitcoin) -------------------------------------------
+  //
+  //  The functions above (encodeBase58 / decodeBase58) are the
+  //  CryptoNote block-based codec. They only accept inputs whose
+  //  length mod 11 lands on a valid encoded-block boundary
+  //  (1, 2, 3, 5, 6, 7, 9, 10, 11 characters). A 111-character
+  //  xpub ends in "mod 11 == 1", which the decoder rejects. So the
+  //  Base58Check helpers below do NOT go through them; they use
+  //  the general big-integer codec implemented here. This leaves
+  //  the CryptoNote callers (CCX addresses) untouched.
+  //
+  //  See Base.h for the format contract.
+
+  namespace
+  {
+    //  General base58 encode. No block structure: correct for any
+    //  input length. Leading zero bytes become leading '1's.
+    std::string base58EncodeGeneral(const uint8_t *data, size_t len)
+    {
+      if (len == 0)
+        return {};
+
+      size_t zeros = 0;
+      while (zeros < len && data[zeros] == 0)
+        ++zeros;
+
+      //  log(256)/log(58) ~= 1.3658, rounded up + 1 for slack.
+      std::vector<uint8_t> b58((len - zeros) * 138 / 100 + 1, 0);
+
+      size_t length = 0;
+      for (size_t i = zeros; i < len; ++i)
+      {
+        int carry = data[i];
+        size_t j = 0;
+        for (auto it = b58.rbegin();
+             (carry != 0 || j < length) && it != b58.rend();
+             ++it, ++j)
+        {
+          carry += 256 * (*it);
+          *it = static_cast<uint8_t>(carry % alphabetSize);
+          carry /= alphabetSize;
+        }
+        length = j;
+      }
+
+      auto it = b58.begin() + (b58.size() - length);
+      while (it != b58.end() && *it == 0)
+        ++it;
+
+      std::string out(zeros, alphabet[0]);
+      for (; it != b58.end(); ++it)
+        out.push_back(alphabet[*it]);
+      return out;
+    }
+
+    //  General base58 decode. Rejects characters not in the
+    //  alphabet. The empty string decodes to an empty vector.
+    bool base58DecodeGeneral(const std::string_view enc,
+                             std::vector<uint8_t> &out)
+    {
+      out.clear();
+      if (enc.empty())
+        return true;
+
+      size_t zeros = 0;
+      while (zeros < enc.size() && enc[zeros] == alphabet[0])
+        ++zeros;
+
+      //  log(58)/log(256) ~= 0.7325, rounded up + 1 for slack.
+      std::vector<uint8_t> bytes(
+          (enc.size() - zeros) * 733 / 1000 + 1, 0);
+
+      size_t length = 0;
+      for (size_t i = zeros; i < enc.size(); ++i)
+      {
+        const int v = reverseAlphabet(enc[i]);
+        if (v < 0)
+          return false;
+
+        int carry = v;
+        size_t j = 0;
+        for (auto it = bytes.rbegin();
+             (carry != 0 || j < length) && it != bytes.rend();
+             ++it, ++j)
+        {
+          carry += 58 * (*it);
+          *it = static_cast<uint8_t>(carry % 256);
+          carry /= 256;
+        }
+        length = j;
+      }
+
+      auto it = bytes.begin() + (bytes.size() - length);
+      while (it != bytes.end() && *it == 0)
+        ++it;
+
+      out.assign(zeros, 0);
+      out.insert(out.end(), it, bytes.end());
+      return true;
+    }
+  } // anonymous namespace
+
+  std::string encodeBase58Check(const std::vector<uint8_t> &payload)
+  {
+    std::vector<uint8_t> buf;
+    buf.reserve(payload.size() + CHECKSUM_BYTES);
+    buf.insert(buf.end(), payload.begin(), payload.end());
+
+    uint8_t checksum[32];
+    sha256d(payload.data(), payload.size(), checksum);
+    buf.insert(buf.end(), checksum, checksum + CHECKSUM_BYTES);
+
+    return base58EncodeGeneral(buf.data(), buf.size());
+  }
+
+  std::optional<std::vector<uint8_t>>
+  decodeBase58Check(const std::string &encoded)
+  {
+    if (encoded.empty())
+      return std::nullopt;
+
+    std::vector<uint8_t> decoded;
+    if (!base58DecodeGeneral(encoded, decoded))
+      return std::nullopt;
+
+    if (decoded.size() < CHECKSUM_BYTES)
+      return std::nullopt;
+
+    const size_t payload_len = decoded.size() - CHECKSUM_BYTES;
+
+    uint8_t checksum[32];
+    sha256d(decoded.data(), payload_len, checksum);
+
+    if (std::memcmp(checksum, decoded.data() + payload_len,
+                    CHECKSUM_BYTES) != 0)
+      return std::nullopt;
+
+    return std::vector<uint8_t>(decoded.begin(),
+                                decoded.begin() + payload_len);
   }
 } // namespace Common

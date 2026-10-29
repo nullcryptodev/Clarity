@@ -640,6 +640,62 @@ namespace State
 
     void putBridgeStats(const Core::BridgeStats &stats);
 
+    //  ---- Deposit destinations ----
+    //
+    //  A per-authority CCX deposit destination. See
+    //  BridgeDepositRecord in Core/BridgeTypes.h. Created by
+    //  BridgeRegisterDeposit; read by the watcher when it needs
+    //  to resolve "what does subaddress index N mint to?"
+    //
+    //  The record is immutable once written. Re-registration
+    //  allocates a new index; the old index continues to mint
+    //  deposits to the old destination.
+
+    bool getBridgeDepositDestination(
+        uint64_t source_chain_id,
+        uint64_t index,
+        Core::BridgeDepositRecord &out) const;
+
+    void putBridgeDepositDestination(
+        const Core::BridgeDepositRecord &rec);
+
+    //  Count of registrations the authority holds on this chain.
+    //  Used by the executor to enforce MAX_BRIDGE_DEPOSITS_PER_AUTHORITY
+    //  before writing a new record. O(registrations for this
+    //  authority), which is bounded by the per-authority cap.
+    uint64_t getBridgeDepositAuthorityCount(
+        uint64_t source_chain_id,
+        const Crypto::Address &authority) const;
+
+    //  Iterate every registration the authority holds on this
+    //  chain, in ascending index order. The callback receives
+    //  (index, record); return false to stop early. This is what
+    //  the wallet uses at startup to enumerate the caller's
+    //  existing destinations, and what the watcher uses to build
+    //  its subaddress set.
+    void forEachBridgeDepositForAuthority(
+        uint64_t source_chain_id,
+        const Crypto::Address &authority,
+        const std::function<bool(uint64_t index,
+                                 const Core::BridgeDepositRecord &)> &fn) const;
+
+    //  Iterate every registration on this chain, in ascending index
+    //  order, starting at `from_index`. The scanner uses this to
+    //  build its subaddress cache; the wallet uses it for a
+    //  chain-wide audit.
+    //
+    //  The visitor receives (index, record). Return false to stop
+    //  early. `max_results` bounds the iteration; 0 means
+    //  unbounded. At chain scale (up to MAX_BRIDGE_DEPOSITS_PER_CHAIN
+    //  = 100,000) a full scan is a one-time startup cost, and the
+    //  scanner will page it.
+    void forEachBridgeDepositForChain(
+        uint64_t source_chain_id,
+        uint64_t from_index,
+        size_t max_results,
+        const std::function<bool(uint64_t index,
+                                 const Core::BridgeDepositRecord &)> &fn) const;
+
     //  =====================================================================
     //  Global state
     //  =====================================================================

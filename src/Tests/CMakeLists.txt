@@ -34,6 +34,20 @@ target_include_directories(${TEST_TARGET}
     ${CMAKE_SOURCE_DIR}/external/gtest/include
 )
 
+# BridgeAdapters::AlwaysLoad instead of BridgeAdapters:
+#
+#   * The adapter .cpp files have static-init registrars that
+#     populate ChainAdapterRegistry. If any of them are discarded
+#     from the link (which a plain static library allows), any test
+#     that touches the registry — e.g. a test that queries
+#     ChainAdapterRegistry::find("btc") — sees an empty registry.
+#     The current tests don't touch the registry directly, but
+#     BridgeAdapters::AlwaysLoad eliminates the class of problem
+#     for any test that ever does.
+#
+#   * It costs nothing at link time (whole-archive on adapter
+#     objects is a few KB).
+#
 target_link_libraries(${TEST_TARGET}
   PRIVATE
     TestsCommon
@@ -46,10 +60,10 @@ target_link_libraries(${TEST_TARGET}
     TestsSerialization
     TestsState
     TestsWallet
+    BridgeAdapters::AlwaysLoad
     CoreLibs
     gtest
     gtest_main
-    monocypher
     ${MDBX_LIBRARY_TARGET}
     ${Boost_LIBRARIES}
     ${OPENSSL_LIBRARIES}

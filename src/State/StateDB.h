@@ -192,7 +192,40 @@ namespace State
       //  TBL_AMM_FARMS.
       TBL_AMM_POSITION_ACCRUALS = 46,
 
-      TBL_COUNT = 47,
+      //  Per-authority CCX deposit destinations. Two tables, both
+      //  indexed by a plain hash, both written by
+      //  executeBridgeRegisterDeposit. See Core/BridgeTypes.h's
+      //  BridgeDepositRecord for the record shape and
+      //  State/Keys.h's bridgeDepositDestination /
+      //  bridgeDepositByAuthority for the SMT keys.
+      //
+      //  TBL_BRIDGE_DEPOSIT_DESTINATIONS holds the mirror row of the
+      //  SMT record at Keys::bridgeDepositDestination(chain, index).
+      //  It is a mirror: the SMT leaf is authoritative, this table
+      //  is what the RPC reads. Not part of the state root, for the
+      //  same reason TBL_BRIDGE_STATS isn't: a node that never wrote
+      //  a mirror row would still produce the same state root as
+      //  one that did.
+      //
+      //  TBL_INDEX_BRIDGE_DEPOSITS_BY_AUTHORITY is the enumeration
+      //  index. Key layout is
+      //
+      //    [8]  source_chain_id  (BE)
+      //    [32] authority
+      //    [8]  index            (BE)
+      //
+      //  chosen so a prefix scan over (chain, authority) yields the
+      //  authority's registrations in ascending index order, which
+      //  is what both the wallet's "list my deposits" RPC and the
+      //  watcher's subaddress set want. Value = the 32-byte
+      //  destination pubkey, inlined so a caller that only wants
+      //  the destination avoids a second SMT read.
+      TBL_BRIDGE_DEPOSIT_DESTINATIONS = 47,
+      TBL_INDEX_BRIDGE_DEPOSITS_BY_AUTHORITY = 48,
+
+      TBL_INDEX_BRIDGE_DEPOSITS_BY_CHAIN = 49,
+      
+      TBL_COUNT = 50,
     };
 
     //  Per-table diagnostic information. Reported by the metrics

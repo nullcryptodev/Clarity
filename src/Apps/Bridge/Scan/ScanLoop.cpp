@@ -69,6 +69,7 @@ namespace Bridge
                              ChainRuntime &rt,
                              const std::string &chain_name,
                              DepositMap &watched,
+                             std::set<std::string> &attested,
                              std::set<std::string> &warned_unregistered_chains,
                              const std::shared_ptr<std::atomic<bool>> &stop)
     {
@@ -76,6 +77,9 @@ namespace Bridge
       try
       {
         status = rt.adapter->fetch_status(*rt.rpc);
+        std::cerr << "[" << chain_name << "] scan: fetch_status -> reachable="
+                  << status.reachable << " height=" << status.current_height
+                  << " version=\"" << status.daemon_version << "\"\n";
       }
       catch (const std::exception &e)
       {
@@ -91,10 +95,25 @@ namespace Bridge
       }
       rt.connected = true;
 
-      if (status.current_height > rt.last_source_height)
+      //  ---- Confirmation gate ----
+      const uint64_t depth = rt.config.confirmation_depth;
+      if (depth == 0)
+      {
+        std::cerr << "[" << chain_name
+                  << "] scan: confirmation_depth is 0; refusing to scan. "
+                     "Set confirmation_depth in the chain config.\n";
+        return;
+      }
+
+      const uint64_t confirmed_height =
+          status.current_height > depth
+              ? status.current_height - depth
+              : 0;
+
+      if (confirmed_height > rt.last_source_height)
       {
         const uint64_t from = rt.last_source_height + 1;
-        const uint64_t to = status.current_height;
+        const uint64_t to = confirmed_height;
         size_t found = 0;
 
         try
@@ -104,79 +123,12 @@ namespace Bridge
               [&](const ObservedDeposit &d)
               {
                 ++found;
-
                 const std::string key =
                     depositKey(d.source_tx_hash, d.source_output_index);
-
                 if (watched.find(key) == watched.end())
                 {
-                  Crypto::Hash attest_txid;
-                  std::string attest_err;
-                  const auto outcome =
-                      Submission::SubmitAttestation(
-                          *session, rt, d, &attest_txid, &attest_err);
-
-                  switch (outcome)
-                  {
-                  case Submission::AttestOutcome::Submitted:
-                    std::cerr << "[" << chain_name
-                              << "] scan: attested "
-                              << d.source_tx_hash.toString().substr(0, 16)
-                              << "..." << d.source_output_index
-                              << " -> " << attest_txid.toString() << "\n";
-                    watched.emplace(key, d);
-                    break;
-
-                  case Submission::AttestOutcome::AlreadyAttested:
-                    watched.emplace(key, d);
-                    break;
-
-                  case Submission::AttestOutcome::AlreadyConsumed:
-                    break;
-
-                  case Submission::AttestOutcome::NotAWriter:
-                    break;
-
-                  case Submission::AttestOutcome::Failed:
-                    //  If the failure is specifically "the source
-                    //  chain is not registered on Clarity," that
-                    //  is a permanent condition until the operator
-                    //  runs `register-chain`. Log it once per chain
-                    //  so the daemon log stays readable while the
-                    //  operator is setting up the chain. The
-                    //  deposit is NOT added to `watched` on this
-                    //  path, which means the next poll re-finds
-                    //  and re-attempts it. The moment the
-                    //  registration confirms, the retry succeeds
-                    //  and the deposit moves into `watched` as a
-                    //  normal Submitted attestation.
-                    if (attest_err.find("chain not registered") !=
-                        std::string::npos)
-                    {
-                      if (warned_unregistered_chains
-                              .insert(chain_name)
-                              .second)
-                      {
-                        std::cerr
-                            << "[" << chain_name
-                            << "] scan: source chain is not registered "
-                               "on Clarity.\n"
-                            << "  Run `register-chain " << chain_name
-                            << "` once to set it up. Deposits will be "
-                               "attested automatically once the "
-                               "registration confirms.\n";
-                      }
-                      break;
-                    }
-                    std::cerr << "[" << chain_name
-                              << "] scan: attest failed for "
-                              << d.source_tx_hash.toString().substr(0, 16)
-                              << "..." << d.source_output_index
-                              << ": " << attest_err << "\n";
-                    break;
-                  }
+                  watched.emplace(key, d);
                 }
-
                 return !stop->load(std::memory_order_acquire);
               });
         }
@@ -188,15 +140,93 @@ namespace Bridge
           return;
         }
 
-        rt.last_source_height = to;
-        std::cerr << "[" << chain_name << "] scan: processed heights "
-                  << from << ".." << to
-                  << ", " << found << " new deposit(s)\n";
+        uint64_t advance_to = to;
+        if (auto resolved = rt.adapter->highestFullyResolvedHeight();
+            resolved.has_value() && *resolved < to)
+        {
+          advance_to = *resolved;
+        }
+
+        if (advance_to > rt.last_source_height)
+        {
+          rt.last_source_height = advance_to;
+          std::cerr << "[" << chain_name << "] scan: processed heights "
+                    << from << ".." << advance_to;
+          if (advance_to < to)
+          {
+            std::cerr << " (held: unresolved deposits in " << (advance_to + 1)
+                      << ".." << to << "; will retry after next refresh)";
+          }
+          std::cerr << ", " << found << " new deposit(s)\n";
+        }
+        else
+        {
+          std::cerr << "[" << chain_name << "] scan: no progress on ["
+                    << from << ", " << to << "] (unresolved deposits at "
+                    << from << "; will retry after next refresh)\n";
+        }
       }
 
+      //  ---- Attestation + mint phase ----
+      //
+      //  For each tracked deposit:
+      //    1. If not yet attested, try. On success/AlreadyAttested,
+      //       mark attested so we stop retrying. On AlreadyConsumed,
+      //       drop the deposit. On Failed, log and leave un-attested:
+      //       next poll retries.
+      //    2. Try to assemble the mint block. If the block assembles,
+      //       submit the mint. On Submitted or AlreadyConsumed, drop
+      //       the deposit. On Failed, leave it: next poll retries.
       for (auto it = watched.begin(); it != watched.end();)
       {
+        const std::string &key = it->first;
         const ObservedDeposit &d = it->second;
+
+        if (attested.find(key) == attested.end())
+        {
+          Crypto::Hash attest_txid;
+          std::string attest_err;
+          const auto attest_outcome =
+              Submission::SubmitAttestation(
+                  *session, rt, d, &attest_txid, &attest_err);
+
+          switch (attest_outcome)
+          {
+          case Submission::AttestOutcome::Submitted:
+            std::cerr << "[" << chain_name
+                      << "] scan: attested deposit "
+                      << d.source_tx_hash.toString().substr(0, 16)
+                      << "..." << d.source_output_index
+                      << " -> " << attest_txid.toString() << "\n";
+            attested.insert(key);
+            break;
+
+          case Submission::AttestOutcome::AlreadyAttested:
+            attested.insert(key);
+            break;
+
+          case Submission::AttestOutcome::AlreadyConsumed:
+            it = watched.erase(it);
+            continue;
+
+          case Submission::AttestOutcome::NotAWriter:
+            if (warned_unregistered_chains.insert(chain_name).second)
+            {
+              std::cerr << "[" << chain_name
+                        << "] scan: not a writer for this chain; "
+                           "not attesting\n";
+            }
+            break;
+
+          case Submission::AttestOutcome::Failed:
+            std::cerr << "[" << chain_name
+                      << "] scan: attest failed for deposit "
+                      << d.source_tx_hash.toString().substr(0, 16)
+                      << "..." << d.source_output_index
+                      << ": " << attest_err << "\n";
+            break;
+          }
+        }
 
         std::string assemble_err;
         std::vector<uint8_t> block;
@@ -233,6 +263,16 @@ namespace Bridge
             it = watched.erase(it);
             continue;
           }
+          else if (submit_outcome == Submission::SubmitOutcome::Failed)
+          {
+            std::cerr << "[" << chain_name
+                      << "] scan: mint submit failed for deposit "
+                      << d.source_tx_hash.toString().substr(0, 16)
+                      << "..." << d.source_output_index
+                      << ": " << submit_err << "\n";
+          }
+          //  Disabled: leave for next poll (shouldn't happen here,
+          //  we just assembled a block).
         }
         else if (assemble_outcome ==
                  Submission::AssembleOutcome::Conflicting)
@@ -261,8 +301,48 @@ namespace Bridge
                     << "..." << d.source_output_index
                     << ": " << assemble_err << "\n";
         }
+        //  NotYetQuorum: silent. Normal while waiting for peers or
+        //  for our own attestation to confirm.
 
         ++it;
+      }
+
+      //  ---- Cursor persistence ----
+      //
+      //  Persist the cursor only when nothing tracked is at or
+      //  below the scanned height. That makes restart-after-crash
+      //  safe: a block whose deposit hasn't minted is not "done,"
+      //  so the cursor stays behind it, and the next run re-scans
+      //  it. On a busy bridge this means the cursor can lag by up
+      //  to `attestation + mint confirmation` per deposit; on
+      //  Bitcoin at testnet4 rates that's a few minutes at most.
+      //
+      //  A failure here is a performance regression on the next
+      //  restart, not a correctness issue (the in-memory cursor is
+      //  still correct and the loop continues normally), so we
+      //  log and continue.
+      if (!stop->load(std::memory_order_acquire))
+      {
+        bool any_below = false;
+        for (const auto &[key, dep] : watched)
+        {
+          (void)key;
+          if (dep.block_height <= rt.last_source_height)
+          {
+            any_below = true;
+            break;
+          }
+        }
+        if (!any_below)
+        {
+          if (!writeChainCursor(rt, rt.last_source_height))
+          {
+            std::cerr << "[" << chain_name
+                      << "] scan: could not persist cursor at height "
+                      << rt.last_source_height
+                      << "; continuing in memory\n";
+          }
+        }
       }
     }
 
@@ -856,6 +936,7 @@ namespace Bridge
                      std::shared_ptr<std::atomic<bool>> stop)
     {
       std::map<std::string, ObservedDeposit> watched_deposits;
+      std::set<std::string> attested_deposits;
       std::map<uint64_t, TrackedWithdrawal> tracked_withdrawals;
       std::set<std::string> warned_unregistered_chains;
       ReleaseTracker release_tracker;
@@ -873,6 +954,7 @@ namespace Bridge
         //  ---- Deposit phase ----
         runDepositScanPhase(session, *rt, chain_name,
                             watched_deposits,
+                            attested_deposits,
                             warned_unregistered_chains,
                             stop);
 

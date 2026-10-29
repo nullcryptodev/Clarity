@@ -332,4 +332,55 @@ namespace Crypto
     return Bech32Error::Ok;
   }
 
+  //  Encode pre-converted 5-bit data.
+  //
+  //  Identical to bech32Encode in everything except the source of
+  //  the 5-bit groups: here they are supplied by the caller instead
+  //  of derived from an 8-bit byte stream. See the header comment
+  //  for why segwit address encoding needs this.
+  std::string bech32Encode5(std::string_view hrp,
+                            const std::vector<uint8_t> &data5,
+                            Bech32Encoding encoding)
+  {
+    if (hrp.empty() || hrp.size() > BECH32_MAX_HRP_LENGTH)
+      return {};
+    for (char c : hrp)
+      if (!validHrpChar(c))
+        return {};
+
+    //  Data entries must be 5-bit values. bech32Encode gets this for
+    //  free because convertBitsTo5 emits only 0..31; a caller-facing
+    //  API must check.
+    for (uint8_t v : data5)
+      if (v > 31)
+        return {};
+
+    const size_t total_len =
+        hrp.size() + 1 + data5.size() + BECH32_CHECKSUM_LENGTH;
+    if (total_len > BECH32_MAX_LENGTH)
+      return {};
+
+    //  Checksum over hrpExpand(hrp) || data5 || [0,0,0,0,0,0].
+    std::vector<uint8_t> values = hrpExpand(hrp);
+    values.insert(values.end(), data5.begin(), data5.end());
+    for (size_t i = 0; i < BECH32_CHECKSUM_LENGTH; ++i)
+      values.push_back(0);
+
+    const uint32_t polymod_val = polymod(values) ^ checksumConst(encoding);
+
+    std::string out;
+    out.reserve(total_len);
+    out.append(hrp.data(), hrp.size());
+    out.push_back('1');
+    for (uint8_t v : data5)
+      out.push_back(CHARSET[v]);
+    for (int i = 0; i < 6; ++i)
+    {
+      const uint8_t v =
+          static_cast<uint8_t>((polymod_val >> (5 * (5 - i))) & 0x1f);
+      out.push_back(CHARSET[v]);
+    }
+    return out;
+  }
+
 } // namespace Crypto

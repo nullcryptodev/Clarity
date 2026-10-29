@@ -140,3 +140,37 @@ TEST(Common_Base64, IgnoresWhitespace)
   EXPECT_EQ(decodeBase64("Zm9v\nYmFy"), "foobar");
   EXPECT_EQ(decodeBase64("Zm9v\tYmFy"), "foobar");
 }
+
+TEST(Common_Base58Check, RoundTrip)
+{
+  const std::vector<uint8_t> payload = {0x00, 0x01, 0x02, 0x03, 0xFF};
+  const std::string enc = encodeBase58Check(payload);
+  auto dec = decodeBase58Check(enc);
+  ASSERT_TRUE(dec.has_value());
+  EXPECT_EQ(*dec, payload);
+}
+
+TEST(Common_Base58Check, TamperedLastCharRejected)
+{
+  const std::vector<uint8_t> payload = {0xDE, 0xAD, 0xBE, 0xEF};
+  std::string enc = encodeBase58Check(payload);
+  enc.back() = (enc.back() == '1') ? '2' : '1';
+  EXPECT_FALSE(decodeBase58Check(enc).has_value());
+}
+
+TEST(Common_Base58Check, TamperedMiddleCharRejected)
+{
+  const std::vector<uint8_t> payload = {0xDE, 0xAD, 0xBE, 0xEF};
+  std::string enc = encodeBase58Check(payload);
+  ASSERT_GT(enc.size(), 2u);
+  enc[1] = (enc[1] == '1') ? '2' : '1';
+  EXPECT_FALSE(decodeBase58Check(enc).has_value());
+}
+
+TEST(Common_Base58Check, TooShortRejected)
+{
+  EXPECT_FALSE(decodeBase58Check("").has_value());
+  EXPECT_FALSE(decodeBase58Check("1").has_value());
+  EXPECT_FALSE(decodeBase58Check("12").has_value());
+  EXPECT_FALSE(decodeBase58Check("123").has_value());
+}

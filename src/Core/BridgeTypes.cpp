@@ -10,6 +10,70 @@
 namespace Core
 {
   //  =========================================================================
+  //  BridgeDepositRecord
+  //  =========================================================================
+
+  std::vector<uint8_t> BridgeDepositRecord::serializeState() const
+  {
+    if (!isWellFormed())
+      return {};
+
+    std::vector<uint8_t> out;
+    out.reserve(STATE_SIZE);
+
+    Common::Writer w(out);
+    w.writeU64(source_chain_id);
+    w.writeU64(index);
+    w.writeBytes(destination.data.data(), destination.data.size());
+    w.writeBytes(authority.data.data(), authority.data.size());
+    w.writeU64(registered_at_height);
+
+    return out;
+  }
+
+  bool BridgeDepositRecord::deserializeState(const uint8_t *data, size_t len,
+                                             BridgeDepositRecord &out)
+  {
+    if (len != STATE_SIZE)
+      return false;
+
+    Common::Reader r(data, len);
+
+    BridgeDepositRecord rec;
+    rec.source_chain_id = r.readU64();
+    rec.index = r.readU64();
+    r.readBytes(rec.destination.data.data(), rec.destination.data.size());
+    r.readBytes(rec.authority.data.data(), rec.authority.data.size());
+    rec.registered_at_height = r.readU64();
+
+    if (!r.ok())
+      return false;
+    if (!rec.isWellFormed())
+      return false;
+
+    out = std::move(rec);
+    return true;
+  }
+
+  void BridgeDepositRecord::serialize(Serialization::ISerializer &s)
+  {
+    s(source_chain_id, "source_chain_id");
+    s(index, "index");
+    s(destination, "destination");
+    s(authority, "authority");
+    s(registered_at_height, "registered_at_height");
+  }
+
+  void BridgeDepositRecord::serialize(Serialization::ISerializer &s) const
+  {
+    s(source_chain_id, "source_chain_id");
+    s(index, "index");
+    s(destination, "destination");
+    s(authority, "authority");
+    s(registered_at_height, "registered_at_height");
+  }
+
+  //  =========================================================================
   //  BridgeWithdrawal
   //  =========================================================================
 
@@ -34,7 +98,6 @@ namespace Core
     w.writeU8(static_cast<uint8_t>(destination_address.size()));
     w.writeString(destination_address);
 
-    //  Release fields are always written, zeroed when unreleased.
     w.writeBytes(release_tx_hash.data.data(), release_tx_hash.data.size());
     w.writeU64(release_height);
     w.writeU64(released_at_height);
@@ -207,86 +270,6 @@ namespace Core
   }
 
   //  =========================================================================
-  //  Status names
-  //  =========================================================================
-
-  const char *bridgeMintStatusName(BridgeMintStatus s) noexcept
-  {
-    switch (s)
-    {
-    case BridgeMintStatus::Ok:
-      return "ok";
-    case BridgeMintStatus::Paused:
-      return "paused";
-    case BridgeMintStatus::ChainDisabled:
-      return "chain_disabled";
-    case BridgeMintStatus::ChainNotRegistered:
-      return "chain_not_registered";
-    case BridgeMintStatus::TokenNotFound:
-      return "token_not_found";
-    case BridgeMintStatus::TokenFingerprintMismatch:
-      return "token_fingerprint_mismatch";
-    case BridgeMintStatus::ValidatorSetTooSmall:
-      return "validator_set_too_small";
-    case BridgeMintStatus::BelowValidatorThreshold:
-      return "below_validator_threshold";
-    case BridgeMintStatus::BadValidatorSignature:
-      return "bad_validator_signature";
-    case BridgeMintStatus::Replay:
-      return "replay";
-    }
-    return "unknown";
-  }
-
-  const char *bridgeBurnStatusName(BridgeBurnStatus s) noexcept
-  {
-    switch (s)
-    {
-    case BridgeBurnStatus::Ok:
-      return "ok";
-    case BridgeBurnStatus::Paused:
-      return "paused";
-    case BridgeBurnStatus::ChainDisabled:
-      return "chain_disabled";
-    case BridgeBurnStatus::ChainNotRegistered:
-      return "chain_not_registered";
-    case BridgeBurnStatus::TokenNotFound:
-      return "token_not_found";
-    case BridgeBurnStatus::TokenFingerprintMismatch:
-      return "token_fingerprint_mismatch";
-    case BridgeBurnStatus::InsufficientBalance:
-      return "insufficient_balance";
-    case BridgeBurnStatus::DestinationTooShort:
-      return "destination_too_short";
-    case BridgeBurnStatus::DestinationTooLong:
-      return "destination_too_long";
-    }
-    return "unknown";
-  }
-
-  const char *bridgeAckStatusName(BridgeAckStatus s) noexcept
-  {
-    switch (s)
-    {
-    case BridgeAckStatus::Ok:
-      return "ok";
-    case BridgeAckStatus::Paused:
-      return "paused";
-    case BridgeAckStatus::ChainNotRegistered:
-      return "chain_not_registered";
-    case BridgeAckStatus::ValidatorSetTooSmall:
-      return "validator_set_too_small";
-    case BridgeAckStatus::BelowValidatorThreshold:
-      return "below_validator_threshold";
-    case BridgeAckStatus::BadValidatorSignature:
-      return "bad_validator_signature";
-    case BridgeAckStatus::WithdrawalNotFound:
-      return "withdrawal_not_found";
-    }
-    return "unknown";
-  }
-
-  //  =========================================================================
   //  BridgeAttestation
   //  =========================================================================
 
@@ -353,36 +336,6 @@ namespace Core
     s(attested_at_height, "attested_at_height");
   }
 
-  const char *bridgeAttestStatusName(BridgeAttestStatus s) noexcept
-  {
-    switch (s)
-    {
-    case BridgeAttestStatus::Ok:
-      return "Ok";
-    case BridgeAttestStatus::Paused:
-      return "Paused";
-    case BridgeAttestStatus::ChainNotRegistered:
-      return "ChainNotRegistered";
-    case BridgeAttestStatus::ChainDisabled:
-      return "ChainDisabled";
-    case BridgeAttestStatus::PayloadMalformed:
-      return "PayloadMalformed";
-    case BridgeAttestStatus::DepositAlreadyConsumed:
-      return "DepositAlreadyConsumed";
-    case BridgeAttestStatus::SignerIndexOutOfRange:
-      return "SignerIndexOutOfRange";
-    case BridgeAttestStatus::SignerNotActiveValidator:
-      return "SignerNotActiveValidator";
-    case BridgeAttestStatus::BadSignature:
-      return "BadSignature";
-    case BridgeAttestStatus::AlreadyAttested:
-      return "AlreadyAttested";
-    case BridgeAttestStatus::ConflictingAttestation:
-      return "ConflictingAttestation";
-    }
-    return "Unknown";
-  }
-
   //  =========================================================================
   //  BridgeAckAttestation
   //  =========================================================================
@@ -433,36 +386,6 @@ namespace Core
     s(signer_index, "signer_index");
     s(signature, "signature");
     s(attested_at_height, "attested_at_height");
-  }
-
-  const char *bridgeAckAttestStatusName(BridgeAckAttestStatus s) noexcept
-  {
-    switch (s)
-    {
-    case BridgeAckAttestStatus::Ok:
-      return "Ok";
-    case BridgeAckAttestStatus::Paused:
-      return "Paused";
-    case BridgeAckAttestStatus::ChainNotRegistered:
-      return "ChainNotRegistered";
-    case BridgeAckAttestStatus::ChainDisabled:
-      return "ChainDisabled";
-    case BridgeAckAttestStatus::PayloadMalformed:
-      return "PayloadMalformed";
-    case BridgeAckAttestStatus::WithdrawalNotFound:
-      return "WithdrawalNotFound";
-    case BridgeAckAttestStatus::WithdrawalAlreadyReleased:
-      return "WithdrawalAlreadyReleased";
-    case BridgeAckAttestStatus::SignerIndexOutOfRange:
-      return "SignerIndexOutOfRange";
-    case BridgeAckAttestStatus::SignerNotActiveValidator:
-      return "SignerNotActiveValidator";
-    case BridgeAckAttestStatus::BadSignature:
-      return "BadSignature";
-    case BridgeAckAttestStatus::AlreadyAttested:
-      return "AlreadyAttested";
-    }
-    return "Unknown";
   }
 
   //  =========================================================================
@@ -552,6 +475,10 @@ namespace Core
     s(last_release_height, "last_release_height");
     s(registered_at_height, "registered_at_height");
   }
+
+  //  =========================================================================
+  //  BridgeEvent
+  //  =========================================================================
 
   const char *bridgeEventKindName(BridgeEventKind k) noexcept
   {
@@ -644,4 +571,84 @@ namespace Core
     out = std::move(e);
     return true;
   }
-}
+
+  //  =========================================================================
+  //  Status names
+  //  =========================================================================
+
+  const char *bridgeMintStatusName(BridgeMintStatus s) noexcept
+  {
+    switch (s)
+    {
+    case BridgeMintStatus::Ok:
+      return "ok";
+    case BridgeMintStatus::Paused:
+      return "paused";
+    case BridgeMintStatus::ChainDisabled:
+      return "chain_disabled";
+    case BridgeMintStatus::ChainNotRegistered:
+      return "chain_not_registered";
+    case BridgeMintStatus::TokenNotFound:
+      return "token_not_found";
+    case BridgeMintStatus::TokenFingerprintMismatch:
+      return "token_fingerprint_mismatch";
+    case BridgeMintStatus::ValidatorSetTooSmall:
+      return "validator_set_too_small";
+    case BridgeMintStatus::BelowValidatorThreshold:
+      return "below_validator_threshold";
+    case BridgeMintStatus::BadValidatorSignature:
+      return "bad_validator_signature";
+    case BridgeMintStatus::Replay:
+      return "replay";
+    }
+    return "unknown";
+  }
+
+  const char *bridgeBurnStatusName(BridgeBurnStatus s) noexcept
+  {
+    switch (s)
+    {
+    case BridgeBurnStatus::Ok:
+      return "ok";
+    case BridgeBurnStatus::Paused:
+      return "paused";
+    case BridgeBurnStatus::ChainDisabled:
+      return "chain_disabled";
+    case BridgeBurnStatus::ChainNotRegistered:
+      return "chain_not_registered";
+    case BridgeBurnStatus::TokenNotFound:
+      return "token_not_found";
+    case BridgeBurnStatus::TokenFingerprintMismatch:
+      return "token_fingerprint_mismatch";
+    case BridgeBurnStatus::InsufficientBalance:
+      return "insufficient_balance";
+    case BridgeBurnStatus::DestinationTooShort:
+      return "destination_too_short";
+    case BridgeBurnStatus::DestinationTooLong:
+      return "destination_too_long";
+    }
+    return "unknown";
+  }
+
+  const char *bridgeAckStatusName(BridgeAckStatus s) noexcept
+  {
+    switch (s)
+    {
+    case BridgeAckStatus::Ok:
+      return "ok";
+    case BridgeAckStatus::Paused:
+      return "paused";
+    case BridgeAckStatus::ChainNotRegistered:
+      return "chain_not_registered";
+    case BridgeAckStatus::ValidatorSetTooSmall:
+      return "validator_set_too_small";
+    case BridgeAckStatus::BelowValidatorThreshold:
+      return "below_validator_threshold";
+    case BridgeAckStatus::BadValidatorSignature:
+      return "bad_validator_signature";
+    case BridgeAckStatus::WithdrawalNotFound:
+      return "withdrawal_not_found";
+    }
+    return "unknown";
+  }
+} // namespace Core

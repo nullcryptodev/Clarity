@@ -5,15 +5,20 @@
 
 #include "Args.h"
 #include "Adapters/ChainAdapter.h"
+#include "Http/HttpServer.h"
 #include "Repl/Commands.h"
 #include "Session/Session.h"
 #include "Signals.h"
 #include "Startup.h"
 #include "Config.h"
 
+#include "Core/Bridge/Bitcoin.h"
+
 #include "Common/Repl.h"
 
+#include "Crypto/Ed25519.h"
 #include "Crypto/Types.h"
+
 #include "Wallet/AddressCodec.h"
 #include "Wallet/RpcClient.h"
 
@@ -109,10 +114,15 @@ namespace
       if (cfg.raw_json.is_object())
         adapter->set_transport_config(cfg.raw_json);
 
-      //  Parse the deposit address into the adapter's
-      //  deposit_script_ before probing. Without this, the first
-      //  scan_deposits call throws "deposit script not set".
-      if (!cfg.bridge_address.empty())
+      //  Bitcoin no longer uses a static deposit address; its
+      //  deposit addresses are derived per registration index.
+      //  Skipping the parse for BTC avoids a spurious warning at
+      //  startup (BitcoinAdapter::parse_deposit_address returns
+      //  nullopt with a message that says exactly this).
+      const bool is_btc =
+          (adapter->source_chain_id() ==
+           Core::BitcoinBridge::BTC_CHAIN_ID);
+      if (!cfg.bridge_address.empty() && !is_btc)
       {
         std::string parse_err;
         auto blob = adapter->parse_deposit_address(cfg.bridge_address, &parse_err);
@@ -218,13 +228,21 @@ namespace
 
   //  Load the custody wallet's private view key from a file.
   //
-  //  Same file format as --consensus-key-file: a single 32-byte
-  //  secret as 64 hex chars, optional 0x prefix, whitespace
-  //  trimmed. The key is not a signing key — it is the "watch-
-  //  only" half of the custody wallet, used solely by the
-  //  adapter to identify which vout of a scanned deposit pays to
-  //  the custody address (via Crypto::generateKeyDerivation and
-  //  Crypto::derivePublicKey).
+  //  File format: a single 32-byte secret as 64 hex chars, optional
+  //  0x prefix, whitespace trimmed. This is the value
+  //  `conceal-wallet-rpc query_key --key-type view` returns, NOT
+  //  the seed from get_seed or a mnemonic. The two are different
+  //  byte sequences and only the reduced scalar works with
+  //  Crypto::generateKeyDerivation (whose internal sc_check
+  //  rejects a seed).
+  //
+  //  Rejecting a seed at load time is the whole point of this
+  //  function's validation: a seed that got through would let the
+  //  daemon start, connect to the chain, and then silently fail
+  //  every deposit scan (generateKeyDerivation returns false for
+  //  every tx, no deposits are detected, and the operator sees
+  //  "no deposits" forever). Catching it here is the difference
+  //  between a five-second fix and an afternoon of debugging.
   bool loadViewKeyFromFile(
       Bridge::WatcherSession &session,
       const std::string &path)
@@ -287,36 +305,75 @@ namespace
       key.data[i] = static_cast<uint8_t>((hi << 4) | lo);
     }
 
+    //  The 32 bytes must be a valid scalar mod the ed25519 group
+    //  order — i.e. what `query_key` returns, not what `get_seed`
+    //  returns. A seed is nearly always > ℓ and would be rejected
+    //  by generateKeyDerivation, causing the scanner to silently
+    //  detect zero deposits. Rejecting it here is loud and early.
+    if (!Crypto::isValidScalar(key))
+    {
+      std::cerr << "error: --view-key-file: the value in '" << path
+                << "' is not a valid CCX view key.\n"
+                << "  The 32 bytes are not a canonical scalar mod the "
+                   "ed25519 group order.\n"
+                << "  You probably exported the *seed* (or a mnemonic-"
+                   "derived value) instead of the view key.\n"
+                << "  Run `conceal-wallet-rpc query_key --key-type view` "
+                   "against the custody wallet to get the correct "
+                   "32-byte scalar.\n";
+      return false;
+    }
+
     session.custody_view_key = key;
     std::cerr << "[startup] loaded custody_view_key from " << path << "\n";
     return true;
   }
 
-  bool loadMintDestination(
+  //  ---- HTTP API ----
+  //
+  //  Start the deposit-address HTTP server if it's enabled in
+  //  the config. Returns nullptr if disabled or if the bind
+  //  failed. A bind failure is non-fatal: the scan worker is the
+  //  critical path; the HTTP API is for front ends, and an
+  //  operator who can't bind can still run the bridge headless.
+  std::unique_ptr<Bridge::HttpServer> startHttpApi(
       Bridge::WatcherSession &session,
-      const std::string &address_bech32m)
+      const Bridge::WatcherConfig &config)
   {
-    if (address_bech32m.empty())
-      return true;
-
-    auto addr = Wallet::decodeAddress(
-        address_bech32m, session.currentNetwork());
-    if (!addr.has_value())
+    if (config.deposit_api_port == 0)
     {
-      std::cerr << "error: --mint-destination: could not decode '"
-                << address_bech32m
-                << "' for the current network\n";
-      return false;
+      std::cerr << "[startup] deposit-address API disabled "
+                   "(deposit_api_port=0)\n";
+      return nullptr;
     }
-    session.mint_destination = *addr;
-    std::cerr << "[startup] mint_destination set to "
-              << address_bech32m << "\n";
-    return true;
+
+    auto server = std::make_unique<Bridge::HttpServer>(
+        session,
+        config.deposit_api_bind.empty()
+            ? std::string("127.0.0.1")
+            : config.deposit_api_bind,
+        config.deposit_api_port);
+
+    if (!server->start())
+    {
+      std::cerr << "[startup] deposit-address API unavailable "
+                   "(bind failed); bridge continues without it\n";
+      return nullptr;
+    }
+
+    return server;
   }
+
 } // anonymous namespace
 
 int main(int argc, char **argv)
 {
+  //  Populate the chain-adapter registry before anything touches
+  //  it. This is what makes the static-init registrars in each
+  //  adapter file reliable when the adapters are linked in from
+  //  a static library. See ChainAdapterRegistry.cpp.
+  Bridge::registerAllChainAdapters();
+
   Bridge::Args args;
   try
   {
@@ -425,9 +482,6 @@ int main(int argc, char **argv)
         if (!loadViewKeyFromFile(session, args.config.view_key_file))
           return 1;
       }
-
-      if (!loadMintDestination(session, args.config.mint_destination))
-        return 1;
     }
     else
     {
@@ -450,9 +504,6 @@ int main(int argc, char **argv)
         if (!loadViewKeyFromFile(session, args.config.view_key_file))
           return 1;
       }
-
-      if (!loadMintDestination(session, args.config.mint_destination))
-        return 1;
     }
   }
   catch (const std::exception &e)
@@ -485,10 +536,29 @@ int main(int argc, char **argv)
         return 1;
       }
 
+      //  ---- HTTP API ----
+      //
+      //  Start after `start` succeeds (custody is installed,
+      //  signer is open, Clarity is reachable). The server must
+      //  outlive the wait loop below; stop it before we close
+      //  the keystore and return.
+      auto http_api = startHttpApi(session, args.config);
+      if (http_api)
+      {
+        std::cerr << "[startup] deposit-address API on http://"
+                  << args.config.deposit_api_bind << ":"
+                  << http_api->boundPort()
+                  << "/bridge/deposit-address\n";
+      }
+
       while (session.running && !Bridge::g_stop_requested)
       {
         std::this_thread::sleep_for(std::chrono::seconds(1));
       }
+
+      //  ---- HTTP API shutdown ----
+      if (http_api)
+        http_api->stop();
 
       Bridge::requestStopAllScans();
       Bridge::closeKeystore(session);
@@ -510,6 +580,23 @@ int main(int argc, char **argv)
     Bridge::requestStopAllScans();
     Bridge::closeKeystore(session);
     return exit_code;
+  }
+
+  //  ---- HTTP API ----
+  //
+  //  Interactive mode. Start after keystore open, before the REPL
+  //  loop. This means the API is available as soon as the operator
+  //  can type into the REPL. `start btc` still has to be run before
+  //  the API can answer (custody installs there), but the server
+  //  itself is up immediately, so a front end can poll and get
+  //  "custody not installed" instead of connection refused.
+  auto http_api = startHttpApi(session, args.config);
+  if (http_api)
+  {
+    std::cerr << "[startup] deposit-address API on http://"
+              << args.config.deposit_api_bind << ":"
+              << http_api->boundPort()
+              << "/bridge/deposit-address\n";
   }
 
   Common::Repl repl;
@@ -536,6 +623,10 @@ int main(int argc, char **argv)
       std::cerr << "error: command failed: " << e.what() << "\n";
     }
   }
+
+  //  ---- HTTP API shutdown ----
+  if (http_api)
+    http_api->stop();
 
   Bridge::requestStopAllScans();
 
