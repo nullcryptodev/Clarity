@@ -205,12 +205,23 @@ namespace Bridge
       cfg.state_dir = getString(j, "state_dir", "./bridge-state");
       cfg.log_level = getString(j, "log_level", "info");
 
-      //  A previous version of the config file could carry a
-      //  "watcher_id" key. Under the validator-is-watcher model
-      //  there is no per-chain watcher id; the daemon's validator
-      //  id is resolved from the keystore address at runtime. The
-      //  key is silently ignored if present, so an old config file
-      //  does not fail to load.
+      //  Deposit-address HTTP API. Port 0 disables the endpoint
+      //  entirely; any other value must fit in uint16_t. Bind
+      //  address defaults to loopback; an operator who wants the
+      //  API reachable from beyond a local front end must set
+      //  deposit_api_bind explicitly (e.g. "0.0.0.0").
+      //
+      //  The fields existed on WatcherConfig and were read by
+      //  main.cpp's startHttpApi, but nothing populated them from
+      //  the config file, so the defaults were unconditional.
+      const uint64_t api_port = getUInt(j, "deposit_api_port", 9638);
+      if (api_port > 65535)
+        throw std::runtime_error(
+            "config: deposit_api_port out of range (0..65535): " +
+            std::to_string(api_port));
+      cfg.deposit_api_port = static_cast<uint16_t>(api_port);
+      cfg.deposit_api_bind =
+          getString(j, "deposit_api_bind", "127.0.0.1");
 
       if (j.contains("no_wizard") && j["no_wizard"].is_boolean())
         cfg.no_wizard = j["no_wizard"].get<bool>();

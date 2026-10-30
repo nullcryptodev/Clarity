@@ -169,6 +169,22 @@ namespace Bridge
     std::pair<uint8_t, uint8_t> registration_blob_bounds() const override;
     uint32_t registration_active_validator_min() const override;
 
+    //  submit_release's building blocks, separated so the flow
+    //  in the .cpp reads as "enumerate → pick → build → sign →
+    //  broadcast" without 200 lines of inline HTTP parsing.
+    //  They are mempool.space-only; a bitcoind transport would
+    //  need a different implementation and is out of scope for
+    //  v1 (see the comment on submit_release).
+    struct UtxoCandidate
+    {
+        std::string address;                 // bech32, for logging
+        std::vector<uint8_t> script;         // 22-byte P2WPKH script
+        uint64_t index{0};                   // custody index; feeding derivePrivateKeyAt
+        std::array<uint8_t, 32> txid_wire{}; // wire-order prev_txid
+        uint32_t vout{0};
+        uint64_t value_sat{0};
+    };
+
   private:
     std::vector<uint8_t> deposit_script_;
     BitcoinConfig config_;
@@ -197,6 +213,14 @@ namespace Bridge
         uint64_t to_height,
         const std::function<bool(const ObservedDeposit &)> &on_deposit)
         const;
+
+    //  ---- Release-path helpers (mempool.space transport) ----
+
+    std::optional<std::vector<UtxoCandidate>>
+    fetchCustodyUtxos(std::string *error_out) const;
+
+    std::optional<uint64_t>
+    fetchHalfHourFeeRate(std::string *error_out) const;
 
     std::optional<uint64_t> fetch_release_height_bitcoind(
         Wallet::RpcClient &rpc,

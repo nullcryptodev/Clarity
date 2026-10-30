@@ -268,7 +268,14 @@ namespace Bridge
     }
   } // anonymous namespace
 
-  BitcoinCustody::~BitcoinCustody() = default;
+  BitcoinCustody::~BitcoinCustody()
+  {
+    if (have_seed_)
+    {
+      Crypto::secureZero(seed_.data(), seed_.size());
+      have_seed_ = false;
+    }
+  }
 
   std::unique_ptr<BitcoinCustody>
   BitcoinCustody::create_or_load(const std::string &custody_dir,
@@ -411,18 +418,31 @@ namespace Bridge
     }
 
     //  ---- mnemonic -> seed -> BIP84 account xpub ----
-    uint8_t seed[64];
-    Wallet::mnemonicToSeed(mnemonic, /*passphrase=*/"", seed);
+    //
+    //  The seed is retained on the custody object: the release
+    //  path needs it to derive the spending key for the deposit
+    //  address a UTXO arrived at, and re-running PBKDF2 + Argon2id
+    //  per release is both slow and a second place for the
+    //  password to leak. Retention is the standard custody-wallet
+    //  tradeoff and matches how the CCX adapter keeps
+    //  bridge_custody_view_priv for the process lifetime.
+    //
+    //  The seed is copied into custody->seed_ and the local copy
+    //  is zeroed. On every failure path below, custody's
+    //  destructor (or an explicit zero here, before returning
+    //  nullptr) wipes the retained copy.
+    std::array<uint8_t, 64> seed{};
+    Wallet::mnemonicToSeed(mnemonic, /*passphrase=*/"", seed.data());
     Crypto::secureZero(mnemonic.data(), mnemonic.size());
 
-    const std::vector<uint8_t> seed_vec(seed, seed + sizeof(seed));
-    Crypto::secureZero(seed, sizeof(seed));
+    const std::vector<uint8_t> seed_vec(seed.begin(), seed.end());
 
     std::string xpub_err;
     auto account_xpub =
         Crypto::bip84AccountXpub(seed_vec, network, &xpub_err);
     if (!account_xpub.has_value())
     {
+      Crypto::secureZero(seed.data(), seed.size());
       if (error_out)
         *error_out = "could not derive BIP84 account xpub: " + xpub_err;
       return nullptr;
@@ -433,10 +453,13 @@ namespace Bridge
     custody->source_ = Source::Generated;
     custody->master_fp_ = Crypto::keyFingerprint(account_xpub->pubkey);
     custody->network_ = network;
+    custody->seed_ = seed;
+    custody->have_seed_ = true;
+    Crypto::secureZero(seed.data(), seed.size());
 
     const std::vector<uint32_t> tail = {0u}; // receive branch
     if (!custody->init_common(network, tail, error_out))
-      return nullptr;
+      return nullptr; // custody's destructor wipes seed_
 
     return custody;
   }
@@ -615,5 +638,74 @@ namespace Bridge
   std::string BitcoinCustody::accountXpubDisplay() const
   {
     return Crypto::encodeExtendedPubKey(account_, network_);
+  }
+
+  std::optional<Crypto::ExtendedPrivKey>
+  BitcoinCustody::derivePrivateKeyAt(
+      uint64_t index,
+      std::string *error_out) const
+  {
+    if (source_ != Source::Generated || !have_seed_)
+    {
+      if (error_out)
+        *error_out =
+            "BitcoinCustody: cannot derive a private key in "
+            "watch-only (FromXpub) mode; the seed was never "
+            "loaded, so spending from this custody is impossible "
+            "by construction";
+      return std::nullopt;
+    }
+
+    //  Walk the same path deriveInto does: the account tail
+    //  (receive branch, 0) followed by the index. Use
+    //  derivePathPriv (which accepts non-hardened indices and
+    //  does the secp256k1 scalar arithmetic) rather than the
+    //  public-only derivePath.
+    std::vector<uint32_t> path = tail_;
+    path.push_back(static_cast<uint32_t>(index & 0x7FFFFFFF));
+
+    std::string master_err;
+    auto master = Crypto::masterFromSeed(
+        std::vector<uint8_t>(seed_.begin(), seed_.end()), &master_err);
+    if (!master.has_value())
+    {
+      if (error_out)
+        *error_out = "masterFromSeed failed: " + master_err;
+      return std::nullopt;
+    }
+
+    //  Hardened account path m/84'/<coin>'/0' must be
+    //  re-walked first, because masterFromSeed gives us the
+    //  BIP32 master and derivePathPriv only descends from
+    //  whatever node it's handed. The account_ xpub in this
+    //  object is already at that path, but xpub → privkey is
+    //  not possible; we have to redo the hardened walk.
+    const uint32_t coin =
+        (network_ == Crypto::BitcoinNetwork::Mainnet) ? 0u : 1u;
+    const std::vector<uint32_t> account_path = {
+        84u | 0x80000000u,
+        coin | 0x80000000u,
+        0u | 0x80000000u,
+    };
+
+    std::string path_err;
+    auto account = Crypto::derivePathPriv(*master, account_path, &path_err);
+    if (!account.has_value())
+    {
+      if (error_out)
+        *error_out = "derivePathPriv (account) failed: " + path_err;
+      return std::nullopt;
+    }
+
+    std::string child_err;
+    auto child = Crypto::derivePathPriv(*account, path, &child_err);
+    if (!child.has_value())
+    {
+      if (error_out)
+        *error_out = "derivePathPriv (child) failed: " + child_err;
+      return std::nullopt;
+    }
+
+    return child;
   }
 } // namespace Bridge

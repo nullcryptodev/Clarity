@@ -176,17 +176,25 @@ namespace Bridge
     //  the ed25519 seed. See ChainRuntime::bridge_custody_view_priv.
     std::optional<Crypto::SecretKey> custody_view_key;
 
-    //  NOTE: no `mint_destination` field here.
-    //
-    //  Where a deposit mints is a property of the deposit, not of
-    //  the watcher. It is carried on ObservedDeposit::destination,
-    //  populated by the adapter from the deposit's own binding
-    //  (Bitcoin OP_RETURN, CCX subaddress registration), and
-    //  submitted verbatim by Submission::SubmitAttestation. A
-    //  session-level destination would be a per-operator choice
-    //  layered on top of a per-deposit fact, which is exactly the
-    //  mismatch the on-chain "conflicting attestation" check
-    //  exists to catch — better to have no way to express it.
+    //  Root state directory, expanded (no leading "~"). Set by
+    //  main.cpp after expandHome(); used by cmd_start to place the
+    //  Bitcoin custody file under <state_dir>/<chain>/, matching
+    //  where the scan cursor lives. Empty until main.cpp sets it.
+    std::string state_dir;
+
+    //  Port the deposit-address HTTP API actually bound to, or 0
+    //  if the API is disabled or the bind failed. Written once by
+    //  main.cpp's startHttpApi() after a successful bind, read by
+    //  cmd_status. Not atomic: written on the main thread before the
+    //  REPL loop starts, read only from the REPL thread thereafter.
+    uint16_t deposit_api_bound_port{0};
+
+    //  Bind address the deposit-address HTTP API actually used, or
+    //  empty if the API is disabled or the bind failed. Written by
+    //  main.cpp's startHttpApi() alongside deposit_api_bound_port;
+    //  read by cmd_status. Not cleared on keystore close/reset —
+    //  it's process config, not session state.
+    std::string deposit_api_bind;
 
     bool running{true};
 

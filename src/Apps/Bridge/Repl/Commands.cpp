@@ -415,6 +415,20 @@ namespace Bridge
       std::cout << "Keystore: (none)\n";
     }
 
+    if (session.deposit_api_bound_port != 0)
+    {
+      std::cout << "Deposit API: http://"
+                << (session.deposit_api_bind.empty()
+                        ? std::string("127.0.0.1")
+                        : session.deposit_api_bind)
+                << ":" << session.deposit_api_bound_port
+                << "/bridge/deposit-address\n";
+    }
+    else
+    {
+      std::cout << "Deposit API: disabled\n";
+    }
+
     std::cout << "\nChains:\n";
     if (session.chains.empty())
     {
@@ -1317,16 +1331,15 @@ namespace Bridge
         }
 
         const std::string custody_dir =
-            rt->config.state_subdir.empty()
-                ? rt->chain_short_name()
-                : rt->config.state_subdir;
+            std::filesystem::path(
+                session.state_dir.empty() ? "." : session.state_dir) /
+            (rt->config.state_subdir.empty()
+                 ? rt->chain_short_name()
+                 : rt->config.state_subdir);
 
         std::string custody_err;
         auto custody = BitcoinCustody::create_or_load(
-            custody_dir,
-            net,
-            session.keystore_password,
-            &custody_err);
+            custody_dir, net, session.keystore_password, &custody_err);
 
         if (!custody)
         {
@@ -2401,6 +2414,7 @@ namespace Bridge
     }
 
     rt->last_source_height = (from == 0) ? 0 : from - 1;
+    writeChainCursor(*rt, rt->last_source_height);
 
     std::cout << "Cursor for " << rt->chain_short_name()
               << " reset. Next scan will start at " << from << ".\n";

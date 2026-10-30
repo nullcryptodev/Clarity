@@ -1560,6 +1560,97 @@ namespace Wallet
       return std::nullopt;
     }
 
+    //  Chain-aware destination-blob shape check.
+    //
+    //  The burn tx carries destination_blob verbatim to the
+    //  withdrawal record; the release path (CcxAdapter or
+    //  BitcoinAdapter, via validate_destination) is what actually
+    //  consumes it. A blob that the release-side validator will
+    //  reject is an unreleasable burn: the burn is on-chain, the
+    //  quorum forms, the release attempt fails, and the user's
+    //  value is stranded. Catching the shape at build time moves
+    //  the failure from "after quorum + finality" to "before the
+    //  tx is signed", which is strictly better.
+    //
+    //  For CCX, the 64-byte length is the whole shape; the spend
+    //  and view keys are opaque pubkeys and there's nothing
+    //  cheaper to validate here than "is it 64 bytes". The
+    //  existing `destination_blob.size() > 255` check above is
+    //  not enough — a 40-byte blob would pass it and fail every
+    //  release attempt. So enforce 64 for CCX here too.
+    //
+    //  For BTC, accept the four standard output-script shapes.
+    //  Anything else (ASCII bytes of the bech32 string, the raw
+    //  20-byte hash, a P2WSH script) is rejected. The check is
+    //  chain-agnostic in the sense that all four shapes are
+    //  valid on mainnet/testnet/regtest — only the bech32 HRP
+    //  differs, and destination_blob doesn't carry the HRP.
+    {
+      constexpr uint64_t kCcxChainId = 0x43435831ULL; // 'CCX1'
+      constexpr uint64_t kBtcChainId = 0x42544331ULL; // 'BTC1'
+
+      const auto &b = params.destination_blob;
+      const size_t n = b.size();
+
+      if (params.source_chain_id == kCcxChainId)
+      {
+        if (n != 64)
+        {
+          if (error_out)
+            *error_out = WalletStatus::fail(
+                WalletError::InvalidParameter,
+                "CCX destination_blob must be exactly 64 bytes "
+                "(spend ‖ view pubkeys); got " +
+                    std::to_string(n));
+          return std::nullopt;
+        }
+      }
+      else if (params.source_chain_id == kBtcChainId)
+      {
+        const bool valid_btc_shape =
+            (n == 22 && b[0] == 0x00 && b[1] == 0x14) ||                  // P2WPKH
+            (n == 23 && b[0] == 0xa9 && b[1] == 0x14 && b[22] == 0x87) || // P2SH
+            (n == 25 && b[0] == 0x76 && b[1] == 0xa9 && b[2] == 0x14 &&
+             b[23] == 0x88 && b[24] == 0xac) ||        // P2PKH
+            (n == 34 && b[0] == 0x51 && b[1] == 0x20); // P2TR
+
+        if (!valid_btc_shape)
+        {
+          if (error_out)
+          {
+            std::string got_hex;
+            static const char HEX[] = "0123456789abcdef";
+            for (size_t i = 0; i < std::min<size_t>(n, 4); ++i)
+            {
+              got_hex.push_back(HEX[b[i] >> 4]);
+              got_hex.push_back(HEX[b[i] & 0xF]);
+            }
+            if (n > 4)
+              got_hex += "…";
+            *error_out = WalletStatus::fail(
+                WalletError::InvalidParameter,
+                "Bitcoin destination_blob must be a supported "
+                "scriptPubKey: P2WPKH (22B 0x0014…), P2SH "
+                "(23B 0xa914…87), P2PKH (25B 0x76a914…88ac), or "
+                "P2TR (34B 0x5120…). Got " +
+                    std::to_string(n) +
+                    " bytes starting with 0x" + got_hex +
+                    ". Pass the scriptPubKey bytes, not the bech32 "
+                    "string.");
+          }
+          return std::nullopt;
+        }
+      }
+      //  Unknown source_chain_id: don't invent a shape check here.
+      //  The executor gates on the chain being registered, and
+      //  registration is where the chain's adapter constraints
+      //  are declared. An unregistered chain never reaches
+      //  buildBridgeBurn in normal use; if it somehow does, the
+      //  executor rejects the tx on apply and no funds move.
+      //  Adding a guess here would just be a second place to get
+      //  the shape wrong.
+    }
+
     if (params.destination_address.empty())
     {
       if (error_out)

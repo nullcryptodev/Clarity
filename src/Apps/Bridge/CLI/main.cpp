@@ -361,6 +361,17 @@ namespace
       return nullptr;
     }
 
+    //  Record the endpoint on the session so cmd_status can show
+    //  it without access to WatcherConfig. The bind string is the
+    //  same one we just passed to the server, with the same
+    //  empty() -> loopback fallback, so what status prints is
+    //  exactly what the server bound to.
+    session.deposit_api_bound_port = server->boundPort();
+    session.deposit_api_bind =
+        config.deposit_api_bind.empty()
+            ? std::string("127.0.0.1")
+            : config.deposit_api_bind;
+
     return server;
   }
 
@@ -511,6 +522,15 @@ int main(int argc, char **argv)
     std::cerr << "error: setup failed: " << e.what() << "\n";
     return 1;
   }
+
+  //  state_dir is set on the session from both the no-wizard and
+  //  wizard paths, after both have populated args.config. Set it
+  //  here (rather than inside each branch) so the two paths can't
+  //  drift; expandHome is idempotent, so a second call on an
+  //  already-expanded path is a no-op. cmd_start uses
+  //  session.state_dir to place the Bitcoin custody file under
+  //  <state_dir>/<chain>/, matching where the scan cursor lives.
+  session.state_dir = Bridge::expandHome(args.config.state_dir);
 
   if (!args.command.empty())
   {

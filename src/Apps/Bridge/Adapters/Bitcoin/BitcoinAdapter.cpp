@@ -11,6 +11,8 @@
 #include "Core/Bridge/Bitcoin.h"
 
 #include "Crypto/Types.h"
+#include "Crypto/BitcoinEcdsa.h"
+#include "Crypto/BitcoinTransaction.h"
 
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -722,6 +724,110 @@ namespace Bridge
       std::memcpy(out.data(), script.data(), 22);
       return true;
     }
+
+    //  Fetch all UTXOs across the custody window. Returns the
+    //  union, unsorted. Fails if any address's UTXO fetch fails —
+    //  partial success here would be worse than failure, because
+    //  "I checked and there's no UTXO big enough" is a much
+    //  stronger claim than "I checked the first three addresses
+    //  and the fourth errored out". The caller decides whether
+    //  a failure is retriable.
+    //
+    //  Per-address query shape (mempool.space Esplora):
+    //    GET /address/<addr>/utxo
+    //  returns a JSON array of {txid, vout, value, status:{...}}.
+    //  `status.confirmed` is true for buried outputs. We accept
+    //  both confirmed and unconfirmed — an unconfirmed UTXO is
+    //  spendable if we can outbid its ancestor, and mempool.space
+    //  broadcast will surface an RBF-or-cpfp failure if not.
+    std::optional<std::vector<BitcoinAdapter::UtxoCandidate>>
+    fetchCustodyUtxosImpl(
+        const BitcoinConfig &config,
+        const BitcoinCustody &custody,
+        std::string *error_out)
+    {
+      std::vector<BitcoinAdapter::UtxoCandidate> out;
+
+      if (!custody.canSpend())
+      {
+        if (error_out)
+          *error_out = "custody is watch-only (FromXpub); cannot "
+                       "enumerate spendable UTXOs";
+        return std::nullopt;
+      }
+
+      for (const auto &[script_key, ds] : custody.scriptsInWindow())
+      {
+        (void)script_key;
+        std::string err;
+        auto resp = callMempoolGet(
+            config, "/address/" + ds.address + "/utxo", &err);
+        if (!resp.has_value() || !resp->is_array())
+        {
+          if (error_out)
+            *error_out = "GET /address/" + ds.address +
+                         "/utxo failed: " +
+                         (err.empty() ? std::string("(malformed)") : err);
+          return std::nullopt;
+        }
+
+        for (const auto &u : *resp)
+        {
+          if (!u.is_object())
+            continue;
+          if (!u.contains("txid") || !u["txid"].is_string())
+            continue;
+          if (!u.contains("vout") || !u["vout"].is_number_unsigned())
+            continue;
+          if (!u.contains("value") || !u["value"].is_number_unsigned())
+            continue;
+
+          BitcoinAdapter::UtxoCandidate c;
+          c.address = ds.address;
+          c.script = std::vector<uint8_t>(ds.script.begin(), ds.script.end());
+          c.index = ds.index;
+          Crypto::Hash txid_hash;
+          if (!parseTxidFromHex(u["txid"].get<std::string>(), txid_hash))
+            continue;
+          std::memcpy(c.txid_wire.data(), txid_hash.data.data(), 32);
+          c.vout = static_cast<uint32_t>(u["vout"].get<uint64_t>());
+          c.value_sat = u["value"].get<uint64_t>();
+          if (c.value_sat == 0)
+            continue;
+          out.push_back(std::move(c));
+        }
+      }
+
+      return out;
+    }
+
+    //  Fetch the half-hour fee rate (sat/vB) from mempool.space.
+    //  Returns nullopt on failure; the caller falls back to 1
+    //  sat/vB. The response shape is:
+    //    {"fastestFee":N,"halfHourFee":N,"hourFee":N,
+    //     "economyFee":N,"minimumFee":N}
+    std::optional<uint64_t>
+    fetchHalfHourFeeRateImpl(const BitcoinConfig &config,
+                             std::string *error_out)
+    {
+      std::string err;
+      auto resp = callMempoolGet(config, "/v1/fees/recommended", &err);
+      if (!resp.has_value() || !resp->is_object())
+      {
+        if (error_out)
+          *error_out = err.empty() ? "fee rate: malformed response"
+                                   : err;
+        return std::nullopt;
+      }
+      if (!resp->contains("halfHourFee") ||
+          !(*resp)["halfHourFee"].is_number_unsigned())
+      {
+        if (error_out)
+          *error_out = "fee rate: no halfHourFee field";
+        return std::nullopt;
+      }
+      return (*resp)["halfHourFee"].get<uint64_t>();
+    }
   } // anonymous namespace
 
   //  ==========================================================================
@@ -1161,15 +1267,316 @@ namespace Bridge
   //  ==========================================================================
 
   ReleaseSubmission BitcoinAdapter::submit_release(
-      Wallet::RpcClient & /*rpc*/,
-      const ReleaseRequest & /*request*/,
-      uint64_t /*amount_source_atomic*/,
-      const std::vector<uint8_t> & /*signature_block*/) const
+      Wallet::RpcClient &rpc,
+      const ReleaseRequest &request,
+      uint64_t amount_source_atomic,
+      const std::vector<uint8_t> &signature_block) const
   {
+    //  The Wallet::RpcClient argument is unused for Bitcoin:
+    //  the adapter talks to its source chain through config_
+    //  (mempool.space or bitcoind), not through a Wallet RPC.
+    //  The ReleaseTracker worker passes a dummy. Matches the
+    //  pattern of scan_deposits_mempool and fetch_release_height.
+    (void)rpc;
+    (void)signature_block; // audit artifact only; Bitcoin has
+                           // no on-chain ack verification
+
     ReleaseSubmission out;
     out.ok = false;
-    out.reason = "Bitcoin release not yet implemented; "
-                 "deposits work, withdrawals stay in Releasable";
+
+    //  ---- Preconditions ----
+
+    if (custody_ == nullptr)
+    {
+      out.reason = "custody not installed";
+      return out;
+    }
+    if (!custody_->canSpend())
+    {
+      out.reason = "custody is watch-only (FromXpub); cannot sign "
+                   "a Bitcoin release";
+      return out;
+    }
+    if (config_.transport != BitcoinTransport::MempoolSpace)
+    {
+      out.reason = "Bitcoin release currently supports mempool.space "
+                   "transport only; bitcoind transport is not yet "
+                   "implemented for the release path";
+      return out;
+    }
+    if (!validate_destination(request.destination_blob))
+    {
+      out.reason = "destination_blob is not a supported Bitcoin "
+                   "output script (expected P2WPKH, P2SH, P2PKH, "
+                   "or P2TR)";
+      return out;
+    }
+    if (amount_source_atomic == 0)
+    {
+      out.reason = "release amount is zero";
+      return out;
+    }
+
+    //  ---- Step 1: enumerate candidate UTXOs ----
+
+    std::string utxo_err;
+    auto utxos = fetchCustodyUtxos(&utxo_err);
+    if (!utxos.has_value())
+    {
+      out.reason = "UTXO enumeration failed: " + utxo_err;
+      return out;
+    }
+
+    //  Largest-first. Single-UTXO policy for v1: no
+    //  consolidation, no fan-in. If the largest UTXO doesn't
+    //  cover amount + fee, the release waits for a larger one
+    //  (or the operator consolidates manually). This is simple
+    //  and predictable; fan-in can come later if needed.
+    std::sort(utxos->begin(), utxos->end(),
+              [](const UtxoCandidate &a, const UtxoCandidate &b)
+              {
+                return a.value_sat > b.value_sat;
+              });
+
+    //  ---- Step 2: fee rate ----
+
+    uint64_t fee_rate = 1;
+    {
+      std::string fee_err;
+      auto r = fetchHalfHourFeeRate(&fee_err);
+      if (r.has_value() && *r >= 1)
+        fee_rate = *r;
+      //  On failure: fall back to 1 sat/vB. The broadcast may
+      //  fail if the mempool is congested, but that's a
+      //  diagnosable error surfaced below, not a reason to
+      //  refuse before trying.
+    }
+
+    //  Estimated vsize for a 1-in-2-out P2WPKH spend. The
+    //  theoretical minimum is ~110 vB; using the standard figure
+    //  absorbs DER-signature-length variance (71 or 72 bytes).
+    constexpr uint64_t kEstimatedVsize = 110;
+    uint64_t fee = fee_rate * kEstimatedVsize;
+    if (fee < kEstimatedVsize)
+      fee = kEstimatedVsize; // floor at 1 sat/vB
+
+    //  Sanity cap: if the fee exceeds 5% of the amount, the fee
+    //  rate is anomalous (or the amount is tiny). Refuse rather
+    //  than burn the user's value on fees.
+    if (amount_source_atomic > 0 &&
+        fee > amount_source_atomic / 20)
+    {
+      out.reason = "computed fee (" + std::to_string(fee) +
+                   " sat) exceeds 5% of the release amount (" +
+                   std::to_string(amount_source_atomic) +
+                   " sat) at fee rate " + std::to_string(fee_rate) +
+                   " sat/vB";
+      return out;
+    }
+
+    //  ---- Step 3: pick the UTXO ----
+
+    const UtxoCandidate *selected = nullptr;
+    for (const auto &u : *utxos)
+    {
+      if (u.value_sat >= amount_source_atomic + fee)
+      {
+        selected = &u;
+        break;
+      }
+    }
+    if (selected == nullptr)
+    {
+      out.reason = "no custody UTXO covers amount + fee (" +
+                   std::to_string(amount_source_atomic) + " + " +
+                   std::to_string(fee) + " = " +
+                   std::to_string(amount_source_atomic + fee) +
+                   " sat); largest available: " +
+                   (utxos->empty() ? std::string("none")
+                                   : std::to_string((*utxos)[0].value_sat) +
+                                         " sat");
+      return out;
+    }
+
+    //  ---- Step 4: derive the spending key ----
+
+    std::string key_err;
+    auto privkey = custody_->derivePrivateKeyAt(selected->index, &key_err);
+    if (!privkey.has_value())
+    {
+      out.reason = "could not derive private key for custody index " +
+                   std::to_string(selected->index) + ": " + key_err;
+      return out;
+    }
+
+    //  ---- Step 5: build the transaction ----
+
+    Crypto::BitcoinTransaction tx;
+    tx.version = 2;
+    tx.locktime = 0; // no timelock; the release is unconditional
+
+    //  Input: the selected UTXO.
+    Crypto::BitcoinTxIn in;
+    in.prev_txid = selected->txid_wire;
+    in.prev_vout = selected->vout;
+    in.sequence = 0xFFFFFFFD; // opt into nLockTime (BIP125-style),
+                              // though we set locktime=0. The
+                              // semantics don't differ at locktime
+                              // 0; using FFFFFFFD rather than
+                              // FFFFFFFF is the modern default and
+                              // keeps the tx RBF-eligible if we
+                              // ever add it.
+    //  script_sig empty (P2WPKH), witness populated after signing.
+    tx.inputs.push_back(in);
+
+    //  Output 0: the destination, verbatim.
+    Crypto::BitcoinTxOut dest_out;
+    dest_out.value_sat = amount_source_atomic;
+    dest_out.script_pubkey = request.destination_blob;
+    tx.outputs.push_back(dest_out);
+
+    //  Output 1: change back to the source custody address.
+    const uint64_t change_sat =
+        selected->value_sat - amount_source_atomic - fee;
+    if (change_sat > 0)
+    {
+      //  Dust threshold for P2WPKH change is 294 sat
+      //  (Bitcoin Core's GetDustThreshold for a P2WPKH output,
+      //  as of this writing). Below that, drop the change into
+      //  the fee rather than create an unspendable output.
+      constexpr uint64_t kP2wpkhDust = 294;
+      if (change_sat >= kP2wpkhDust)
+      {
+        Crypto::BitcoinTxOut change_out;
+        change_out.value_sat = change_sat;
+        change_out.script_pubkey = selected->script;
+        tx.outputs.push_back(change_out);
+      }
+      else
+      {
+        //  Change too small: the fee absorbs it. The reason
+        //  string for this is informational only; the release
+        //  still succeeds with the effective fee.
+        fee += change_sat;
+        //  Note: fee is now the effective fee, not the
+        //  estimate. The output value is unchanged (we still
+        //  send amount_source_atomic to the destination), so
+        //  the extra value comes out of the change allocation
+        //  and is absorbed.
+      }
+    }
+
+    //  ---- Step 6: sign ----
+
+    //  BIP143 sighash for input 0. script_code is the spent
+    //  P2WPKH script, prev_output_value is the UTXO value.
+    const Crypto::Hash sighash = Crypto::sighashBip143(
+        tx,
+        /*input_index=*/0,
+        selected->script,
+        selected->value_sat,
+        /*hash_type=*/0x01);
+
+    if (sighash.isNull())
+    {
+      out.reason = "sighashBip143 returned a null hash";
+      return out;
+    }
+
+    std::string sign_err;
+    auto sig_with_type = Crypto::signDerWithHashType(
+        *privkey, sighash, 0x01, &sign_err);
+    if (!sig_with_type.has_value())
+    {
+      out.reason = "signing failed: " + sign_err;
+      return out;
+    }
+
+    //  Compressed pubkey for the second witness item.
+    std::string pub_err;
+    auto pub = Crypto::toXpub(*privkey, &pub_err);
+    if (!pub.has_value())
+    {
+      out.reason = "could not derive public key for witness: " + pub_err;
+      return out;
+    }
+
+    //  ---- Step 7: assemble the witness ----
+
+    //  P2WPKH witness stack, exactly two items:
+    //    [ DER signature || SIGHASH_ALL ]  [ 33-byte compressed pubkey ]
+    std::vector<uint8_t> pubkey_vec(pub->pubkey.begin(), pub->pubkey.end());
+    tx.inputs[0].witness.push_back(*sig_with_type);
+    tx.inputs[0].witness.push_back(std::move(pubkey_vec));
+
+    //  ---- Step 8: serialize and broadcast ----
+
+    const auto raw_tx = tx.serialize();
+    const std::string raw_hex = hexOf(raw_tx);
+
+    //  POST /api/tx with the raw hex as the body. mempool.space
+    //  returns the txid as plain text on success, and a JSON
+    //  error body on rejection. We can't use jsonPost here
+    //  because the success body isn't JSON.
+    std::string base = config_.mempool_url;
+    if (base.empty())
+    {
+      out.reason = "mempool_url is empty";
+      return out;
+    }
+    if (base.find("://") == std::string::npos)
+      base = "https://" + base;
+
+    std::string url = base + "/tx";
+    if (!config_.mempool_api_key.empty())
+    {
+      url += (url.find('?') == std::string::npos ? '?' : '&');
+      url += "key=";
+      url += config_.mempool_api_key;
+    }
+
+    auto result = doHttpRequest("POST", url, raw_hex,
+                                BTC_HTTP_TIMEOUT_SECONDS);
+    if (!result.ok)
+    {
+      out.reason = "broadcast POST failed: " +
+                   (result.error.empty() ? "(no detail)" : result.error);
+      return out;
+    }
+    if (result.status_code < 200 || result.status_code >= 300)
+    {
+      out.reason = "broadcast rejected (HTTP " +
+                   std::to_string(result.status_code) + "): " +
+                   result.body;
+      return out;
+    }
+
+    //  Success: mempool.space returns the txid (64 hex chars) as
+    //  the body. Trim trailing whitespace and validate.
+    std::string txid_hex = result.body;
+    while (!txid_hex.empty() &&
+           (txid_hex.back() == '\n' || txid_hex.back() == '\r' ||
+            txid_hex.back() == ' ' || txid_hex.back() == '\t'))
+      txid_hex.pop_back();
+    if (txid_hex.size() != 64)
+    {
+      out.reason = "broadcast response body is not a 64-char txid: \"" +
+                   txid_hex + "\"";
+      return out;
+    }
+
+    //  Convert display txid to Crypto::Hash's wire order.
+    Crypto::Hash txid_hash;
+    if (!parseTxidFromHex(txid_hex, txid_hash))
+    {
+      out.reason = "broadcast returned an unparseable txid: " + txid_hex;
+      return out;
+    }
+
+    out.ok = true;
+    out.source_tx_hash = txid_hash;
+    //  block_height is zero on broadcast; fetch_release_height
+    //  will populate it on a later poll once the tx confirms.
     return out;
   }
 
@@ -1258,8 +1665,43 @@ namespace Bridge
   bool BitcoinAdapter::validate_destination(
       const std::vector<uint8_t> &destination_blob) const
   {
-    return !destination_blob.empty() &&
-           destination_blob.size() <= BTC_MAX_SCRIPT_BYTES;
+    //  Accept the four standard output-script shapes a Bitcoin
+    //  wallet will produce for a user-supplied address:
+    //
+    //    P2WPKH  22 bytes: 0x00 0x14 || 20-byte-hash
+    //    P2SH    23 bytes: 0xa9 0x14 || 20-byte-hash || 0x87
+    //    P2PKH   25 bytes: 0x76 0xa9 0x14 || 20-byte-hash || 0x88 0xac
+    //    P2TR    34 bytes: 0x51 0x20 || 32-byte-x-only-key
+    //
+    //  Anything else is rejected. This is the burn-side gate:
+    //  an invalid destination is an unreleasable burn, which is
+    //  a loss of funds. Being strict here is the difference
+    //  between "the front end rejects an unparseable address" and
+    //  "the user burns wBTC and the bridge can't pay it out".
+    //
+    //  P2WSH (34 bytes, 0x00 0x20) is deliberately NOT accepted.
+    //  A P2WSH destination is a multisig or script-hash address;
+    //  releasing to one is almost certainly a user error or a
+    //  front end that didn't validate. If we ever support it, the
+    //  right change is to accept it here AND to test end to end,
+    //  not to loosen the check speculatively.
+    const auto &b = destination_blob;
+    const size_t n = b.size();
+
+    if (n == 22 && b[0] == 0x00 && b[1] == 0x14)
+      return true; // P2WPKH
+
+    if (n == 23 && b[0] == 0xa9 && b[1] == 0x14 && b[22] == 0x87)
+      return true; // P2SH
+
+    if (n == 25 && b[0] == 0x76 && b[1] == 0xa9 && b[2] == 0x14 &&
+        b[23] == 0x88 && b[24] == 0xac)
+      return true; // P2PKH
+
+    if (n == 34 && b[0] == 0x51 && b[1] == 0x20)
+      return true; // P2TR
+
+    return false;
   }
 
   bool BitcoinAdapter::validate_deposit_address(
@@ -1433,6 +1875,24 @@ namespace Bridge
   uint32_t BitcoinAdapter::registration_active_validator_min() const
   {
     return GlobalConfig::ACTIVE_SET_MIN;
+  }
+
+  std::optional<std::vector<BitcoinAdapter::UtxoCandidate>>
+  BitcoinAdapter::fetchCustodyUtxos(std::string *error_out) const
+  {
+    if (custody_ == nullptr)
+    {
+      if (error_out)
+        *error_out = "Bitcoin custody is not installed";
+      return std::nullopt;
+    }
+    return fetchCustodyUtxosImpl(config_, *custody_, error_out);
+  }
+
+  std::optional<uint64_t>
+  BitcoinAdapter::fetchHalfHourFeeRate(std::string *error_out) const
+  {
+    return fetchHalfHourFeeRateImpl(config_, error_out);
   }
 
   //  ==========================================================================

@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "Crypto/BitcoinBip32.h"
+#include "Crypto/BitcoinBip32Private.h"
 
 namespace Bridge
 {
@@ -114,6 +114,28 @@ namespace Bridge
 
     std::string accountXpubDisplay() const;
 
+    //  Derive the private key for the deposit address at `index`.
+    //
+    //  The path is the same one deriveScript() walks: the
+    //  account tail (receive branch, 0) followed by the index.
+    //  For a deposit that arrived at custody address N, the key
+    //  returned here is what spends it — the UTXO lives on the
+    //  P2WPKH output whose script hash derives from this key.
+    //
+    //  Returns nullopt in watch-only mode (source() == FromXpub),
+    //  because from_xpub never had the seed and cannot spend. The
+    //  error message says so, so a caller that reaches this path
+    //  in the wrong mode gets a diagnosable failure rather than a
+    //  null ExtendedPrivKey.
+    //
+    //  The returned key is sensitive. Callers must not persist
+    //  it, log it, or copy it into long-lived structures. The
+    //  bridge's release path uses it, signs one transaction, and
+    //  drops it.
+    std::optional<Crypto::ExtendedPrivKey>
+    derivePrivateKeyAt(uint64_t index,
+                       std::string *error_out = nullptr) const;
+
   private:
     BitcoinCustody() = default;
 
@@ -136,5 +158,13 @@ namespace Bridge
 
     uint64_t highest_used_{0};
     bool have_used_{false};
+
+    //  The BIP39 seed. Present in Generated mode, all zeros in
+    //  FromXpub mode. Zeroed in the destructor and on the
+    //  failure paths of create_or_load. Never leaves the object
+    //  except through derivePrivateKeyAt, which hands out one
+    //  child key at a time.
+    std::array<uint8_t, 64> seed_{};
+    bool have_seed_{false};
   };
 } // namespace Bridge

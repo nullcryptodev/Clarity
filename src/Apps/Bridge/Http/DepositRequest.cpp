@@ -177,7 +177,6 @@ namespace Bridge
           match_index = d.index;
           found = true;
         }
-        break;
       }
 
       if (!found)
